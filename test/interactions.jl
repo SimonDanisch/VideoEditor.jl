@@ -1,0 +1,589 @@
+# UI tests driving the real GLMakie window with synthetic mouse/keyboard
+# events (same mechanism FakeInteraction uses) and asserting on editor state.
+# Included from runtests.jl only when a GL context is available.
+
+import GLMakie
+import VideoEditor.Makie as Makie
+using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
+
+@testset "UI interactions" begin
+    GLMakie.activate!(; visible = false)
+    p = Player(testvideo)  # 320×180, 120 frames @30 (from runtests.jl)
+    try
+        fig = p.fig
+        ev = Makie.events(fig)
+        tl = p.timeline
+        ax = tl.axis
+        sleep(1.5)  # decode warm-up + layout
+
+        tlx(t) = begin  # timeline time → figure pixel
+            lims = ax.finallimits[]
+            vp = ax.scene.viewport[]
+            frac = (t - minimum(lims)[1]) / (maximum(lims)[1] - minimum(lims)[1])
+            Point2f(vp.origin[1] + frac * vp.widths[1], vp.origin[2] + 0.5 * vp.widths[2])
+        end
+        pv(fx, fy) = begin  # preview viewport fraction → figure pixel
+            vp = p.previewaxis.scene.viewport[]
+            Point2f(vp.origin[1] + fx * vp.widths[1], vp.origin[2] + fy * vp.widths[2])
+        end
+        moveto(pos) = (ev.mouseposition[] = Tuple(pos))
+        press(pos) = (moveto(pos); ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.press))
+        release() = (ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.release))
+        keypress(k) = (ev.keyboardbutton[] = KeyEvent(k, Keyboard.press);
+                       ev.keyboardbutton[] = KeyEvent(k, Keyboard.release))
+        waitfor(pred; s = 6) = (t0 = time();
+                                while !pred() && time() - t0 < s
+                                    sleep(0.1)
+                                end;
+                                pred())
+
+        @testset "scrub selects and follows" begin
+            @test occursin("Space plays", p.status[])   # onboarding hint on startup
+            press(tlx(1.0))
+            @test p.playhead[] == 30
+            @test tl.selected[] == 1
+            @test tl.scrubbing[]
+            moveto(tlx(2.5))
+            @test p.playhead[] == 75
+            release()
+            @test !tl.scrubbing[]
+        end
+
+        @testset "crop tool keeps orientation" begin
+            keypress(Keyboard.c)
+            @test p.cropmode[]
+            press(pv(0.3, 0.3))
+            moveto(pv(0.7, 0.7))
+            release()
+            @test !p.cropmode[]
+            crop = p.sequence.clips[1].crop
+            @test crop != (0.0, 0.0, 1.0, 1.0)
+            @test 0.05 < crop[1] < 0.5 && 0.2 < crop[3] < 0.8
+            # regression: applying the crop must not un-reverse the y axis
+            # (Makie's ylims! derives yreversed from argument order)
+            @test p.previewaxis.yreversed[]
+            keypress(Keyboard.r)  # reset for later tests
+            @test p.sequence.clips[1].crop == (0.0, 0.0, 1.0, 1.0)
+        end
+
+        @testset "right-click modal" begin
+            ev.mouseposition[] = Tuple(tlx(1.0))
+            ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.press)
+            ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.release)
+            @test p.clipmodal.open[]
+            press(Point2f(10, 10))  # backdrop click dismisses
+            release()
+            @test !p.clipmodal.open[]
+        end
+
+        @testset "hold-to-compare" begin
+            comparebtn = p.fxwidgets[:compare]   # dock content is not in fig.content
+            center = comparebtn.layoutobservables.computedbbox[]
+            pos = Point2f(center.origin .+ center.widths ./ 2)
+            @test p.applytracks[]
+            press(pos)
+            @test !p.applytracks[]
+            release()
+            @test p.applytracks[]
+        end
+
+        @testset "split, ctrl-drag with snap, ripple delete" begin
+            press(tlx(2.0)); release()
+            keypress(Keyboard.s)
+            @test length(p.sequence.clips) == 2
+            @test p.sequence.clips[2].start == 60
+
+            # Ctrl-drag clip 2 right: nothing moves until release
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
+            press(tlx(3.0))
+            @test tl.dragclip !== nothing
+            moveto(tlx(3.5))
+            @test p.sequence.clips[2].start == 60      # not committed yet
+            @test tl.ghost_plot.visible[]
+            release()
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
+            @test p.sequence.clips[2].start == 75      # committed on release
+            @test !tl.ghost_plot.visible[]
+
+            # drag back until it snaps against clip 1's end
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
+            press(tlx(3.0))                            # grab (offset 15 frames)
+            moveto(tlx(2.55))                          # raw ≈ 61-62 → snaps to 60
+            @test !isempty(tl.snapline[])
+            release()
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
+            @test p.sequence.clips[2].start == 60
+
+            # ripple delete the second clip
+            press(tlx(3.0)); release()
+            keypress(Keyboard.x)
+            @test length(p.sequence.clips) == 1
+            @test VE.seqlength(p.sequence) == 60
+            @test length(tl.clipplots) == 1            # plot reconciled away
+            # the view follows the shrunken sequence (no dead space)
+            @test maximum(ax.finallimits[])[1] <= 2.0 * 1.05
+        end
+
+        @testset "edge trim" begin
+            # state here: one clip, frames 0:60 (2 s)
+            clip = p.sequence.clips[1]
+            @test VE.cliplength(clip) == 60
+            moveto(tlx(1.0))                      # clip middle: no trim handle
+            @test isempty(p.timeline.edgeline[])
+            moveto(tlx(2.0))                      # right edge: handle bar shows
+            @test !isempty(p.timeline.edgeline[])
+            press(tlx(2.0))                       # grab the right edge (within 8 px)
+            @test p.timeline.trimclip !== nothing
+            moveto(tlx(1.5))                      # trim to 1.5 s
+            @test !isempty(p.timeline.edgeline[])             # handle follows the drag
+            @test startswith(p.timeline.tooltip_text[], "clip ")  # live clip length
+            release()
+            @test p.timeline.trimclip === nothing
+            @test VE.cliplength(clip) == 45
+            @test clip.src_out == 45
+
+            press(tlx(0.0))                       # left edge: shift start + src_in
+            moveto(tlx(0.5))
+            release()
+            @test clip.src_in == 15
+            @test clip.start == 15
+            @test VE.cliplength(clip) == 30
+
+            # regression (Simon): exactly ON the edge and just OUTSIDE the last
+            # clip must both show the handle — the boundary frame belongs to
+            # the next clip, so a clipat-based hit test missed these
+            moveto(tlx(1.5))                      # exactly on the right edge
+            @test !isempty(p.timeline.edgeline[])
+            @test p.timeline.hovered[] == 1       # edge hover brightens its clip
+            moveto(tlx(1.5 + VE.edgezone(p.timeline) / 2))  # just past the end
+            @test !isempty(p.timeline.edgeline[])
+            moveto(tlx(1.0))                      # interior: no handle
+            @test isempty(p.timeline.edgeline[])
+        end
+
+        @testset "undo / redo" begin
+            # two trims above pushed two snapshots; Ctrl+Z restores them
+            clip() = p.sequence.clips[1]
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
+            keypress(Keyboard.z)                  # undo left trim
+            @test clip().src_in == 0 && VE.cliplength(clip()) == 45
+            keypress(Keyboard.z)                  # undo right trim
+            @test VE.cliplength(clip()) == 60
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_shift, Keyboard.press)
+            keypress(Keyboard.z)                  # redo right trim
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_shift, Keyboard.release)
+            @test VE.cliplength(clip()) == 45
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
+
+            # undo also covers keyboard edits
+            press(tlx(0.7)); release()
+            keypress(Keyboard.s)
+            @test length(p.sequence.clips) == 2
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
+            keypress(Keyboard.z)
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
+            @test length(p.sequence.clips) == 1
+            @test length(p.timeline.clipplots) == 1
+        end
+
+        @testset "cut prefetch" begin
+            # current state: one clip of 45 frames; split → two adjacent clips
+            press(tlx(0.7)); release()
+            keypress(Keyboard.s)
+            @test length(p.sequence.clips) == 2
+            cut = p.sequence.clips[2].start
+            press(tlx((cut - 5) / 30)); release()   # 5 frames before the cut
+            sleep(0.6)                              # worker buffers the tail
+            clip, srcframe = VE.locate(p.sequence, p.playhead[])
+            target, protect = VE.decodetarget(p, p.playhead[], clip, srcframe)
+            @test target == p.sequence.clips[2].src_in  # aims across the cut
+            @test first(protect) == srcframe            # tail slots protected
+            # on the last clip there is nothing to prefetch
+            press(tlx(1.0)); release()
+            sleep(0.3)
+            clip2, src2 = VE.locate(p.sequence, p.playhead[])
+            target2, protect2 = VE.decodetarget(p, p.playhead[], clip2, src2)
+            @test target2 == src2 && isempty(protect2)
+        end
+
+        @testset "drop a second source" begin
+            # state: two clips (0.7s split of a 45-frame clip), 45 frames total
+            nclips = length(p.sequence.clips)
+            ev.dropped_files[] = [testvideo2]      # what GLFW delivers on file drop
+            @test length(p.sequence.clips) == nclips + 1
+            @test length(tl.clipplots) == nclips + 1
+            added = p.sequence.clips[end]
+            @test added.source.width == 480
+            @test added.start == 45                # appended at the sequence end
+            @test maximum(ax.finallimits[])[1] >= VE.seqduration(p.sequence) - 1e-6
+
+            # scrubbing onto the new clip switches the preview buffers
+            press(tlx((45 + 15) / 30)); release()
+            sleep(0.6)
+            @test size(p.frame[]) == (480, 270)
+
+            # near the cross-source cut the other source's worker pre-warms;
+            # the current clip's worker stays on its own tail (separate rings)
+            VE.settarget!(VE.pool(p, added.source).worker, 60)  # point it away first
+            press(tlx((45 - 5) / 30)); release()
+            clip, src = VE.locate(p.sequence, p.playhead[])
+            target, protect = VE.decodetarget(p, p.playhead[], clip, src)
+            @test target == src && isempty(protect)
+            @test VE.pool(p, added.source).worker.target[] == added.src_in
+
+            # adding is one undoable edit
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
+            keypress(Keyboard.z)
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
+            @test length(p.sequence.clips) == nclips
+            @test length(tl.clipplots) == nclips
+        end
+
+        @testset "object-lock pick flow" begin
+            # select "Object lock" in the mode menu via real clicks
+            menu = p.fxwidgets[:modemenu]
+            bb() = menu.layoutobservables.computedbbox[]
+            mpos(rely) = Point2f(bb().origin[1] + bb().widths[1] / 2,
+                                 bb().origin[2] + rely * bb().widths[2])
+            press(mpos(0.5)); release()          # open the dropdown
+            @test menu.is_open[]
+            press(mpos(-1.5)); release()         # option 2 (list opens downward)
+            @test menu.selection[] == :objectlock
+
+            stabbtn = p.fxwidgets[:analyze]
+            sc = stabbtn.layoutobservables.computedbbox[]
+            stabcenter = Point2f(sc.origin .+ sc.widths ./ 2)
+            press(stabcenter); release()
+            @test p.onpick !== nothing           # armed, waiting for the pick
+
+            keypress(Keyboard.escape)            # Esc cancels the pick
+            @test p.onpick === nothing
+
+            # re-arm and click the preview: analysis runs and produces a track
+            # (pause first: a second click at the same spot within Makie's
+            # double-click interval registers as dblclick, not click)
+            sleep(0.5)
+            press(stabcenter); release()
+            @test p.onpick !== nothing
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            clip.motiontrack = nothing
+            press(pv(0.5, 0.5)); release()
+            @test p.onpick === nothing
+            t0 = time()
+            while clip.motiontrack === nothing && time() - t0 < 15
+                sleep(0.1)
+            end
+            clip.motiontrack === nothing &&
+                @info "objectlock debug" p.status[] p.stabinfo[] p.playhead[] length(p.sequence.clips)
+            @test clip.motiontrack !== nothing
+
+            # a motion analysis composes the stabilization border crop into
+            # the clip's crop, and the new framing is flashed on the preview
+            @test waitfor(() -> clip.crop != (0.0, 0.0, 1.0, 1.0))
+            @test waitfor(() -> !isempty(p.croprect[]))      # outline flash on
+            @test waitfor(() -> isempty(p.croprect[]))       # …and cleared again
+            # the track remembers the framing it auto-cropped away, and the
+            # panel names the active mode
+            @test clip.motiontrack.basecrop == (0.0, 0.0, 1.0, 1.0)
+            @test waitfor(() -> occursin("object lock", p.stabinfo[]))
+
+            press(mpos(0.5)); release()          # restore the default mode
+            press(mpos(-0.5)); release()
+            @test menu.selection[] == :similarity
+        end
+
+        @testset "remove stabilization restores the framing" begin
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            @test clip.motiontrack !== nothing   # from the object-lock beat
+            @test clip.crop != (0.0, 0.0, 1.0, 1.0)
+            rmbtn = p.fxwidgets[:remove]
+            bb = rmbtn.layoutobservables.computedbbox[]
+            press(Point2f(bb.origin .+ bb.widths ./ 2)); release()
+            @test clip.motiontrack === nothing
+            @test clip.crop == (0.0, 0.0, 1.0, 1.0)          # basecrop restored
+            @test occursin("no stabilization", p.stabinfo[])
+            @test waitfor(() -> occursin("removed", p.status[]))   # async status queue
+            # removing again reports politely instead of erroring (pause: a
+            # second click at the same spot within the dblclick window would
+            # be swallowed)
+            sleep(0.5)
+            press(Point2f(bb.origin .+ bb.widths ./ 2)); release()
+            @test waitfor(() -> occursin("no stabilization to remove", p.status[]))
+            # let the restore glide + outline flash finish before later beats
+            @test waitfor(() -> isempty(p.croprect[]))
+        end
+
+        @testset "proxy swap keeps the preview consistent" begin
+            press(tlx(0.3)); release()               # onto clip 1
+            clip = p.sequence.clips[1]
+            VE.startproxy!(p, clip.source; height = 90)
+            t0 = time()
+            while size(p.frame[]) != (160, 90) && time() - t0 < 20
+                sleep(0.1)
+            end
+            @test size(p.frame[]) == (160, 90)       # preview decodes the proxy
+            @test VE.pool(p, clip.source).source.height == 90
+            # the axis limits follow on the first successful present — the
+            # crop drag below maps through them, so wait for the switch
+            @test waitfor(() -> maximum(p.previewaxis.finallimits[])[1] <= 161)
+
+            # crop is normalized, so dragging the same viewport region gives
+            # the same crop regardless of the displayed resolution
+            keypress(Keyboard.c)
+            press(pv(0.3, 0.3))
+            moveto(pv(0.7, 0.7))
+            release()
+            crop = clip.crop
+            @test 0.05 < crop[1] < 0.5 && 0.2 < crop[3] < 0.8
+            @test p.previewaxis.yreversed[]
+            keypress(Keyboard.r)
+
+            # playback still presents (through the proxy pool)
+            before = p.presented
+            press(tlx(0.1)); release()
+            keypress(Keyboard.space)
+            sleep(0.8)
+            keypress(Keyboard.space)
+            @test p.presented > before
+        end
+
+        @testset "Ctrl+S saves the project" begin
+            path = VE.projectfile(p)
+            isfile(path) && rm(path)
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
+            keypress(Keyboard.s)
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
+            @test isfile(path)
+            @test length(p.sequence.clips) == length(VE.loadproject(path).clips)
+            # and plain S still splits (Ctrl branch must not shadow it)
+            nclips = length(p.sequence.clips)
+            press(tlx(0.4)); release()
+            keypress(Keyboard.s)
+            @test length(p.sequence.clips) == nclips + 1
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
+            keypress(Keyboard.z)                       # undo the split
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
+            rm(path)
+        end
+
+        @testset "space toggles playback" begin
+            keypress(Keyboard.space)
+            @test p.playing[]
+            keypress(Keyboard.space)
+            @test !p.playing[]
+        end
+
+        @testset "audio feed & mute" begin
+            if Sys.which("pw-cat") === nothing
+                @test_skip "PipeWire (pw-cat) not available"
+            else
+                # lifecycle: the feed spawns on play and dies on pause
+                p.playhead[] = 2
+                VE.play!(p); sleep(0.4)
+                @test p.audio.proc !== nothing
+                VE.pause!(p); sleep(0.3)
+                @test p.audio.proc === nothing
+
+                # the Sound/Muted button (one isolated real click)
+                mutebtn = first(b for b in fig.content
+                                if b isa Makie.Button && b.label[] in ("Sound", "Muted"))
+                mb = mutebtn.layoutobservables.computedbbox[]
+                mcenter = Point2f(mb.origin .+ mb.widths ./ 2)
+                sleep(0.5)                             # outside any dblclick window
+                press(mcenter); release(); sleep(0.2)
+                @test !p.audio.enabled
+                @test mutebtn.label[] == "Muted"
+
+                # muted playback spawns no feed
+                p.playhead[] = 2
+                VE.play!(p); sleep(0.4)
+                @test p.audio.proc === nothing
+                VE.pause!(p)
+
+                sleep(0.5)
+                press(mcenter); release(); sleep(0.2)  # unmute again
+                @test p.audio.enabled
+                @test mutebtn.label[] == "Sound"
+            end
+        end
+
+        @testset "empty timeline stays safe" begin
+            # deleting every clip is a valid state — nothing may crash on it
+            while !isempty(p.sequence.clips)
+                VE.deleteclip!(p.sequence, p.sequence.clips[1].start)
+            end
+            VE.relayout!(p.timeline)
+            @test isempty(p.sequence.clips)
+            @test VE.saveproject!(p) === nothing         # Ctrl+S path: refuses politely
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
+            keypress(Keyboard.s)                          # the real key event too
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
+            sleep(0.3)
+            @test occursin("empty", p.status[])
+            @test VE.renderpreview(p, 0.0, 240) isa Matrix  # MCP get_frame: black, no throw
+            @test_throws ErrorException exportvideo(joinpath(mktempdir(), "x.mp4"), p.sequence)
+            @test VE.showframe!(p, 0)                     # preview shows black
+        end
+
+        @testset "media bin drag-drop refills the timeline" begin
+            # the bin still lists the source; dragging a row onto the (empty)
+            # timeline places a clip at the drop position
+            binbtn = first(b for b in fig.content
+                           if b isa Makie.Button && b.label[] == "Bin")
+            bb = binbtn.layoutobservables.computedbbox[]
+            sleep(0.5)                       # clear the dblclick window
+            press(Point2f(bb.origin .+ bb.widths ./ 2)); release()
+            @test waitfor(() -> p.dockopen[] === :media)
+            @test !isempty(p.binrows)
+            rb = p.binrows[1][1].layoutobservables.computedbbox[]  # (button, thumbnail axis)
+            sleep(0.5)
+            press(Point2f(rb.origin .+ rb.widths ./ 2))
+            @test p.dragsource !== nothing
+            moveto(tlx(0.3))                       # ghost follows the cursor
+            moveto(tlx(0.5))
+            release()
+            @test p.dragsource === nothing
+            @test length(p.sequence.clips) == 1
+            @test p.sequence.clips[1].start == 15         # dropped at 0.5 s @30fps
+            @test waitfor(() -> occursin("placed", p.status[]))  # async statusqueue
+        end
+
+        @testset "toolbar tools: arm, click-to-act, cursor" begin
+            toolbtn(lbl) = first(b for b in fig.content
+                                 if b isa Makie.Button && b.label[] == lbl)
+            click(b) = (bb = b.layoutobservables.computedbbox[];
+                        press(Point2f(bb.origin .+ bb.widths ./ 2)); release())
+            # the media beat left one clip 0.5–16.5s; place the playhead early
+            press(tlx(0.7)); release()
+            nclips = length(p.sequence.clips)
+            playhead_before = p.playhead[]
+            sleep(0.5)
+            click(toolbtn("✂"))                   # split tool ARMS (no cut yet)
+            @test p.tool[] == :split
+            @test length(p.sequence.clips) == nclips
+            # click the timeline elsewhere → cut THERE, not at the playhead
+            press(tlx(3.0)); release()
+            @test length(p.sequence.clips) == nclips + 1
+            @test p.tool[] == :none                # auto-disarms after the cut
+            @test p.playhead[] == playhead_before  # the click cut, didn't scrub
+            @test any(c -> c.start == 90, p.sequence.clips)  # cut at 3.0 s @30fps
+            sleep(0.5)
+            click(toolbtn("↶"))                   # undo tool
+            @test length(p.sequence.clips) == nclips
+            sleep(0.5)
+            click(toolbtn("▢"))                   # crop tool arms crop mode
+            @test p.tool[] == :crop
+            @test p.cropmode[]
+            keypress(Keyboard.escape)
+            @test !p.cropmode[]
+            @test p.tool[] == :none
+        end
+
+        @testset "export dock panel renders the timeline" begin
+            outbtn = first(b for b in fig.content
+                           if b isa Makie.Button && b.label[] == "Export")
+            bb = outbtn.layoutobservables.computedbbox[]
+            sleep(0.5)
+            press(Point2f(bb.origin .+ bb.widths ./ 2)); release()
+            @test waitfor(() -> p.dockopen[] === :export)
+            out = joinpath(mktempdir(), "paneltest.mp4")
+            p.fxwidgets[:exportpath][] = out
+            gb = p.fxwidgets[:exportgo].layoutobservables.computedbbox[]
+            sleep(0.5)
+            press(Point2f(gb.origin .+ gb.widths ./ 2)); release()
+            @test waitfor(() -> occursin("exported", p.status[]) ||
+                                occursin("failed", p.status[]); s = 45)
+            @test occursin("exported", p.status[])
+            @test isfile(out)
+        end
+    finally
+        close(p)
+    end
+end
+
+@testset "chaos: random event storm leaves the editor coherent" begin
+    using Random
+    p = Player(testvideo)
+    sleep(1.5)
+    ev = Makie.events(p.fig)
+    # dock-panel widgets live outside fig.content — include them in the storm
+    buttons = vcat([b for b in p.fig.content if b isa Makie.Button],
+                   [w for w in values(p.fxwidgets) if w isa Makie.Button])
+    rng = MersenneTwister(42)   # seeded: the event sequence is reproducible
+    randpos() = Point2f(rand(rng) * 1490 + 5, rand(rng) * 940 + 5)
+    fuzzkeys = [Keyboard.space, Keyboard.s, Keyboard.x, Keyboard.c, Keyboard.r,
+                Keyboard.left, Keyboard.right, Keyboard.escape]
+    errormsgs = String[]
+    t0 = time()
+    while time() - t0 < 10
+        try
+            r = rand(rng)
+            if r < 0.35
+                ev.mouseposition[] = Tuple(randpos())
+                rand(rng, Bool) &&
+                    (ev.mousebutton[] = MouseButtonEvent(rand(rng, (Mouse.left, Mouse.right)), Mouse.press);
+                     ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.release))
+            elseif r < 0.60
+                rand(rng) < 0.2 && (ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press))
+                k = rand(rng, fuzzkeys)
+                ev.keyboardbutton[] = KeyEvent(k, Keyboard.press)
+                ev.keyboardbutton[] = KeyEvent(k, Keyboard.release)
+                ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
+            elseif r < 0.75
+                b = rand(rng, buttons)
+                bb = b.layoutobservables.computedbbox[]
+                ev.mouseposition[] = Tuple(Point2f(bb.origin .+ rand(rng, 2) .* bb.widths))
+                ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.press)
+                ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.release)
+            elseif r < 0.90
+                ev.mouseposition[] = Tuple(Point2f(rand(rng) * 1400 + 20, 60))
+                ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.press)
+                ev.mouseposition[] = Tuple(Point2f(rand(rng) * 1400 + 20, 60))
+                ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.release)
+            elseif r < 0.97
+                ev.mouseposition[] = Tuple(Point2f(rand(rng) * 1400 + 20, 60))
+                ev.scroll[] = (0.0, rand(rng, -4:4))
+            else
+                ev.dropped_files[] = [rand(rng, (testvideo2, "/nonexistent/nope.mp4"))]
+            end
+        catch e
+            push!(errormsgs, sprint(showerror, e)[1:min(end, 300)])
+            length(errormsgs) > 3 && break
+        end
+        rand(rng) < 0.1 && sleep(0.02)
+    end
+    isempty(errormsgs) || @info "chaos exceptions" errormsgs
+    @test isempty(errormsgs)                # no listener ever threw
+    sleep(0.5)
+    VE.pause!(p)                            # the storm may leave playback running,
+    p.playhead[] = 10                       # and its presents would race this one
+    ok = VE.showframe!(p, 10)
+    t1 = time()
+    while !ok && time() - t1 < 5            # decoder settles after the seek storm
+        sleep(0.05)
+        ok = VE.showframe!(p, 10)
+    end
+    @test ok                                # still presents (empty sequence = black)
+    close(p)                                # and closes cleanly
+    sleep(0.5)
+    @test true
+end
+
+@testset "Player opens a saved project" begin
+    src = VideoSource(testvideo)
+    seq = Sequence(src)
+    split!(seq, 40)
+    seq.clips[1].crop = (0.1, 0.1, 0.8, 0.8)
+    path = joinpath(mktempdir(), "edit.videoedit.toml")
+    saveproject(path, seq)
+    p2 = Player(path)   # .toml path → the saved edit, not a video
+    try
+        sleep(1.5)
+        @test length(p2.sequence.clips) == 2
+        @test p2.sequence.clips[1].crop == (0.1, 0.1, 0.8, 0.8)
+        @test VE.seqlength(p2.sequence) == 120
+        @test size(p2.frame[]) == (320, 180)   # presents from the project's source
+    finally
+        close(p2)
+    end
+end

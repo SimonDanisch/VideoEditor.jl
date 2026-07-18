@@ -1,0 +1,61 @@
+"""
+    hasaudio(path) -> Bool
+
+Whether the media file contains at least one audio stream (ffprobe).
+"""
+function hasaudio(path::AbstractString)
+    out = read(`$(FFMPEG_jll.ffprobe()) -v error -select_streams a -show_entries stream=index -of csv=p=0 $path`,
+               String)
+    return !isempty(strip(out))
+end
+
+"""
+    muxaudio(rendered, seq, outpath; samplerate=48000) -> outpath
+
+Assemble the sequence's audio track from the cut list — one `atrim` branch
+per clip in timeline order, generated silence over gaps and clips whose
+source has no audio — and mux it with the rendered video (video stream
+copied, audio encoded as AAC). Because the edit model is frame-exact, the
+audio segments are simply the clips' source time ranges: cuts, trims and
+moves stay sample-aligned with the picture.
+"""
+function muxaudio(rendered::AbstractString, seq::Sequence, outpath::AbstractString;
+                  samplerate::Integer = 48000)
+    fps = seq.framerate
+    clips = sort(seq.clips; by = c -> c.start)
+
+    inputs = `-i $rendered`
+    inputidx = Dict{String, Int}()  # source path → ffmpeg input index
+    for clip in clips
+        path = clip.source.path
+        if !haskey(inputidx, path) && hasaudio(path)
+            inputidx[path] = length(inputidx) + 1
+            inputs = `$inputs -i $path`
+        end
+    end
+
+    norm = "aresample=$samplerate,aformat=channel_layouts=stereo"
+    branches = String[]
+    silence(frames) = "aevalsrc=0:d=$(frames / fps):s=$samplerate,$norm[s$(length(branches) + 1)]"
+    cursor = 0
+    for clip in clips
+        clip.start > cursor && push!(branches, silence(clip.start - cursor))
+        idx = get(inputidx, clip.source.path, nothing)
+        if idx === nothing
+            push!(branches, silence(cliplength(clip)))
+        else
+            t0 = clip.src_in / clip.source.framerate
+            t1 = clip.src_out / clip.source.framerate
+            push!(branches,
+                  "[$idx:a]atrim=start=$t0:end=$t1,asetpts=PTS-STARTPTS,$norm[s$(length(branches) + 1)]")
+        end
+        cursor = clipend(clip)
+    end
+
+    pads = join(("[s$i]" for i in eachindex(branches)))
+    graph = join(branches, ";") * ";$(pads)concat=n=$(length(branches)):v=0:a=1[aout]"
+    run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y $inputs -filter_complex $graph
+                  -map 0:v -map "[aout]" -c:v copy -c:a aac -shortest $outpath`,
+                 stdout = devnull, stderr = devnull))
+    return outpath
+end
