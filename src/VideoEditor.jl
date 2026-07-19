@@ -45,6 +45,7 @@ include("colorstab.jl")
 include("motionstab.jl")
 include("campath.jl")
 include("bundlestab.jl")
+include("gpudecode.jl")
 include("mcp.jl")
 
 export VideoSource, Player, Clip, Sequence
