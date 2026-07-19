@@ -443,7 +443,8 @@ Search is sub-sampled by `step` frames for speed. This is a real content match,
 not a reverse/boomerang.
 """
 function findloop(clip::Clip; minseconds::Real = 1.5, maxseconds::Real = 6.0,
-                  matchwidth::Integer = 64, step::Integer = 2, progress = nothing)
+                  matchwidth::Integer = 64, step::Integer = 2, lengthbias::Real = 0.0,
+                  progress = nothing)
     src = clip.source
     fps = src.framerate
     n = cliplength(clip)
@@ -485,19 +486,28 @@ function findloop(clip::Clip; minseconds::Real = 1.5, maxseconds::Real = 6.0,
     minL = max(round(Int, minseconds * fps), 1)
     maxL = max(round(Int, maxseconds * fps), minL)
     npx = gw * gh
-    best = (Inf32, 1, 1 + minL)
+    lb = Float32(lengthbias)
+    # rank by seam MINUS a small per-second bonus: with lengthbias 0 this is the
+    # globally most-seamless loop; a small bias makes a fuller cycle win over a
+    # near-equally-seamless short sub-loop (what "make a loop" usually wants).
+    bestrank = Inf32; besta = 1; bestb = 1 + minL; bestscore = Inf32
     st = Int(step)
-    @inbounds for a in 1:st:(n - minL), L in minL:st:maxL
-        b = a + L
-        b > n && break
-        d = 0.0f0
-        for p in 1:npx
-            d += (frames[p + (a - 1) * npx] - frames[p + (b - 1) * npx])^2
+    @inbounds for a in 1:st:(n - minL)          # NESTED loops: the inner `break`
+        for L in minL:st:maxL                   # must end THIS a's scan, not the
+            b = a + L                           # whole search (a fused `for a, L`
+            b > n && break                      # would break out of both)
+            d = 0.0f0
+            for p in 1:npx
+                d += (frames[p + (a - 1) * npx] - frames[p + (b - 1) * npx])^2
+            end
+            score = d / npx
+            rank = score - lb * (Float32(L) / Float32(fps))
+            if rank < bestrank
+                bestrank = rank; besta = a; bestb = b; bestscore = score
+            end
         end
-        d < best[1] && (best = (d / npx, a, b))
     end
-    score, a, b = best
-    return (a - 1, b - 1, score)               # 0-based clip-relative offsets
+    return (besta - 1, bestb - 1, bestscore)   # 0-based clip-relative offsets
 end
 
 "Apply the clip's motion stabilization for `srcframe`: affine warp via `tmp`.

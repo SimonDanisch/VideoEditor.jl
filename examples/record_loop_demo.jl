@@ -1,117 +1,159 @@
-# Records a walkthrough of an "LLM" driving the editor THROUGH THE MCP TOOL
-# LAYER to turn a handheld bird clip into a seamless loop:
-#   get_state → trim to a stable window → analyze_motion (camera lock) →
-#   analyze_color → find_loop (content frame-matching) → trim to the loop →
-#   play → export a looping GIF.
-# Every edit goes through VideoEditor.calltool — the exact code path an MCP
-# client hits — while the editor window is captured to a video.
+# Mouse-driven walkthrough: turn a handheld bird clip into a STABILIZED, seamless,
+# full-cycle loop and export it as a GIF — every step driven by the on-screen mouse
+# (FakeInteraction renders a real cursor + click state), the way a user actually does it.
+#
+#   play the raw clip (nest box drifts) → Camera-lock stabilize the whole clip (GPU) →
+#   cut off the shaky intro with the split tool → "Make seamless loop" (finds the full
+#   ~13 s behavioural cycle where the bird goes around and comes back) → play the loop →
+#   export as a looping GIF (export dock, GIF format).
+#
+# RULES (same as record_demo.jl): everything VISIBLE is a mouse/keyboard event — never
+# mutate observables or call editor functions from the events list. The only script-side
+# state pokes are INSTRUMENTATION (STABILIZING flag) so we can time-lapse the GPU-analysis
+# wait in post; they don't drive any on-screen interaction.
 
 ENV["DISPLAY"] = get(ENV, "DISPLAY", ":1")
 ENV["XAUTHORITY"] = get(ENV, "XAUTHORITY", "/run/user/1000/xauth_hqQZRv")
 ENV["XDG_RUNTIME_DIR"] = get(ENV, "XDG_RUNTIME_DIR", "/run/user/1000")
 
-using VideoEditor, GLMakie, Lava
+using VideoEditor, GLMakie, Makie, Lava
 import VideoEditor as VE
-import VideoEditor.JSON as JSON
-import VideoEditor.Makie as MK
-using VideoEditor.Makie: VideoStream, recordframe!, save
+import FFMPEG_jll
 
-GLMakie.activate!(; visible = false)
+isdefined(Main, :FakeInteraction) ||
+    include(joinpath(@__DIR__, "..", "..", "Makie", "docs", "fake_interaction.jl"))
+using .FakeInteraction: Wait, WaitUntil, MouseTo, LeftClick, LeftDown, LeftUp, Lazy, KeyPress
 
-const BIRD = "/windows/Users/sdani/Cloudi/giffers/20260708_160827.mp4"
-const OUT_MP4 = joinpath(@__DIR__, "..", "..", "..", "media", "loop_demo.mp4")
-const OUT_GIF = joinpath(tempdir(), "bird_loop.gif")
+const DEMOLOOP = joinpath(@__DIR__, "..", "..", "..", "media", "demo_loop.mp4")
+const RAW_MP4  = joinpath(tempdir(), "loop_walkthrough_raw.mp4")
+const OUT_MP4  = joinpath(@__DIR__, "..", "..", "..", "media", "loop_walkthrough.mp4")
+const OUT_GIF  = joinpath(tempdir(), "bird_fullcycle.gif")
 
-player = Player(BIRD; analysisbackend = LavaBackend())
-srv = VE.mcpserve!(player; port = 8901)
-sleep(2.0)
+GLMakie.activate!(; visible = false, framerate = 30)
+player = Player(DEMOLOOP; analysisbackend = LavaBackend())
+fig = player.fig
+resize!(fig, 1440, 900)
+sleep(4.0)                                   # let the thumbnail strip fill
+Makie.disconnect!(player.screen, Makie.mouse_position)   # keep the real OS mouse out
+fig.scene.events.hasfocus[] = false
+player.fxwidgets[:exportpath][] = OUT_GIF    # off-camera: preset the export path
 
-# call a tool the way an MCP client would; parse its JSON payload
-function mcp(name; kw...)
-    r = VE.calltool(srv, name, Dict(string(k) => v for (k, v) in kw))
-    txt = try r["content"][1]["text"] catch; "" end
-    return try JSON.parse(txt) catch; txt end
+# warm the GPU kernels off-camera (first Lava analysis compiles them)
+let done = Ref(false)
+    VE.rungpu(() -> (VE.analyzemotion!(VE.Clip(VideoSource(DEMOLOOP), 0, 48, 0, (0.,0.,1.,1.));
+                                       backend = LavaBackend()); done[] = true), player)
+    while !done[]; sleep(0.3); end
 end
-caption(s) = (player.status[] = s)
 
-# warm the GPU kernels off-camera (first Lava analysis compiles ~40s)
-let warm = VE.Clip(player.sequence.clips[1].source, 720, 770, 0, (0.0, 0.0, 1.0, 1.0)),
-    done = Channel{Bool}(1)
-    VE.rungpu(() -> (VE.analyzemotion!(warm; backend = player.analysisbackend); put!(done, true)), player)
-    take!(done)
+# ------------------------------------------------------------------ helpers
+block_center(b) = FakeInteraction.relative_pos(b, (0.5, 0.5))
+function timeline_pos(t; yfrac = 0.5)
+    ax = player.timeline.axis; lims = ax.finallimits[]; vp = ax.scene.viewport[]
+    frac = (Float64(t) - lims.origin[1]) / lims.widths[1]
+    Point2f(vp.origin[1] + frac * vp.widths[1], vp.origin[2] + yfrac * vp.widths[2])
 end
-@info "GPU warm — recording"
-
-io = VideoStream(player.fig; framerate = 30, px_per_unit = 1)
-hold(sec) = for _ in 1:round(Int, sec * 30); sleep(1 / 30); recordframe!(io); end
-# capture while waiting for `cond`, compressed (~1 frame / 0.3s wall)
-function waitcap(cond; maxsec = 20)
-    t0 = time(); i = 0
-    while time() - t0 < maxsec && !cond()
-        sleep(0.1); i += 1
-        i % 3 == 0 && recordframe!(io)
-    end
-    hold(0.5)
+function menu_pos(menu, rely)  # rely 0.5 = the closed button; -(i-0.5) = open option i
+    bb = menu.layoutobservables.computedbbox[]
+    Point2f(bb.origin[1] + bb.widths[1] / 2, bb.origin[2] + rely * bb.widths[2])
 end
-hasmotion() = player.sequence.clips[1].motiontrack !== nothing
-hascolor() = player.sequence.clips[1].motiontrack !== nothing &&
-             any(c -> c.colortrack !== nothing, player.sequence.clips)
 
-# [1] the raw clip — a shaky 39s handheld bird video
-caption("MCP: get_state — a 39s handheld clip of a bird at a nest box")
-mcp("get_state"); mcp("seek"; time = 14.0); hold(2.0)
+buttons = [c for c in fig.content if c isa Makie.Button]
+play_btn = first(b for b in buttons if b.label[] in ("Play", "Pause"))
+fx_btn   = first(b for b in buttons if b.label[] == "FX")
+out_btn  = first(b for b in buttons if b.label[] == "Out")
+split_btn = first(b for b in buttons if b.label[] == "✂")
+mode_menu = player.fxwidgets[:modemenu]
+stabilize_btn = player.fxwidgets[:analyze]
+loop_btn = player.fxwidgets[:loop]
+fmt_menu = player.fxwidgets[:exportformat]
+export_go = player.fxwidgets[:exportgo]
 
-# [2] trim to a stable 8s window (skip the shaky zoom-in intro), src 720–1200
-caption("MCP: trim to a stable 8-second window")
-mcp("split_at"; time = 12.0); hold(0.8)
-mcp("split_at"; time = 20.0); hold(0.8)
-mcp("delete_clip_at"; time = 6.0); hold(0.8)     # drop the intro [0,12]
-mcp("delete_clip_at"; time = 15.0); hold(0.8)    # drop the tail  → keep [0,8]
-mcp("seek"; time = 2.0); hold(1.0)
-
-# [3] camera-lock stabilization (GPU) — the nest box locks in place
-caption("MCP: analyze_motion (camera lock) — locking the camera like a tripod")
-mcp("analyze_motion"; time = 2.0, mode = "similarity")
-waitcap(hasmotion; maxsec = 20)
-mcp("seek"; time = 2.0); hold(2.0)               # refresh → stabilized + auto-cropped
-
-# [4] color/exposure stabilization — kill the flicker
-caption("MCP: analyze_color — removing exposure flicker")
-mcp("analyze_color"; time = 2.0)
-waitcap(hascolor; maxsec = 12)
-mcp("seek"; time = 2.0); hold(1.0)
-
-# [5] find the seamless loop point (content frame-matching)
-caption("MCP: find_loop — matching frames so the bird is ~back where it started")
-hold(0.8)
-loop = mcp("find_loop"; time = 2.0, min_seconds = 1.5, max_seconds = 5.0)
-t0 = Float64(loop["start_time"]); t1 = Float64(loop["end_time"])
-caption("found a $(loop["loop_seconds"])s loop — trimming to it")
-hold(1.2)
-
-# [6] trim the timeline down to just the loop
-if t1 < VE.seqduration(player.sequence) - 0.05
-    mcp("split_at"; time = t1); hold(0.7)
-    mcp("delete_clip_at"; time = t1 + 0.3); hold(0.7)   # drop everything after
+# held-key badge (so viewers see Esc etc.)
+key_badge = Observable(" ")
+on(Makie.events(fig).keyboardbutton) do e
+    e.action == Makie.Keyboard.press && e.key == Makie.Keyboard.escape ?
+        (key_badge[] = "Esc") : (key_badge[] = " ")
 end
-if t0 > 0.01
-    mcp("split_at"; time = t0); hold(0.7)
-    mcp("delete_clip_at"; time = t0 / 2); hold(0.7)     # drop everything before
-end
-mcp("seek"; time = 0.0); hold(1.0)
+Makie.text!(fig.scene, key_badge; position = Point2f(720, 880), space = :pixel,
+            align = (:center, :top), fontsize = 34, font = :bold,
+            color = RGBAf(0.85, 0.15, 0.15, 1), strokecolor = :white, strokewidth = 3,
+            overdraw = true)
 
-# [7] play the loop a few times
-caption("the finished loop — bird returns to the same spot, no reversing")
-mcp("play"); hold(6.0); mcp("pause")
+# instrumentation: during every async wait (GPU analysis, loop search, GIF export) throttle
+# the record loop to ~real time (else a WaitUntil spins at max encode speed and records tens
+# of thousands of frames) AND collect those frame indices so post can time-lapse each span.
+const TIMELAPSE = Ref(false)
+const SLOW_FRAMES = Int[]
+const MAXFRAME = Ref(0)
+recfunc = (i, t) -> (MAXFRAME[] = i; TIMELAPSE[] && (push!(SLOW_FRAMES, i); sleep(1 / 30)); nothing)
 
-# [8] export as a forever-looping GIF
-caption("MCP: export as a looping GIF")
-hold(0.6)
-res = mcp("export"; path = OUT_GIF, format = "gif", fps = 20, loop = 0)
-caption("exported $(basename(OUT_GIF)) — a seamless, stabilized bird loop")
-mcp("seek"; time = 0.0); mcp("play"); hold(4.0); mcp("pause")
+# condition predicates (recording load makes GPU analysis time vary wildly — wait on the
+# RESULT, not a guessed duration, so make-loop never runs on a half-stabilized clip)
+hasmotion() = !isempty(player.sequence.clips) && player.sequence.clips[1].motiontrack !== nothing
+looptrimmed() = VE.seqduration(player.sequence) < 15.0
+exported() = occursin("exported", player.status[])
 
-save(OUT_MP4, io)
-@info "saved walkthrough" OUT_MP4 gif = OUT_GIF exported = res
-VE.stop!(srv)
+# -------------------------------------------------------------------- events
+K = Makie.Keyboard
+events = [
+    Wait(1.2),
+
+    # [1] the raw handheld clip — play it, then scrub to the busy nest box; it DRIFTS
+    MouseTo(block_center(play_btn)), LeftClick(), Wait(3.0),
+    KeyPress(K.space), Wait(0.5),
+    Lazy(_ -> MouseTo(timeline_pos(2.0))), LeftDown(), Wait(0.2),
+    Lazy(_ -> MouseTo(timeline_pos(13.0))), Wait(0.5), LeftUp(), Wait(0.8),
+
+    # [2] Camera-lock stabilize the WHOLE clip (GPU): open the mode menu to show the
+    # modes, pick "Camera lock", click "Stabilize clip". The status counts the frames;
+    # the view glides into the auto-crop when it's done. (analysis wait time-lapsed in post)
+    Lazy(_ -> MouseTo(menu_pos(mode_menu, 0.5))), LeftClick(), Wait(1.6),
+    Lazy(_ -> MouseTo(menu_pos(mode_menu, -0.5))), LeftClick(), Wait(0.8),
+    Lazy(_ -> (TIMELAPSE[] = true; MouseTo(block_center(stabilize_btn)))), LeftClick(),
+    WaitUntil(hasmotion; timeout = 500.0),          # wait for the GPU analysis to finish
+
+    # [3] the auto-crop glides in (normal speed = a nice reveal), then play the stabilized
+    # clip: background nailed, only the birds move
+    Lazy(_ -> (TIMELAPSE[] = false; MouseTo(block_center(play_btn)))), Wait(2.5),
+    LeftClick(), Wait(3.0),
+    KeyPress(K.space), Wait(0.6),
+
+    # [4] cut off the shaky zoom-in intro with the SPLIT TOOL (crosshair cursor): click
+    # the timeline at 5 s to cut, Esc to put the tool away, click the intro clip, X deletes it
+    MouseTo(block_center(split_btn)), LeftClick(), Wait(0.8),
+    Lazy(_ -> MouseTo(timeline_pos(5.0))), LeftClick(), Wait(1.1),
+    KeyPress(K.escape), Wait(0.5),
+    Lazy(_ -> MouseTo(timeline_pos(2.5))), LeftClick(), Wait(0.6),
+    KeyPress(K.x), Wait(1.3),
+
+    # [5] "Make seamless loop" — finds the full ~13 s cycle (bird goes around and returns)
+    # and trims the timeline to it
+    Lazy(_ -> MouseTo(timeline_pos(6.0))), LeftClick(), Wait(0.5),
+    Lazy(_ -> (TIMELAPSE[] = true; MouseTo(block_center(loop_btn)))), LeftClick(),
+    WaitUntil(looptrimmed; timeout = 120.0),
+    Lazy(_ -> (TIMELAPSE[] = false; MouseTo(block_center(play_btn)))), Wait(1.0),
+
+    # [6] play the finished loop — it goes around completely and comes back seamlessly
+    MouseTo(block_center(play_btn)), LeftClick(), Wait(15.0),
+    KeyPress(K.space), Wait(0.6),
+
+    # [7] export as a looping GIF: open the export dock, set format = gif, Export GIF
+    MouseTo(block_center(out_btn)), LeftClick(), Wait(1.2),
+    Lazy(_ -> MouseTo(menu_pos(fmt_menu, 0.5))), LeftClick(), Wait(1.0),
+    Lazy(_ -> MouseTo(menu_pos(fmt_menu, -3.5))), LeftClick(), Wait(0.8),   # 4th option = gif
+    Lazy(_ -> (TIMELAPSE[] = true; MouseTo(block_center(export_go)))), LeftClick(),
+    WaitUntil(exported; timeout = 150.0),
+    Lazy(_ -> (TIMELAPSE[] = false; MouseTo(block_center(export_go)))), Wait(2.5),   # show "exported …"
+]
+
+FakeInteraction.interaction_record(recfunc, fig, RAW_MP4, events; fps = 30, px_per_unit = 1)
 close(player)
+
+# ---- collapse the dead time ------------------------------------------------
+# Recording the editor while it does heavy GPU/CPU work (analysis, loop search,
+# GIF export) starves the record loop, so the raw is minutes of a near-static
+# frame between the real beats. mpdecimate drops the duplicate frames and we
+# re-time to a constant 30 fps — the mouse moves, playback and edits survive,
+# the dead waits collapse to a beat each.
+run(`$(FFMPEG_jll.ffmpeg()) -y -i $RAW_MP4 -vf "mpdecimate=hi=64*10:lo=64*4:frac=0.05,setpts=N/30/TB" -r 30 -c:v libx264 -crf 22 -pix_fmt yuv420p $OUT_MP4`)
+@info "saved walkthrough" OUT_MP4 gif = OUT_GIF

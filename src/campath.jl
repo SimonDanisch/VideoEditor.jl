@@ -143,7 +143,7 @@ dedicated NLE's *Similarity + Camera Lock*; `analyzemotion!(:similarity)` calls 
 function similaritypath!(clip::Clip; window::Integer = 11, iters::Integer = 15,
                          minfeatures::Integer = 220, maxfeatures::Integer = 520,
                          ransacpx::Real = 2.0, fbmax::Real = 0.7, redetectevery::Integer = 5,
-                         refwindow::Integer = 28, refradius::Integer = 26,
+                         refwindow::Integer = 28, refradius::Integer = 10,
                          outlierwindow::Integer = 3, outliertrans::Real = 20.0,
                          outlierscale::Real = 0.1, outlierrot::Real = 5.0,
                          backend = KA.CPU(), progress = nothing)

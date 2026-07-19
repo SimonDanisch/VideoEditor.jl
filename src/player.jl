@@ -314,11 +314,13 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
         tlscene = timeline.axis.scene
         mp in tlscene.viewport[] || return Consume(false)
         t = Makie.mouseposition(tlscene)[1]
-        frame = clamp(round(Int, t * sequence.framerate), 0, max(seqlength(sequence) - 1, 0))
+        # NB: must NOT be named `frame` — that would rebind the shared preview
+        # Observable this scope captures (used by image! + the scrub fallback)
+        cutat = clamp(round(Int, t * sequence.framerate), 0, max(seqlength(sequence) - 1, 0))
         snapshot!(player)  # so Ctrl+Z / the undo tool can revert the cut
-        split!(sequence, frame)
+        split!(sequence, cutat)
         refreshedit!(player)
-        setstatus!(player, "split at $(timecode(sequence, frame))")
+        setstatus!(player, "split at $(timecode(sequence, cutat))")
         player.tool[] = :none
         return Consume(true)
     end
@@ -784,6 +786,52 @@ function analyzeat!(player::Player, analyze!::Function, what::String;
         Threads.@spawn job()
     else
         rungpu(job, player)  # GPU dispatches must all come from one pinned thread
+    end
+    return nothing
+end
+
+"""
+    findlooptrim!(player; at, minseconds, maxseconds)
+
+Find the most seamless loop inside the clip under `at` — matching its
+STABILIZED, cropped content so the camera is locked and the match is on the
+subject's motion (e.g. a bird returning to the same spot after a full cycle) —
+and trim the whole timeline down to that loop, so it's ready to export as a
+forever-looping GIF. The frame search runs off the UI thread; `maxseconds ≤ 0`
+searches up to the clip length (picks the globally most seamless loop, which is
+usually the full behavioural cycle, not a short snippet).
+"""
+function findlooptrim!(player::Player; at::Integer = player.playhead[],
+                       minseconds::Real = 2.0, maxseconds::Real = 0.0)
+    loc = locate(player.sequence, at)
+    if loc === nothing
+        setstatus!(player, "make loop: no clip under the playhead — move it onto a clip first")
+        return nothing
+    end
+    clip = loc[1]
+    fps = clip.source.framerate
+    # cap below the full length so it can't return the whole clip; a small
+    # length bias makes a full behavioural cycle win over a short sub-loop
+    maxs = maxseconds > 0 ? Float64(maxseconds) : 0.9 * cliplength(clip) / fps
+    setstatus!(player, "make loop: matching frames across $(cliplength(clip)) frames…")
+    Threads.@spawn try
+        a, b, score = findloop(clip; minseconds = 3.0, maxseconds = maxs, lengthbias = 0.0002,
+                               progress = (d, t) -> setstatus!(player, "make loop: matching $d/$t"))
+        put!(player.uiqueue, () -> begin
+            snapshot!(player)
+            newin = clip.src_in + a
+            newout = clip.src_in + b
+            clip.src_in = newin           # motiontrack is keyed by absolute source
+            clip.src_out = newout         # frame, so it survives the trim
+            clip.start = 0
+            filter!(c -> c === clip, player.sequence.clips)   # timeline == the loop
+            setstatus!(player, "trimmed to a $(round((b - a) / fps, digits = 1))s seamless loop " *
+                               "(seam $(round(score, digits = 4))) — export as a looping GIF")
+            refreshedit!(player)
+        end)
+    catch e
+        setstatus!(player, "make loop failed: $(sprint(showerror, e))")
+        @error "make loop failed" exception = (e, catch_backtrace())
     end
     return nothing
 end
@@ -1270,7 +1318,8 @@ function buildexportpanel!(player::Player, gridpos, uicolors)
             @error "export failed" exception = (e, catch_backtrace())
         end
     end
-    merge!(player.fxwidgets, Dict{Symbol, Any}(:exportgo => gobtn, :exportpath => path))
+    merge!(player.fxwidgets, Dict{Symbol, Any}(:exportgo => gobtn, :exportpath => path,
+                                               :exportformat => fmtmenu))
     return panel
 end
 
@@ -1329,9 +1378,11 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     removebtn = Button(panel[nrows + 6, 1:2]; label = "Remove stabilization",
                        tellwidth = false)
     colorbtn = Button(panel[nrows + 7, 1:2]; label = "Fix color flicker", tellwidth = false)
+    Label(panel[nrows + 8, 1:2], "Loop"; font = :bold, halign = :left)
+    loopbtn = Button(panel[nrows + 9, 1:2]; label = "Make seamless loop", tellwidth = false)
     merge!(player.fxwidgets, Dict{Symbol, Any}(
         :modemenu => modemenu, :analyze => analyzebtn, :compare => comparebtn,
-        :remove => removebtn, :color => colorbtn))
+        :remove => removebtn, :color => colorbtn, :loop => loopbtn))
 
     on(analyzebtn.clicks) do _
         mode = something(modemenu.selection[], :similarity)
@@ -1345,6 +1396,7 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     end
     on(_ -> removestabilization!(player), removebtn.clicks)
     on(_ -> analyzeat!(player, analyzecolor!, "color stabilization"), colorbtn.clicks)
+    on(_ -> findlooptrim!(player), loopbtn.clicks)
 
     # press-and-hold on the compare button shows the un-stabilized original.
     # High priority: the Button block consumes presses itself, which would
