@@ -52,6 +52,10 @@ mutable struct Timeline
     onrightclick::Function
     onedit::Function                            # called before a gesture mutates
     refreshtask::Task
+    transbox::Observable{Vector{Rect2f}}        # cross-dissolve span boxes
+    transx::Observable{Vector{Point2f}}         # the bowtie X inside each box
+    transplot::Any
+    transxplot::Any
 
     function Timeline(gridpos, sequence::Sequence, playhead::Observable{Int},
                       playing::Observable{Bool})
@@ -93,6 +97,15 @@ mutable struct Timeline
                                       align = (:center, :top), offset = (0, -2),
                                       space = :data, visible = false, overdraw = true)
         translate!(timeline.tooltip_plot, 0, 0, 12)
+        # cross-dissolve markers: a translucent span with a bowtie X over the cut
+        timeline.transbox = Observable(Rect2f[])
+        timeline.transx = Observable(Point2f[])
+        timeline.transplot = poly!(axis, timeline.transbox; color = (colors.accent, 0.20),
+                                   strokecolor = colors.accent, strokewidth = 1.0)
+        translate!(timeline.transplot, 0, 0, 6)
+        timeline.transxplot = linesegments!(axis, timeline.transx;
+                                            color = colors.accent, linewidth = 1.5)
+        translate!(timeline.transxplot, 0, 0, 7)
 
         onany(axis.finallimits, axis.scene.viewport) do lims, vp
             x0, x1 = minimum(lims)[1], maximum(lims)[1]
@@ -212,8 +225,28 @@ function relayout!(timeline::Timeline)
             timeline.clipplots[i].thumbsize = (cache.thumbwidth, cache.thumbheight)
         end
     end
+    prunetransitions!(seq)
+    refreshtransitions!(timeline)
     cliplimits!(timeline)
     setstates!(timeline)
+    return nothing
+end
+
+"Rebuild the cross-dissolve span boxes + bowtie Xs from `seq.transitions`."
+function refreshtransitions!(timeline::Timeline)
+    seq = timeline.sequence
+    fps = seq.framerate
+    boxes = Rect2f[]
+    xs = Point2f[]
+    y0, y1 = 0.06, 0.94
+    for t in seq.transitions
+        x0 = transstart(t) / fps
+        x1 = transstop(t) / fps
+        push!(boxes, Rect2f(x0, y0, x1 - x0, y1 - y0))
+        push!(xs, Point2f(x0, y0), Point2f(x1, y1), Point2f(x0, y1), Point2f(x1, y0))
+    end
+    timeline.transbox[] = boxes
+    timeline.transx[] = xs
     return nothing
 end
 

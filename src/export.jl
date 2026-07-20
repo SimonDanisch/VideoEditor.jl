@@ -32,8 +32,7 @@ function exportvideo(path::AbstractString, seq::Sequence;
     videopath = wantaudio ? tempname() * ".mp4" : path
 
     outbuf = zeros(RGB{N0f8}, canvas[1], canvas[2])
-    tmp1 = RGBFrame(undef, canvas[1], canvas[2])
-    tmp2 = RGBFrame(undef, canvas[1], canvas[2])
+    transbuf = RGBFrame(undef, canvas[1], canvas[2])  # incoming side of a transition
     readers = Dict{String, SequentialReader}()
     fxbufs = Dict{String, NTuple{3, RGBFrame}}()  # per-source full-res scratch
 
@@ -42,24 +41,17 @@ function exportvideo(path::AbstractString, seq::Sequence;
                                     encoder_options = encoder_options)
     try
         for n in 0:(total - 1)
-            loc = locate(seq, n)
-            if loc === nothing
-                fill!(outbuf, RGB{N0f8}(0, 0, 0))
+            tr = transitionat(seq, n)
+            sample = tr === nothing ? nothing : transitionsample(seq, tr, n)
+            if sample !== nothing
+                left, srcA, right, srcB, p = sample
+                rendercanvas!(outbuf, left, srcA, readers, fxbufs)
+                rendercanvas!(transbuf, right, srcB, readers, fxbufs)
+                blend!(outbuf, outbuf, transbuf, p)
             else
-                clip, srcframe = loc
-                sr = get!(() -> SequentialReader(clip.source), readers, clip.source.path)
-                frame, fx1, fx2 = get!(() -> ntuple(_ -> RGBFrame(undef, clip.source.width, clip.source.height), 3),
-                                       fxbufs, clip.source.path)
-                readframe!(frame, sr, srcframe)
-                applymotiontrack!(frame, fx1, clip, srcframe)
-                applycolortrack!(frame, clip, srcframe)
-                applyeffects!(frame, fx1, fx2, clip)
-                if clip.crop == (0.0, 0.0, 1.0, 1.0) && Base.size(frame) == Base.size(outbuf)
-                    copyto!(outbuf, frame)
-                else
-                    warp!(outbuf, frame, clip.crop)
-                    KA.synchronize(KA.get_backend(outbuf))
-                end
+                loc = locate(seq, n)
+                loc === nothing ? fill!(outbuf, RGB{N0f8}(0, 0, 0)) :
+                                  rendercanvas!(outbuf, loc[1], loc[2], readers, fxbufs)
             end
             write(writer, PermutedDimsArray(outbuf, (2, 1)))
             progress === nothing || n % 30 == 0 && progress(n + 1, total)
@@ -136,6 +128,30 @@ mutable struct SequentialReader
         reader = VideoIO.openvideo(source.path, target_format = VideoIO.AV_PIX_FMT_RGB24)
         return new(source, reader, 0)
     end
+end
+
+"""
+Render `clip` at source frame `srcframe` — decode, motion/color tracks, effect
+stack, then warp its crop into `dest` (a canvas-sized buffer). `readers`/`fxbufs`
+cache one reader and one scratch triple per source path.
+"""
+function rendercanvas!(dest::RGBFrame, clip::Clip, srcframe::Integer,
+                       readers::Dict{String, SequentialReader},
+                       fxbufs::Dict{String, NTuple{3, RGBFrame}})
+    sr = get!(() -> SequentialReader(clip.source), readers, clip.source.path)
+    frame, fx1, fx2 = get!(() -> ntuple(_ -> RGBFrame(undef, clip.source.width, clip.source.height), 3),
+                           fxbufs, clip.source.path)
+    readframe!(frame, sr, srcframe)
+    applymotiontrack!(frame, fx1, clip, srcframe)
+    applycolortrack!(frame, clip, srcframe)
+    applyeffects!(frame, fx1, fx2, clip)
+    if clip.crop == (0.0, 0.0, 1.0, 1.0) && Base.size(frame) == Base.size(dest)
+        copyto!(dest, frame)
+    else
+        warp!(dest, frame, clip.crop)
+        KA.synchronize(KA.get_backend(dest))
+    end
+    return dest
 end
 
 function readframe!(dest::RGBFrame, sr::SequentialReader, n::Integer)

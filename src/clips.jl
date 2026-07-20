@@ -57,17 +57,38 @@ clipend(clip::Clip) = clip.start + cliplength(clip)
 hascrop(clip::Clip) = clip.crop != (0.0, 0.0, 1.0, 1.0)
 
 """
+A transition centered on the cut at timeline frame `at` (== `clipend(left)` ==
+`right.start` of the two adjacent clips), blending the outgoing clip into the
+incoming one over `duration` frames. `kind` is `:dissolve` (cross-dissolve) for
+now — the outgoing clip is extended past its out-point and the incoming clip is
+pulled in before its in-point (using each source's handle frames), then the two
+are mixed `(1-p)·A + p·B` with `p` sweeping 0→1 across the region.
+"""
+mutable struct Transition
+    kind::Symbol
+    at::Int
+    duration::Int
+end
+
+"Half-width of a transition (frames on each side of the cut)."
+transhalf(t::Transition) = t.duration ÷ 2
+transstart(t::Transition) = t.at - transhalf(t)
+transstop(t::Transition) = transstart(t) + t.duration   # exclusive
+
+"""
     Sequence(source) / Sequence(clips, framerate)
 
 An edited timeline: non-overlapping clips sorted by start. All edits are
 metadata operations on this structure; frames are resolved on demand via
-`locate`.
+`locate`. `transitions` overlay cross-dissolves on clip cuts.
 """
 mutable struct Sequence
     const clips::Vector{Clip}
     framerate::Float64
+    const transitions::Vector{Transition}
 end
 
+Sequence(clips::Vector{Clip}, framerate::Real) = Sequence(clips, framerate, Transition[])
 Sequence(source::VideoSource) = Sequence([Clip(source)], source.framerate)
 
 seqlength(seq::Sequence) = maximum(clipend, seq.clips; init = 0)
@@ -82,6 +103,81 @@ function locate(seq::Sequence, n::Integer)
     i === nothing && return nothing
     clip = seq.clips[i]
     return (clip, clip.src_in + (n - clip.start))
+end
+
+"The transition whose region contains timeline frame `n`, or `nothing`."
+function transitionat(seq::Sequence, n::Integer)
+    for t in seq.transitions
+        transstart(t) <= n < transstop(t) && return t
+    end
+    return nothing
+end
+
+"The outgoing clip (ending at `at`) and incoming clip (starting at `at`), or `nothing`s."
+function transitionclips(seq::Sequence, at::Integer)
+    l = findfirst(c -> clipend(c) == at, seq.clips)
+    r = findfirst(c -> c.start == at, seq.clips)
+    return (l === nothing ? nothing : seq.clips[l], r === nothing ? nothing : seq.clips[r])
+end
+
+"""
+    transitionsample(seq, t, n) -> (left, srcA, right, srcB, p) | nothing
+
+Resolve timeline frame `n` inside transition `t`: the two clips, the source
+frame each contributes (extended into its handle past the cut, clamped to
+available source), and the mix `p` ∈ [0,1] (0 = fully outgoing, 1 = incoming).
+"""
+function transitionsample(seq::Sequence, t::Transition, n::Integer)
+    left, right = transitionclips(seq, t.at)
+    (left === nothing || right === nothing) && return nothing
+    p = clamp((n - transstart(t) + 0.5) / t.duration, 0.0, 1.0)
+    srcA = clamp(left.src_in + (n - left.start), 0, left.source.nframes - 1)
+    srcB = clamp(right.src_in + (n - right.start), 0, right.source.nframes - 1)
+    return (left, srcA, right, srcB, p)
+end
+
+"Largest even duration a dissolve on this cut can take without overrunning either clip."
+clamptransition(left::Clip, right::Clip, duration::Integer) =
+    2 * max(min(duration ÷ 2, cliplength(left), cliplength(right)), 0)
+
+"""
+    addtransition!(seq, at; duration, kind=:dissolve) -> Union{Transition, Nothing}
+
+Add (or resize) a cross-dissolve on the cut at timeline frame `at`. No-op unless
+`at` is a real cut between two adjacent clips; `duration` is clamped to fit both.
+"""
+function addtransition!(seq::Sequence, at::Integer; duration::Integer, kind::Symbol = :dissolve)
+    left, right = transitionclips(seq, at)
+    (left === nothing || right === nothing) && return nothing
+    dur = clamptransition(left, right, duration)
+    dur >= 2 || return nothing
+    i = findfirst(t -> t.at == at, seq.transitions)
+    if i === nothing
+        t = Transition(kind, at, dur)
+        push!(seq.transitions, t)
+        return t
+    end
+    seq.transitions[i].kind = kind
+    seq.transitions[i].duration = dur
+    return seq.transitions[i]
+end
+
+"Remove the transition on the cut at `at` (returns it, or `nothing`)."
+function removetransition!(seq::Sequence, at::Integer)
+    i = findfirst(t -> t.at == at, seq.transitions)
+    i === nothing && return nothing
+    t = seq.transitions[i]
+    deleteat!(seq.transitions, i)
+    return t
+end
+
+"Drop transitions whose cut no longer exists (after edits that move/merge clips)."
+function prunetransitions!(seq::Sequence)
+    filter!(seq.transitions) do t
+        left, right = transitionclips(seq, t.at)
+        left !== nothing && right !== nothing
+    end
+    return seq
 end
 
 """

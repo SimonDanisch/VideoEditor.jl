@@ -81,6 +81,7 @@ mutable struct Player
     const binrows::Vector{Any}           # bin row buttons (rebuilt on change)
     dragsource::Any                      # bin source mid-drag onto the timeline
     const tool::Observable{Symbol}       # armed tool: :none, :split, :crop
+    const playrate::Base.RefValue{Float64}  # JKL shuttle rate: 1.0 normal, <0 reverse, |·|>1 fast
 end
 
 "Push the current edit state onto the undo stack (clears redo)."
@@ -258,7 +259,8 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     nothing, nothing, nothing, nothing, nothing,
                     Vector{Clip}[], Vector{Clip}[], 0.0, nothing, 0, 0,
                     Dict{Symbol, Any}(), Observable(:none),
-                    Observable(VideoSource[]), Any[], nothing, Observable(:none))
+                    Observable(VideoSource[]), Any[], nothing, Observable(:none),
+                    Ref(1.0))
     @async for s in player.statusqueue  # main-thread consumer: threads → observable
         status[] = s
     end
@@ -288,23 +290,52 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     cropbtn = Button(toolbar[5, 1]; label = "▢", width = 40, height = 40)
     on(_ -> armtool!(player, :split), splitbtn.clicks)
     on(_ -> armtool!(player, :crop), cropbtn.clicks)
-    oneshots = [("✕", () -> deleteat!(player)),
-                ("↶", () -> isempty(player.undostack) ? setstatus!(player, "nothing to undo") :
+    oneshots = [("✕", "Delete  (X)", () -> deleteat!(player)),
+                ("↶", "Undo  (Ctrl+Z)", () -> isempty(player.undostack) ? setstatus!(player, "nothing to undo") :
                             (undo!(player); setstatus!(player, "undone (Ctrl+Z redoes with Shift)"))),
-                ("↷", () -> isempty(player.redostack) ? setstatus!(player, "nothing to redo") :
+                ("↷", "Redo  (Ctrl+⇧+Z)", () -> isempty(player.redostack) ? setstatus!(player, "nothing to redo") :
                             (redo!(player); setstatus!(player, "redone")))]
-    for (row, (lbl, action)) in enumerate(oneshots)
-        on(_ -> action(), Button(toolbar[5 + row, 1]; label = lbl, width = 40, height = 40).clicks)
+    onebtns = Makie.Button[]
+    for (row, (lbl, _tip, action)) in enumerate(oneshots)
+        b = Button(toolbar[5 + row, 1]; label = lbl, width = 40, height = 40)
+        on(_ -> action(), b.clicks)
+        push!(onebtns, b)
+    end
+    # hover tooltips: hovering a toolbar button shows its name + shortcut to the
+    # right of it (detected by mouse-vs-bbox; Makie Buttons have no hover attr).
+    tiptargets = vcat([(splitbtn, "Blade  (S)"), (cropbtn, "Crop  (C)")],
+                      [(onebtns[i], oneshots[i][2]) for i in eachindex(onebtns)])
+    tip_txt = Observable(" "); tip_pos = Observable(Point2f(0, 0)); tip_vis = Observable(false)
+    Makie.text!(fig.scene, tip_pos; text = tip_txt, visible = tip_vis, space = :pixel,
+                align = (:left, :center), fontsize = 15, font = :bold, color = :white,
+                strokecolor = (:black, 0.95), strokewidth = 2.5, overdraw = true)
+    on(events(fig).mouseposition) do mp
+        p = Point2f(mp); hit = nothing
+        for (btn, label) in tiptargets
+            bb = btn.layoutobservables.computedbbox[]
+            if bb.origin[1] <= p[1] <= bb.origin[1] + bb.widths[1] &&
+               bb.origin[2] <= p[2] <= bb.origin[2] + bb.widths[2]
+                hit = (bb, label); break
+            end
+        end
+        if hit === nothing
+            tip_vis[] && (tip_vis[] = false)
+        else
+            bb, label = hit
+            tip_pos[] = Point2f(bb.origin[1] + bb.widths[1] + 10, bb.origin[2] + bb.widths[2] / 2)
+            tip_txt[] = label; tip_vis[] = true
+        end
+        return Consume(false)
     end
     # armed tool → cursor, crop mode, hint, button highlight (cropmode is a
     # Ref, not an Observable, so it's driven here and reset in finishcrop!)
     on(player.tool; update = true) do t
         player.cropmode[] = (t === :crop)
-        setcursor!(player, t === :none ? :arrow : :crosshair)
+        setcursor!(player, t === :none ? :arrow : t === :split ? :scissor : :crosshair)
         splitbtn.buttoncolor[] = t === :split ? uicolors.accent : uicolors.surface
         cropbtn.buttoncolor[] = t === :crop ? uicolors.accent : uicolors.surface
-        t === :split && setstatus!(player, "split tool — click the timeline where you want to cut")
-        t === :crop && setstatus!(player, "crop tool — drag a rectangle on the preview")
+        t === :split && setstatus!(player, "blade tool — click the timeline to cut (stays active; Esc or ✂ to put it away)")
+        t === :crop && setstatus!(player, "crop tool — drag a rectangle on the preview (Esc to put it away)")
     end
     # split tool: the next timeline click cuts THERE (not at the playhead)
     on(events(fig).mousebutton; priority = 95) do event
@@ -320,8 +351,9 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
         snapshot!(player)  # so Ctrl+Z / the undo tool can revert the cut
         split!(sequence, cutat)
         refreshedit!(player)
-        setstatus!(player, "split at $(timecode(sequence, cutat))")
-        player.tool[] = :none
+        # Persistent blade: stays armed so the mouse keeps cutting (DaVinci blade).
+        # Esc or clicking ✂ again puts it away.
+        setstatus!(player, "cut at $(timecode(sequence, cutat)) — blade still active (Esc to stop)")
         return Consume(true)
     end
     opendock!(player, :effects)   # the working panel starts open
@@ -390,6 +422,13 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     end
 
     timeline.onedit = () -> snapshot!(player)
+    # Trim affordance: hovering a clip edge shows a horizontal-resize cursor so it
+    # reads as "drag to trim the in/out point" (not "move"). Only when no tool is
+    # armed — an armed blade/crop owns the cursor. `edgeline` is the edge marker
+    # the timeline sets on edge-hover.
+    on(timeline.edgeline) do e
+        player.tool[] === :none && setcursor!(player, isempty(e) ? :arrow : :hresize)
+    end
     wirecroptool(player)
     wirekeys(player)
     wireclipmenu!(player)
@@ -404,8 +443,46 @@ end
 
 # ---------------------------------------------------------------- presentation
 
+"""
+Preview a cross-dissolve at timeline frame `n`: fetch both clips' frames from
+their rings, run each clip's tracks + effects, and blend `(1-p)·A + p·B`.
+Best-effort — returns `false` (caller falls back to the plain single-clip path)
+if either frame isn't buffered yet, or the two sources differ in size (mismatched
+dissolves preview as the outgoing clip; export still blends them via warp).
+"""
+function showtransition!(player::Player, sample)
+    left, srcA, right, srcB, p = sample
+    spA = pool(player, left.source)
+    spB = pool(player, right.source)
+    (spA.source.width, spA.source.height) == (spB.source.width, spB.source.height) || return false
+    settarget!(spA.worker, srcA)
+    settarget!(spB.worker, srcB)
+    ensureframesize!(player, spA.source)
+    bufA = player.frame[]
+    fetchframe!(bufA, spA.ring, srcA) || return false
+    bufB = similar(bufA)
+    fetchframe!(bufB, spB.ring, srcB) || return false
+    if player.applytracks[]
+        applymotiontrack!(bufA, player.fxtmp1, left, srcA)
+        applycolortrack!(bufA, left, srcA)
+        applymotiontrack!(bufB, player.fxtmp1, right, srcB)
+        applycolortrack!(bufB, right, srcB)
+    end
+    applyeffects!(bufA, player.fxtmp1, player.fxtmp2, left)
+    applyeffects!(bufB, player.fxtmp1, player.fxtmp2, right)
+    blend!(bufA, bufA, bufB, p)
+    notify(player.frame)
+    applycrop!(player, left)  # both sides share framing in the common (split) case
+    return true
+end
+
 "Resolve and show timeline frame `n` if possible (gaps show black). Returns success."
 function showframe!(player::Player, n::Integer)
+    tr = transitionat(player.sequence, n)
+    if tr !== nothing
+        s = transitionsample(player.sequence, tr, n)
+        s !== nothing && showtransition!(player, s) && return true
+    end
     loc = locate(player.sequence, n)
     if loc === nothing
         fill!(player.frame[], RGB{N0f8}(0, 0, 0))
@@ -555,11 +632,15 @@ end
 
 # ---------------------------------------------------------------- transport
 
-function play!(player::Player)
-    player.playing[] && return player
-    player.playhead[] >= seqlength(player.sequence) - 1 && (player.playhead[] = 0)
+function play!(player::Player; rate::Real = 1.0)
+    last = max(seqlength(player.sequence) - 1, 0)
+    # wrap at the boundary we're heading toward, so play/reverse from an end loops in
+    rate >= 0 ? (player.playhead[] >= last && (player.playhead[] = 0)) :
+                (player.playhead[] <= 0 && (player.playhead[] = last))
+    player.playrate[] = rate
+    player.playing[] && return player   # a running loop reads playrate live — just retarget
     player.playing[] = true
-    startaudio!(player)
+    rate == 1.0 && startaudio!(player)  # audio only tracks real-time forward play
     @async playloop(player)
     return player
 end
@@ -576,23 +657,59 @@ function step!(player::Player, delta::Integer = 1)
     return player
 end
 
+"Jump the playhead to the sequence start (`n = 0`) or end. `seek!` pauses first."
+function seek!(player::Player, n::Integer)
+    pause!(player)
+    player.playhead[] = clamp(n, 0, max(seqlength(player.sequence) - 1, 0))
+    return player
+end
+
+"DaVinci ↑/↓: jump to the previous (`dir < 0`) or next (`dir > 0`) edit point —
+the start/end boundary of any clip. Nothing happens past the outermost edit."
+function jumpedit!(player::Player, dir::Integer)
+    pause!(player)
+    seq = player.sequence
+    bounds = sort!(unique(vcat(Int[c.start for c in seq.clips],
+                               Int[clipend(c) for c in seq.clips], 0)))
+    cur = player.playhead[]
+    target = dir > 0 ? findfirst(>(cur), bounds) : findlast(<(cur), bounds)
+    target === nothing && return player   # already at the outermost edit
+    player.playhead[] = clamp(bounds[target], 0, max(seqlength(seq) - 1, 0))
+    return player
+end
+
+"JKL shuttle (`dir = +1` forward / `-1` reverse). Repeated taps in the same
+direction ramp the rate 1×→2×→4×→8×; switching direction resets to 1×."
+function shuttle!(player::Player, dir::Integer)
+    r = player.playrate[]
+    rate = (player.playing[] && sign(r) == dir) ? clamp(2r, -8.0, 8.0) : float(dir)
+    play!(player; rate = rate)
+    setstatus!(player, "shuttle $(rate > 0 ? "▶▶" : "◀◀") $(abs(round(Int, rate)))×  (K to stop)")
+    return player
+end
+
 "Wall-clock paced playback: playhead follows elapsed time, dropping frames if needed."
 function playloop(player::Player)
     fps = player.sequence.framerate
     base = player.playhead[]
+    rate = player.playrate[]
     t0 = time_ns()
     lastset = base
     while player.playing[]
-        if player.playhead[] != lastset  # external scrub while playing: rebase the clock
+        # external scrub OR a shuttle-rate change (J/K/L) → rebase the clock
+        if player.playhead[] != lastset || player.playrate[] != rate
             base = player.playhead[]
+            rate = player.playrate[]
             t0 = time_ns()
         end
-        n = base + floor(Int, (time_ns() - t0) / 1.0e9 * fps)
-        if n >= seqlength(player.sequence)
-            player.playhead[] = max(seqlength(player.sequence) - 1, 0)
+        n = base + floor(Int, (time_ns() - t0) / 1.0e9 * fps * rate)
+        last = max(seqlength(player.sequence) - 1, 0)
+        if (rate >= 0 && n >= seqlength(player.sequence)) || (rate < 0 && n < 0)
+            player.playhead[] = rate < 0 ? 0 : last   # park at the end we reached
             pause!(player)
             break
         end
+        n = clamp(n, 0, last)
         n == player.playhead[] || (player.playhead[] = n)
         lastset = player.playhead[]
         sleep(0.003)
@@ -619,6 +736,28 @@ function Base.deleteat!(player::Player)
     deleteclip!(player.sequence, player.playhead[]) === nothing && return (pop!(player.undostack); nothing)
     player.playhead[] = clamp(player.playhead[], 0, max(seqlength(player.sequence) - 1, 0))
     refreshedit!(player)
+    return nothing
+end
+
+"""
+Toggle a cross-dissolve on the cut nearest the playhead: adds a ~0.6 s dissolve
+if none is there, removes it otherwise. No-op unless the playhead is near a real
+cut between two adjacent clips (split one first with `S`).
+"""
+function toggletransition!(player::Player)
+    seq = player.sequence
+    fps = seq.framerate
+    cuts = sort!(unique(Int[c.start for c in seq.clips if c.start > 0]))
+    isempty(cuts) && return setstatus!(player, "no cut here — split a clip first (S), then press T on the cut")
+    at = cuts[argmin(abs.(cuts .- player.playhead[]))]
+    if removetransition!(seq, at) !== nothing
+        refreshedit!(player)
+        return setstatus!(player, "removed transition at $(timecode(seq, at))")
+    end
+    t = addtransition!(seq, at; duration = round(Int, 0.6fps))
+    t === nothing && return setstatus!(player, "can't add a dissolve there — need a real cut between two clips")
+    refreshedit!(player)
+    setstatus!(player, "cross-dissolve at $(timecode(seq, at)) · $(round(t.duration / fps, digits = 2))s  (T to remove)")
     return nothing
 end
 
@@ -909,9 +1048,8 @@ end
 function finishcrop!(player::Player, corner::Point2f)
     anchor = player.cropanchor
     player.cropanchor = nothing
-    player.cropmode[] = false
-    player.tool[] === :none || (player.tool[] = :none)  # disarm the crop tool
-    player.croprect[] = Point2f[]
+    player.croprect[] = Point2f[]   # clear the in-progress rectangle; stay armed
+    # Persistent crop tool: stays armed so you can re-drag to refine (Esc to put away).
     anchor === nothing && return nothing
     loc = locate(player.sequence, player.playhead[])
     loc === nothing && return nothing
@@ -939,6 +1077,20 @@ function wirekeys(player::Player)
             step!(player, shift ? 10 : 1)
         elseif event.key == Keyboard.left
             step!(player, shift ? -10 : -1)
+        elseif event.key == Keyboard.l && ispress   # JKL shuttle: forward / faster
+            shuttle!(player, 1)
+        elseif event.key == Keyboard.j && ispress   # reverse / faster reverse
+            shuttle!(player, -1)
+        elseif event.key == Keyboard.k && ispress   # stop shuttle
+            pause!(player); player.playrate[] = 1.0
+        elseif event.key == Keyboard.up             # previous edit point
+            jumpedit!(player, -1)
+        elseif event.key == Keyboard.down           # next edit point
+            jumpedit!(player, 1)
+        elseif event.key == Keyboard.home && ispress
+            seek!(player, 0)
+        elseif event.key == Keyboard._end && ispress
+            seek!(player, seqlength(player.sequence) - 1)
         elseif event.key == Keyboard.s && ispress &&
                ispressed(player.fig, Keyboard.left_control | Keyboard.right_control)
             saveproject!(player)
@@ -948,6 +1100,8 @@ function wirekeys(player::Player)
             deleteat!(player)
         elseif event.key == Keyboard.c && ispress
             armtool!(player, :crop)
+        elseif event.key == Keyboard.t && ispress
+            toggletransition!(player)
         elseif event.key == Keyboard.r && ispress
             resetcrop!(player)
         elseif event.key == Keyboard.a && ispress
@@ -1019,18 +1173,45 @@ function toolbarbutton!(player::Player, gridpos, label::AbstractString, key::Sym
     return btn
 end
 
-# process-wide cache of GLFW standard cursors (immutable handles, shared)
+# process-wide cache of cursors (immutable handles, shared). Custom cursors
+# (:scissor) build once from an RGBA bitmap; the rest are GLFW standard cursors.
 const CURSORS = Dict{Symbol, Any}()
 
-"Set the window's mouse cursor (`:arrow` or `:crosshair`); no-op when headless."
+"A 24×24 RGBA scissor cursor (dark blades + white halo so it reads on any
+background), for the armed blade tool. Hotspot returned alongside."
+function scissor_bitmap()
+    S = 24
+    img = fill((0x00, 0x00, 0x00, 0x00), S, S)   # (r,g,b,a); row = y, col = x
+    ink = (0x18, 0x18, 0x18, 0xff); halo = (0xff, 0xff, 0xff, 0xff)
+    put!(x, y, c) = (1 <= x <= S && 1 <= y <= S) && (img[y, x] = c)
+    line!(x0, y0, x1, y1) = for t in range(0, 1; length = round(Int, hypot(x1 - x0, y1 - y0)) * 2 + 1)
+        x = x0 + t * (x1 - x0); y = y0 + t * (y1 - y0)
+        for dx in -1:1, dy in -1:1; put!(round(Int, x) + dx, round(Int, y) + dy, halo); end
+        put!(round(Int, x), round(Int, y), ink)
+    end
+    ring!(cx, cy, r) = for a in range(0, 2pi; length = 48)
+        put!(round(Int, cx + r * cos(a)), round(Int, cy + r * sin(a)), halo)
+        put!(round(Int, cx + r * cos(a)) + 1, round(Int, cy + r * sin(a)), ink)
+    end
+    line!(15, 17, 12, 13); line!(12, 13, 8, 2)    # blade 1: handle → pivot → tip
+    line!(9, 17, 12, 13);  line!(12, 13, 16, 2)   # blade 2 (crosses at the pivot)
+    ring!(6, 19, 3); ring!(18, 19, 3)             # finger holes
+    put!(12, 13, halo)                             # pivot rivet
+    return img
+end
+
+"Set the window's mouse cursor (`:arrow`, `:crosshair`, `:hand`, `:hresize`, or
+`:scissor`); no-op when headless."
 function setcursor!(player::Player, shape::Symbol)
     player.screen === nothing && return nothing
     try  # GLFW cursor calls require the main thread + a real window
         GLFW = GLMakie.GLFW
         cur = get!(CURSORS, shape) do
-            GLFW.CreateStandardCursor(shape === :crosshair ? GLFW.CROSSHAIR_CURSOR :
-                                      shape === :hand ? GLFW.POINTING_HAND_CURSOR :
-                                      GLFW.ARROW_CURSOR)
+            shape === :scissor  ? GLFW.CreateCursor(scissor_bitmap(), (12, 3)) :
+            shape === :hresize  ? GLFW.CreateStandardCursor(GLFW.RESIZE_EW_CURSOR) :
+            shape === :crosshair ? GLFW.CreateStandardCursor(GLFW.CROSSHAIR_CURSOR) :
+            shape === :hand     ? GLFW.CreateStandardCursor(GLFW.POINTING_HAND_CURSOR) :
+                                  GLFW.CreateStandardCursor(GLFW.ARROW_CURSOR)
         end
         GLFW.SetCursor(player.screen.glscreen, cur)
     catch
