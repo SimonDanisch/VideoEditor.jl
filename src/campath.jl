@@ -39,22 +39,29 @@ end
 # Pass 1: frame-to-frame similarity accumulation via GPU Lucas-Kanade tracking.
 function trackcampath(clip::Clip, n::Integer; window::Integer, iters::Integer,
                       minfeatures::Integer, maxfeatures::Integer, ransacpx::Real,
-                      fbmax::Real, redetectevery::Integer, backend, progress)
+                      fbmax::Real, redetectevery::Integer, backend, progress, frames = nothing)
     source = clip.source
     W, H = source.width, source.height
     g0 = KA.allocate(backend, Float32, (W, H)); g1 = similar(g0)
     ix0 = similar(g0); iy0 = similar(g0); ix1 = similar(g0); iy1 = similar(g0)
-    sr = SequentialReader(source)
-    frame = RGBFrame(undef, W, H)
-    host = Matrix{Float32}(undef, W, H)
+    # `frames` (device-resident RGB, whole source) → Rec.709 grayscale on the GPU;
+    # otherwise CPU decode + the same grayscale + upload. Identical grayscale on both
+    # paths (GPU RGB matches VideoIO to ~1 level), so tracking is unchanged.
+    usevio = frames === nothing
+    sr = usevio ? SequentialReader(source) : nothing
+    frame = usevio ? RGBFrame(undef, W, H) : nothing
+    host = usevio ? Matrix{Float32}(undef, W, H) : nothing
+    loadgray!(g, k) = usevio ?
+        (readframe!(frame, sr, clip.src_in + k - 1); grayscale!(host, frame); copyto!(g, host)) :
+        grayscale!(g, frames[clip.src_in + k])
     transforms = fill(Mat3f(1, 0, 0, 0, 1, 0, 0, 0, 1), n)
     try
-        readframe!(frame, sr, clip.src_in); grayscale!(host, frame); copyto!(g0, host)
+        loadgray!(g0, 1)
         gradients!(ix0, iy0, g0)
         pts = goodfeatures(backend, g0; maxpoints = maxfeatures, border = window + 4)
         px = Float64[p[1] for p in pts]; py = Float64[p[2] for p in pts]
         for k in 2:n
-            readframe!(frame, sr, clip.src_in + k - 1); grayscale!(host, frame); copyto!(g1, host)
+            loadgray!(g1, k)
             gradients!(ix1, iy1, g1)
             nf = length(px)
             dpx = KA.allocate(backend, Float32, nf); copyto!(dpx, Float32.(px))
@@ -93,7 +100,7 @@ function trackcampath(clip::Clip, n::Integer; window::Integer, iters::Integer,
             progress === nothing || (k % 30 == 0 && progress(k, 2n))
         end
     finally
-        close(sr)
+        usevio && close(sr)
     end
     return transforms
 end
@@ -101,23 +108,35 @@ end
 # Pass 2: drift-free translation refinement against frame-1 NCC templates.
 function refinecampath(clip::Clip, seed::Vector{Mat3f}, n::Integer; window::Integer,
                        radius::Integer, minscore::Real, minmargin::Real, thresh::Real,
-                       maxfeatures::Integer, backend, progress)
+                       maxfeatures::Integer, backend, progress, frames = nothing)
     source = clip.source
     W, H = source.width, source.height
-    sr = SequentialReader(source)
-    frame = RGBFrame(undef, W, H)
-    host = Matrix{Float32}(undef, W, H)
+    usevio = frames === nothing
+    sr = usevio ? SequentialReader(source) : nothing
+    frame = usevio ? RGBFrame(undef, W, H) : nothing
+    host = Matrix{Float32}(undef, W, H)   # PatchTracker (template cut) needs host
+    # GPU path: grayscale each RGB frame on-device and hand matchpatches! the device
+    # array — it copies device→device (no per-frame host download / re-upload).
+    dg = usevio ? nothing : KA.allocate(backend, Float32, (W, H))
     A = copy(seed)
     try
-        readframe!(frame, sr, clip.src_in); grayscale!(host, frame)
-        dg = KA.allocate(backend, Float32, (W, H)); copyto!(dg, host)
-        feats = goodfeatures(backend, dg; maxpoints = maxfeatures, border = radius + window)
+        if usevio
+            readframe!(frame, sr, clip.src_in); grayscale!(host, frame)
+        else
+            grayscale!(host, Array(frames[clip.src_in + 1]))   # one download, for the templates
+        end
+        dg0 = KA.allocate(backend, Float32, (W, H)); copyto!(dg0, host)
+        feats = goodfeatures(backend, dg0; maxpoints = maxfeatures, border = radius + window)
         length(feats) >= 6 || return A
         tracker = PatchTracker(backend, host, feats; window = window,
                                maxradius = radius + 18, minstd = 0.0)
         for k in 2:n
-            readframe!(frame, sr, clip.src_in + k - 1); grayscale!(host, frame)
-            good = [m for m in matchpatches!(tracker, host, seed[k]; radius = radius)
+            gray = if usevio
+                readframe!(frame, sr, clip.src_in + k - 1); grayscale!(host, frame); host
+            else
+                grayscale!(dg, frames[clip.src_in + k]); dg
+            end
+            good = [m for m in matchpatches!(tracker, gray, seed[k]; radius = radius)
                     if m.score >= minscore && m.margin >= minmargin]
             if length(good) >= 6
                 dx, dy = ransactranslation([m.dx for m in good], [m.dy for m in good]; thresh = thresh)
@@ -126,7 +145,7 @@ function refinecampath(clip::Clip, seed::Vector{Mat3f}, n::Integer; window::Inte
             progress === nothing || (k % 30 == 0 && progress(n + k, 2n))
         end
     finally
-        close(sr)
+        usevio && close(sr)
     end
     return A
 end
@@ -149,10 +168,28 @@ function similaritypath!(clip::Clip; window::Integer = 11, iters::Integer = 15,
                          backend = KA.CPU(), progress = nothing)
     n = cliplength(clip)
     n >= 2 || return nothing
-    A = trackcampath(clip, n; window, iters, minfeatures, maxfeatures, ransacpx,
-                     fbmax, redetectevery, backend, progress)
-    A = refinecampath(clip, A, n; window = refwindow, radius = refradius, minscore = 0.5,
-                      minmargin = 0.05, thresh = 2.0, maxfeatures = 400, backend, progress)
+    # Decode the whole source GPU-resident once (RGB), reused by both passes (no
+    # per-frame CPU decode / grayscale / upload). Falls back to CPU decode for
+    # unsupported streams (non-4:2:0, single-reference) or non-Lava backends.
+    frames = nothing
+    if gpu_decode_available(backend)
+        try
+            w, h, fr = gpu_decode_rgb(backend, clip.source.path)
+            if (w, h) == (clip.source.width, clip.source.height) && length(fr) >= clip.src_in + n
+                frames = fr
+            end
+        catch
+            frames = nothing
+        end
+    end
+    A = try
+        A = trackcampath(clip, n; window, iters, minfeatures, maxfeatures, ransacpx,
+                         fbmax, redetectevery, backend, progress, frames)
+        refinecampath(clip, A, n; window = refwindow, radius = refradius, minscore = 0.5,
+                      minmargin = 0.05, thresh = 2.0, maxfeatures = 400, backend, progress, frames)
+    finally
+        gpu_free_frames!(frames)   # release the ~GBs of GPU-resident frames now
+    end
     # scrub single-frame glitches in (scale, rotation, translation) — WITHOUT
     # attenuating real motion, which a lock must fully cancel rather than smooth
     sc = deoutlier([Float64(hypot(M[1, 1], M[2, 1])) for M in A], outlierwindow, outlierscale)
