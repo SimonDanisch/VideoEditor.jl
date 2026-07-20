@@ -13,7 +13,11 @@
 # wait in post; they don't drive any on-screen interaction.
 
 ENV["DISPLAY"] = get(ENV, "DISPLAY", ":1")
-ENV["XAUTHORITY"] = get(ENV, "XAUTHORITY", "/run/user/1000/xauth_hqQZRv")
+# XAUTHORITY rotates across reboots — pick the newest xauth_* if not already set.
+if !haskey(ENV, "XAUTHORITY")
+    xs = filter(f -> startswith(basename(f), "xauth_"), readdir("/run/user/1000"; join = true))
+    isempty(xs) || (ENV["XAUTHORITY"] = last(sort(xs; by = mtime)))
+end
 ENV["XDG_RUNTIME_DIR"] = get(ENV, "XDG_RUNTIME_DIR", "/run/user/1000")
 
 using VideoEditor, GLMakie, Makie, Lava
@@ -98,43 +102,44 @@ K = Makie.Keyboard
 events = [
     Wait(1.2),
 
-    # [1] the raw handheld clip — play it, then scrub to the busy nest box; it DRIFTS
-    MouseTo(block_center(play_btn)), LeftClick(), Wait(3.0),
-    KeyPress(K.space), Wait(0.5),
-    Lazy(_ -> MouseTo(timeline_pos(2.0))), LeftDown(), Wait(0.2),
-    Lazy(_ -> MouseTo(timeline_pos(13.0))), Wait(0.5), LeftUp(), Wait(0.8),
-
-    # [2] Camera-lock stabilize the WHOLE clip (GPU): open the mode menu to show the
-    # modes, pick "Camera lock", click "Stabilize clip". The status counts the frames;
-    # the view glides into the auto-crop when it's done. (analysis wait time-lapsed in post)
-    Lazy(_ -> MouseTo(menu_pos(mode_menu, 0.5))), LeftClick(), Wait(1.6),
-    Lazy(_ -> MouseTo(menu_pos(mode_menu, -0.5))), LeftClick(), Wait(0.8),
-    Lazy(_ -> (TIMELAPSE[] = true; MouseTo(block_center(stabilize_btn)))), LeftClick(),
-    WaitUntil(hasmotion; timeout = 500.0),          # wait for the GPU analysis to finish
-
-    # [3] the auto-crop glides in (normal speed = a nice reveal), then play the stabilized
-    # clip: background nailed, only the birds move
-    Lazy(_ -> (TIMELAPSE[] = false; MouseTo(block_center(play_btn)))), Wait(2.5),
-    LeftClick(), Wait(3.0),
+    # [1] the raw handheld clip — play it: it opens with a shaky zoom-in and DRIFTS
+    MouseTo(block_center(play_btn)), LeftClick(), Wait(4.0),
     KeyPress(K.space), Wait(0.6),
 
-    # [4] cut off the shaky zoom-in intro with the SPLIT TOOL (crosshair cursor): click
-    # the timeline at 5 s to cut, Esc to put the tool away, click the intro clip, X deletes it
+    # [2] cut off the shaky zoom-in intro FIRST with the SPLIT TOOL (crosshair cursor):
+    # click the timeline at 5 s to cut, Esc puts the tool away, click the intro clip, X deletes it.
+    # (Cutting the zoom BEFORE stabilizing is the whole point — locking a 5× zoom would just
+    #  magnify the frame into mush; the steady nest-box section locks cleanly.)
     MouseTo(block_center(split_btn)), LeftClick(), Wait(0.8),
     Lazy(_ -> MouseTo(timeline_pos(5.0))), LeftClick(), Wait(1.1),
     KeyPress(K.escape), Wait(0.5),
     Lazy(_ -> MouseTo(timeline_pos(2.5))), LeftClick(), Wait(0.6),
     KeyPress(K.x), Wait(1.3),
 
-    # [5] "Make seamless loop" — finds the full ~13 s cycle (bird goes around and returns)
+    # [3] Camera-lock stabilize the STEADY clip (GPU): select it, open the mode menu to show
+    # the modes, pick "Camera lock", click "Stabilize clip". The status counts the frames; the
+    # view glides into the auto-crop when it's done. (analysis wait time-lapsed in post)
+    Lazy(_ -> MouseTo(timeline_pos(8.0))), LeftClick(), Wait(0.6),
+    Lazy(_ -> MouseTo(menu_pos(mode_menu, 0.5))), LeftClick(), Wait(1.6),
+    Lazy(_ -> MouseTo(menu_pos(mode_menu, -0.5))), LeftClick(), Wait(0.8),
+    Lazy(_ -> (TIMELAPSE[] = true; MouseTo(block_center(stabilize_btn)))), LeftClick(),
+    WaitUntil(hasmotion; timeout = 500.0),          # wait for the GPU analysis to finish
+
+    # [4] the auto-crop glides in (normal speed = a nice reveal), then play the stabilized
+    # clip: background nailed, no zoom-magnification, only the birds move
+    Lazy(_ -> (TIMELAPSE[] = false; MouseTo(block_center(play_btn)))), Wait(2.5),
+    LeftClick(), Wait(3.5),
+    KeyPress(K.space), Wait(0.6),
+
+    # [5] "Make seamless loop" — finds the full behavioural cycle (bird goes around and returns)
     # and trims the timeline to it
-    Lazy(_ -> MouseTo(timeline_pos(6.0))), LeftClick(), Wait(0.5),
+    Lazy(_ -> MouseTo(timeline_pos(8.0))), LeftClick(), Wait(0.5),
     Lazy(_ -> (TIMELAPSE[] = true; MouseTo(block_center(loop_btn)))), LeftClick(),
     WaitUntil(looptrimmed; timeout = 120.0),
-    Lazy(_ -> (TIMELAPSE[] = false; MouseTo(block_center(play_btn)))), Wait(1.0),
 
     # [6] play the finished loop — it goes around completely and comes back seamlessly
-    MouseTo(block_center(play_btn)), LeftClick(), Wait(15.0),
+    Lazy(_ -> (TIMELAPSE[] = false; MouseTo(block_center(play_btn)))), Wait(1.0),
+    LeftClick(), Wait(14.0),
     KeyPress(K.space), Wait(0.6),
 
     # [7] export as a looping GIF: open the export dock, set format = gif, Export GIF
