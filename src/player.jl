@@ -171,7 +171,14 @@ function Player(path::AbstractString; capacity::Integer = 64,
     playhead = Observable(0)
     playing = Observable(false)
 
-    uicolors = Makie.derive_colors(; background, accent)
+    # `derive_colors` mixes surfaces only ~3–6% toward the contrast pole — weights
+    # tuned for light mode that are nearly invisible on a dark canvas. Widen the steps
+    # so the dark UI has real depth (void → panel → button → border read as distinct).
+    bgc = RGBf(Makie.to_color(background)); wht = RGBf(1, 1, 1)
+    uicolors = merge(Makie.derive_colors(; background, accent),
+        (surface_subtle = Makie.lerp_oklab(bgc, wht, 0.05),
+         surface        = Makie.lerp_oklab(bgc, wht, 0.11),
+         border         = Makie.lerp_oklab(bgc, wht, 0.26)))
     player = Makie.with_theme(colors = Makie.Attributes(; uicolors...),
                               backgroundcolor = background,
                               textcolor = uicolors.text) do
@@ -240,7 +247,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     # the void: a dark rail behind the toolbar, a lighter panel behind the dock slot
     # (both collapse with their columns). Created before their content → drawn behind.
     Box(fig[1, 1]; color = uicolors.surface_subtle, strokewidth = 0, tellwidth = false, tellheight = false)
-    Box(fig[1, 2]; color = uicolors.background, strokecolor = uicolors.border, strokewidth = 1,
+    Box(fig[1, 2]; color = uicolors.surface_subtle, strokecolor = uicolors.border, strokewidth = 1,
         tellwidth = false, tellheight = false)
     # DataAspect keeps pixels square and letterboxes the crop inside the cell,
     # so we never show outside the crop (which would re-reveal the warp border
