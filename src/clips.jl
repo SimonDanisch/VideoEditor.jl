@@ -278,10 +278,11 @@ function snappedstart(newstart::Integer, len::Integer, snap::Integer, targets::V
 end
 
 "Whether `clip` can sit at `newstart` without overlapping another clip."
-function canplace(seq::Sequence, clip::Clip, newstart::Integer)
+function canplace(seq::Sequence, clip::Clip, newstart::Integer, track::Integer = clip.track)
     len = cliplength(clip)
     for other in seq.clips
         other === clip && continue
+        other.track == track || continue          # different tracks may overlap in time
         newstart < clipend(other) && other.start < newstart + len && return false
     end
     return true

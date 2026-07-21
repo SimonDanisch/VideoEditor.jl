@@ -47,6 +47,7 @@ mutable struct Timeline
     tooltip_plot::Any
     dragclip::Union{Nothing, Tuple{Clip, Int}}  # (clip, grab offset in frames)
     dragstart::Int                              # committed on release
+    dragtrack::Int                              # target track, committed on release
     dragvalid::Bool
     trimclip::Union{Nothing, Tuple{Clip, Symbol, Int}}  # (clip, :left/:right, index)
     onrightclick::Function
@@ -79,7 +80,7 @@ mutable struct Timeline
                        Observable(Float64[]), Observable(Point2f[]),
                        Observable(""), Observable(Point2f(0, 0)),
                        Threads.Atomic{Bool}(true),
-                       nothing, nothing, nothing, 0, false, nothing, identity, identity)
+                       nothing, nothing, nothing, 0, 1, false, nothing, identity, identity)
 
         timeline.ghost_plot = poly!(axis, timeline.ghost_rect; color = timeline.ghost_color,
                                     strokecolor = colors.accent, strokewidth = 1.5,
@@ -326,7 +327,7 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
     on(events(axis.scene).mouseposition) do _
         inside = is_mouseinside(axis.scene)
         if timeline.dragclip !== nothing
-            dragto!(timeline, mouseposition(axis.scene)[1])
+            mp = mouseposition(axis.scene); dragto!(timeline, mp[1], mp[2])
         elseif timeline.trimclip !== nothing
             trimto!(timeline, mouseposition(axis.scene)[1])
         elseif timeline.scrubbing[]
@@ -415,8 +416,9 @@ function edgemark!(timeline::Timeline, edge)
     return nothing
 end
 
-"Ctrl-drag: move a translucent ghost to the (snapped) drop position."
-function dragto!(timeline::Timeline, t::Real)
+"Ctrl-drag: move a translucent ghost to the (snapped) drop position; cursor height
+picks the target track (drag above the top row to create a new one)."
+function dragto!(timeline::Timeline, t::Real, y::Real = NaN)
     drag = timeline.dragclip
     drag === nothing && return nothing
     clip, offset = drag
@@ -430,11 +432,19 @@ function dragto!(timeline::Timeline, t::Real)
         other === clip && continue
         push!(targets, other.start, clipend(other))
     end
-
     snapped, didsnap = snappedstart(rawstart, cliplength(clip), snapframes, targets)
+
+    # target track from cursor height (bands match relayout!); above the top → new track
+    ntr = ntracks(seq); span = 0.96 / ntr
+    track = isnan(y) ? clip.track : clamp(floor(Int, (Float64(y) - 0.02) / span) + 1, 1, ntr + 1)
     timeline.dragstart = snapped
-    timeline.dragvalid = canplace(seq, clip, snapped)
-    timeline.ghost_rect[] = Rect2f(snapped / fps, 0.05, cliplength(clip) / fps, 0.9)
+    timeline.dragtrack = track
+    timeline.dragvalid = canplace(seq, clip, snapped, track)
+
+    g = min(0.02, span * 0.15)
+    ghostspan = 0.96 / max(ntr, track)              # if dropping on a new track, shrink to fit
+    lo = 0.02 + (track - 1) * ghostspan + g; hi = 0.02 + track * ghostspan - g
+    timeline.ghost_rect[] = Rect2f(snapped / fps, lo, cliplength(clip) / fps, hi - lo)
     timeline.ghost_color[] = timeline.dragvalid ? (timeline.colors.accent_subtle, 0.55) :
                              (RGBf(0.75, 0.2, 0.2), 0.4)
     timeline.ghost_plot.visible = true
@@ -482,10 +492,11 @@ function finishdrag!(timeline::Timeline)
     timeline.dragclip = nothing
     timeline.ghost_plot.visible = false
     timeline.snapline[] = Float64[]
-    if timeline.dragvalid && timeline.dragstart != clip.start
+    if timeline.dragvalid && (timeline.dragstart != clip.start || timeline.dragtrack != clip.track)
         timeline.onedit()
         clip.start = max(timeline.dragstart, 0)
-        sort!(timeline.sequence.clips, by = c -> c.start)
+        clip.track = timeline.dragtrack
+        sort!(timeline.sequence.clips, by = c -> (c.track, c.start))
         timeline.selected[] = something(findfirst(c -> c === clip, timeline.sequence.clips), 0)
         notify(timeline.playhead)  # frame under the playhead may have changed
     end
