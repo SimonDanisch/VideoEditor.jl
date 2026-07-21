@@ -126,3 +126,59 @@ registerplugin!(:soften, "Soften", [FxParam(:radius, "Radius"; min = 1, max = 8,
         end
         acc / n
     end)
+
+# ---------------------------------------------------------------- effect kinds
+
+"""
+A uniform, editable descriptor for ANY effect — built-in or plugin — so the effect
+list, the add-picker and the modal editor treat them identically. `params` are the
+tunable fields; `kfkeys` is the keyframe-registry key per param (so the ◆ toggle
+animates the right curve); `make(nt)` builds the `Effect`; `matches(e)` and `read(e)`
+recognise and read back an existing instance.
+"""
+struct EffectKind
+    name::Symbol
+    label::String
+    params::Vector{FxParam}
+    kfkeys::Vector{Symbol}
+    make::Any
+    matches::Any
+    read::Any
+end
+
+# built-in effects, edited exactly like plugins (their param names ARE their PARAMS keys)
+const BUILTIN_KINDS = EffectKind[
+    EffectKind(:color, "Color",
+        [FxParam(:brightness, "Brightness"; min = -0.5, max = 0.5, default = 0.0),
+         FxParam(:contrast, "Contrast"; min = 0.0, max = 2.0, default = 1.0),
+         FxParam(:saturation, "Saturation"; min = 0.0, max = 2.0, default = 1.0),
+         FxParam(:temperature, "Temperature"; min = -1.0, max = 1.0, default = 0.0)],
+        [:brightness, :contrast, :saturation, :temperature],
+        nt -> ColorEffect(brightness = nt.brightness, contrast = nt.contrast,
+                          saturation = nt.saturation, temperature = nt.temperature),
+        e -> e isa ColorEffect,
+        e -> (brightness = Float64(e.adj.brightness), contrast = Float64(e.adj.contrast),
+              saturation = Float64(e.adj.saturation), temperature = Float64(e.adj.temperature))),
+    EffectKind(:opacity, "Opacity", [FxParam(:opacity, "Opacity"; min = 0.0, max = 1.0, default = 1.0)],
+        [:opacity], nt -> OpacityEffect(Float32(nt.opacity)), e -> e isa OpacityEffect,
+        e -> (opacity = Float64(e.α),)),
+    EffectKind(:blur, "Blur", [FxParam(:blur, "Blur"; min = 0.0, max = 12.0, default = 0.0)],
+        [:blur], nt -> BlurEffect(Float32(nt.blur)), e -> e isa BlurEffect, e -> (blur = Float64(e.σ),)),
+    EffectKind(:sharpen, "Sharpen", [FxParam(:sharpen, "Sharpen"; min = 0.0, max = 2.0, default = 0.0)],
+        [:sharpen], nt -> SharpenEffect(2.0f0, Float32(nt.sharpen)), e -> e isa SharpenEffect,
+        e -> (sharpen = Float64(e.amount),)),
+]
+
+"The `EffectKind` for a registered plugin (its keyframe keys come from `pluginparamkey`)."
+pluginkind(p::FxPlugin) = EffectKind(p.name, p.label, p.params,
+    [pluginparamkey(p, pr) for pr in p.params],
+    nt -> plugineffect(p.name; nt...),
+    e -> e isa PluginEffect && e.name === p.name,
+    e -> NamedTuple(pr.name => Float64(get(e.params, pr.name, pr.default)) for pr in p.params))
+
+"All editable effect kinds — built-ins then registered plugins."
+effectkinds() = vcat(BUILTIN_KINDS, EffectKind[pluginkind(p) for p in PLUGINS])
+"The kind matching effect `e`, or `nothing`."
+effectkindfor(e::Effect) = (for k in effectkinds(); k.matches(e) && return k; end; nothing)
+"The kind named `name`, or `nothing`."
+kindbyname(name::Symbol) = (for k in effectkinds(); k.name === name && return k; end; nothing)

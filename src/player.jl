@@ -326,9 +326,10 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
         push!(onebtns, b)
     end
     buildkeyframelegend!(player, uicolors)   # modal: show/hide keyframe tracks
-    buildpluginpicker!(player, uicolors)     # modal: pick a plugin + edit its params (ParamForm)
-    # their open buttons live in the effects panel (see buildfxpanel!), not the
-    # toolbar — the toolbar must stay short enough to clear the full-width timeline
+    buildeffecteditor!(player, uicolors)     # modal: add / edit any effect (ParamForm)
+    buildstabmodal!(player, uicolors)        # modal: stabilization + loop controls
+    # these modals' open buttons live in the effects panel (see buildfxpanel!), not
+    # the toolbar — the toolbar must stay short enough to clear the full-width timeline
     # hover tooltips: hovering a toolbar button shows its name + shortcut to the
     # right of it (detected by mouse-vs-bbox; Makie Buttons have no hover attr).
     tiptargets = vcat([(splitbtn, "Blade  (S)"), (cropbtn, "Crop  (C)")],
@@ -1903,30 +1904,38 @@ function buildkeyframelegend!(player::Player, uicolors)
 end
 
 """
-Modal effect picker: choose a registered plugin, then edit its parameters in a
-`ParamForm` (auto-built from the plugin's `FxParam`s) whose per-row accessory is the
-same colored ◆ keyframe + ● visibility pair. Applies to the clip under the playhead
-live. This is where `ParamForm` fits — a fresh per-plugin form — rather than the
-always-on panel. Call `player.fxwidgets[:pluginpickeropen]()`.
+Modal editor for ANY effect (built-in or plugin), driven by `EffectKind`. Add mode
+(`:effectaddopen`) shows a kind menu and appends the chosen effect; edit mode
+(`:effecteditopen(i)`) fixes the kind and seeds the form from effect `i`. A `ParamForm`
+(auto-built from the kind's params) with the colored ◆ keyframe + ● visibility
+accessory per row live-applies to the clip.
 """
-function buildpluginpicker!(player::Player, uicolors)
-    modal = Modal(player.fig; title = "Add effect", min_size = (340, 300), halign = :left)
+function buildeffecteditor!(player::Player, uicolors)
+    modal = Modal(player.fig; title = "Effect", min_size = (340, 300), halign = :left)
     formref = Ref{Any}(nothing)
-    curclip() = (loc = locate(player.sequence, player.playhead[]); loc === nothing ? nothing : loc[1])
+    editclip = Ref{Any}(nothing)
+    editindex = Ref(0)                       # 0 = append a new effect; >0 = edit that index
     menu = Menu(modal[1, 1]; prompt = "Choose an effect…", tellwidth = false,
-                options = [(p.label, p.name) for p in PLUGINS])
-    function showform(name)
+                options = [(k.label, k.name) for k in effectkinds()])
+    function showform(kindname)
         formref[] === nothing || (Makie.clear!(formref[]); formref[] = nothing)
-        p = PLUGINBYNAME[name]
-        c = curclip()
-        c === nothing || (snapshot!(player); seteffect!(c, plugineffect(name)); notify(player.playhead))
-        if isempty(p.params)
-            formref[] = Label(modal[2, 1], "$(p.label) applied — no parameters."; halign = :left, tellwidth = false)
+        clip = editclip[]; clip === nothing && return
+        k = kindbyname(kindname); k === nothing && return
+        defs = NamedTuple(pr.name => pr.default for pr in k.params)
+        if editindex[] == 0                  # add: append with defaults, then edit it
+            snapshot!(player); push!(clip.effects, k.make(defs))
+            editindex[] = length(clip.effects); notify(player.playhead)
+        elseif !(1 <= editindex[] <= length(clip.effects) && k.matches(clip.effects[editindex[]]))
+            snapshot!(player); clip.effects[editindex[]] = k.make(defs); notify(player.playhead)  # kind changed
+        end
+        cur = k.read(clip.effects[editindex[]])
+        if isempty(k.params)
+            formref[] = Label(modal[2, 1], "$(k.label) — no parameters."; halign = :left, tellwidth = false)
             return
         end
-        spec = NamedTuple(pr.name => (Float64(pr.default), Makie.Between(pr.min, pr.max)) for pr in p.params)
+        spec = NamedTuple(pr.name => (Float64(cur[pr.name]), Makie.Between(pr.min, pr.max)) for pr in k.params)
         accessory = (field, pos) -> begin
-            key = pluginparamkey(p, p.params[findfirst(q -> q.name === field, p.params)])
+            key = k.kfkeys[findfirst(pr -> pr.name === field, k.params)]
             pcol = paramcolor(key)
             gl = GridLayout(pos)
             kf = Button(gl[1, 1]; label = "◆", width = 20, tellwidth = false, labelcolor = pcol)
@@ -1938,13 +1947,28 @@ function buildpluginpicker!(player::Player, uicolors)
         end
         pf = Makie.ParamForm(modal[2, 1], spec, accessory; accessorywidth = 48, labelwidth = 96)
         formref[] = pf
-        on(pf.graph[:values]) do vals   # live-apply as parameters change
-            c = curclip(); c === nothing && return
-            seteffect!(c, plugineffect(name; vals...)); notify(player.playhead)
+        on(pf.graph[:values]) do vals        # live-apply to the edited effect
+            clip = editclip[]; clip === nothing && return
+            (1 <= editindex[] <= length(clip.effects)) || return
+            clip.effects[editindex[]] = k.make(vals); notify(player.playhead)
         end
     end
     on(sel -> sel === nothing || showform(sel), menu.selection)
-    player.fxwidgets[:pluginpickeropen] = () -> openmodal!(player, modal)
+    player.fxwidgets[:effectaddopen] = () -> begin
+        loc = locate(player.sequence, player.playhead[])
+        editclip[] = loc === nothing ? nothing : loc[1]
+        editindex[] = 0; modal.title = "Add effect"; menu.i_selected[] = 0
+        openmodal!(player, modal)
+    end
+    player.fxwidgets[:effecteditopen] = (i::Integer) -> begin
+        loc = locate(player.sequence, player.playhead[]); loc === nothing && return
+        clip = loc[1]; (1 <= i <= length(clip.effects)) || return
+        k = effectkindfor(clip.effects[i]); k === nothing && return
+        editclip[] = clip; editindex[] = i; modal.title = k.label
+        openmodal!(player, modal)
+        mi = findfirst(o -> o[2] === k.name, menu.options[])
+        mi === nothing || (menu.i_selected[] = 0; menu.i_selected[] = mi)   # force showform to re-seed
+    end
     player.fxwidgets[:pickermenu] = menu
     player.fxwidgets[:pickerform] = formref
     return modal
@@ -1952,167 +1976,94 @@ end
 
 # ------------------------------------------------------------- effect panel
 
-"Sliders editing the effect stack of the clip under the playhead."
+"""
+The effects dock: a compact, scrollable list of the clip's applied effects (the
+stack). `+ Add effect` opens the picker modal; clicking an effect opens its editor
+modal ([`buildeffecteditor!`](@ref)); `×` removes it. `Tracks…` opens the keyframe
+legend, `Stabilize…` the stabilization modal — editing lives in modals, not here.
+"""
 function buildfxpanel!(player::Player, gridpos, uicolors)
-    specs = Any[
-        (:opacity, "Opacity", 0.0:0.01:1.0, 1.0),
-        (:brightness, "Brightness", -0.5:0.01:0.5, 0.0),
-        (:contrast, "Contrast", 0.0:0.01:2.0, 1.0),
-        (:saturation, "Saturation", 0.0:0.01:2.0, 1.0),
-        (:temperature, "Temperature", -1.0:0.02:1.0, 0.0),
-        (:blur, "Blur", 0.0:0.1:12.0, 0.0),
-        (:sharpen, "Sharpen", 0.0:0.05:2.0, 0.0),
-    ]
-    # registry-driven: every registered plugin param (from any package, present when
-    # this panel is built) gets a labeled slider + ◆ keyframe button, like the built-ins.
-    for p in PARAMS
-        p.group === :plugin || continue
-        push!(specs, (p.key, p.label, p.lo:(p.hi - p.lo) / 100:p.hi, Float64(p.default)))
-    end
-    # wrap the panel in a scrollable Subfigure so tall content stays reachable
     fxscroll = Subfigure(gridpos; scrollbar_thumb_color = uicolors.border)
     player.fxwidgets[:fxscroll] = fxscroll
     panel = GridLayout(fxscroll[1, 1]; valign = :top)
     Label(panel[1, 1:4], "Effects"; font = :bold, halign = :left)
-    # which clip these controls edit (the clip under the playhead)
     target = map(player.playhead) do n
         loc = locate(player.sequence, n)
         loc === nothing && return "▸ no clip at the playhead"
-        c = loc[1]
-        i = something(findfirst(x -> x === c, player.sequence.clips), 0)
+        c = loc[1]; i = something(findfirst(x -> x === c, player.sequence.clips), 0)
         fps = player.sequence.framerate
-        "▸ editing clip $i · $(basename(c.source.path)) " *
-        "($(timestring(c.start / fps))–$(timestring(clipend(c) / fps)))"
+        "▸ clip $i · $(basename(c.source.path)) ($(timestring(c.start / fps))–$(timestring(clipend(c) / fps)))"
     end
-    Label(panel[2, 1:4], target; halign = :left, fontsize = 11, color = uicolors.accent,
-          tellwidth = false)
+    Label(panel[2, 1:4], target; halign = :left, fontsize = 11, color = uicolors.accent, tellwidth = false)
     addbtn = Button(panel[3, 1:2]; label = "+ Add effect", tellwidth = false)
-    on(_ -> player.fxwidgets[:pluginpickeropen](), addbtn.clicks)
+    on(_ -> player.fxwidgets[:effectaddopen](), addbtn.clicks)
     tracksbtn = Button(panel[3, 3:4]; label = "Tracks…", tellwidth = false)
     on(_ -> player.fxwidgets[:kflegendopen](), tracksbtn.clicks)
-    Label(panel[4, 1:4], "◆ toggles keyframing — then scrub + move a slider to animate";
-          halign = :left, fontsize = 10, color = uicolors.text_muted, tellwidth = false)
-    for (row, (key, text, range, default)) in enumerate(specs)
-        r = row + 4
-        namelbl = Label(panel[r, 1], text; halign = :left, fontsize = 12)
-        slider = Slider(panel[r, 2]; range, startvalue = default, width = 104)
-        player.fxsliders[key] = slider
-        Label(panel[r, 3], map(player.playhead) do n
-                  loc = locate(player.sequence, n)
-                  loc === nothing ? "" : string(round(paramvalue(loc[1], key, playheadframe(player, loc[1])), digits = 2))
-              end; halign = :right, fontsize = 10, color = uicolors.text_muted, width = 36)
-        # accessory column: ◆ keyframe toggle + ● curve-visibility toggle (both param-colored)
-        acc = GridLayout(panel[r, 4]; tellwidth = false)
-        kfbtn = Button(acc[1, 1]; label = "◆", width = 22, tellwidth = false)
-        eyebtn = Button(acc[1, 2]; label = "●", width = 22, tellwidth = false)
-        player.fxwidgets[Symbol(:kf_, key)] = kfbtn
-        player.fxwidgets[Symbol(:eye_, key)] = eyebtn
-        pcol = paramcolor(key)   # the param's unique color — matches its keyframe curve
-        trackplot() = (ov = get(player.fxwidgets, :kfoverlay, nothing);
-                       ov === nothing ? nothing : get(ov, key, nothing))
-        on(slider.value) do value
-            if !player.fxsyncing[]
-                player.kffocus[] = key
-                applyslider!(player, key, Float32(value))
+
+    # the applied-effects stack — rebuilt only when the clip or its effect list changes
+    listref = Ref{Any}(nothing); lastsig = Ref{Any}(:init)
+    effsig(clip) = clip === nothing ? nothing :
+        (objectid(clip), Tuple(e isa PluginEffect ? e.name : nameof(typeof(e)) for e in clip.effects))
+    function rebuildlist()
+        loc = locate(player.sequence, player.playhead[])
+        clip = loc === nothing ? nothing : loc[1]
+        sig = effsig(clip)
+        sig == lastsig[] && return
+        lastsig[] = sig
+        listref[] === nothing || Makie.clear!(listref[])
+        gl = GridLayout(panel[4, 1:4]); listref[] = gl
+        if clip === nothing || isempty(clip.effects)
+            Label(gl[1, 1], clip === nothing ? "—" : "No effects yet — click “+ Add effect”.";
+                  halign = :left, fontsize = 11, color = uicolors.text_muted, tellwidth = false)
+        else
+            for (i, e) in enumerate(clip.effects)
+                k = effectkindfor(e)
+                b = Button(gl[i, 1]; label = k === nothing ? string(nameof(typeof(e))) : k.label,
+                           halign = :left, tellwidth = false)
+                on(_ -> player.fxwidgets[:effecteditopen](i), b.clicks)
+                rm = Button(gl[i, 2]; label = "×", width = 28, tellwidth = false)
+                on(rm.clicks) do _
+                    snapshot!(player); deleteat!(clip.effects, i); notify(player.playhead); rebuildlist()
+                end
             end
         end
-        on(_ -> armkeyframe!(player, key), kfbtn.clicks)
-        on(eyebtn.clicks) do _   # hide/show this param's curve everywhere (same plot the legend flips)
-            t = trackplot(); t === nothing && return
-            v = !t[1].visible[]; t[1].visible[] = v
-            eyebtn.label[] = v ? "●" : "○"; eyebtn.labelcolor[] = v ? pcol : uicolors.text_muted
-        end
-        onany(player.playhead, player.kffocus) do n, foc
-            loc = locate(player.sequence, n)
-            anim = loc !== nothing && clipanimated(loc[1], key)
-            want = anim ? pcol : uicolors.surface
-            kfbtn.buttoncolor[] == want || (kfbtn.buttoncolor[] = want;
-                kfbtn.labelcolor[] = anim ? uicolors.text_on_accent : pcol)   # ◆ carries the color even when off
-            wname = foc === key ? pcol : uicolors.text
-            namelbl.color[] == wname || (namelbl.color[] = wname)
-            t = trackplot(); vis = t === nothing ? true : t[1].visible[]   # ● only meaningful when animated
-            ecol = anim ? (vis ? pcol : uicolors.text_muted) : uicolors.surface
-            eyebtn.labelcolor[] == ecol || (eyebtn.labelcolor[] = ecol)
-            elbl = vis ? "●" : "○"; eyebtn.label[] == elbl || (eyebtn.label[] = elbl)
-        end
+        return
     end
-    base = length(specs) + 4
-    Label(panel[base + 1, 1:2], "Keyframes"; font = :bold, halign = :left)
-    lanebtn = Button(panel[base + 1, 3:4];
-                     label = map(o -> o ? "Hide curve" : "Show curve", player.kflaneopen),
-                     fontsize = 10, tellwidth = false)
-    on(_ -> (player.kflaneopen[] = !player.kflaneopen[]), lanebtn.clicks)
-    Label(panel[base + 2, 1:2], map(k -> "◆ $(paramspec(k).label)", player.kffocus);
-          halign = :left, fontsize = 11, color = uicolors.accent, tellwidth = false)
-    clearbtn = Button(panel[base + 2, 3:4]; label = "Clear", fontsize = 10, tellwidth = false)
-    on(_ -> clearkeyframes!(player), clearbtn.clicks)
-    easemenu = Menu(panel[base + 3, 1:4];
-                    options = [("Linear", :linear), ("Smooth (ease in/out)", :smooth)],
-                    default = "Linear", tellwidth = false)
-    merge!(player.fxwidgets, Dict{Symbol, Any}(:easemenu => easemenu, :kfclear => clearbtn,
-                                               :kflanebtn => lanebtn))
-    on(easemenu.selection) do mode
-        loc = locate(player.sequence, player.playhead[])
-        loc === nothing && return
-        c = get(loc[1].animations, player.kffocus[], nothing)
-        c === nothing && return
-        c.interp = something(mode, :linear)
-        notify(player.playhead)
-    end
-    onany(player.playhead, player.kffocus) do n, foc  # ease menu tracks the focused curve
-        loc = locate(player.sequence, n)
-        loc === nothing && return
-        c = get(loc[1].animations, foc, nothing)
-        c === nothing && return
-        want = c.interp === :smooth ? 2 : 1
-        easemenu.i_selected[] == want || (easemenu.i_selected[] = want)
-    end
-    nrows = base + 3
-    Label(panel[nrows + 1, 1:4], "Stabilize"; font = :bold, halign = :left)
-    modemenu = Menu(panel[nrows + 2, 1:4];
-                    options = [("Camera lock — like a tripod", :similarity),
-                               ("Object lock — keep a subject still", :objectlock),
-                               ("Tripod (affine) — legacy", :tripod),
-                               ("Tripod + perspective — legacy", :perspective),
-                               ("Smooth — keep camera moves", :smooth)],
-                    tellwidth = false)
-    analyzebtn = Button(panel[nrows + 3, 1:4]; label = "Stabilize clip", tellwidth = false)
-    Label(panel[nrows + 4, 1:4], player.stabinfo; halign = :left, fontsize = 11,
-          tellwidth = false)
-    comparebtn = Button(panel[nrows + 5, 1:4]; label = "Hold to compare original",
-                        tellwidth = false)
-    removebtn = Button(panel[nrows + 6, 1:4]; label = "Remove stabilization",
-                       tellwidth = false)
-    colorbtn = Button(panel[nrows + 7, 1:4]; label = "Fix color flicker", tellwidth = false)
-    Label(panel[nrows + 8, 1:4], "Loop"; font = :bold, halign = :left)
-    loopbtn = Button(panel[nrows + 9, 1:4]; label = "Make seamless loop", tellwidth = false)
-    # registered effect plugins — this menu tracks PLUGINSVERSION, so effects added at
-    # runtime (incl. by the MCP agent) appear here immediately, no restart.
-    Label(panel[nrows + 10, 1:4], "Plugins"; font = :bold, halign = :left)
-    # Every registered plugin (from any package) is listed here. The menu is built
-    # from the registry when the panel is created; effects registered later in the
-    # session (e.g. authored live by the MCP) are applied over MCP and appear here on
-    # the next editor open. (This Makie build can't grow a Menu's options in place.)
-    pluginmenu = Menu(panel[nrows + 11, 1:4]; prompt = "Add effect…", tellwidth = false,
-                      options = [(p.label, p.name) for p in PLUGINS])
-    on(pluginmenu.selection) do sel
-        sel === nothing && return
-        loc = locate(player.sequence, player.playhead[]); loc === nothing && return
-        snapshot!(player)
-        seteffect!(loc[1], plugineffect(sel))
-        p = PLUGINBYNAME[sel]
-        isempty(p.params) || (player.kffocus[] = pluginparamkey(p, p.params[1]))
-        syncsliders!(player, loc[1]); refreshedit!(player)
-        pluginmenu.i_selected[] = 0                 # reset so the same effect can be re-added
-    end
-    merge!(player.fxwidgets, Dict{Symbol, Any}(
-        :modemenu => modemenu, :analyze => analyzebtn, :compare => comparebtn,
-        :remove => removebtn, :color => colorbtn, :loop => loopbtn, :pluginmenu => pluginmenu))
+    on(_ -> rebuildlist(), player.playhead)
+    rebuildlist()
 
+    Label(panel[5, 1:2], "Stabilize"; font = :bold, halign = :left)
+    stabbtn = Button(panel[5, 3:4]; label = "Stabilize…", tellwidth = false)
+    on(_ -> player.fxwidgets[:stabmodalopen](), stabbtn.clicks)
+    player.fxwidgets[:fxlistrefresh] = rebuildlist
+    return panel
+end
+
+"""
+Stabilization + loop controls in a modal (opened from the effects panel's Stabilize…
+button): mode menu, Stabilize/Compare/Remove/Fix-flicker, and Make-seamless-loop.
+"""
+function buildstabmodal!(player::Player, uicolors)
+    modal = Modal(player.fig; title = "Stabilize", min_size = (320, 320), halign = :left)
+    gl = GridLayout(modal[1, 1])
+    modemenu = Menu(gl[1, 1]; options = [("Camera lock — like a tripod", :similarity),
+                                         ("Object lock — keep a subject still", :objectlock),
+                                         ("Tripod (affine) — legacy", :tripod),
+                                         ("Tripod + perspective — legacy", :perspective),
+                                         ("Smooth — keep camera moves", :smooth)], tellwidth = false)
+    analyzebtn = Button(gl[2, 1]; label = "Stabilize clip", tellwidth = false)
+    Label(gl[3, 1], player.stabinfo; halign = :left, fontsize = 11, tellwidth = false)
+    comparebtn = Button(gl[4, 1]; label = "Hold to compare original", tellwidth = false)
+    removebtn = Button(gl[5, 1]; label = "Remove stabilization", tellwidth = false)
+    colorbtn = Button(gl[6, 1]; label = "Fix color flicker", tellwidth = false)
+    Label(gl[7, 1], "Loop"; font = :bold, halign = :left)
+    loopbtn = Button(gl[8, 1]; label = "Make seamless loop", tellwidth = false)
+    merge!(player.fxwidgets, Dict{Symbol, Any}(:modemenu => modemenu, :analyze => analyzebtn,
+        :compare => comparebtn, :remove => removebtn, :color => colorbtn, :loop => loopbtn))
     on(analyzebtn.clicks) do _
         mode = something(modemenu.selection[], :similarity)
         if mode === :objectlock
-            armpick!(player)
+            close!(modal); armpick!(player)
         else
             analyzeat!(player, (clip; kwargs...) ->
                            analyzemotion!(clip; mode, backend = player.analysisbackend, kwargs...),
@@ -2121,25 +2072,19 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     end
     on(_ -> removestabilization!(player), removebtn.clicks)
     on(_ -> analyzeat!(player, analyzecolor!, "color stabilization"), colorbtn.clicks)
-    on(_ -> findlooptrim!(player), loopbtn.clicks)
-
-    # press-and-hold on the compare button shows the un-stabilized original.
-    # High priority: the Button block consumes presses itself, which would
-    # shadow this handler (caught by the interaction tests).
-    on(events(player.fig).mousebutton; priority = 100) do event
-        event.button == Mouse.left || return Consume(false)
+    on(_ -> (close!(modal); findlooptrim!(player)), loopbtn.clicks)
+    on(events(player.fig).mousebutton; priority = 100) do event   # press-and-hold compare
+        (modal.open[] && event.button == Mouse.left) || return Consume(false)
         if event.action == Mouse.press &&
            Point2f(events(player.fig).mouseposition[]) in comparebtn.layoutobservables.computedbbox[]
-            player.applytracks[] = false
-            notify(player.playhead)
-            return Consume(true)
+            player.applytracks[] = false; notify(player.playhead); return Consume(true)
         elseif event.action == Mouse.release && !player.applytracks[]
-            player.applytracks[] = true
-            notify(player.playhead)
+            player.applytracks[] = true; notify(player.playhead)
         end
         return Consume(false)
     end
-    return panel
+    player.fxwidgets[:stabmodalopen] = () -> openmodal!(player, modal)
+    return modal
 end
 
 "Right-click context modal on the timeline: clip actions + shortcut reference."
