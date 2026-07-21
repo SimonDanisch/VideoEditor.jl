@@ -210,6 +210,7 @@ function split!(seq::Sequence, n::Integer)
     n == clip.start && return nothing
     offset = n - clip.start
     right = Clip(clip.source, clip.src_in + offset, clip.src_out, n, clip.crop)
+    right.track = clip.track              # both halves stay on the same stacking layer
     append!(right.effects, clip.effects)  # elements are immutable, sharing is safe
     right.colortrack = clip.colortrack    # keyed by absolute source frame, still valid
     right.motiontrack = clip.motiontrack

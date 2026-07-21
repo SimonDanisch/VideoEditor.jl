@@ -104,6 +104,29 @@ end
     @test err !== nothing && occursin("missing video file", err) && occursin(".gone", err)
 end
 
+@testset "multi-track edits" begin
+    src = VideoSource(testvideo)
+    a = VE.Clip(src, 0, 60, 0, (0.0, 0.0, 1.0, 1.0))
+    b = VE.Clip(src, 0, 40, 10, (0.0, 0.0, 1.0, 1.0)); b.track = 2
+    seq = Sequence([a, b], src.framerate)
+    @test VE.ntracks(seq) == 2
+    @test length(VE.clipsat(seq, 20)) == 2               # both cover frame 20
+    @test seq.clips[VE.clipat(seq, 20)].track == 2       # the top layer wins
+    @test VE.clipat(seq, 55) == 1                        # only the base clip covers 55
+
+    # splitting the top clip keeps BOTH halves on layer 2 (regression: the
+    # 5-arg Clip constructor used to reset the new half to track 1)
+    right = split!(seq, 20)
+    @test right.track == 2
+    @test count(c -> c.track == 2, seq.clips) == 2
+
+    # the layer survives snapshot/restore and a project roundtrip
+    @test sort([c.track for c in VE.snapshot(seq)]) == [1, 2, 2]
+    path = joinpath(mktempdir(), "mt.videoedit.toml")
+    saveproject(path, seq)
+    @test sort([c.track for c in loadproject(path).clips]) == [1, 2, 2]
+end
+
 @testset "Multi-source model" begin
     using Statistics: mean
     src1 = VideoSource(testvideo)    # 320x180, 120 frames
