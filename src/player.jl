@@ -261,6 +261,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
 
     # row 2: a full-width, collapsible keyframe curve lane, time-aligned with the
     # timeline directly below it (populated by buildkeyframelane!, shown with ◆)
+    Box(fig[3, 1:3]; color = uicolors.surface_subtle, strokewidth = 0, tellwidth = false, tellheight = false)  # timeline zone
     timeline = Timeline(fig[3, 1:3], sequence, playhead, playing)
     rowsize!(fig.layout, 2, Makie.Fixed(0))
     rowsize!(fig.layout, 3, Makie.Fixed(96))
