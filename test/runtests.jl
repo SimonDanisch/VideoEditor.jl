@@ -183,6 +183,15 @@ end
     VE.applyeffect!(f, similar(f), similar(f), e)
     @test all(px -> Float32(px.r) < 0.8, f)                        # gain 0.25 darkens
     @test VE.plugineffectfromdict(VE.effectdict(e)).params.gain == 0.25
+
+    # the stock :soften plugin exercises the OTHER effect kind — Stencil (reads a
+    # neighbourhood), applied through the same kernel the GPU graph uses
+    soften = VE.plugineffect(:soften; radius = 2)
+    @test VE.fxkind(soften) isa VE.Stencil
+    edge = fill(VE.RGB{VE.N0f8}(0.0, 0.0, 0.0), 16, 16)
+    edge[9:end, :] .= VE.RGB{VE.N0f8}(1.0, 1.0, 1.0)               # sharp black/white seam
+    VE.applyeffect!(edge, similar(edge), similar(edge), soften)
+    @test any(px -> 0.1 < Float32(px.r) < 0.9, edge)              # box blur softened the seam
 end
 
 @testset "Multi-source model" begin
