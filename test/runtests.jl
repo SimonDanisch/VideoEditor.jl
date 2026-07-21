@@ -208,6 +208,20 @@ end
     @test String(hdr) in ("GIF89a", "GIF87a")
     # the NETSCAPE loop extension must be present for loop = 0 (loop forever)
     @test occursin("NETSCAPE", String(read(gif)))
+
+    # keyframed parameters bake per-frame into the export (opacity ramp → luma ramp)
+    kseq = Sequence(VideoSource(testvideo))
+    kcurve = VE.AnimCurve(); VE.setkey!(kcurve, 0, 0.1); VE.setkey!(kcurve, 119, 1.0)
+    kseq.clips[1].animations[:opacity] = kcurve
+    kout = joinpath(mktempdir(), "kf.mp4")
+    exportvideo(kout, kseq; audio = false, encoder_options = (crf = 18, preset = "fast"))
+    luma(f) = mean(Float32(px.r) + px.g + px.b for px in f) / 3
+    kr = VideoIO.openvideo(kout)
+    lo = luma(read(kr))                       # frame 0: opacity ~0.1 (dark)
+    for _ in 1:100; read(kr); end
+    hi = luma(read(kr))                        # frame 101: opacity ~0.86 (bright)
+    close(kr)
+    @test hi > 2 * lo
 end
 
 @testset "Audio export" begin
