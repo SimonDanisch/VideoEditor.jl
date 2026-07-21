@@ -194,6 +194,17 @@ end
     @test any(px -> 0.1 < Float32(px.r) < 0.9, edge)              # box blur softened the seam
 end
 
+@testset "example plugins load (how-to-hack reference)" begin
+    import VideoEditor.GeometryBasics: Vec3f   # precondition: Vec3f already in scope, as in any GLMakie session
+    include(joinpath(pkgdir(VideoEditor), "examples", "example_plugins.jl"))  # must not error
+    f = fill(VE.RGB{VE.N0f8}(0.4, 0.6, 0.3), 16, 16)
+    for name in (:invert, :sepia, :posterize, :levels, :edges, :emboss)
+        @test haskey(VE.PLUGINBYNAME, name)
+        g = copy(f); VE.applyeffect!(g, similar(g), similar(g), VE.plugineffect(name))
+        @test all(px -> isfinite(Float32(px.r)), g)      # every example plugin applies cleanly
+    end
+end
+
 @testset "Multi-source model" begin
     using Statistics: mean
     src1 = VideoSource(testvideo)    # 320x180, 120 frames

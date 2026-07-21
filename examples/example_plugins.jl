@@ -13,7 +13,7 @@
 #   • Stencil (n×m neighborhood) — edges, emboss
 
 import VideoEditor as VE
-const Vec3f = VE.Vec3f
+using VideoEditor.GeometryBasics: Vec3f   # idempotent even if Vec3f is already in scope (e.g. GLMakie)
 
 # luma of a linear-ish RGB triple
 luma(v) = 0.299f0 * v[1] + 0.587f0 * v[2] + 0.114f0 * v[3]
