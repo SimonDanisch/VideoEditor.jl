@@ -33,6 +33,7 @@ function exportvideo(path::AbstractString, seq::Sequence;
 
     outbuf = zeros(RGB{N0f8}, canvas[1], canvas[2])
     transbuf = RGBFrame(undef, canvas[1], canvas[2])  # incoming side of a transition
+    layerbuf = RGBFrame(undef, canvas[1], canvas[2])  # one track layer while compositing
     readers = Dict{String, SequentialReader}()
     fxbufs = Dict{String, NTuple{3, RGBFrame}}()  # per-source full-res scratch
 
@@ -48,6 +49,13 @@ function exportvideo(path::AbstractString, seq::Sequence;
                 rendercanvas!(outbuf, left, srcA, readers, fxbufs)
                 rendercanvas!(transbuf, right, srcB, readers, fxbufs)
                 blend!(outbuf, outbuf, transbuf, p)
+            elseif ntracks(seq) > 1 && length(clipsat(seq, n)) > 1
+                fill!(outbuf, RGB{N0f8}(0, 0, 0))               # composite the track stack
+                for clip in clipsat(seq, n)                     # bottom → top
+                    sf = clip.src_in + (n - clip.start)
+                    rendercanvas!(layerbuf, clip, sf, readers, fxbufs; skipopacity = true)
+                    blend!(outbuf, outbuf, layerbuf, Float32(clamp(paramvalue(clip, :opacity, sf), 0.0, 1.0)))
+                end
             else
                 loc = locate(seq, n)
                 loc === nothing ? fill!(outbuf, RGB{N0f8}(0, 0, 0)) :
@@ -137,7 +145,7 @@ cache one reader and one scratch triple per source path.
 """
 function rendercanvas!(dest::RGBFrame, clip::Clip, srcframe::Integer,
                        readers::Dict{String, SequentialReader},
-                       fxbufs::Dict{String, NTuple{3, RGBFrame}})
+                       fxbufs::Dict{String, NTuple{3, RGBFrame}}; skipopacity::Bool = false)
     sr = get!(() -> SequentialReader(clip.source), readers, clip.source.path)
     frame, fx1, fx2 = get!(() -> ntuple(_ -> RGBFrame(undef, clip.source.width, clip.source.height), 3),
                            fxbufs, clip.source.path)
@@ -145,7 +153,15 @@ function rendercanvas!(dest::RGBFrame, clip::Clip, srcframe::Integer,
     clip = effectiveclip(clip, srcframe)  # keyframed params baked at this frame
     applymotiontrack!(frame, fx1, clip, srcframe)
     applycolortrack!(frame, clip, srcframe)
-    applyeffects!(frame, fx1, fx2, clip)
+    if skipopacity                        # compositing: opacity is the layer alpha, not fade-to-black
+        for e in clip.effects
+            (e isa OpacityEffect || isneutral(e)) && continue
+            applyeffect!(frame, fx1, fx2, e)
+        end
+        KA.synchronize(KA.get_backend(frame))
+    else
+        applyeffects!(frame, fx1, fx2, clip)
+    end
     if clip.crop == (0.0, 0.0, 1.0, 1.0) && Base.size(frame) == Base.size(dest)
         copyto!(dest, frame)
     else
