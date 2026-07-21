@@ -10,6 +10,11 @@ function saveproject(path::AbstractString, seq::Sequence)
         "framerate" => seq.framerate,
         "clips" => [clipdict(clip) for clip in seq.clips],
     )
+    # transitions (cross-dissolves) are part of the edit — losing them on reopen
+    # would silently drop every dissolve
+    isempty(seq.transitions) || (dict["transitions"] =
+        [Dict{String, Any}("kind" => String(t.kind), "at" => t.at, "duration" => t.duration)
+         for t in seq.transitions])
     open(io -> TOML.print(io, dict), path, "w")
     return path
 end
@@ -86,5 +91,9 @@ function loadproject(path::AbstractString)
         end
         clip
     end
-    return Sequence(collect(Clip, clips), Float64(dict["framerate"]))
+    seq = Sequence(collect(Clip, clips), Float64(dict["framerate"]))
+    for td in get(dict, "transitions", [])
+        push!(seq.transitions, Transition(Symbol(td["kind"]), Int(td["at"]), Int(td["duration"])))
+    end
+    return seq
 end

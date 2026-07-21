@@ -124,6 +124,21 @@ end
     @test !isempty(VE.snapshot(seq)[1].animations)             # undo snapshot keeps it too
 end
 
+@testset "transition roundtrip" begin
+    src = VideoSource(testvideo)
+    seq = Sequence(src)
+    split!(seq, 40)
+    VE.addtransition!(seq, 40; duration = 12)
+    @test length(seq.transitions) == 1
+    path = joinpath(mktempdir(), "trans.videoedit.toml")
+    saveproject(path, seq)
+    seq2 = loadproject(path)
+    @test length(seq2.transitions) == 1                # dissolve survived the roundtrip
+    t = seq2.transitions[1]
+    @test (t.kind, t.at, t.duration) == (:dissolve, 40, 12)
+    @test VE.transitionat(seq2, 40) !== nothing        # resolves at the cut after reload
+end
+
 @testset "multi-track edits" begin
     src = VideoSource(testvideo)
     a = VE.Clip(src, 0, 60, 0, (0.0, 0.0, 1.0, 1.0))
