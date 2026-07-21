@@ -215,9 +215,16 @@ function relayout!(timeline::Timeline)
         pop!(timeline.clipstates)
         pop!(timeline.plotsources)
     end
+    ntr = ntracks(seq)
+    span = 0.96 / ntr                       # each track's vertical share of the axis
+    g = min(0.02, span * 0.15)              # gap between stacked tracks
     for (i, clip) in enumerate(seq.clips)
         timeline.clipranges[i][] = (clip.start / fps, clipend(clip) / fps)
         timeline.clipstarts[i][] = clip.src_in / clip.source.framerate
+        # higher track sits higher up the axis (on top)
+        timeline.clipplots[i].bandlo = 0.02 + (clip.track - 1) * span + g
+        timeline.clipplots[i].bandhi = 0.02 + clip.track * span - g
+        timeline.clipplots[i].ntracks = ntr
         if timeline.plotsources[i] !== clip.source  # edits shift clips across plots
             timeline.plotsources[i] = clip.source
             cache = cachefor(timeline, clip.source)

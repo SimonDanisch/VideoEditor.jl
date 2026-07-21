@@ -43,10 +43,11 @@ mutable struct Clip
     colortrack::Union{Nothing, ColorTrack}
     motiontrack::Union{Nothing, MotionTrack}
     const animations::Dict{Symbol, AnimCurve}  # keyframed params (see keyframes.jl)
+    track::Int                  # stacking layer; higher = on top (1 = base)
 end
 
 Clip(source::VideoSource, src_in, src_out, start, crop) =
-    Clip(source, src_in, src_out, start, crop, [], nothing, nothing, Dict{Symbol, AnimCurve}())
+    Clip(source, src_in, src_out, start, crop, [], nothing, nothing, Dict{Symbol, AnimCurve}(), 1)
 
 function Clip(source::VideoSource; src_in::Integer = 0, src_out::Integer = source.nframes,
               start::Integer = 0)
@@ -95,8 +96,23 @@ Sequence(source::VideoSource) = Sequence([Clip(source)], source.framerate)
 seqlength(seq::Sequence) = maximum(clipend, seq.clips; init = 0)
 seqduration(seq::Sequence) = seqlength(seq) / seq.framerate
 
-"Index of the clip containing timeline frame `n`, or `nothing` (gap)."
-clipat(seq::Sequence, n::Integer) = findfirst(c -> c.start <= n < clipend(c), seq.clips)
+"Number of stacking layers (1-based; the base track is 1)."
+ntracks(seq::Sequence) = isempty(seq.clips) ? 1 : maximum(c.track for c in seq.clips)
+
+"Every clip covering timeline frame `n`, bottom track first (base → top)."
+clipsat(seq::Sequence, n::Integer) =
+    sort!([c for c in seq.clips if c.start <= n < clipend(c)]; by = c -> c.track)
+
+"Index of the TOP-most clip containing timeline frame `n`, or `nothing` (gap)."
+function clipat(seq::Sequence, n::Integer)
+    best = nothing; besttrack = typemin(Int)
+    for (i, c) in enumerate(seq.clips)
+        if c.start <= n < clipend(c) && c.track > besttrack
+            best = i; besttrack = c.track
+        end
+    end
+    return best
+end
 
 "Resolve timeline frame `n` to `(clip, source_frame)`, or `nothing` in a gap."
 function locate(seq::Sequence, n::Integer)
@@ -226,7 +242,7 @@ end
 "Copy of the edit state for undo/redo. Sources and analysis tracks are shared."
 snapshot(seq::Sequence) =
     [Clip(c.source, c.src_in, c.src_out, c.start, c.crop, copy(c.effects),
-          c.colortrack, c.motiontrack, deepcopy(c.animations)) for c in seq.clips]
+          c.colortrack, c.motiontrack, deepcopy(c.animations), c.track) for c in seq.clips]
 
 "Restore a [`snapshot`](@ref) (the snapshot itself stays reusable)."
 function restore!(seq::Sequence, snap::Vector{Clip})

@@ -41,25 +41,35 @@ Bump `refresh` to re-pull thumbnails after asynchronous loads.
     strokecolor_selected = RGBAf(1.0, 0.47, 0.22, 1)
     "Thumbnail width/height in pixels (composition resolution)."
     thumbsize = (49, 88)
+    "Bottom edge of this clip's band in axis y (0..1) — its track's row."
+    bandlo = 0.03
+    "Top edge of this clip's band in axis y (0..1)."
+    bandhi = 0.97
+    "Number of stacked tracks (thumbnail tiles shrink 1/ntracks so their aspect holds)."
+    ntracks = 1
 end
 
 function Makie.plot!(p::ClipView)
-    map!(p, [:timerange], :bandrect) do (t0, t1)
-        return Rect2f(t0, 0.03, t1 - t0, 0.94)
+    map!(p, [:timerange, :bandlo, :bandhi], :bandrect) do (t0, t1), lo, hi
+        return Rect2f(t0, lo, t1 - t0, hi - lo)
     end
     map!(p, [:state, :strokecolor_idle, :strokecolor_hovered, :strokecolor_selected],
          :bandstroke) do state, idle, hovered, selected
         return state === :selected ? selected : state === :hovered ? hovered : idle
     end
     map!(p, [:timerange, :viewrange, :pixelspersecond, :bandheight, :sourcestart,
-             :thumbs, :thumbsize, :color, :refresh],
-         [:strip, :stripx, :stripvisible]) do trange, vrange, pps, bh, s0, thumbs, tsize, color, _
-        return composetiles(trange, vrange, pps, bh, s0, thumbs, tsize, to_color(color))
+             :thumbs, :thumbsize, :color, :refresh, :ntracks],
+         [:strip, :stripx, :stripvisible]) do trange, vrange, pps, bh, s0, thumbs, tsize, color, _, ntr
+        return composetiles(trange, vrange, pps, bh / max(ntr, 1), s0, thumbs, tsize, to_color(color))
+    end
+    # thumbnails inset inside the band (same 0.04/0.94 proportion as the full-height band)
+    map!(p, [:bandlo, :bandhi], :stripy) do lo, hi
+        inset = 0.04 / 0.94 * (hi - lo)
+        return (hi - inset, lo + inset)
     end
 
     poly!(p, p.bandrect; color = p.color, strokecolor = p.bandstroke, strokewidth = 2)
-    image!(p, p.stripx, (0.93, 0.07), p.strip; interpolate = true,
-           visible = p.stripvisible)
+    image!(p, p.stripx, p.stripy, p.strip; interpolate = true, visible = p.stripvisible)
     return p
 end
 

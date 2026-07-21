@@ -20,6 +20,7 @@ function clipdict(clip::Clip)
         "src_in" => clip.src_in,
         "src_out" => clip.src_out,
         "start" => clip.start,
+        "track" => clip.track,
         "crop" => collect(clip.crop),
         "effects" => [effectdict(e) for e in clip.effects],
     )
@@ -53,6 +54,7 @@ function loadproject(path::AbstractString)
         source = get!(() -> VideoSource(cd["source"]), sources, cd["source"])
         clip = Clip(source, cd["src_in"], cd["src_out"], cd["start"],
                     Tuple(Float64.(cd["crop"])))
+        clip.track = Int(get(cd, "track", 1))
         for ed in get(cd, "effects", [])
             push!(clip.effects, effectfromdict(ed))
         end

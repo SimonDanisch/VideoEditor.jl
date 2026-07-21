@@ -1734,8 +1734,15 @@ function buildkeyframeoverlay!(player::Player)
     ax = player.timeline.axis
     seq = player.sequence
     fps = seq.framerate
-    ybot, ytop = 0.10, 0.90          # inside the thumbnail band (y 0.07..0.93)
-    yat(p, v) = ybot + (ytop - ybot) * clamp(paramnorm(p, v), 0.0, 1.0)
+    # a clip's curve band = its track's row (matches the timeline), inset a little
+    function clipband(clip)
+        ntr = ntracks(seq); span = 0.96 / ntr; g = min(0.02, span * 0.15)
+        lo = 0.02 + (clip.track - 1) * span + g; hi = 0.02 + clip.track * span - g
+        inset = 0.12 * (hi - lo)
+        return (lo + inset, hi - inset)
+    end
+    yat(clip, p, v) = (b = clipband(clip); b[1] + (b[2] - b[1]) * clamp(paramnorm(p, v), 0.0, 1.0))
+    yval(clip, p, y) = (b = clipband(clip); paramdenorm(p, clamp((y - b[1]) / (b[2] - b[1]), 0.0, 1.0)))
     curveplots = Dict{Symbol, Any}()  # param => (plot, points-observable)
     # keyframe ◆ markers for the focused parameter on the clip under the playhead
     focuspts = Observable(Point2f[]); focuscol = Observable{Any}(paramcolor(player.kffocus[]))
@@ -1767,7 +1774,7 @@ function buildkeyframeoverlay!(player::Player)
                     s = x0 + (x1 - x0) * i / 60
                     sf = clip.src_in + (round(Int, s * fps) - clip.start)
                     v = something(valueat(c, sf), p.get(clip))
-                    push!(segs, Point2f(s, yat(p, v)))
+                    push!(segs, Point2f(s, yat(clip, p, v)))
                 end
                 push!(segs, Point2f(NaN, NaN))   # break between clips
             end
@@ -1782,7 +1789,7 @@ function buildkeyframeoverlay!(player::Player)
         if loc !== nothing && clipanimated(loc[1], key)
             clip = loc[1]; p = paramspec(key); c = clip.animations[key]
             focuscol[] = paramcolor(key)
-            focuspts[] = [Point2f((clip.start + (k.frame - clip.src_in)) / fps, yat(p, k.value))
+            focuspts[] = [Point2f((clip.start + (k.frame - clip.src_in)) / fps, yat(clip, p, k.value))
                           for k in c.keys if clip.src_in <= k.frame <= clip.src_out]
         else
             focuspts[] = Point2f[]
@@ -1798,7 +1805,6 @@ function buildkeyframeoverlay!(player::Player)
     # trim / the right-click menu are untouched everywhere else.
     tl = player.timeline
     dragref = Ref{Any}(nothing)                          # (curve, index, clip)
-    yval(p, y) = paramdenorm(p, clamp((y - ybot) / (ytop - ybot), 0.0, 1.0))
     focuscurve() = (loc = locate(seq, player.playhead[]);
                     loc === nothing ? nothing : get(loc[1].animations, player.kffocus[], nothing))
     function nearestmarker(t, y)                         # key index near (t,y), else 0
@@ -1821,7 +1827,7 @@ function buildkeyframeoverlay!(player::Player)
                 clip = loc[1]; p = paramspec(player.kffocus[])
                 snapshot!(player)
                 setkey!(get!(() -> AnimCurve(), clip.animations, player.kffocus[]),
-                        clip.src_in + (timelineframe(tl, t) - clip.start), yval(p, y))
+                        clip.src_in + (timelineframe(tl, t) - clip.start), yval(clip, p, y))
                 notify(player.playhead); return Consume(true)
             end
             c = focuscurve(); c === nothing && return Consume(false)
@@ -1845,7 +1851,7 @@ function buildkeyframeoverlay!(player::Player)
         t, y = mouseposition(ax.scene)
         p = paramspec(player.kffocus[])
         f = clamp(clip.src_in + (timelineframe(tl, t) - clip.start), clip.src_in, clip.src_out)
-        movekey!(c, i, f, yval(p, y))
+        movekey!(c, i, f, yval(clip, p, y))
         j = findfirst(k -> k.frame == f, c.keys); j === nothing || (dragref[] = (c, j, clip))
         notify(player.playhead); return Consume(true)
     end

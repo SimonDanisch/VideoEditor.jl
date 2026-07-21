@@ -169,7 +169,7 @@ and a copied effect stack are mutated.
 function effectiveclip(clip::Clip, srcframe::Integer)
     isempty(clip.animations) && return clip
     ec = Clip(clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
-              copy(clip.effects), clip.colortrack, clip.motiontrack, clip.animations)
+              copy(clip.effects), clip.colortrack, clip.motiontrack, clip.animations, clip.track)
     for (key, curve) in clip.animations
         haskey(PARAMBYKEY, key) || continue
         v = valueat(curve, srcframe)
