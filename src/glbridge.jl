@@ -162,6 +162,66 @@ function presentgpu!(player::Player, clip::Clip, srcframe::Integer; stream = not
     end
 end
 
+"""
+Composite a stack of clips (bottom track → top) entirely on the GPU: each layer's
+effect graph runs device-resident, its crop is baked with `warp!`, and layers are
+alpha-blended by opacity — the multi-track analogue of [`presentgpu!`]. Every layer's
+source must have a live `GpuVideoStream`; returns `false` otherwise so the caller
+falls back to the CPU composite. The composited canvas is blitted to the shared image.
+"""
+function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
+    gp = player.gpupreview
+    all(haskey(player.gpucache, c.source) for c in clips) || return false
+    try
+        top = clips[end]
+        W, H = top.source.width, top.source.height
+        if (gp.width, gp.height) != (W, H)
+            notify(player.frame)
+            setupgpupreview!(player, gp, W, H)
+        end
+        rungpuowned(player, gp) do
+            gp.engine === nothing && (gp.engine = FxEngine(player.analysisbackend))
+            pool = gp.engine.pool
+            accum = acquire!(pool, (W, H))
+            first = true
+            for clip in clips
+                srcframe = clip.src_in + (n - clip.start)
+                stream = player.gpucache[clip.source]
+                ec = effectiveclip(clip, srcframe)
+                # graph WITHOUT opacity — it becomes the layer alpha, not a fade to black
+                gclip = Clip(ec.source, ec.src_in, ec.src_out, ec.start, ec.crop,
+                             filter(e -> !(e isa OpacityEffect), ec.effects),
+                             ec.colortrack, ec.motiontrack, ec.animations, ec.track)
+                layer = execute!(graphof(gclip; applytracks = player.applytracks[]), pool,
+                                 FxContext(stream, gclip, srcframe))
+                α = Float32(clamp(paramvalue(clip, :opacity, srcframe), 0.0, 1.0))
+                if first
+                    warp!(accum, layer, ec.crop)                  # bake crop into the canvas
+                    α < 0.999f0 && channellinear!(accum, Vec3f(α), Vec3f(0))
+                    first = false
+                else
+                    warpbuf = acquire!(pool, (W, H))
+                    warp!(warpbuf, layer, ec.crop)
+                    blend!(accum, accum, warpbuf, α)              # (1-α)·below + α·layer
+                    release!(pool, warpbuf)
+                end
+                release!(pool, layer)
+            end
+            KA.synchronize(pool.backend)
+            gp.packed .= packrgba.(reshape(accum, W * H))
+            copyto!(gp.eimage, gp.packed)
+            release!(pool, accum)
+            nothing
+        end
+        player.screen.requires_update = true
+        return true
+    catch e
+        gp.failed = true
+        @error "GPU composite failed — falling back" exception = (e, catch_backtrace())
+        return false
+    end
+end
+
 "Frames kept VRAM-resident per source stream (a bounded ring; ~a few seconds)."
 const GPU_STREAM_CAPACITY = 120
 

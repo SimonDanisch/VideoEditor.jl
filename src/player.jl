@@ -559,11 +559,17 @@ function showframe!(player::Player, n::Integer)
         s = transitionsample(player.sequence, tr, n)
         s !== nothing && showtransition!(player, s) && return true
     end
-    # multiple stacked tracks → composite on the CPU (the GPU preview path shows the
-    # top clip only; compositing there is future work)
-    if ntracks(player.sequence) > 1 && !(player.gpupreview isa GPUPreview && !player.gpupreview.failed)
+    # multiple stacked tracks → composite the stack (on the GPU if every layer has a
+    # stream, else on the CPU)
+    if ntracks(player.sequence) > 1
         clips = clipsat(player.sequence, n)
-        length(clips) > 1 && compositeframe!(player, n, clips) && return true
+        if length(clips) > 1
+            gp = player.gpupreview
+            if gp isa GPUPreview && !gp.failed && all(haskey(player.gpucache, c.source) for c in clips)
+                presentgpucomposite!(player, clips, n) && return true
+            end
+            compositeframe!(player, n, clips) && return true
+        end
     end
     loc = locate(player.sequence, n)
     if loc === nothing
