@@ -236,6 +236,12 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     # where the effects / media / export panels open (never over the preview);
     # column 3: the preview. Timeline and controls span the full window width.
     toolbar = GridLayout(fig[1, 1]; tellheight = false, valign = :top)
+    # Sidebar surfaces so the controls read as a designed panel, not text floating on
+    # the void: a dark rail behind the toolbar, a lighter panel behind the dock slot
+    # (both collapse with their columns). Created before their content → drawn behind.
+    Box(fig[1, 1]; color = uicolors.surface_subtle, strokewidth = 0, tellwidth = false, tellheight = false)
+    Box(fig[1, 2]; color = uicolors.background, strokecolor = uicolors.border, strokewidth = 1,
+        tellwidth = false, tellheight = false)
     # DataAspect keeps pixels square and letterboxes the crop inside the cell,
     # so we never show outside the crop (which would re-reveal the warp border
     # a stabilization crop hides). The wide dock-less cell gives the extra width.
@@ -255,6 +261,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     # onboarding hint; replaced by the first real status update
     status = Observable("Space plays · S splits · right-click a clip for all actions")
     controls = GridLayout(fig[4, 1:3], tellwidth = false)
+    Box(fig[4, 1:3]; color = uicolors.surface_subtle, strokewidth = 0, tellwidth = false, tellheight = false)  # footer bar
     playbtn = Button(controls[1, 1]; label = map(p -> p ? "Pause" : "Play", playing), width = 80)
     Label(controls[1, 2], map(n -> timecode(sequence, n), playhead); width = 220)
     exportbtn = Button(controls[1, 3]; label = "Export", width = 80)
@@ -1635,6 +1642,7 @@ function buildkeyframelane!(player::Player, uicolors)
     lanevis = player.kflaneopen
     on(player.kflaneopen; update = true) do o
         rowsize!(fig.layout, 2, Makie.Fixed(o ? 150 : 0))
+        lane.titlevisible = o   # don't leak the param title above the timeline when collapsed
     end
     # title = focused parameter; corner labels = its value scale (kept inside the
     # plot so the lane's left edge still lines up with the timeline below)
