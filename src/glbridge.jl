@@ -129,11 +129,15 @@ packrgba(c::RGB{N0f8}) = UInt32(reinterpret(UInt8, c.r)) |
                          UInt32(reinterpret(UInt8, c.b)) << 16 | 0xff000000
 
 """
-Present the already-fetched CPU frame through the GPU chain. Returns `true`
-when the frame is on screen; `false` (after flagging `failed`) hands the
-job back to the CPU path.
+Present a frame through the GPU chain: the source pixels are put into the working
+buffer, motion/color tracks + the effect stack run as Lava kernels, and the result
+is blitted into the shared image GLMakie samples. The source is a `GpuVideoStream`
+when given — `frameat!` decodes the owning GOP device-resident and `nv12torgb!`
+converts it in place (fully-GPU, disk→VRAM path, no CPU frame) — otherwise the
+CPU frame `player.frame[]` is uploaded once. Returns `true` when on screen; `false`
+(after flagging `failed`) hands the job back to the CPU path.
 """
-function presentgpu!(player::Player, clip::Clip, srcframe::Integer)
+function presentgpu!(player::Player, clip::Clip, srcframe::Integer; stream = nothing)
     gp = player.gpupreview
     try
         W, H = size(player.frame[])
@@ -143,7 +147,12 @@ function presentgpu!(player::Player, clip::Clip, srcframe::Integer)
         end
         applytracks = player.applytracks[]
         rungpuowned(player, gp) do
-            copyto!(gp.gpuframe, player.frame[])           # the one PCIe upload
+            if stream === nothing
+                copyto!(gp.gpuframe, player.frame[])           # the one PCIe upload
+            else
+                f = frameat!(stream, srcframe)                 # decode owning GOP → VRAM
+                nv12torgb!(gp.gpuframe, f.y, f.uv; bt601 = stream.bt601)   # NV12 → RGB, on device
+            end
             if applytracks
                 applymotiontrack!(gp.gpuframe, gp.gputmp1, clip, srcframe)
                 applycolortrack!(gp.gpuframe, clip, srcframe)
@@ -161,4 +170,83 @@ function presentgpu!(player::Player, clip::Clip, srcframe::Integer)
         @error "GPU preview disabled" exception = (e, catch_backtrace())
         return false
     end
+end
+
+"Frames kept VRAM-resident per source stream (a bounded ring; ~a few seconds)."
+const GPU_STREAM_CAPACITY = 120
+
+"""
+Open a streaming GPU decoder ([`GpuVideoStream`]) over `source` so its clips play
+back purely on the GPU — Vulkan-Video decode into a bounded VRAM ring, no CPU
+decode or per-frame upload. A no-op (playback stays on the CPU decode path) unless
+the GPU preview is live and the stream is hardware-decodable at the display size.
+Cheap — demux + `mmap` + GOP index only; frames decode on demand. Call it off the
+UI thread; playback uses the CPU path until the stream is ready.
+"""
+function preloadgpu!(player::Player, source::VideoSource)
+    gp = player.gpupreview
+    (gp isa GPUPreview && !gp.failed) || return nothing
+    haskey(player.gpucache, source) && return nothing
+    stream = nothing
+    try
+        stream = openstream(player.analysisbackend, source.path, source.width, source.height;
+                            capacity = GPU_STREAM_CAPACITY)
+        ok = rungpusync(player) do   # probe: decode GOP 0, confirm it's supported at the display size
+            f = frameat!(stream, 0)
+            size(f.y) == (source.width, source.height)
+        end
+        if ok
+            player.gpucache[source] = stream
+            setstatus!(player, "$(basename(source.path)) — streaming decode on the GPU")
+        else
+            close(stream)
+        end
+    catch e
+        stream === nothing || (try; close(stream); catch; end)
+        @warn "GPU stream unavailable; staying on CPU decode" exception = e
+    end
+    return nothing
+end
+
+"""
+Enable GPU playback if the device supports hardware video decode. The capability is
+probed with `vk_context().video_decode_available` ON THE GPU WORKER, so the worker
+creates and owns the (process-global, single-writer) Vulkan context — keeping async
+analysis on the same thread. On success it attaches a [`GPUPreview`] and opens a
+streaming decoder per source; otherwise it is a silent no-op and playback stays on
+the CPU. Called in the background from the default `Player` constructor.
+"""
+function autodetectgpu!(player::Player)
+    player.gpupreview isa GPUPreview && return nothing   # already enabled (explicit gpupreview)
+    capable = try
+        rungpusync(player) do
+            Lava.vk_context().video_decode_available
+        end
+    catch
+        false
+    end
+    capable || return nothing
+    player.analysisbackend = LavaBackend()               # wraps the worker-owned context
+    player.gpupreview = GPUPreview()
+    for src in unique(c.source for c in player.sequence.clips)
+        Threads.@spawn preloadgpu!(player, src)
+    end
+    setstatus!(player, "GPU playback on — hardware decode + effects on the GPU")
+    # re-present on the MAIN thread (GL context is main-thread-owned; this runs off it)
+    player.playing[] || put!(player.uiqueue, () -> notify(player.playhead))
+    return nothing
+end
+
+"Close every source's GPU stream (frees its VRAM ring + unmaps its bitstream)."
+function freegpucache!(player::Player)
+    isempty(player.gpucache) && return nothing
+    for s in values(player.gpucache)
+        try
+            rungpusync(player) do; close(s); end
+        catch
+            try; close(s); catch; end
+        end
+    end
+    empty!(player.gpucache)
+    return nothing
 end

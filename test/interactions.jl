@@ -8,7 +8,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
 
 @testset "UI interactions" begin
     GLMakie.activate!(; visible = false)
-    p = Player(testvideo)  # 320×180, 120 frames @30 (from runtests.jl)
+    p = Player(testvideo; gpupreview = false)  # 320×180, 120 frames @30 (from runtests.jl); CPU for determinism
     try
         fig = p.fig
         ev = Makie.events(fig)
@@ -503,7 +503,7 @@ end
 
 @testset "chaos: random event storm leaves the editor coherent" begin
     using Random
-    p = Player(testvideo)
+    p = Player(testvideo; gpupreview = false)
     sleep(1.5)
     ev = Makie.events(p.fig)
     # dock-panel widgets live outside fig.content — include them in the storm
@@ -576,7 +576,7 @@ end
     seq.clips[1].crop = (0.1, 0.1, 0.8, 0.8)
     path = joinpath(mktempdir(), "edit.videoedit.toml")
     saveproject(path, seq)
-    p2 = Player(path)   # .toml path → the saved edit, not a video
+    p2 = Player(path; gpupreview = false)   # .toml path → the saved edit, not a video
     try
         sleep(1.5)
         @test length(p2.sequence.clips) == 2

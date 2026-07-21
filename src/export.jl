@@ -142,6 +142,7 @@ function rendercanvas!(dest::RGBFrame, clip::Clip, srcframe::Integer,
     frame, fx1, fx2 = get!(() -> ntuple(_ -> RGBFrame(undef, clip.source.width, clip.source.height), 3),
                            fxbufs, clip.source.path)
     readframe!(frame, sr, srcframe)
+    clip = effectiveclip(clip, srcframe)  # keyframed params baked at this frame
     applymotiontrack!(frame, fx1, clip, srcframe)
     applycolortrack!(frame, clip, srcframe)
     applyeffects!(frame, fx1, fx2, clip)

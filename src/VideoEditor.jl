@@ -5,6 +5,7 @@ using FixedPointNumbers
 using GeometryBasics
 using GLMakie
 using GPUFiltering
+using Lava
 using Makie
 using Observables
 using Printf
@@ -30,6 +31,7 @@ include("source.jl")
 include("proxy.jl")
 include("buffer.jl")
 include("decoder.jl")
+include("keyframes.jl")
 include("clips.jl")
 include("effects.jl")
 include("project.jl")
@@ -46,6 +48,7 @@ include("motionstab.jl")
 include("campath.jl")
 include("bundlestab.jl")
 include("gpudecode.jl")
+include("gpustream.jl")
 include("mcp.jl")
 
 export VideoSource, Player, Clip, Sequence

@@ -42,10 +42,11 @@ mutable struct Clip
     const effects::Vector{Any}  # ordered Effect stack (see effects.jl)
     colortrack::Union{Nothing, ColorTrack}
     motiontrack::Union{Nothing, MotionTrack}
+    const animations::Dict{Symbol, AnimCurve}  # keyframed params (see keyframes.jl)
 end
 
 Clip(source::VideoSource, src_in, src_out, start, crop) =
-    Clip(source, src_in, src_out, start, crop, [], nothing, nothing)
+    Clip(source, src_in, src_out, start, crop, [], nothing, nothing, Dict{Symbol, AnimCurve}())
 
 function Clip(source::VideoSource; src_in::Integer = 0, src_out::Integer = source.nframes,
               start::Integer = 0)
@@ -196,6 +197,7 @@ function split!(seq::Sequence, n::Integer)
     append!(right.effects, clip.effects)  # elements are immutable, sharing is safe
     right.colortrack = clip.colortrack    # keyed by absolute source frame, still valid
     right.motiontrack = clip.motiontrack
+    merge!(right.animations, clip.animations)  # curves too are absolute-frame keyed
     clip.src_out = clip.src_in + offset
     insert!(seq.clips, i + 1, right)
     return right
@@ -224,7 +226,7 @@ end
 "Copy of the edit state for undo/redo. Sources and analysis tracks are shared."
 snapshot(seq::Sequence) =
     [Clip(c.source, c.src_in, c.src_out, c.start, c.crop, copy(c.effects),
-          c.colortrack, c.motiontrack) for c in seq.clips]
+          c.colortrack, c.motiontrack, deepcopy(c.animations)) for c in seq.clips]
 
 "Restore a [`snapshot`](@ref) (the snapshot itself stays reusable)."
 function restore!(seq::Sequence, snap::Vector{Clip})

@@ -47,7 +47,7 @@ mutable struct Player
     const uiqueue::Channel{Function}   # thread → main-thread actions
     const applytracks::Observable{Bool}
     const stabinfo::Observable{String}
-    const analysisbackend::Any  # KA backend for motion analysis (e.g. LavaBackend())
+    analysisbackend::Any  # KA backend for analysis/GPU playback; set by auto-detect
     const fig::Figure
     const previewaxis::Axis
     const cropmode::Base.RefValue{Bool}
@@ -82,6 +82,9 @@ mutable struct Player
     dragsource::Any                      # bin source mid-drag onto the timeline
     const tool::Observable{Symbol}       # armed tool: :none, :split, :crop
     const playrate::Base.RefValue{Float64}  # JKL shuttle rate: 1.0 normal, <0 reverse, |·|>1 fast
+    const kffocus::Observable{Symbol}    # param whose curve the keyframe lane shows
+    const kflaneopen::Observable{Bool}   # keyframe curve lane visible
+    const gpucache::Dict{Any, Any}       # source → device-resident decoded frames (pure-GPU playback)
 end
 
 "Push the current edit state onto the undo stack (clears redo)."
@@ -146,10 +149,16 @@ end
 
 function Player(path::AbstractString; capacity::Integer = 64,
                 background = RGBf(0.114, 0.12, 0.135), accent = RGBf(1.0, 0.47, 0.22),
-                analysisbackend = KA.CPU(), gpupreview::Bool = false,
+                analysisbackend = nothing, gpupreview = nothing,
                 audiopreview::Bool = true,
                 proxyheight::Integer = 720, proxythreshold::Integer = 2_100_000)
-    gpupreview && analysisbackend isa KA.CPU &&
+    # GPU playback is the default: leaving both `analysisbackend` and `gpupreview`
+    # unset auto-detects a video-capable Vulkan device (below) and, if present, runs
+    # decode + effects on the GPU. Pass either to force the choice.
+    autodetect = analysisbackend === nothing && gpupreview === nothing
+    backend = analysisbackend === nothing ? KA.CPU() : analysisbackend
+    wantgpu = gpupreview === true
+    wantgpu && backend isa KA.CPU &&
         error("gpupreview = true requires a GPU backend, e.g. Player(path; analysisbackend = LavaBackend(), gpupreview = true)")
     # a .toml path opens a saved project (Ctrl+S / saveproject) instead of a video
     sequence = endswith(lowercase(path), ".toml") ? loadproject(path) :
@@ -167,15 +176,19 @@ function Player(path::AbstractString; capacity::Integer = 64,
                               backgroundcolor = background,
                               textcolor = uicolors.text) do
         buildui(sequence, pools, Int(capacity), Int(proxyheight), Int(proxythreshold),
-                frame, playhead, playing; background, uicolors, analysisbackend)
+                frame, playhead, playing; background, uicolors, analysisbackend = backend)
     end
     player.screen = display(player.fig)
-    gpupreview && (player.gpupreview = GPUPreview())
+    wantgpu && (player.gpupreview = GPUPreview())
     audiopreview && (player.audio = AudioPreview())
     retrypresent(player, 0)
     for src in unique(c.source for c in sequence.clips)  # projects may be multi-source
         needsproxy(src; maxpixels = proxythreshold) && startproxy!(player, src)
+        # with the GPU preview on, stream-decode each source on the GPU so playback
+        # runs purely on the GPU (background; CPU decode until the stream is ready)
+        wantgpu && Threads.@spawn preloadgpu!(player, src)
     end
+    autodetect && Threads.@spawn autodetectgpu!(player)  # enable GPU playback if capable
     Threads.@spawn begin  # keep the regenerable proxy/PCM caches bounded
         pruned = prunecache!()
         pruned > 0 && setstatus!(player, "cache pruned — freed $(round(pruned / 2^30, digits = 1)) GiB")
@@ -233,12 +246,15 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     deregister_interaction!(ax, :rectanglezoom)  # left-drag is the crop tool
     previewplot = image!(ax, frame; interpolate = true)
 
-    timeline = Timeline(fig[2, 1:3], sequence, playhead, playing)
-    rowsize!(fig.layout, 2, Makie.Fixed(96))
+    # row 2: a full-width, collapsible keyframe curve lane, time-aligned with the
+    # timeline directly below it (populated by buildkeyframelane!, shown with ◆)
+    timeline = Timeline(fig[3, 1:3], sequence, playhead, playing)
+    rowsize!(fig.layout, 2, Makie.Fixed(0))
+    rowsize!(fig.layout, 3, Makie.Fixed(96))
 
     # onboarding hint; replaced by the first real status update
     status = Observable("Space plays · S splits · right-click a clip for all actions")
-    controls = GridLayout(fig[3, 1:3], tellwidth = false)
+    controls = GridLayout(fig[4, 1:3], tellwidth = false)
     playbtn = Button(controls[1, 1]; label = map(p -> p ? "Pause" : "Play", playing), width = 80)
     Label(controls[1, 2], map(n -> timecode(sequence, n), playhead); width = 220)
     exportbtn = Button(controls[1, 3]; label = "Export", width = 80)
@@ -260,7 +276,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     Vector{Clip}[], Vector{Clip}[], 0.0, nothing, 0, 0,
                     Dict{Symbol, Any}(), Observable(:none),
                     Observable(VideoSource[]), Any[], nothing, Observable(:none),
-                    Ref(1.0))
+                    Ref(1.0), Observable(:opacity), Observable(false), Dict{Any, Any}())
     @async for s in player.statusqueue  # main-thread consumer: threads → observable
         status[] = s
     end
@@ -274,7 +290,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
 
     lines!(ax, player.croprect; color = :orangered, linewidth = 2)
 
-    fxdock = dockpanel!(player, :effects)
+    fxdock = dockpanel!(player, :effects; width = 340)
     buildfxpanel!(player, fxdock[1, 1], uicolors)
     toolbarbutton!(player, toolbar[1, 1], "FX", :effects, uicolors)
     player.mediasources[] = unique([c.source for c in sequence.clips])
@@ -284,10 +300,17 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     exportdock = dockpanel!(player, :export)
     buildexportpanel!(player, exportdock[1, 1], uicolors)
     toolbarbutton!(player, toolbar[3, 1], "Out", :export, uicolors)
+    buildkeyframelane!(player, uicolors)   # full-width curve lane above the timeline
+    kflanebtn = Button(toolbar[4, 1]; label = "◆", width = 40, height = 40)
+    on(_ -> (player.kflaneopen[] = !player.kflaneopen[]), kflanebtn.clicks)
+    on(player.kflaneopen; update = true) do o
+        kflanebtn.buttoncolor[] = o ? uicolors.accent : uicolors.surface
+        kflanebtn.labelcolor[] = o ? uicolors.text_on_accent : uicolors.text
+    end
     # tool strip: ✂ split and ▢ crop ARM (change the cursor + act where you
     # click/drag); ✕ ↶ ↷ are one-shot at the playhead
-    splitbtn = Button(toolbar[4, 1]; label = "✂", width = 40, height = 40)
-    cropbtn = Button(toolbar[5, 1]; label = "▢", width = 40, height = 40)
+    splitbtn = Button(toolbar[5, 1]; label = "✂", width = 40, height = 40)
+    cropbtn = Button(toolbar[6, 1]; label = "▢", width = 40, height = 40)
     on(_ -> armtool!(player, :split), splitbtn.clicks)
     on(_ -> armtool!(player, :crop), cropbtn.clicks)
     oneshots = [("✕", "Delete  (X)", () -> deleteat!(player)),
@@ -297,7 +320,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                             (redo!(player); setstatus!(player, "redone")))]
     onebtns = Makie.Button[]
     for (row, (lbl, _tip, action)) in enumerate(oneshots)
-        b = Button(toolbar[5 + row, 1]; label = lbl, width = 40, height = 40)
+        b = Button(toolbar[6 + row, 1]; label = lbl, width = 40, height = 40)
         on(_ -> action(), b.clicks)
         push!(onebtns, b)
     end
@@ -368,6 +391,8 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                 # the panel always tells WHICH stabilization this clip carries
                 player.stabinfo[] = stabdescription(clip.motiontrack)
             end
+        elseif clip !== nothing
+            syncanimatedsliders!(player, clip)  # follow the curves while scrubbing
         end
         if !present!(player)
             if timeline.scrubbing[]
@@ -381,7 +406,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     # (and warping a per-second thumbnail by a per-frame track
                     # just wobbles). For those clips, hold the last exact frame.
                     plain = (clip.motiontrack === nothing || !player.applytracks[]) &&
-                            clip.crop == (0.0, 0.0, 1.0, 1.0)
+                            clip.crop == (0.0, 0.0, 1.0, 1.0) && isempty(clip.animations)
                     thumb = plain ? nearestthumb(cachefor(timeline, clip.source),
                                                  floor(Int, srcframe / clip.source.framerate)) :
                             nothing
@@ -462,17 +487,19 @@ function showtransition!(player::Player, sample)
     fetchframe!(bufA, spA.ring, srcA) || return false
     bufB = similar(bufA)
     fetchframe!(bufB, spB.ring, srcB) || return false
+    lclip = effectiveclip(left, srcA)   # keyframed params on each side
+    rclip = effectiveclip(right, srcB)
     if player.applytracks[]
-        applymotiontrack!(bufA, player.fxtmp1, left, srcA)
-        applycolortrack!(bufA, left, srcA)
-        applymotiontrack!(bufB, player.fxtmp1, right, srcB)
-        applycolortrack!(bufB, right, srcB)
+        applymotiontrack!(bufA, player.fxtmp1, lclip, srcA)
+        applycolortrack!(bufA, lclip, srcA)
+        applymotiontrack!(bufB, player.fxtmp1, rclip, srcB)
+        applycolortrack!(bufB, rclip, srcB)
     end
-    applyeffects!(bufA, player.fxtmp1, player.fxtmp2, left)
-    applyeffects!(bufB, player.fxtmp1, player.fxtmp2, right)
+    applyeffects!(bufA, player.fxtmp1, player.fxtmp2, lclip)
+    applyeffects!(bufB, player.fxtmp1, player.fxtmp2, rclip)
     blend!(bufA, bufA, bufB, p)
     notify(player.frame)
-    applycrop!(player, left)  # both sides share framing in the common (split) case
+    applycrop!(player, lclip)  # both sides share framing in the common (split) case
     return true
 end
 
@@ -490,23 +517,38 @@ function showframe!(player::Player, n::Integer)
         return true
     end
     clip, srcframe = loc
+    # PURE-GPU path: a streaming GPU decoder feeds this source — Vulkan-Video decode
+    # into a bounded VRAM ring + effects on device, no CPU decode, no upload.
+    gp = player.gpupreview
+    if gp isa GPUPreview && !gp.failed && haskey(player.gpucache, clip.source)
+        stream = player.gpucache[clip.source]
+        if 0 <= srcframe < nframes(stream)
+            ensureframesize!(player, clip.source)
+            eclip = effectiveclip(clip, srcframe)
+            if presentgpu!(player, eclip, srcframe; stream = stream)
+                applycrop!(player, eclip)
+                return true
+            end
+        end
+    end
     sp = pool(player, clip.source)
     target, protect = decodetarget(player, n, clip, srcframe)
     settarget!(sp.worker, target; protect)
     ensureframesize!(player, sp.source)  # proxy resolution when one is active
     if fetchframe!(player.frame[], sp.ring, srcframe)
+        eclip = effectiveclip(clip, srcframe)  # keyframed params sampled at this frame
         gp = player.gpupreview
-        if gp isa GPUPreview && !gp.failed && presentgpu!(player, clip, srcframe)
-            applycrop!(player, clip)   # tracks/effects ran on the GPU
+        if gp isa GPUPreview && !gp.failed && presentgpu!(player, eclip, srcframe)
+            applycrop!(player, eclip)  # tracks/effects (incl. keyframes) ran on the GPU
             return true
         end
         if player.applytracks[]
-            applymotiontrack!(player.frame[], player.fxtmp1, clip, srcframe)
-            applycolortrack!(player.frame[], clip, srcframe)
+            applymotiontrack!(player.frame[], player.fxtmp1, eclip, srcframe)
+            applycolortrack!(player.frame[], eclip, srcframe)
         end
-        applyeffects!(player.frame[], player.fxtmp1, player.fxtmp2, clip)
+        applyeffects!(player.frame[], player.fxtmp1, player.fxtmp2, eclip)
         notify(player.frame)
-        applycrop!(player, clip)
+        applycrop!(player, eclip)
         return true
     end
     return false
@@ -1504,63 +1546,262 @@ function buildexportpanel!(player::Player, gridpos, uicolors)
     return panel
 end
 
+# ------------------------------------------------------------- keyframe editor
+
+"""
+The full-width keyframe curve lane, docked directly above the timeline and locked
+to its time axis so a key sits over its frame. Shows the curve of the focused
+parameter (`player.kffocus`, set by arming/touching a slider), with a value scale.
+Click adds a key, drag a ◆ moves it (time ↔ x, value ↔ y), right-click deletes.
+A main-figure `Axis`, so its plots render and its mouse coordinates behave normally.
+"""
+function buildkeyframelane!(player::Player, uicolors)
+    fig = player.fig
+    timeline = player.timeline
+    seq = player.sequence
+    fps = seq.framerate
+    lane = Axis(fig[2, 1:3]; backgroundcolor = uicolors.surface, xgridvisible = false,
+                ygridvisible = false, xticksvisible = false, yticksvisible = false,
+                xticklabelsvisible = false, yticklabelsvisible = false,
+                titlealign = :left, titlesize = 11, titlecolor = uicolors.accent, titlegap = 2)
+    Makie.hidespines!(lane)
+    foreach(i -> Makie.deregister_interaction!(lane, i), (:rectanglezoom, :scrollzoom, :dragpan))
+    ylims!(lane, -0.06, 1.06)
+    on(timeline.viewrange; update = true) do (x0, x1)
+        Makie.xlims!(lane, x0, x1)
+    end
+    player.fxwidgets[:kflane] = lane
+    lanevis = player.kflaneopen
+    on(player.kflaneopen; update = true) do o
+        rowsize!(fig.layout, 2, Makie.Fixed(o ? 150 : 0))
+    end
+    # title = focused parameter; corner labels = its value scale (kept inside the
+    # plot so the lane's left edge still lines up with the timeline below)
+    numfmt(x) = (r = round(x; digits = 2); r == round(x) ? string(round(Int, r)) : string(r))
+    vscale_txt = Observable(["", "", ""])
+    text!(lane, [Point2f(0.004, 0.93), Point2f(0.004, 0.5), Point2f(0.004, 0.07)];
+          text = vscale_txt, space = :relative, align = (:left, :center), fontsize = 9,
+          color = uicolors.text_muted, visible = lanevis)
+    on(player.kffocus; update = true) do key
+        p = paramspec(key)
+        lane.title[] = p.label
+        vscale_txt[] = [numfmt(p.hi), numfmt((p.lo + p.hi) / 2), numfmt(p.lo)]
+    end
+
+    curveline = Observable(Point2f[]); keypts = Observable(Point2f[])
+    activespan = Observable(Rect2f(0, 0, 0, 1))   # the editable clip's time region
+    poly!(lane, activespan; color = (uicolors.accent, 0.07), visible = lanevis)
+    hlines!(lane, [0.0, 0.5, 1.0]; color = (uicolors.text, 0.1), visible = lanevis)
+    lines!(lane, curveline; color = uicolors.accent, linewidth = 2.5, visible = lanevis)
+    vlines!(lane, map(n -> n / fps, player.playhead); color = uicolors.text, linewidth = 1,
+            visible = lanevis)
+    kfscatter = scatter!(lane, keypts; marker = :diamond, markersize = 15, color = uicolors.accent,
+                         strokecolor = uicolors.background, strokewidth = 1.5, visible = lanevis)
+    translate!(kfscatter, 0, 0, 5)
+    hint_vis = Observable(false)   # shown when the focused curve has no keys yet
+    text!(lane, Point2f(0.5, 0.4); text = "click to add a keyframe   ·   drag a ◆ to move it   ·   right-click to delete",
+          space = :relative, align = (:center, :center), fontsize = 11, color = uicolors.text_muted,
+          visible = hint_vis)
+
+    focusparam() = player.kffocus[]
+    currentclip() = (loc = locate(seq, player.playhead[]); loc === nothing ? nothing : loc[1])
+    keytl(clip, f) = (clip.start + (f - clip.src_in)) / fps   # source frame → timeline seconds
+    function redraw()
+        clip = currentclip()
+        key = focusparam(); p = paramspec(key)
+        if clip === nothing
+            curveline[] = Point2f[]; keypts[] = Point2f[]
+            hint_vis[] = false
+            return
+        end
+        c = get(clip.animations, key, nothing)
+        x0 = clip.start / fps; x1 = clipend(clip) / fps
+        activespan[] = Rect2f(x0, -0.06, x1 - x0, 1.12)
+        curveline[] = map(0:80) do i
+            s = x0 + (x1 - x0) * i / 80
+            sf = clip.src_in + (round(Int, s * fps) - clip.start)
+            v = c === nothing ? p.get(clip) : something(valueat(c, sf), p.get(clip))
+            Point2f(s, paramnorm(p, v))
+        end
+        keypts[] = c === nothing ? Point2f[] :
+                   [Point2f(keytl(clip, k.frame), paramnorm(p, k.value)) for k in c.keys
+                    if clip.src_in <= k.frame <= clip.src_out]
+        hint_vis[] = player.kflaneopen[] && isempty(keypts[])
+        return
+    end
+    on(_ -> redraw(), player.playhead)
+    on(_ -> redraw(), player.kffocus)
+    on(_ -> redraw(), player.kflaneopen)
+
+    getcurve!(clip, key) = get!(() -> AnimCurve(), clip.animations, key)
+    repaint() = (redraw(); player.playing[] || notify(player.playhead))
+    drag = Ref{Union{Nothing, AnimCurve}}(nothing)
+    dragi = Ref(0)
+    laneframe(clip, s) = clip.src_in + (clamp(round(Int, s * fps), clip.start, clipend(clip) - 1) - clip.start)
+    function nearestkey(clip, key, s, v)
+        c = get(clip.animations, key, nothing); c === nothing && return 0
+        p = paramspec(key); x0, x1 = timeline.viewrange[]; span = max(x1 - x0, 1.0e-6)
+        best = 0; bestd = 0.05
+        for (i, k) in enumerate(c.keys)
+            clip.src_in <= k.frame <= clip.src_out || continue
+            d = hypot((keytl(clip, k.frame) - s) / span, paramnorm(p, k.value) - v)
+            d < bestd && ((best, bestd) = (i, d))
+        end
+        return best
+    end
+    readout(clip, key, f, v) = setstatus!(player,
+        "$(paramspec(key).label) = $(round(paramdenorm(paramspec(key), v), digits = 3)) @ $(timecode(seq, clip.start + (f - clip.src_in)))")
+    on(events(fig).mousebutton; priority = 92) do event
+        if event.action == Mouse.release && drag[] !== nothing
+            drag[] = nothing; return Consume(true)
+        end
+        (player.kflaneopen[] && Makie.is_mouseinside(lane.scene)) || return Consume(false)
+        clip = currentclip(); clip === nothing && return Consume(false)
+        key = focusparam(); p = paramspec(key)
+        pos = Makie.mouseposition(lane.scene); s = pos[1]; v = clamp(pos[2], 0.0, 1.0)
+        clip.start / fps <= s <= clipend(clip) / fps || return Consume(false)  # only the active clip
+        if event.button == Mouse.right && event.action == Mouse.press
+            i = nearestkey(clip, key, s, v)
+            i == 0 && return Consume(false)
+            snapshot!(player); c = clip.animations[key]; deleteat!(c.keys, i)
+            isempty(c) && delete!(clip.animations, key); repaint()
+            return Consume(true)
+        elseif event.button == Mouse.left && event.action == Mouse.press
+            i = nearestkey(clip, key, s, v)
+            snapshot!(player)
+            if i == 0
+                cur = getcurve!(clip, key); f = laneframe(clip, s)
+                setkey!(cur, f, paramdenorm(p, v))
+                drag[] = cur; dragi[] = something(findfirst(k -> k.frame == f, cur.keys), 1)
+            else
+                drag[] = clip.animations[key]; dragi[] = i
+            end
+            readout(clip, key, laneframe(clip, s), v); repaint()
+            return Consume(true)
+        end
+        return Consume(false)
+    end
+    on(events(fig).mouseposition) do _
+        cur = drag[]; cur === nothing && return
+        clip = currentclip(); clip === nothing && return
+        key = focusparam(); p = paramspec(key)
+        pos = Makie.mouseposition(lane.scene)
+        f = laneframe(clip, pos[1]); v = clamp(pos[2], 0.0, 1.0)
+        movekey!(cur, dragi[], f, paramdenorm(p, v))
+        dragi[] = something(findfirst(k -> k.frame == f, cur.keys), dragi[])
+        readout(clip, key, f, v); repaint()
+    end
+    redraw()
+    return lane
+end
+
 # ------------------------------------------------------------- effect panel
 
 "Sliders editing the effect stack of the clip under the playhead."
 function buildfxpanel!(player::Player, gridpos, uicolors)
     specs = [
+        (:opacity, "Opacity", 0.0:0.01:1.0, 1.0),
         (:brightness, "Brightness", -0.5:0.01:0.5, 0.0),
-        (:contrast, "Contrast", 0.5:0.01:2.0, 1.0),
+        (:contrast, "Contrast", 0.0:0.01:2.0, 1.0),
         (:saturation, "Saturation", 0.0:0.01:2.0, 1.0),
         (:temperature, "Temperature", -1.0:0.02:1.0, 0.0),
-        (:blur, "Blur", 0.0:0.1:8.0, 0.0),
+        (:blur, "Blur", 0.0:0.1:12.0, 0.0),
         (:sharpen, "Sharpen", 0.0:0.05:2.0, 0.0),
     ]
     panel = GridLayout(gridpos; tellheight = false, valign = :top)
-    Label(panel[1, 1:2], "Effects"; font = :bold, halign = :left)
-    # which clip these controls edit (the clip under the playhead) — the panel
-    # acts on it, so name it and its timeline position explicitly
+    Label(panel[1, 1:4], "Effects"; font = :bold, halign = :left)
+    # which clip these controls edit (the clip under the playhead)
     target = map(player.playhead) do n
         loc = locate(player.sequence, n)
-        if loc === nothing
-            "▸ no clip at the playhead"
-        else
-            c = loc[1]
-            i = something(findfirst(x -> x === c, player.sequence.clips), 0)
-            fps = player.sequence.framerate
-            "▸ editing clip $i · $(basename(c.source.path)) " *
-            "($(timestring(c.start / fps))–$(timestring(clipend(c) / fps)))"
-        end
+        loc === nothing && return "▸ no clip at the playhead"
+        c = loc[1]
+        i = something(findfirst(x -> x === c, player.sequence.clips), 0)
+        fps = player.sequence.framerate
+        "▸ editing clip $i · $(basename(c.source.path)) " *
+        "($(timestring(c.start / fps))–$(timestring(clipend(c) / fps)))"
     end
-    Label(panel[2, 1:2], target; halign = :left, fontsize = 11,
-          color = uicolors.accent, tellwidth = false)
+    Label(panel[2, 1:4], target; halign = :left, fontsize = 11, color = uicolors.accent,
+          tellwidth = false)
+    Label(panel[3, 1:4], "◆ toggles keyframing — then scrub + move a slider to animate";
+          halign = :left, fontsize = 10, color = uicolors.text_muted, tellwidth = false)
     for (row, (key, text, range, default)) in enumerate(specs)
-        Label(panel[row + 2, 1], text; halign = :left, fontsize = 12)
-        slider = Slider(panel[row + 2, 2]; range, startvalue = default, width = 120)
+        r = row + 3
+        namelbl = Label(panel[r, 1], text; halign = :left, fontsize = 12)
+        slider = Slider(panel[r, 2]; range, startvalue = default, width = 104)
         player.fxsliders[key] = slider
+        Label(panel[r, 3], map(player.playhead) do n
+                  loc = locate(player.sequence, n)
+                  loc === nothing ? "" : string(round(paramvalue(loc[1], key, playheadframe(player, loc[1])), digits = 2))
+              end; halign = :right, fontsize = 10, color = uicolors.text_muted, width = 36)
+        kfbtn = Button(panel[r, 4]; label = "◆", width = 24, tellwidth = false)
+        player.fxwidgets[Symbol(:kf_, key)] = kfbtn
         on(slider.value) do value
-            player.fxsyncing[] || applyslider!(player, key, Float32(value))
+            if !player.fxsyncing[]
+                player.kffocus[] = key
+                applyslider!(player, key, Float32(value))
+            end
+        end
+        on(_ -> armkeyframe!(player, key), kfbtn.clicks)
+        onany(player.playhead, player.kffocus) do n, foc
+            loc = locate(player.sequence, n)
+            anim = loc !== nothing && clipanimated(loc[1], key)
+            want = anim ? uicolors.accent : uicolors.surface
+            kfbtn.buttoncolor[] == want || (kfbtn.buttoncolor[] = want;
+                kfbtn.labelcolor[] = anim ? uicolors.text_on_accent : uicolors.text_muted)
+            wname = foc === key ? uicolors.accent : uicolors.text
+            namelbl.color[] == wname || (namelbl.color[] = wname)
         end
     end
-    nrows = length(specs) + 2
-    Label(panel[nrows + 1, 1:2], "Stabilize"; font = :bold, halign = :left)
-    modemenu = Menu(panel[nrows + 2, 1:2];
+    base = length(specs) + 3
+    Label(panel[base + 1, 1:2], "Keyframes"; font = :bold, halign = :left)
+    lanebtn = Button(panel[base + 1, 3:4];
+                     label = map(o -> o ? "Hide curve" : "Show curve", player.kflaneopen),
+                     fontsize = 10, tellwidth = false)
+    on(_ -> (player.kflaneopen[] = !player.kflaneopen[]), lanebtn.clicks)
+    Label(panel[base + 2, 1:2], map(k -> "◆ $(paramspec(k).label)", player.kffocus);
+          halign = :left, fontsize = 11, color = uicolors.accent, tellwidth = false)
+    clearbtn = Button(panel[base + 2, 3:4]; label = "Clear", fontsize = 10, tellwidth = false)
+    on(_ -> clearkeyframes!(player), clearbtn.clicks)
+    easemenu = Menu(panel[base + 3, 1:4];
+                    options = [("Linear", :linear), ("Smooth (ease in/out)", :smooth)],
+                    default = "Linear", tellwidth = false)
+    merge!(player.fxwidgets, Dict{Symbol, Any}(:easemenu => easemenu, :kfclear => clearbtn,
+                                               :kflanebtn => lanebtn))
+    on(easemenu.selection) do mode
+        loc = locate(player.sequence, player.playhead[])
+        loc === nothing && return
+        c = get(loc[1].animations, player.kffocus[], nothing)
+        c === nothing && return
+        c.interp = something(mode, :linear)
+        notify(player.playhead)
+    end
+    onany(player.playhead, player.kffocus) do n, foc  # ease menu tracks the focused curve
+        loc = locate(player.sequence, n)
+        loc === nothing && return
+        c = get(loc[1].animations, foc, nothing)
+        c === nothing && return
+        want = c.interp === :smooth ? 2 : 1
+        easemenu.i_selected[] == want || (easemenu.i_selected[] = want)
+    end
+    nrows = base + 3
+    Label(panel[nrows + 1, 1:4], "Stabilize"; font = :bold, halign = :left)
+    modemenu = Menu(panel[nrows + 2, 1:4];
                     options = [("Camera lock — like a tripod", :similarity),
                                ("Object lock — keep a subject still", :objectlock),
                                ("Tripod (affine) — legacy", :tripod),
                                ("Tripod + perspective — legacy", :perspective),
                                ("Smooth — keep camera moves", :smooth)],
                     tellwidth = false)
-    analyzebtn = Button(panel[nrows + 3, 1:2]; label = "Stabilize clip", tellwidth = false)
-    Label(panel[nrows + 4, 1:2], player.stabinfo; halign = :left, fontsize = 11,
+    analyzebtn = Button(panel[nrows + 3, 1:4]; label = "Stabilize clip", tellwidth = false)
+    Label(panel[nrows + 4, 1:4], player.stabinfo; halign = :left, fontsize = 11,
           tellwidth = false)
-    comparebtn = Button(panel[nrows + 5, 1:2]; label = "Hold to compare original",
+    comparebtn = Button(panel[nrows + 5, 1:4]; label = "Hold to compare original",
                         tellwidth = false)
-    removebtn = Button(panel[nrows + 6, 1:2]; label = "Remove stabilization",
+    removebtn = Button(panel[nrows + 6, 1:4]; label = "Remove stabilization",
                        tellwidth = false)
-    colorbtn = Button(panel[nrows + 7, 1:2]; label = "Fix color flicker", tellwidth = false)
-    Label(panel[nrows + 8, 1:2], "Loop"; font = :bold, halign = :left)
-    loopbtn = Button(panel[nrows + 9, 1:2]; label = "Make seamless loop", tellwidth = false)
+    colorbtn = Button(panel[nrows + 7, 1:4]; label = "Fix color flicker", tellwidth = false)
+    Label(panel[nrows + 8, 1:4], "Loop"; font = :bold, halign = :left)
+    loopbtn = Button(panel[nrows + 9, 1:4]; label = "Make seamless loop", tellwidth = false)
     merge!(player.fxwidgets, Dict{Symbol, Any}(
         :modemenu => modemenu, :analyze => analyzebtn, :compare => comparebtn,
         :remove => removebtn, :color => colorbtn, :loop => loopbtn))
@@ -1636,6 +1877,23 @@ function wireclipmenu!(player::Player)
     return nothing
 end
 
+"Whether param `key` is keyframed on `clip` (has at least one key)."
+clipanimated(clip::Clip, key::Symbol) = haskey(clip.animations, key) && !isempty(clip.animations[key])
+
+"Absolute source frame the playhead currently maps to within `clip`."
+playheadframe(player::Player, clip::Clip) = clip.src_in + (player.playhead[] - clip.start)
+
+"Effective value of `key` on `clip` at source frame `sf` — the animated curve if
+keyframed, otherwise the static value."
+paramvalue(clip::Clip, key::Symbol, sf::Integer) =
+    clipanimated(clip, key) ? something(valueat(clip.animations[key], sf), paramspec(key).get(clip)) :
+    paramspec(key).get(clip)
+
+"""
+A slider moved: if the parameter is keyframed on the clip, writes/updates a key
+at the playhead (so animating is just scrub-and-adjust); otherwise sets the
+static value. Registry-driven, so every `PARAMS` entry with a slider works.
+"""
 function applyslider!(player::Player, key::Symbol, value::Float32)
     loc = locate(player.sequence, player.playhead[])
     loc === nothing && return nothing
@@ -1644,38 +1902,84 @@ function applyslider!(player::Player, key::Symbol, value::Float32)
         snapshot!(player)
         player.lastslidersnap = time()
     end
-    sliders = player.fxsliders
-    if key in (:brightness, :contrast, :saturation, :temperature)
-        seteffect!(clip, ColorEffect(
-            brightness = sliders[:brightness].value[], contrast = sliders[:contrast].value[],
-            saturation = sliders[:saturation].value[], temperature = sliders[:temperature].value[]))
-    elseif key == :blur
-        seteffect!(clip, BlurEffect(value))
-    elseif key == :sharpen
-        seteffect!(clip, SharpenEffect(1.0f0, value))
+    if clipanimated(clip, key)
+        setkey!(clip.animations[key], playheadframe(player, clip), Float64(value))
+    else
+        paramspec(key).set(clip, Float64(value))
     end
-    player.playing[] || notify(player.playhead)  # live re-present while paused
+    player.playing[] || notify(player.playhead)  # live re-present + lane refresh while paused
     return nothing
 end
 
-"Reflect `clip`'s effect stack in the sliders (when the playhead enters it)."
+"Reflect the clip's effective values (animated or static) in every slider."
 function syncsliders!(player::Player, clip::Clip)
     player.fxsyncing[] = true
-    color = something(findeffect(clip, ColorEffect), ColorEffect()).adj
-    blur = something(findeffect(clip, BlurEffect), BlurEffect(0.0f0))
-    sharpen = something(findeffect(clip, SharpenEffect), SharpenEffect(1.0f0, 0.0f0))
-    set_close_to!(player.fxsliders[:brightness], color.brightness)
-    set_close_to!(player.fxsliders[:contrast], color.contrast)
-    set_close_to!(player.fxsliders[:saturation], color.saturation)
-    set_close_to!(player.fxsliders[:temperature], color.temperature)
-    set_close_to!(player.fxsliders[:blur], blur.σ)
-    set_close_to!(player.fxsliders[:sharpen], sharpen.amount)
+    sf = playheadframe(player, clip)
+    for (key, slider) in player.fxsliders
+        set_close_to!(slider, paramvalue(clip, key, sf))
+    end
     player.fxsyncing[] = false
+    return nothing
+end
+
+"While scrubbing within one clip, keep only the KEYFRAMED sliders tracking their
+curve (cheap no-op when nothing is animated)."
+function syncanimatedsliders!(player::Player, clip::Clip)
+    isempty(clip.animations) && return nothing
+    player.fxsyncing[] = true
+    sf = playheadframe(player, clip)
+    for (key, slider) in player.fxsliders
+        clipanimated(clip, key) && set_close_to!(slider, paramvalue(clip, key, sf))
+    end
+    player.fxsyncing[] = false
+    return nothing
+end
+
+"""
+The ◆ button next to a slider: begin keyframing this parameter (first key = its
+current value) if it isn't animated yet, otherwise just focus the lane on its
+curve. Never destructive — clearing is the separate `clearkeyframes!` action, so
+a stray click can't wipe your work.
+"""
+function armkeyframe!(player::Player, key::Symbol)
+    loc = locate(player.sequence, player.playhead[])
+    loc === nothing && return nothing
+    clip = loc[1]
+    p = paramspec(key)
+    if !clipanimated(clip, key)
+        snapshot!(player)
+        setkey!(get!(() -> AnimCurve(), clip.animations, key), playheadframe(player, clip), p.get(clip))
+        setstatus!(player, "$(p.label): keyframing on — scrub and move the slider to add keys")
+    else
+        setstatus!(player, "$(p.label): editing its keyframes on the curve below")
+    end
+    player.kffocus[] = key
+    player.kflaneopen[] = true
+    notify(player.playhead)
+    return nothing
+end
+
+"Clear every keyframe of the focused parameter on the clip under the playhead
+(the slider returns to its static value; undoable)."
+function clearkeyframes!(player::Player)
+    loc = locate(player.sequence, player.playhead[])
+    loc === nothing && return nothing
+    clip = loc[1]
+    key = player.kffocus[]
+    p = paramspec(key)
+    clipanimated(clip, key) || return setstatus!(player, "$(p.label): no keyframes to clear")
+    snapshot!(player)
+    n = length(clip.animations[key].keys)
+    delete!(clip.animations, key)
+    syncsliders!(player, clip)   # slider drops back to the static value
+    notify(player.playhead)
+    setstatus!(player, "$(p.label): cleared $n keyframe$(n == 1 ? "" : "s") (Ctrl+Z to restore)")
     return nothing
 end
 
 function Base.close(player::Player)
     pause!(player)   # also stops the audio feed
+    freegpucache!(player)
     foreach(sp -> stop!(sp.worker), values(player.pools))
     stop!(player.timeline)
     close(player.statusqueue)
