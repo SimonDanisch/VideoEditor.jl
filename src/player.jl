@@ -2060,6 +2060,8 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     on(_ -> player.fxwidgets[:effectaddopen](), addbtn.clicks)
     tracksbtn = Button(panel[3, 3:4]; label = "Tracks…", tellwidth = false)
     on(_ -> player.fxwidgets[:kflegendopen](), tracksbtn.clicks)
+    # expose the panel buttons (in a Subfigure → not in fig.content) for tests/demos
+    merge!(player.fxwidgets, Dict{Symbol, Any}(:addeffect => addbtn, :tracksbtn => tracksbtn))
 
     # the applied-effects stack — rebuilt only when the clip or its effect list changes
     listref = Ref{Any}(nothing); lastsig = Ref{Any}(:init)
@@ -2073,6 +2075,7 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
         lastsig[] = sig
         listref[] === nothing || Makie.clear!(listref[])
         gl = GridLayout(panel[4, 1:4]); listref[] = gl
+        rows = Makie.Button[]   # exposed for tests/demos (Subfigure widgets aren't in fig.content)
         if clip === nothing || isempty(clip.effects)
             Label(gl[1, 1], clip === nothing ? "—" : "No effects yet — click “+ Add effect”.";
                   halign = :left, fontsize = 11, color = uicolors.text_muted, tellwidth = false)
@@ -2082,12 +2085,14 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
                 b = Button(gl[i, 1]; label = k === nothing ? string(nameof(typeof(e))) : k.label,
                            halign = :left, tellwidth = false)
                 on(_ -> player.fxwidgets[:effecteditopen](i), b.clicks)
+                push!(rows, b)
                 rm = Button(gl[i, 2]; label = "×", width = 28, tellwidth = false)
                 on(rm.clicks) do _
                     snapshot!(player); deleteat!(clip.effects, i); notify(player.playhead); rebuildlist()
                 end
             end
         end
+        player.fxwidgets[:effectrows] = rows
         return
     end
     on(_ -> rebuildlist(), player.playhead)
