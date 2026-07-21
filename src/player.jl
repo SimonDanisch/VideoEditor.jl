@@ -2108,6 +2108,7 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
             end
         end
         player.fxwidgets[:effectrows] = rows
+        length(gl.content) > 1 && rowgap!(gl, 6)
         return
     end
     on(_ -> rebuildlist(), player.playhead)
@@ -2117,6 +2118,8 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     stabbtn = Button(panel[5, 3:4]; label = "Stabilize…", tellwidth = false)
     on(_ -> player.fxwidgets[:stabmodalopen](), stabbtn.clicks)
     player.fxwidgets[:fxlistrefresh] = rebuildlist
+    rowgap!(panel, 12)              # breathing room between the panel's sections
+    rowgap!(panel, 4, 22.0)         # extra space above the Stabilize group (a new section)
     return panel
 end
 
