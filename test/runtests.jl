@@ -104,6 +104,26 @@ end
     @test err !== nothing && occursin("missing video file", err) && occursin(".gone", err)
 end
 
+@testset "keyframe animation roundtrip" begin
+    src = VideoSource(testvideo)
+    clip = VE.Clip(src, 0, 60, 0, (0.0, 0.0, 1.0, 1.0))
+    curve = VE.AnimCurve()
+    VE.setkey!(curve, 0, 1.0); VE.setkey!(curve, 30, 0.25); VE.setkey!(curve, 59, 0.8)
+    curve.interp = :smooth
+    clip.animations[:opacity] = curve
+    seq = Sequence([clip], src.framerate)
+
+    path = joinpath(mktempdir(), "anim.videoedit.toml")
+    saveproject(path, seq)
+    c2 = loadproject(path).clips[1]
+    @test haskey(c2.animations, :opacity)                       # curve survived the roundtrip
+    a = c2.animations[:opacity]
+    @test a.interp == :smooth                                   # easing preserved
+    @test [(k.frame, k.value) for k in a.keys] == [(0, 1.0), (30, 0.25), (59, 0.8)]
+    @test VE.valueat(a, 15) ≈ VE.valueat(curve, 15)            # interpolation identical after reload
+    @test !isempty(VE.snapshot(seq)[1].animations)             # undo snapshot keeps it too
+end
+
 @testset "multi-track edits" begin
     src = VideoSource(testvideo)
     a = VE.Clip(src, 0, 60, 0, (0.0, 0.0, 1.0, 1.0))

@@ -40,6 +40,14 @@ function clipdict(clip::Clip)
             "gains" => [Float64.(collect(g)) for g in clip.colortrack.gains],
             "offsets" => [Float64.(collect(o)) for o in clip.colortrack.offsets])
     end
+    # keyframed parameters — losing them on reopen would silently drop an animation
+    anims = Dict{String, Any}(
+        String(key) => Dict{String, Any}(
+            "interp" => String(curve.interp),
+            "frames" => [k.frame for k in curve.keys],
+            "values" => [Float64(k.value) for k in curve.keys])
+        for (key, curve) in clip.animations if !isempty(curve))
+    isempty(anims) || (cd["animations"] = anims)
     return cd
 end
 
@@ -70,6 +78,11 @@ function loadproject(path::AbstractString)
             clip.colortrack = ColorTrack(
                 [Vec3f(Float32.(v)...) for v in ct["gains"]],
                 [Vec3f(Float32.(v)...) for v in ct["offsets"]], Int(ct["src_in"]))
+        end
+        for (key, ad) in get(cd, "animations", Dict{String, Any}())
+            clip.animations[Symbol(key)] = AnimCurve(
+                [Keyframe(Int(f), Float64(v)) for (f, v) in zip(ad["frames"], ad["values"])],
+                Symbol(get(ad, "interp", "linear")))
         end
         clip
     end
