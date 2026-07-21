@@ -24,15 +24,13 @@ mutable struct GPUPreview
     failed::Bool
     inline::Bool   # Lava context is owned by the main thread → run jobs inline
     # worker-owned (Lava)
-    gpuframe::Any   # LavaArray{RGB{N0f8},2}
-    gputmp1::Any
-    gputmp2::Any
-    packed::Any     # LavaArray{UInt32,1}
+    packed::Any     # LavaArray{UInt32,1} — RGBA pack scratch for the blit
     eimage::Any     # Lava.ExternalImage
+    pool::Any       # BufferPool — the effect graph's reusable device buffers
     # main-thread-owned (GL)
     texid::UInt32
 end
-GPUPreview() = GPUPreview(0, 0, false, false, nothing, nothing, nothing, nothing, nothing, UInt32(0))
+GPUPreview() = GPUPreview(0, 0, false, false, nothing, nothing, nothing, UInt32(0))
 
 "Run `f` on the player's pinned GPU worker and wait for its result."
 function rungpusync(f::Function, player::Player)
@@ -82,10 +80,9 @@ function setupgpupreview!(player::Player, gp::GPUPreview, W::Integer, H::Integer
     lavamod = parentmodule(typeof(player.analysisbackend))
     fd, allocsize = rungpuowned(player, gp) do
         backend = player.analysisbackend
-        gp.gpuframe = KA.allocate(backend, RGB{N0f8}, (Int(W), Int(H)))
-        gp.gputmp1 = KA.allocate(backend, RGB{N0f8}, (Int(W), Int(H)))
-        gp.gputmp2 = KA.allocate(backend, RGB{N0f8}, (Int(W), Int(H)))
-        gp.packed = KA.allocate(backend, UInt32, Int(W) * Int(H))
+        gp.pool !== nothing && emptypool!(gp.pool)   # drop old-resolution graph buffers
+        gp.pool = nothing
+        gp.packed = KA.allocate(backend, UInt32, Int(W) * Int(H))   # RGBA pack scratch
         gp.eimage = lavamod.ExternalImage(W, H)
         (lavamod.memoryfd(gp.eimage), gp.eimage.allocation_size)
     end
@@ -145,21 +142,15 @@ function presentgpu!(player::Player, clip::Clip, srcframe::Integer; stream = not
             notify(player.frame)  # settle plot geometry for the new size first
             setupgpupreview!(player, gp, W, H)
         end
-        applytracks = player.applytracks[]
         rungpuowned(player, gp) do
-            if stream === nothing
-                copyto!(gp.gpuframe, player.frame[])           # the one PCIe upload
-            else
-                f = frameat!(stream, srcframe)                 # decode owning GOP → VRAM
-                nv12torgb!(gp.gpuframe, f.y, f.uv; bt601 = stream.bt601)   # NV12 → RGB, on device
-            end
-            if applytracks
-                applymotiontrack!(gp.gpuframe, gp.gputmp1, clip, srcframe)
-                applycolortrack!(gp.gpuframe, clip, srcframe)
-            end
-            applyeffects!(gp.gpuframe, gp.gputmp1, gp.gputmp2, clip)
-            gp.packed .= packrgba.(reshape(gp.gpuframe, gp.width * gp.height))
+            gp.pool === nothing && (gp.pool = BufferPool(player.analysisbackend))
+            # source = the streaming decoder (disk→VRAM) or the CPU frame (one upload)
+            ctx = FxContext(stream, player.frame[], clip, Int(srcframe), gp.width, gp.height,
+                            stream === nothing ? false : stream.bt601)
+            out = execute!(graphof(clip; applytracks = player.applytracks[]), gp.pool, ctx)
+            gp.packed .= packrgba.(reshape(out, gp.width * gp.height))
             copyto!(gp.eimage, gp.packed)                  # device blit + wait
+            release!(gp.pool, out)                          # back to the pool for next frame
             nothing
         end
         player.screen.requires_update = true
@@ -237,8 +228,14 @@ function autodetectgpu!(player::Player)
     return nothing
 end
 
-"Close every source's GPU stream (frees its VRAM ring + unmaps its bitstream)."
+"Close every source's GPU stream (frees its VRAM ring + unmaps its bitstream) and the
+effect graph's buffer pool."
 function freegpucache!(player::Player)
+    gp = player.gpupreview
+    if gp isa GPUPreview && gp.pool !== nothing
+        try; rungpusync(player) do; emptypool!(gp.pool); end; catch; end
+        gp.pool = nothing
+    end
     isempty(player.gpucache) && return nothing
     for s in values(player.gpucache)
         try

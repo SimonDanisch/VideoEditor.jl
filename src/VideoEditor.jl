@@ -49,6 +49,7 @@ include("campath.jl")
 include("bundlestab.jl")
 include("gpudecode.jl")
 include("gpustream.jl")
+include("gpugraph.jl")
 include("mcp.jl")
 
 export VideoSource, Player, Clip, Sequence
