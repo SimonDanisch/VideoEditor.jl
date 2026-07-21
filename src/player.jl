@@ -2124,7 +2124,7 @@ function buildstabmodal!(player::Player, uicolors)
     on(analyzebtn.clicks) do _
         mode = something(modemenu.selection[], :similarity)
         if mode === :objectlock
-            close!(modal); armpick!(player)
+            close!(modal); armpick!(player)   # close so the pick click reaches the preview
         else
             analyzeat!(player, (clip; kwargs...) ->
                            analyzemotion!(clip; mode, backend = player.analysisbackend, kwargs...),

@@ -36,6 +36,9 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
                                     sleep(0.1)
                                 end;
                                 pred())
+        # stabilization controls now live in a modal; open/close it around those beats
+        stabopen() = (p.fxwidgets[:stabmodalopen](); sleep(0.3))
+        stabclose() = (foreach(m -> m.open[] = false, get(p.fxwidgets, :modals, Any[])); sleep(0.1))
 
         @testset "scrub selects and follows" begin
             @test occursin("Space plays", p.status[])   # onboarding hint on startup
@@ -55,14 +58,16 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             press(pv(0.3, 0.3))
             moveto(pv(0.7, 0.7))
             release()
-            @test !p.cropmode[]
+            @test p.cropmode[]                 # persistent crop tool stays armed (re-drag to refine)
             crop = p.sequence.clips[1].crop
             @test crop != (0.0, 0.0, 1.0, 1.0)
             @test 0.05 < crop[1] < 0.5 && 0.2 < crop[3] < 0.8
             # regression: applying the crop must not un-reverse the y axis
             # (Makie's ylims! derives yreversed from argument order)
             @test p.previewaxis.yreversed[]
-            keypress(Keyboard.r)  # reset for later tests
+            keypress(Keyboard.escape)          # put the crop tool away
+            @test !p.cropmode[]
+            keypress(Keyboard.r)  # reset crop for later tests
             @test p.sequence.clips[1].crop == (0.0, 0.0, 1.0, 1.0)
         end
 
@@ -77,7 +82,8 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
         end
 
         @testset "hold-to-compare" begin
-            comparebtn = p.fxwidgets[:compare]   # dock content is not in fig.content
+            stabopen()
+            comparebtn = p.fxwidgets[:compare]   # in the stabilize modal
             center = comparebtn.layoutobservables.computedbbox[]
             pos = Point2f(center.origin .+ center.widths ./ 2)
             @test p.applytracks[]
@@ -85,6 +91,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test !p.applytracks[]
             release()
             @test p.applytracks[]
+            stabclose()
         end
 
         @testset "split, ctrl-drag with snap, ripple delete" begin
@@ -240,6 +247,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
         end
 
         @testset "object-lock pick flow" begin
+            stabopen()
             # select "Object lock" in the mode menu via real clicks
             menu = p.fxwidgets[:modemenu]
             bb() = menu.layoutobservables.computedbbox[]
@@ -251,23 +259,23 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test menu.selection[] == :objectlock
 
             stabbtn = p.fxwidgets[:analyze]
-            sc = stabbtn.layoutobservables.computedbbox[]
-            stabcenter = Point2f(sc.origin .+ sc.widths ./ 2)
-            press(stabcenter); release()
-            @test p.onpick !== nothing           # armed, waiting for the pick
+            stabcenter() = (sc = stabbtn.layoutobservables.computedbbox[]; Point2f(sc.origin .+ sc.widths ./ 2))
+            press(stabcenter()); release()       # arms the pick AND closes the modal
+            @test p.onpick !== nothing
 
             keypress(Keyboard.escape)            # Esc cancels the pick
             @test p.onpick === nothing
 
-            # re-arm and click the preview: analysis runs and produces a track
-            # (pause first: a second click at the same spot within Makie's
-            # double-click interval registers as dblclick, not click)
+            # re-arm (reopen the modal, click Stabilize again) then pick on the preview
+            # (pause first: a second click at the same spot within the dblclick window
+            # would register as dblclick, not click)
             sleep(0.5)
-            press(stabcenter); release()
+            stabopen()
+            press(stabcenter()); release()
             @test p.onpick !== nothing
             clip = VE.locate(p.sequence, p.playhead[])[1]
             clip.motiontrack = nothing
-            press(pv(0.5, 0.5)); release()
+            press(pv(0.5, 0.5)); release()       # modal closed by the arm → click reaches the preview
             @test p.onpick === nothing
             t0 = time()
             while clip.motiontrack === nothing && time() - t0 < 15
@@ -287,9 +295,11 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test clip.motiontrack.basecrop == (0.0, 0.0, 1.0, 1.0)
             @test waitfor(() -> occursin("object lock", p.stabinfo[]))
 
-            press(mpos(0.5)); release()          # restore the default mode
+            stabopen()                           # reopen to restore the default mode
+            press(mpos(0.5)); release()
             press(mpos(-0.5)); release()
             @test menu.selection[] == :similarity
+            # modal left open for the remove-stabilization testset
         end
 
         @testset "remove stabilization restores the framing" begin
@@ -311,6 +321,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test waitfor(() -> occursin("no stabilization to remove", p.status[]))
             # let the restore glide + outline flash finish before later beats
             @test waitfor(() -> isempty(p.croprect[]))
+            stabclose()   # timeline beats below need the modal backdrop gone
         end
 
         @testset "proxy swap keeps the preview consistent" begin
@@ -464,7 +475,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             # click the timeline elsewhere → cut THERE, not at the playhead
             press(tlx(3.0)); release()
             @test length(p.sequence.clips) == nclips + 1
-            @test p.tool[] == :none                # auto-disarms after the cut
+            @test p.tool[] == :split               # persistent blade stays armed (Esc/✂ to stop)
             @test p.playhead[] == playhead_before  # the click cut, didn't scrub
             @test any(c -> c.start == 90, p.sequence.clips)  # cut at 3.0 s @30fps
             sleep(0.5)
