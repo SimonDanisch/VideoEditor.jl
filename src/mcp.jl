@@ -94,7 +94,7 @@ str(description) = Dict("type" => "string", "description" => description)
 
 function tooldefinitions()
     t = num("timeline time in seconds")
-    return [
+    tools = Any[
         tool("get_state", "Project state: clips (source ranges, timeline placement, crop, effects, stabilization flags), playhead, duration."),
         tool("get_frame", "Rendered preview PNG at a timeline time — includes stabilization, color correction, effects and crop (what export will produce).",
              Dict("time" => t, "width" => Dict("type" => "integer", "description" => "preview width px (default 480)")), ["time"]),
@@ -132,6 +132,24 @@ function tooldefinitions()
         tool("add_source", "Append a video file as a new clip at the end of the timeline (framerate must match the sequence).",
              Dict("path" => str("video file path")), ["path"]),
     ]
+    # registered effect plugins → one tool each (reflects new plugins on every list)
+    for p in PLUGINS
+        props = Dict{String, Any}("time" => t)
+        for pr in p.params
+            props[String(pr.name)] = num("$(pr.label) ($(pr.min)..$(pr.max), default $(pr.default))")
+        end
+        push!(tools, tool("effect_$(p.name)", "Apply the '$(p.label)' effect to the clip at `time`.", props, ["time"]))
+    end
+    push!(tools, tool("define_effect",
+        "Author and register a NEW effect plugin at runtime, then use it via effect_<name> " *
+        "(it also appears in the editor's Add-effect menu and is keyframable). `code` is a Julia " *
+        "snippet that calls `registerplugin!(name::Symbol, label, params::Vector{FxParam}, kind)`, " *
+        "where `kind(p) -> Pointwise((c,uv) -> Vec3f)` or `Stencil(radius) do sample,r,uv ... end`; " *
+        "`c` is the pixel (Vec3f, 0..1), `uv` its coordinate (Vec2f, 0..1²), `sample(di,dj)` a neighbor. " *
+        "Example: `registerplugin!(:invert, \"Invert\", FxParam[], p -> Pointwise((c,uv)->Vec3f(1,1,1)-c))`. " *
+        "After defining, re-list tools to see effect_<name>.",
+        Dict("code" => str("Julia snippet calling registerplugin!")), ["code"]))
+    return tools
 end
 
 # ---------------------------------------------------------------- tool calls
@@ -178,6 +196,14 @@ function calltool(srv::MCPServer, name::String, args)
                                 "end_time" => round(t1, digits = 3),
                                 "loop_seconds" => round((b - a) / fps, digits = 2),
                                 "seam_score" => round(score, digits = 4)))
+    elseif name == "define_effect"
+        # author + register a new plugin (mutates the global registry, not the player)
+        before = Set(p.name for p in PLUGINS)
+        definepluginfromcode!(String(args["code"]))
+        added = [String(p.name) for p in PLUGINS if !(p.name in before)]
+        return textcontent(Dict("registered" => added,
+            "call_with" => ["effect_$n" for n in added],
+            "note" => "re-list tools (tools/list) to see the new effect_<name> tool"))
     end
 
     result = runoneditor(srv) do
@@ -276,6 +302,16 @@ function calltool(srv::MCPServer, name::String, args)
         elseif name == "add_source"
             clip = addsource!(player, String(args["path"]))  # snapshots itself
             statedict(player)
+        elseif startswith(name, "effect_") && haskey(PLUGINBYNAME, Symbol(name[8:end]))
+            clip = clipattime(args["time"])
+            clip === nothing && return "no clip at that time"
+            p = PLUGINBYNAME[Symbol(name[8:end])]
+            snapshot!(player)
+            kw = (; (pr.name => Float64(get(args, String(pr.name), pr.default)) for pr in p.params)...)
+            seteffect!(clip, plugineffect(p.name; kw...))
+            syncsliders!(player, clip)
+            refreshedit!(player)
+            "applied $(p.label)"
         else
             Dict("isError" => true, "message" => "unknown tool $name")
         end

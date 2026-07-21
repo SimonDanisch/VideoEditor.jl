@@ -1,10 +1,15 @@
 # A GPU effect graph: a DAG of device-image operations, executed with a pooled,
 # liveness-minimal set of VRAM buffers so there is ZERO per-frame allocation after
-# warm-up. Each node produces one device image from its inputs; the graph is topo-
-# ordered and carries a precomputed last-use per node. Adding an effect = one
-# `FxNode` subtype + one `eval_node!` method — the whole thing is free functions +
-# multiple dispatch. The pixel kernels are the existing GPUFiltering calls; this is
-# pure orchestration + buffer management.
+# warm-up. The whole thing is free functions + multiple dispatch.
+#
+# Two layers, so most effects are NOT kernels:
+#   • the CALLBACK layer — a `Pointwise`/`Stencil` effect is a pure function mapped
+#     by a framework-owned kernel (`GPUFiltering.pointwise!`/`stencil!`), and the
+#     SAME function runs the CPU stack and the GPU graph. This is what plugins use.
+#   • the NODE layer — an `FxNode` + `eval_node!` for ops that own a specialized
+#     kernel or multiple passes (decode, motion warp, separable blur, blend). This
+#     is the escape hatch.
+# An `FxEngine` owns the buffer pool; `render` hides acquire/release entirely.
 
 # ---------------------------------------------------------------- buffer pool
 
@@ -41,13 +46,78 @@ function emptypool!(pool::BufferPool)
     return nothing
 end
 
+# ---------------------------------------------------------------- per-frame inputs
+
+"""
+Per-frame inputs the graph pulls from: the frame `source` (a `GpuVideoStream` for
+disk→VRAM decode, or a CPU `RGBFrame` uploaded once), the `clip` (for track
+transforms and effect params), and the frame index. Size and colour range are
+derived from the source — nothing else to pass.
+"""
+struct FxContext
+    source::Any
+    clip::Clip
+    frame::Int
+end
+framesize(s) = size(s)                                   # a CPU RGBFrame
+framesize(s::GpuVideoStream) = (s.width, s.height)
+frameisbt601(::Any) = false
+frameisbt601(s::GpuVideoStream) = s.bt601
+
+# fill `out` with the decoded source frame (device-resident decode, or one upload)
+sourceinto!(out, s::GpuVideoStream, frame) =
+    (f = frameat!(s, frame); nv12torgb!(out, f.y, f.uv; bt601 = s.bt601); out)
+sourceinto!(out, s, frame) = copyto!(out, s)             # CPU frame → device upload
+
+# ---------------------------------------------------------------- effect callbacks
+
+"""
+How a per-pixel/neighborhood effect renders, as a pure callback the framework maps
+with one kernel (on CPU and GPU alike). An effect opts in by defining [`fxkind`];
+then it needs no node, no `eval_node!`, and no CPU/GPU split.
+"""
+abstract type FxKind end
+"`f(c::Vec3f, uv::Vec2f) -> Vec3f` per pixel (`uv ∈ [0,1]²`); may run in place."
+struct Pointwise{F} <: FxKind
+    f::F
+end
+"`f(sample, radius, uv) -> Vec3f` over an n×m neighborhood; `sample(di,dj) -> Vec3f`."
+struct Stencil{F} <: FxKind
+    f::F
+    radius::Int
+end
+
+"""
+    fxkind(e::Effect) -> FxKind
+
+The render callback for a per-pixel/neighborhood effect. Define this (plus a struct
+and [`isneutral`](@ref)) and the effect renders on the CPU stack AND the GPU graph —
+no kernel required. Effects that own a specialized/multi-pass kernel skip this and
+define [`nodefor`](@ref) + `eval_node!` instead.
+"""
+function fxkind end
+
+# run a kind into `out` from `inp` on the GPU graph (device images)
+applykind!(out, inp, k::Pointwise) = pointwise!(out, inp, k.f)
+applykind!(out, inp, k::Stencil) = stencil!(out, inp, k.f, k.radius)
+# a Pointwise op may overwrite its input; a Stencil reads neighbors so it cannot
+needsfresh(::Pointwise) = false
+needsfresh(::Stencil) = true
+
+# CPU effect stack (`applyeffects!`): the same callbacks, run in place with scratch
+applykindcpu!(buf, tmp, k::Pointwise) = pointwise!(buf, buf, k.f)
+applykindcpu!(buf, tmp, k::Stencil) = (stencil!(tmp, buf, k.f, k.radius); copyto!(buf, tmp); buf)
+
+# built-in opacity is just a pointwise scale toward black — no dedicated kernel
+fxkind(e::OpacityEffect) = (a = e.α; Pointwise((c, uv) -> c * a))
+
 # ---------------------------------------------------------------- nodes
 
 "A node in a [`FxGraph`]: produces one device image from the results of `inputs`."
 abstract type FxNode end
 inputs(::FxNode) = ()
 "Whether the node is a per-pixel op that could be fused with adjacent pointwise nodes."
-pointwise(::FxNode) = false
+pointwiseop(::FxNode) = false
 
 struct SourceNode <: FxNode end                                      # the decoded frame
 struct MotionNode <: FxNode; input::Int; end                         # stabilization warp
@@ -55,44 +125,26 @@ struct ColorTrackNode <: FxNode; input::Int; end                     # per-frame
 struct ColorNode <: FxNode; input::Int; adj::ColorAdjustments; end
 struct BlurNode <: FxNode; input::Int; σ::Float32; end
 struct SharpenNode <: FxNode; input::Int; σ::Float32; amount::Float32; end
-struct OpacityNode <: FxNode; input::Int; α::Float32; end
 struct BlendNode <: FxNode; a::Int; b::Int; t::Float32; end          # cross-dissolve (2 inputs)
+struct PixelNode{K <: FxKind} <: FxNode; input::Int; kind::K; end    # a callback effect
 
 inputs(n::MotionNode) = (n.input,)
 inputs(n::ColorTrackNode) = (n.input,)
 inputs(n::ColorNode) = (n.input,)
 inputs(n::BlurNode) = (n.input,)
 inputs(n::SharpenNode) = (n.input,)
-inputs(n::OpacityNode) = (n.input,)
 inputs(n::BlendNode) = (n.a, n.b)
-pointwise(::ColorNode) = true
-pointwise(::OpacityNode) = true
-pointwise(::BlendNode) = true
-
-"Per-frame inputs the graph pulls from: the frame source (a `GpuVideoStream` or a CPU
-frame), the clip (for track transforms), the frame index, size, and colour range."
-struct FxContext
-    stream::Any        # GpuVideoStream, or `nothing` for the CPU-frame source
-    cpuframe::Any      # the CPU frame when `stream === nothing`
-    clip::Clip
-    frame::Int
-    width::Int
-    height::Int
-    bt601::Bool
-end
+inputs(n::PixelNode) = (n.input,)
+pointwiseop(::ColorNode) = true
+pointwiseop(::BlendNode) = true
+pointwiseop(n::PixelNode) = n.kind isa Pointwise
 
 # eval_node!(node, ins, pool, canmutate, ctx) -> device image.
 # `ins` are the input nodes' device images; `canmutate` is true when this node may
 # overwrite `ins[1]` in place (its last consumer is this node).
 function eval_node!(::SourceNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
-    out = acquire!(pool, (ctx.width, ctx.height))
-    if ctx.stream === nothing
-        copyto!(out, ctx.cpuframe)
-    else
-        f = frameat!(ctx.stream, ctx.frame)
-        nv12torgb!(out, f.y, f.uv; bt601 = ctx.bt601)
-    end
-    return out
+    out = acquire!(pool, framesize(ctx.source))
+    return sourceinto!(out, ctx.source, ctx.frame)
 end
 function eval_node!(n::MotionNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
     out = canmutate ? ins[1] : copyacquire!(pool, ins[1])
@@ -109,11 +161,6 @@ end
 function eval_node!(n::ColorNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
     out = canmutate ? ins[1] : copyacquire!(pool, ins[1])
     coloradjust!(out, n.adj)
-    return out
-end
-function eval_node!(n::OpacityNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
-    out = canmutate ? ins[1] : copyacquire!(pool, ins[1])
-    channellinear!(out, Vec3f(n.α), Vec3f(0))   # scale toward black
     return out
 end
 function eval_node!(n::BlurNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
@@ -134,6 +181,11 @@ function eval_node!(n::BlendNode, ins, pool::BufferPool, canmutate, ctx::FxConte
     out = canmutate ? ins[1] : acquire!(pool, size(ins[1]))
     blend!(out, ins[1], ins[2], n.t)   # element-wise, safe when out aliases ins[1]
     return out
+end
+function eval_node!(n::PixelNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
+    reuse = canmutate && !needsfresh(n.kind)
+    out = reuse ? ins[1] : acquire!(pool, size(ins[1]))
+    return applykind!(out, ins[1], n.kind)
 end
 
 # ---------------------------------------------------------------- graph
@@ -160,8 +212,8 @@ end
     execute!(graph, pool, ctx) -> device image
 
 Run the graph for one frame, acquiring/releasing pooled buffers by liveness. The
-returned image is the output node's buffer — the caller uses it (blit/download) and
-`release!`s it back to the pool for the next frame. One `KA.synchronize` at the end.
+returned image is the output node's buffer; use [`render`](@ref) to have it released
+for you. One `KA.synchronize` at the end.
 """
 function execute!(graph::FxGraph, pool::BufferPool, ctx::FxContext)
     results = Vector{Any}(undef, length(graph.nodes))
@@ -180,10 +232,10 @@ end
 
 # ---------------------------------------------------------------- build from a clip
 
-nodefor(e::ColorEffect, input) = ColorNode(input, e.adj)
+nodefor(e::ColorEffect, input) = ColorNode(input, e.adj)             # specialized kernels
 nodefor(e::BlurEffect, input) = BlurNode(input, e.σ)
 nodefor(e::SharpenEffect, input) = SharpenNode(input, e.σ, e.amount)
-nodefor(e::OpacityEffect, input) = OpacityNode(input, e.α)
+nodefor(e::Effect, input) = PixelNode(input, fxkind(e))              # callback effects (incl. plugins)
 
 """
     graphof(clip; applytracks=true) -> FxGraph
@@ -206,4 +258,35 @@ function graphof(clip::Clip; applytracks::Bool = true)
         push!(nodes, nodefor(e, cur)); cur = length(nodes)
     end
     return compilegraph(nodes, cur)
+end
+
+# ---------------------------------------------------------------- engine
+
+"""
+Owns the render resources so callers pass one handle, not a pool. `render` acquires,
+runs the graph, hands you the output, and releases everything back to the pool.
+"""
+mutable struct FxEngine
+    backend::Any
+    pool::BufferPool
+end
+FxEngine(backend) = FxEngine(backend, BufferPool(backend))
+emptyengine!(e::FxEngine) = emptypool!(e.pool)
+
+"""
+    render(f, engine, source, clip, frame; applytracks=true)
+
+Render `clip` at `frame` from `source` (a `GpuVideoStream` or a CPU `RGBFrame`) and
+call `f(out)` with the finished device image. The buffer is released to the engine's
+pool afterwards, so `f` must consume it (blit/download) before returning — never hold
+it. All buffer management is internal.
+"""
+function render(f, engine::FxEngine, source, clip::Clip, frame::Integer; applytracks::Bool = true)
+    graph = graphof(clip; applytracks = applytracks)
+    out = execute!(graph, engine.pool, FxContext(source, clip, Int(frame)))
+    try
+        return f(out)
+    finally
+        release!(engine.pool, out)
+    end
 end

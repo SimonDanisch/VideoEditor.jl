@@ -42,12 +42,14 @@ function applyeffects!(buf::AnyRGBFrame, tmp1::AnyRGBFrame, tmp2::AnyRGBFrame, c
     return buf
 end
 
+# Effects with a specialized/multi-pass kernel apply it directly.
 applyeffect!(buf, tmp1, tmp2, e::ColorEffect) = coloradjust!(buf, e.adj)
 applyeffect!(buf, tmp1, tmp2, e::BlurEffect) =
     (gaussianblur!(tmp1, buf, e.σ; tmp = tmp2); copyto!(buf, tmp1))
 applyeffect!(buf, tmp1, tmp2, e::SharpenEffect) =
     (unsharpmask!(tmp1, buf, e.σ, e.amount; tmp = tmp2); copyto!(buf, tmp1))
-applyeffect!(buf, tmp1, tmp2, e::OpacityEffect) = channellinear!(buf, Vec3f(e.α), Vec3f(0))
+# Callback effects (`fxkind`, incl. plugins) run the SAME kernel the GPU graph uses.
+applyeffect!(buf, tmp1, tmp2, e::Effect) = applykindcpu!(buf, tmp1, fxkind(e))
 
 # ------------------------------------------------------------- serialization
 
@@ -66,6 +68,7 @@ function effectfromdict(d::AbstractDict)
     t == "blur" && return BlurEffect(Float32(d["sigma"]))
     t == "sharpen" && return SharpenEffect(Float32(d["sigma"]), Float32(d["amount"]))
     t == "opacity" && return OpacityEffect(Float32(d["alpha"]))
+    t == "plugin" && return plugineffectfromdict(d)   # requires the plugin registered
     error("unknown effect type: $t")
 end
 
@@ -77,9 +80,13 @@ function findeffect(clip::Clip, ::Type{T}) where {T <: Effect}
     return i === nothing ? nothing : clip.effects[i]::T
 end
 
-"Replace the clip's effect of the same type, or append it."
+# Effects upsert by identity: one instance per type — except plugin effects, which
+# share a type, so they upsert per plugin name (see plugins.jl).
+effectkey(e::Effect) = typeof(e)
+
+"Replace the clip's effect with the same key, or append it."
 function seteffect!(clip::Clip, e::Effect)
-    i = findfirst(x -> typeof(x) == typeof(e), clip.effects)
+    i = findfirst(x -> effectkey(x) == effectkey(e), clip.effects)
     i === nothing ? push!(clip.effects, e) : (clip.effects[i] = e)
     return clip
 end
@@ -133,6 +140,19 @@ const PARAMBYKEY = Dict(p.key => p for p in PARAMS)
 
 "The [`ParamSpec`](@ref) for `key` (throws if unknown)."
 paramspec(key::Symbol) = PARAMBYKEY[key]
+
+# A stable, visually distinct color per animatable parameter — shared by its keyframe
+# curve and its ◆ toggle so a parameter's control and its line are easy to match.
+const PARAMPALETTE = map(Makie.to_color,
+    ["#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#EECA3B",
+     "#B279A2", "#FF9DA6", "#9D755D", "#5C6BC0", "#26A69A", "#8E24AA"])
+
+"A distinct, stable display color for parameter `key` (by its registry position)."
+function paramcolor(key::Symbol)
+    i = findfirst(p -> p.key == key, PARAMS)
+    i === nothing && (i = abs(hash(key)) % length(PARAMPALETTE) + 1)
+    return PARAMPALETTE[mod1(i, length(PARAMPALETTE))]
+end
 
 "Whether any registered parameter is keyframed on `clip`."
 isanimated(clip::Clip) = !isempty(clip.animations)

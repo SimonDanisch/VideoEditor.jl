@@ -301,6 +301,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     buildexportpanel!(player, exportdock[1, 1], uicolors)
     toolbarbutton!(player, toolbar[3, 1], "Out", :export, uicolors)
     buildkeyframelane!(player, uicolors)   # full-width curve lane above the timeline
+    buildkeyframeoverlay!(player)          # colored keyframe curves on the thumbnail track
     kflanebtn = Button(toolbar[4, 1]; label = "◆", width = 40, height = 40)
     on(_ -> (player.kflaneopen[] = !player.kflaneopen[]), kflanebtn.clicks)
     on(player.kflaneopen; update = true) do o
@@ -324,6 +325,10 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
         on(_ -> action(), b.clicks)
         push!(onebtns, b)
     end
+    buildkeyframelegend!(player, uicolors)   # modal: show/hide keyframe tracks
+    buildpluginpicker!(player, uicolors)     # modal: pick a plugin + edit its params (ParamForm)
+    # their open buttons live in the effects panel (see buildfxpanel!), not the
+    # toolbar — the toolbar must stay short enough to clear the full-width timeline
     # hover tooltips: hovering a toolbar button shows its name + shortcut to the
     # right of it (detected by mouse-vs-bbox; Makie Buttons have no hover attr).
     tiptargets = vcat([(splitbtn, "Blade  (S)"), (cropbtn, "Crop  (C)")],
@@ -1585,17 +1590,26 @@ function buildkeyframelane!(player::Player, uicolors)
     on(player.kffocus; update = true) do key
         p = paramspec(key)
         lane.title[] = p.label
+        lane.titlecolor[] = paramcolor(key)   # title matches the focused curve's color
         vscale_txt[] = [numfmt(p.hi), numfmt((p.lo + p.hi) / 2), numfmt(p.lo)]
     end
 
     curveline = Observable(Point2f[]); keypts = Observable(Point2f[])
+    curvecolor = Observable{Any}(paramcolor(player.kffocus[]))         # focused param's color
+    # one thin line per keyframed parameter (scalar color each → no per-vertex matching)
+    MAXCURVES = length(PARAMPALETTE)
+    poolpts = [Observable(Point2f[]) for _ in 1:MAXCURVES]
+    poolcol = [Observable{Any}(uicolors.text) for _ in 1:MAXCURVES]
     activespan = Observable(Rect2f(0, 0, 0, 1))   # the editable clip's time region
     poly!(lane, activespan; color = (uicolors.accent, 0.07), visible = lanevis)
     hlines!(lane, [0.0, 0.5, 1.0]; color = (uicolors.text, 0.1), visible = lanevis)
-    lines!(lane, curveline; color = uicolors.accent, linewidth = 2.5, visible = lanevis)
+    for i in 1:MAXCURVES
+        lines!(lane, poolpts[i]; color = poolcol[i], linewidth = 1.5, visible = lanevis)
+    end
+    lines!(lane, curveline; color = curvecolor, linewidth = 2.5, visible = lanevis) # focused, bolded on top
     vlines!(lane, map(n -> n / fps, player.playhead); color = uicolors.text, linewidth = 1,
             visible = lanevis)
-    kfscatter = scatter!(lane, keypts; marker = :diamond, markersize = 15, color = uicolors.accent,
+    kfscatter = scatter!(lane, keypts; marker = :diamond, markersize = 15, color = curvecolor,
                          strokecolor = uicolors.background, strokewidth = 1.5, visible = lanevis)
     translate!(kfscatter, 0, 0, 5)
     hint_vis = Observable(false)   # shown when the focused curve has no keys yet
@@ -1606,27 +1620,38 @@ function buildkeyframelane!(player::Player, uicolors)
     focusparam() = player.kffocus[]
     currentclip() = (loc = locate(seq, player.playhead[]); loc === nothing ? nothing : loc[1])
     keytl(clip, f) = (clip.start + (f - clip.src_in)) / fps   # source frame → timeline seconds
+    samplecurve(clip, pp, cc, x0, x1) = map(0:80) do i
+        s = x0 + (x1 - x0) * i / 80
+        sf = clip.src_in + (round(Int, s * fps) - clip.start)
+        v = cc === nothing ? pp.get(clip) : something(valueat(cc, sf), pp.get(clip))
+        Point2f(s, paramnorm(pp, v))
+    end
     function redraw()
         clip = currentclip()
         key = focusparam(); p = paramspec(key)
         if clip === nothing
             curveline[] = Point2f[]; keypts[] = Point2f[]
+            foreach(pp -> isempty(pp[]) || (pp[] = Point2f[]), poolpts)
             hint_vis[] = false
             return
         end
-        c = get(clip.animations, key, nothing)
         x0 = clip.start / fps; x1 = clipend(clip) / fps
         activespan[] = Rect2f(x0, -0.06, x1 - x0, 1.12)
-        curveline[] = map(0:80) do i
-            s = x0 + (x1 - x0) * i / 80
-            sf = clip.src_in + (round(Int, s * fps) - clip.start)
-            v = c === nothing ? p.get(clip) : something(valueat(c, sf), p.get(clip))
-            Point2f(s, paramnorm(p, v))
-        end
+        c = get(clip.animations, key, nothing)
+        curvecolor[] = paramcolor(key)
+        curveline[] = samplecurve(clip, p, c, x0, x1)
         keypts[] = c === nothing ? Point2f[] :
                    [Point2f(keytl(clip, k.frame), paramnorm(p, k.value)) for k in c.keys
                     if clip.src_in <= k.frame <= clip.src_out]
-        hint_vis[] = player.kflaneopen[] && isempty(keypts[])
+        # draw every keyframed parameter as its own colored curve (the focused one is bolded above)
+        i = 0
+        for (k2, c2) in clip.animations
+            i += 1; i > MAXCURVES && break
+            poolcol[i][] = paramcolor(k2)
+            poolpts[i][] = samplecurve(clip, paramspec(k2), c2, x0, x1)
+        end
+        foreach(j -> isempty(poolpts[j][]) || (poolpts[j][] = Point2f[]), (i + 1):MAXCURVES)
+        hint_vis[] = player.kflaneopen[] && isempty(keypts[]) && i == 0
         return
     end
     on(_ -> redraw(), player.playhead)
@@ -1695,11 +1720,241 @@ function buildkeyframelane!(player::Player, uicolors)
     return lane
 end
 
+# ---------------------------------------------------- keyframe overlay (on thumbnails)
+
+"""
+Draw every clip's keyframed parameters as colored curves overlaid on its thumbnail
+strip in the timeline. One STABLE `lines!` plot per parameter (across all clips,
+NaN-separated) so its `.visible` is settable — the legend modal and the per-param
+toggles flip the same plot. Colors come from [`paramcolor`](@ref). Returns the
+`param => (plot, points)` registry (also stored in `player.fxwidgets[:kfoverlay]`).
+"""
+function buildkeyframeoverlay!(player::Player)
+    ax = player.timeline.axis
+    seq = player.sequence
+    fps = seq.framerate
+    ybot, ytop = 0.10, 0.90          # inside the thumbnail band (y 0.07..0.93)
+    yat(p, v) = ybot + (ytop - ybot) * clamp(paramnorm(p, v), 0.0, 1.0)
+    curveplots = Dict{Symbol, Any}()  # param => (plot, points-observable)
+    # keyframe ◆ markers for the focused parameter on the clip under the playhead
+    focuspts = Observable(Point2f[]); focuscol = Observable{Any}(paramcolor(player.kffocus[]))
+    focussc = scatter!(ax, focuspts; marker = :diamond, markersize = 12, color = focuscol,
+                       strokecolor = :white, strokewidth = 1.0)
+    translate!(focussc, 0, 0, 6)
+    function ensureplot!(key)
+        get!(curveplots, key) do
+            pts = Observable(Point2f[])
+            pl = lines!(ax, pts; color = paramcolor(key), linewidth = 2.0)
+            translate!(pl, 0, 0, 4)   # above the thumbnails, below the playhead line
+            (pl, pts)
+        end
+    end
+    function refresh()
+        active = Set{Symbol}()
+        for clip in seq.clips, k in keys(clip.animations)
+            push!(active, k)
+        end
+        for key in active
+            _, pts = ensureplot!(key)
+            p = paramspec(key)
+            segs = Point2f[]
+            for clip in seq.clips
+                c = get(clip.animations, key, nothing)
+                c === nothing && continue
+                x0 = clip.start / fps; x1 = clipend(clip) / fps
+                for i in 0:60
+                    s = x0 + (x1 - x0) * i / 60
+                    sf = clip.src_in + (round(Int, s * fps) - clip.start)
+                    v = something(valueat(c, sf), p.get(clip))
+                    push!(segs, Point2f(s, yat(p, v)))
+                end
+                push!(segs, Point2f(NaN, NaN))   # break between clips
+            end
+            pts[] = segs
+        end
+        for (key, (_, pts)) in curveplots       # empty curves for params no longer animated
+            key in active || isempty(pts[]) || (pts[] = Point2f[])
+        end
+        # ◆ markers = the focused param's keys on the clip under the playhead
+        key = player.kffocus[]
+        loc = locate(seq, player.playhead[])
+        if loc !== nothing && clipanimated(loc[1], key)
+            clip = loc[1]; p = paramspec(key); c = clip.animations[key]
+            focuscol[] = paramcolor(key)
+            focuspts[] = [Point2f((clip.start + (k.frame - clip.src_in)) / fps, yat(p, k.value))
+                          for k in c.keys if clip.src_in <= k.frame <= clip.src_out]
+        else
+            focuspts[] = Point2f[]
+        end
+        return
+    end
+    on(_ -> refresh(), player.playhead)   # refreshes on edits too (they notify the playhead)
+    on(_ -> refresh(), player.kffocus)
+    refresh()
+
+    # ---- editing on the overlay: drag a ◆, Alt-click to add, right-click to delete.
+    # Conservative: only consumes near a marker (or with Alt), so scrub / clip-drag /
+    # trim / the right-click menu are untouched everywhere else.
+    tl = player.timeline
+    dragref = Ref{Any}(nothing)                          # (curve, index, clip)
+    yval(p, y) = paramdenorm(p, clamp((y - ybot) / (ytop - ybot), 0.0, 1.0))
+    focuscurve() = (loc = locate(seq, player.playhead[]);
+                    loc === nothing ? nothing : get(loc[1].animations, player.kffocus[], nothing))
+    function nearestmarker(t, y)                         # key index near (t,y), else 0
+        pts = focuspts[]; isempty(pts) && return 0
+        vp = ax.scene.viewport[]; (x0, x1) = tl.viewrange[]
+        sx = (x1 - x0) / max(vp.widths[1], 1); sy = 1.0 / max(vp.widths[2], 1)
+        best = 0; bestd = 14.0
+        for (i, pt) in enumerate(pts)
+            d = hypot((t - pt[1]) / sx, (y - pt[2]) / sy)
+            d < bestd && ((best, bestd) = (i, d))
+        end
+        return best
+    end
+    on(events(ax.scene).mousebutton; priority = 20) do event
+        is_mouseinside(ax.scene) || return Consume(false)
+        t, y = mouseposition(ax.scene)
+        if event.button == Mouse.left && event.action == Mouse.press
+            if ispressed(ax.scene, Keyboard.left_alt | Keyboard.right_alt)   # Alt-click adds a key
+                loc = locate(seq, timelineframe(tl, t)); loc === nothing && return Consume(false)
+                clip = loc[1]; p = paramspec(player.kffocus[])
+                snapshot!(player)
+                setkey!(get!(() -> AnimCurve(), clip.animations, player.kffocus[]),
+                        clip.src_in + (timelineframe(tl, t) - clip.start), yval(p, y))
+                notify(player.playhead); return Consume(true)
+            end
+            c = focuscurve(); c === nothing && return Consume(false)
+            i = nearestmarker(t, y); i == 0 && return Consume(false)   # else fall through to scrub
+            snapshot!(player); dragref[] = (c, i, locate(seq, player.playhead[])[1])
+            return Consume(true)
+        elseif event.button == Mouse.left && event.action == Mouse.release && dragref[] !== nothing
+            dragref[] = nothing; return Consume(true)
+        elseif event.button == Mouse.right && event.action == Mouse.press
+            c = focuscurve(); c === nothing && return Consume(false)
+            i = nearestmarker(t, y); i == 0 && return Consume(false)   # else the clip menu opens
+            snapshot!(player); deleteat!(c.keys, i)
+            isempty(c) && delete!(locate(seq, player.playhead[])[1].animations, player.kffocus[])
+            notify(player.playhead); return Consume(true)
+        end
+        return Consume(false)
+    end
+    on(events(ax.scene).mouseposition; priority = 20) do _
+        dragref[] === nothing && return Consume(false)
+        c, i, clip = dragref[]
+        t, y = mouseposition(ax.scene)
+        p = paramspec(player.kffocus[])
+        f = clamp(clip.src_in + (timelineframe(tl, t) - clip.start), clip.src_in, clip.src_out)
+        movekey!(c, i, f, yval(p, y))
+        j = findfirst(k -> k.frame == f, c.keys); j === nothing || (dragref[] = (c, j, clip))
+        notify(player.playhead); return Consume(true)
+    end
+
+    player.fxwidgets[:kfoverlay] = curveplots
+    player.fxwidgets[:kfrefresh] = refresh
+    return curveplots
+end
+
+"Register `modal` and open it exclusively — any other registered modal is closed first,
+so modals never stack on top of each other."
+function openmodal!(player::Player, modal)
+    reg = get!(() -> Any[], player.fxwidgets, :modals)
+    modal in reg || push!(reg, modal)
+    for m in reg
+        m === modal || (try; close!(m); catch; end)
+    end
+    open!(modal)
+    return nothing
+end
+
+"""
+A modal "legend" of every keyframed parameter — a Makie [`Legend`](@ref) connected to
+the overlay's per-param curve plots, so its built-in interaction toggles track
+visibility: left-click hide/show one, middle-click show-all/hide-all, right-click
+toggle all (hidden entries shade out). Rebuilt each open from the current animations.
+Call `player.fxwidgets[:kflegendopen]()` to show it.
+"""
+function buildkeyframelegend!(player::Player, uicolors)
+    modal = Modal(player.fig; title = "Keyframed tracks", min_size = (300, 240), halign = :left)
+    curveplots = player.fxwidgets[:kfoverlay]
+    content = Ref{Any}(nothing)
+    function rebuild()
+        content[] === nothing || (Makie.clear!(content[]); content[] = nothing)
+        player.fxwidgets[:kfrefresh]()   # make sure every active param has a plot
+        keys_active = [p.key for p in PARAMS
+                       if haskey(curveplots, p.key) &&
+                          any(clipanimated(cl, p.key) for cl in player.sequence.clips)]
+        gl = GridLayout(modal[1, 1])
+        content[] = gl
+        if isempty(keys_active)
+            Label(gl[1, 1], "No keyframed parameters yet.\nToggle ◆ on a parameter to animate it.";
+                  fontsize = 12, halign = :left, tellwidth = false)
+            return
+        end
+        plots = [curveplots[k][1] for k in keys_active]
+        labels = [paramspec(k).label for k in keys_active]
+        Legend(gl[1, 1], plots, labels; framevisible = false, valign = :top, halign = :left,
+               titlevisible = false, rowgap = 3, labelcolor = uicolors.text)
+        Label(gl[2, 1], "click: hide / show   ·   middle-click: all   ·   right-click: toggle all";
+              fontsize = 10, halign = :left, color = uicolors.text_muted, tellwidth = false)
+        return
+    end
+    player.fxwidgets[:kflegendopen] = () -> (rebuild(); openmodal!(player, modal))
+    return modal
+end
+
+"""
+Modal effect picker: choose a registered plugin, then edit its parameters in a
+`ParamForm` (auto-built from the plugin's `FxParam`s) whose per-row accessory is the
+same colored ◆ keyframe + ● visibility pair. Applies to the clip under the playhead
+live. This is where `ParamForm` fits — a fresh per-plugin form — rather than the
+always-on panel. Call `player.fxwidgets[:pluginpickeropen]()`.
+"""
+function buildpluginpicker!(player::Player, uicolors)
+    modal = Modal(player.fig; title = "Add effect", min_size = (340, 300), halign = :left)
+    formref = Ref{Any}(nothing)
+    curclip() = (loc = locate(player.sequence, player.playhead[]); loc === nothing ? nothing : loc[1])
+    menu = Menu(modal[1, 1]; prompt = "Choose an effect…", tellwidth = false,
+                options = [(p.label, p.name) for p in PLUGINS])
+    function showform(name)
+        formref[] === nothing || (Makie.clear!(formref[]); formref[] = nothing)
+        p = PLUGINBYNAME[name]
+        c = curclip()
+        c === nothing || (snapshot!(player); seteffect!(c, plugineffect(name)); notify(player.playhead))
+        if isempty(p.params)
+            formref[] = Label(modal[2, 1], "$(p.label) applied — no parameters."; halign = :left, tellwidth = false)
+            return
+        end
+        spec = NamedTuple(pr.name => (Float64(pr.default), Makie.Between(pr.min, pr.max)) for pr in p.params)
+        accessory = (field, pos) -> begin
+            key = pluginparamkey(p, p.params[findfirst(q -> q.name === field, p.params)])
+            pcol = paramcolor(key)
+            gl = GridLayout(pos)
+            kf = Button(gl[1, 1]; label = "◆", width = 20, tellwidth = false, labelcolor = pcol)
+            ey = Button(gl[1, 2]; label = "●", width = 20, tellwidth = false, labelcolor = pcol)
+            on(_ -> armkeyframe!(player, key), kf.clicks)
+            on(_ -> (ov = get(player.fxwidgets, :kfoverlay, nothing);
+                     ov !== nothing && haskey(ov, key) && (ov[key][1].visible[] = !ov[key][1].visible[])), ey.clicks)
+            gl
+        end
+        pf = Makie.ParamForm(modal[2, 1], spec, accessory; accessorywidth = 48, labelwidth = 96)
+        formref[] = pf
+        on(pf.graph[:values]) do vals   # live-apply as parameters change
+            c = curclip(); c === nothing && return
+            seteffect!(c, plugineffect(name; vals...)); notify(player.playhead)
+        end
+    end
+    on(sel -> sel === nothing || showform(sel), menu.selection)
+    player.fxwidgets[:pluginpickeropen] = () -> openmodal!(player, modal)
+    player.fxwidgets[:pickermenu] = menu
+    player.fxwidgets[:pickerform] = formref
+    return modal
+end
+
 # ------------------------------------------------------------- effect panel
 
 "Sliders editing the effect stack of the clip under the playhead."
 function buildfxpanel!(player::Player, gridpos, uicolors)
-    specs = [
+    specs = Any[
         (:opacity, "Opacity", 0.0:0.01:1.0, 1.0),
         (:brightness, "Brightness", -0.5:0.01:0.5, 0.0),
         (:contrast, "Contrast", 0.0:0.01:2.0, 1.0),
@@ -1708,7 +1963,16 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
         (:blur, "Blur", 0.0:0.1:12.0, 0.0),
         (:sharpen, "Sharpen", 0.0:0.05:2.0, 0.0),
     ]
-    panel = GridLayout(gridpos; tellheight = false, valign = :top)
+    # registry-driven: every registered plugin param (from any package, present when
+    # this panel is built) gets a labeled slider + ◆ keyframe button, like the built-ins.
+    for p in PARAMS
+        p.group === :plugin || continue
+        push!(specs, (p.key, p.label, p.lo:(p.hi - p.lo) / 100:p.hi, Float64(p.default)))
+    end
+    # wrap the panel in a scrollable Subfigure so tall content stays reachable
+    fxscroll = Subfigure(gridpos; scrollbar_thumb_color = uicolors.border)
+    player.fxwidgets[:fxscroll] = fxscroll
+    panel = GridLayout(fxscroll[1, 1]; valign = :top)
     Label(panel[1, 1:4], "Effects"; font = :bold, halign = :left)
     # which clip these controls edit (the clip under the playhead)
     target = map(player.playhead) do n
@@ -1722,10 +1986,14 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     end
     Label(panel[2, 1:4], target; halign = :left, fontsize = 11, color = uicolors.accent,
           tellwidth = false)
-    Label(panel[3, 1:4], "◆ toggles keyframing — then scrub + move a slider to animate";
+    addbtn = Button(panel[3, 1:2]; label = "+ Add effect", tellwidth = false)
+    on(_ -> player.fxwidgets[:pluginpickeropen](), addbtn.clicks)
+    tracksbtn = Button(panel[3, 3:4]; label = "Tracks…", tellwidth = false)
+    on(_ -> player.fxwidgets[:kflegendopen](), tracksbtn.clicks)
+    Label(panel[4, 1:4], "◆ toggles keyframing — then scrub + move a slider to animate";
           halign = :left, fontsize = 10, color = uicolors.text_muted, tellwidth = false)
     for (row, (key, text, range, default)) in enumerate(specs)
-        r = row + 3
+        r = row + 4
         namelbl = Label(panel[r, 1], text; halign = :left, fontsize = 12)
         slider = Slider(panel[r, 2]; range, startvalue = default, width = 104)
         player.fxsliders[key] = slider
@@ -1733,8 +2001,15 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
                   loc = locate(player.sequence, n)
                   loc === nothing ? "" : string(round(paramvalue(loc[1], key, playheadframe(player, loc[1])), digits = 2))
               end; halign = :right, fontsize = 10, color = uicolors.text_muted, width = 36)
-        kfbtn = Button(panel[r, 4]; label = "◆", width = 24, tellwidth = false)
+        # accessory column: ◆ keyframe toggle + ● curve-visibility toggle (both param-colored)
+        acc = GridLayout(panel[r, 4]; tellwidth = false)
+        kfbtn = Button(acc[1, 1]; label = "◆", width = 22, tellwidth = false)
+        eyebtn = Button(acc[1, 2]; label = "●", width = 22, tellwidth = false)
         player.fxwidgets[Symbol(:kf_, key)] = kfbtn
+        player.fxwidgets[Symbol(:eye_, key)] = eyebtn
+        pcol = paramcolor(key)   # the param's unique color — matches its keyframe curve
+        trackplot() = (ov = get(player.fxwidgets, :kfoverlay, nothing);
+                       ov === nothing ? nothing : get(ov, key, nothing))
         on(slider.value) do value
             if !player.fxsyncing[]
                 player.kffocus[] = key
@@ -1742,17 +2017,26 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
             end
         end
         on(_ -> armkeyframe!(player, key), kfbtn.clicks)
+        on(eyebtn.clicks) do _   # hide/show this param's curve everywhere (same plot the legend flips)
+            t = trackplot(); t === nothing && return
+            v = !t[1].visible[]; t[1].visible[] = v
+            eyebtn.label[] = v ? "●" : "○"; eyebtn.labelcolor[] = v ? pcol : uicolors.text_muted
+        end
         onany(player.playhead, player.kffocus) do n, foc
             loc = locate(player.sequence, n)
             anim = loc !== nothing && clipanimated(loc[1], key)
-            want = anim ? uicolors.accent : uicolors.surface
+            want = anim ? pcol : uicolors.surface
             kfbtn.buttoncolor[] == want || (kfbtn.buttoncolor[] = want;
-                kfbtn.labelcolor[] = anim ? uicolors.text_on_accent : uicolors.text_muted)
-            wname = foc === key ? uicolors.accent : uicolors.text
+                kfbtn.labelcolor[] = anim ? uicolors.text_on_accent : pcol)   # ◆ carries the color even when off
+            wname = foc === key ? pcol : uicolors.text
             namelbl.color[] == wname || (namelbl.color[] = wname)
+            t = trackplot(); vis = t === nothing ? true : t[1].visible[]   # ● only meaningful when animated
+            ecol = anim ? (vis ? pcol : uicolors.text_muted) : uicolors.surface
+            eyebtn.labelcolor[] == ecol || (eyebtn.labelcolor[] = ecol)
+            elbl = vis ? "●" : "○"; eyebtn.label[] == elbl || (eyebtn.label[] = elbl)
         end
     end
-    base = length(specs) + 3
+    base = length(specs) + 4
     Label(panel[base + 1, 1:2], "Keyframes"; font = :bold, halign = :left)
     lanebtn = Button(panel[base + 1, 3:4];
                      label = map(o -> o ? "Hide curve" : "Show curve", player.kflaneopen),
@@ -1802,9 +2086,28 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     colorbtn = Button(panel[nrows + 7, 1:4]; label = "Fix color flicker", tellwidth = false)
     Label(panel[nrows + 8, 1:4], "Loop"; font = :bold, halign = :left)
     loopbtn = Button(panel[nrows + 9, 1:4]; label = "Make seamless loop", tellwidth = false)
+    # registered effect plugins — this menu tracks PLUGINSVERSION, so effects added at
+    # runtime (incl. by the MCP agent) appear here immediately, no restart.
+    Label(panel[nrows + 10, 1:4], "Plugins"; font = :bold, halign = :left)
+    # Every registered plugin (from any package) is listed here. The menu is built
+    # from the registry when the panel is created; effects registered later in the
+    # session (e.g. authored live by the MCP) are applied over MCP and appear here on
+    # the next editor open. (This Makie build can't grow a Menu's options in place.)
+    pluginmenu = Menu(panel[nrows + 11, 1:4]; prompt = "Add effect…", tellwidth = false,
+                      options = [(p.label, p.name) for p in PLUGINS])
+    on(pluginmenu.selection) do sel
+        sel === nothing && return
+        loc = locate(player.sequence, player.playhead[]); loc === nothing && return
+        snapshot!(player)
+        seteffect!(loc[1], plugineffect(sel))
+        p = PLUGINBYNAME[sel]
+        isempty(p.params) || (player.kffocus[] = pluginparamkey(p, p.params[1]))
+        syncsliders!(player, loc[1]); refreshedit!(player)
+        pluginmenu.i_selected[] = 0                 # reset so the same effect can be re-added
+    end
     merge!(player.fxwidgets, Dict{Symbol, Any}(
         :modemenu => modemenu, :analyze => analyzebtn, :compare => comparebtn,
-        :remove => removebtn, :color => colorbtn, :loop => loopbtn))
+        :remove => removebtn, :color => colorbtn, :loop => loopbtn, :pluginmenu => pluginmenu))
 
     on(analyzebtn.clicks) do _
         mode = something(modemenu.selection[], :similarity)

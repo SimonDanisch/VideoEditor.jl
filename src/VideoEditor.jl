@@ -50,12 +50,14 @@ include("bundlestab.jl")
 include("gpudecode.jl")
 include("gpustream.jl")
 include("gpugraph.jl")
+include("plugins.jl")
 include("mcp.jl")
 
 export VideoSource, Player, Clip, Sequence
 export play!, pause!, step!
 export split!, deleteclip!, moveclip!, addsource!, saveproject, loadproject
 export ColorEffect, BlurEffect, SharpenEffect, seteffect!
+export registerplugin!, FxParam, FxPlugin, Pointwise, Stencil
 export exportvideo, exportgif, analyzecolor!, analyzemotion!, analyzeobject!, findloop
 export generateproxy, startproxy!
 export mcpserve!

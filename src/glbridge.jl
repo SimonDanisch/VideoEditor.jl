@@ -26,7 +26,7 @@ mutable struct GPUPreview
     # worker-owned (Lava)
     packed::Any     # LavaArray{UInt32,1} — RGBA pack scratch for the blit
     eimage::Any     # Lava.ExternalImage
-    pool::Any       # BufferPool — the effect graph's reusable device buffers
+    engine::Any     # FxEngine — owns the effect graph's reusable device buffers
     # main-thread-owned (GL)
     texid::UInt32
 end
@@ -80,8 +80,8 @@ function setupgpupreview!(player::Player, gp::GPUPreview, W::Integer, H::Integer
     lavamod = parentmodule(typeof(player.analysisbackend))
     fd, allocsize = rungpuowned(player, gp) do
         backend = player.analysisbackend
-        gp.pool !== nothing && emptypool!(gp.pool)   # drop old-resolution graph buffers
-        gp.pool = nothing
+        gp.engine !== nothing && emptyengine!(gp.engine)   # drop old-resolution graph buffers
+        gp.engine = nothing
         gp.packed = KA.allocate(backend, UInt32, Int(W) * Int(H))   # RGBA pack scratch
         gp.eimage = lavamod.ExternalImage(W, H)
         (lavamod.memoryfd(gp.eimage), gp.eimage.allocation_size)
@@ -137,21 +137,20 @@ CPU frame `player.frame[]` is uploaded once. Returns `true` when on screen; `fal
 function presentgpu!(player::Player, clip::Clip, srcframe::Integer; stream = nothing)
     gp = player.gpupreview
     try
-        W, H = size(player.frame[])
+        # source = the streaming decoder (disk→VRAM) or the CPU frame (one upload)
+        source = stream === nothing ? player.frame[] : stream
+        W, H = framesize(source)
         if (gp.width, gp.height) != (W, H)
             notify(player.frame)  # settle plot geometry for the new size first
             setupgpupreview!(player, gp, W, H)
         end
         rungpuowned(player, gp) do
-            gp.pool === nothing && (gp.pool = BufferPool(player.analysisbackend))
-            # source = the streaming decoder (disk→VRAM) or the CPU frame (one upload)
-            ctx = FxContext(stream, player.frame[], clip, Int(srcframe), gp.width, gp.height,
-                            stream === nothing ? false : stream.bt601)
-            out = execute!(graphof(clip; applytracks = player.applytracks[]), gp.pool, ctx)
-            gp.packed .= packrgba.(reshape(out, gp.width * gp.height))
-            copyto!(gp.eimage, gp.packed)                  # device blit + wait
-            release!(gp.pool, out)                          # back to the pool for next frame
-            nothing
+            gp.engine === nothing && (gp.engine = FxEngine(player.analysisbackend))
+            render(gp.engine, source, clip, Int(srcframe); applytracks = player.applytracks[]) do out
+                gp.packed .= packrgba.(reshape(out, gp.width * gp.height))
+                copyto!(gp.eimage, gp.packed)              # device blit + wait
+                nothing
+            end
         end
         player.screen.requires_update = true
         return true
@@ -232,9 +231,9 @@ end
 effect graph's buffer pool."
 function freegpucache!(player::Player)
     gp = player.gpupreview
-    if gp isa GPUPreview && gp.pool !== nothing
-        try; rungpusync(player) do; emptypool!(gp.pool); end; catch; end
-        gp.pool = nothing
+    if gp isa GPUPreview && gp.engine !== nothing
+        try; rungpusync(player) do; emptyengine!(gp.engine); end; catch; end
+        gp.engine = nothing
     end
     isempty(player.gpucache) && return nothing
     for s in values(player.gpucache)
