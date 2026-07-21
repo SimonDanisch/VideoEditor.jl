@@ -147,6 +147,29 @@ end
     @test sort([c.track for c in loadproject(path).clips]) == [1, 2, 2]
 end
 
+@testset "plugin registry + MCP authoring" begin
+    # register a plugin directly (any package can) — it becomes an effect kind
+    VE.registerplugin!(:testfx, "Test FX", [VE.FxParam(:k, "k", 0.0, 1.0, 1.0)],
+                       p -> VE.Pointwise((c, uv) -> c * Float32(p.k)))
+    @test haskey(VE.PLUGINBYNAME, :testfx)
+    @test any(k -> k.name == :testfx, VE.effectkinds())            # shows in the Add-effect surface
+
+    # …and via the MCP `define_effect` code path (live Base.eval authoring)
+    VE.definepluginfromcode!("""
+        registerplugin!(:mcpfx, "MCP FX", [FxParam(:gain, "gain", 0.0, 2.0, 1.0)],
+                        p -> Pointwise((c, uv) -> c * Float32(p.gain)))
+    """)
+    @test haskey(VE.PLUGINBYNAME, :mcpfx)
+    @test any(t -> t["name"] == "effect_mcpfx", VE.tooldefinitions())  # surfaces as an MCP tool
+
+    # a plugin effect applies through the shared kernel + roundtrips through the project dict
+    e = VE.plugineffect(:mcpfx; gain = 0.25)
+    f = fill(VE.RGB{VE.N0f8}(0.8, 0.8, 0.8), 8, 8)
+    VE.applyeffect!(f, similar(f), similar(f), e)
+    @test all(px -> Float32(px.r) < 0.8, f)                        # gain 0.25 darkens
+    @test VE.plugineffectfromdict(VE.effectdict(e)).params.gain == 0.25
+end
+
 @testset "Multi-source model" begin
     using Statistics: mean
     src1 = VideoSource(testvideo)    # 320x180, 120 frames
