@@ -509,12 +509,61 @@ function showtransition!(player::Player, sample)
     return true
 end
 
+"""
+Composite the stack of clips covering timeline frame `n` (bottom track → top) into
+the preview: each layer is decoded, its tracks + effects applied, its crop BAKED into
+the shared canvas via `warp!`, then alpha-blended by its opacity (upper over lower).
+Returns `false` (caller falls back to the single-clip path) if any layer isn't buffered
+yet. CPU preview path — the GPU/export paths still show the top clip for now.
+"""
+function compositeframe!(player::Player, n::Integer, clips::Vector{Clip})
+    ensureframesize!(player, clips[end].source)      # canvas at the top clip's resolution
+    canvas = player.frame[]; W, H = size(canvas)
+    warpbuf = similar(canvas)
+    fill!(canvas, RGB{N0f8}(0, 0, 0))
+    for clip in clips
+        srcframe = clip.src_in + (n - clip.start)
+        sp = pool(player, clip.source)
+        settarget!(sp.worker, srcframe)
+        clipbuf = RGBFrame(undef, clip.source.width, clip.source.height)
+        deadline = time() + 1.0
+        while !fetchframe!(clipbuf, sp.ring, srcframe)
+            time() > deadline && return false            # not buffered yet → single-clip fallback
+            sleep(0.004)
+        end
+        ec = effectiveclip(clip, srcframe)               # keyframed params at this frame
+        st1 = similar(clipbuf); st2 = similar(clipbuf)
+        if player.applytracks[]
+            applymotiontrack!(clipbuf, st1, ec, srcframe)
+            applycolortrack!(clipbuf, ec, srcframe)
+        end
+        for e in ec.effects                              # opacity is the layer alpha, not scale-to-black
+            (e isa OpacityEffect || isneutral(e)) && continue
+            applyeffect!(clipbuf, st1, st2, e)
+        end
+        KA.synchronize(KA.get_backend(clipbuf))
+        warp!(warpbuf, clipbuf, ec.crop)                 # bake this layer's crop into canvas space
+        α = Float32(clamp(paramvalue(clip, :opacity, srcframe), 0.0, 1.0))
+        blend!(canvas, canvas, warpbuf, α)               # (1-α)·below + α·layer
+    end
+    notify(player.frame)
+    player.lastcrop = (0.0, 0.0, 1.0, 1.0)
+    coverlimits!(player, 0, W, H, 0)                     # show the full baked canvas
+    return true
+end
+
 "Resolve and show timeline frame `n` if possible (gaps show black). Returns success."
 function showframe!(player::Player, n::Integer)
     tr = transitionat(player.sequence, n)
     if tr !== nothing
         s = transitionsample(player.sequence, tr, n)
         s !== nothing && showtransition!(player, s) && return true
+    end
+    # multiple stacked tracks → composite on the CPU (the GPU preview path shows the
+    # top clip only; compositing there is future work)
+    if ntracks(player.sequence) > 1 && !(player.gpupreview isa GPUPreview && !player.gpupreview.failed)
+        clips = clipsat(player.sequence, n)
+        length(clips) > 1 && compositeframe!(player, n, clips) && return true
     end
     loc = locate(player.sequence, n)
     if loc === nothing
