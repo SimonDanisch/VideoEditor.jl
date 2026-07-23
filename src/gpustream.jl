@@ -35,9 +35,10 @@ bitstream.
 """
 mutable struct GpuVideoStream
     backend   ::LavaBackend
+    codec     ::Symbol                    # :h264 | :hevc — selects parser + decode session
     tmpfile   ::String                    # demux temp file (mmap-backed); removed on close
     bitstream ::Vector{UInt8}             # Mmap view of `tmpfile` — disk-paged
-    leadparams::Vector{UInt8}             # first SPS+PPS, prepended to GOPs that lack them
+    leadparams::Vector{UInt8}             # first parameter sets, prepended to GOPs that lack them
     gops      ::Vector{Gop}
     width     ::Int
     height    ::Int
@@ -73,12 +74,16 @@ caller falls back to CPU decode) rather than thrash.
 """
 function openstream(backend::LavaBackend, path::AbstractString, width::Integer, height::Integer;
                     capacity::Integer = 120, vrambudget::Integer = 3 * 2^30)
-    tmp = tempname() * ".h264"
-    run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -v error -i $path -map 0:v:0 -c:v copy -bsf:v h264_mp4toannexb -f h264 $tmp`))
+    codec = videocodec(path)
+    codec in (:h264, :hevc) ||
+        error("GPU stream: codec $codec has no hardware decode session yet — transcode first")
+    bsf = codec === :hevc ? "hevc_mp4toannexb" : "h264_mp4toannexb"
+    tmp = tempname() * "." * String(codec)
+    run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -v error -i $path -map 0:v:0 -c:v copy -bsf:v $bsf -f $(codec === :hevc ? "hevc" : "h264") $tmp`))
     io = open(tmp, "r")
     bits = Mmap.mmap(io, Vector{UInt8})
     close(io)
-    gops, lead = index_gops(bits)
+    gops, lead = codec === :hevc ? index_gops_h265(bits) : index_gops(bits)
     # honor the container's EDIT LIST: the mp4 may cut leading coded frames (phone
     # footage typically trims a couple) — every other decoder (ffmpeg, VideoIO,
     # players) shows the video WITHOUT them, so the raw Annex-B stream must shift
@@ -102,9 +107,16 @@ function openstream(backend::LavaBackend, path::AbstractString, width::Integer, 
     cap = min(max(Int(capacity), 2 * maxgop), fit)
     cap < 2 * maxgop &&
         @warn "VRAM too tight for decode-ahead — expect brief GOP-boundary hitches" maxgop fit
-    return GpuVideoStream(backend, tmp, bits, lead, gops, Int(width), Int(height),
+    return GpuVideoStream(backend, codec, tmp, bits, lead, gops, Int(width), Int(height),
                           video_is_bt601(path), Dict{Int, Nv12Frame}(), Int[], cap,
                           nothing, 0, 0)
+end
+
+"Video codec of `path` (`:h264`, `:hevc`, …) via ffprobe."
+function videocodec(path::AbstractString)
+    out = read(`$(FFMPEG_jll.ffprobe()) -v error -select_streams v:0
+                -show_entries stream=codec_name -of csv=p=0 $path`, String)
+    return Symbol(strip(out))
 end
 
 """
@@ -145,6 +157,9 @@ function editlistlead(path::AbstractString)
     catch
         return 0
     end
+    # only ISO-BMFF containers carry edit lists; walking an mkv's EBML as boxes
+    # would read garbage sizes
+    (length(bytes) >= 12 && String(bytes[5:8]) == "ftyp") || return 0
     be32(o) = (Int(bytes[o]) << 24) | (Int(bytes[o+1]) << 16) | (Int(bytes[o+2]) << 8) | Int(bytes[o+3])
     boxtype(o) = String(bytes[o+4:o+7])
     # walk boxes for the VIDEO track's edts/elst media_time and stts sample delta
@@ -243,6 +258,54 @@ function index_gops(bits::AbstractVector{UInt8})
     return gops, lead
 end
 
+"""
+The HEVC sibling of [`index_gops`](@ref): 2-byte NAL headers, GOPs at IDR
+boundaries (types 19/20) backed up over leading VPS/SPS/PPS/prefix-SEI; frame
+count counts FIRST slice segments so multi-slice pictures stay one frame.
+CRA recovery points (type 21, open GOPs) are refused — their RASL pictures
+reference across the GOP cut, so per-GOP seeking would mis-decode; the caller
+falls back (and the ingest transcode produces closed GOPs anyway).
+"""
+function index_gops_h265(bits::AbstractVector{UInt8})
+    starts = Int[]; types = UInt8[]; firsts = Bool[]
+    i = 1; n = length(bits)
+    @inbounds while i <= n - 3
+        if bits[i] == 0x00 && bits[i + 1] == 0x00 && bits[i + 2] == 0x01
+            t = (bits[i + 3] >> 1) & 0x3f
+            push!(starts, i); push!(types, t)
+            push!(firsts, t <= 0x15 && i + 5 <= n && (bits[i + 5] & 0x80) != 0)
+            i += 3
+        else
+            i += 1
+        end
+    end
+    isempty(starts) && error("no NAL units found in elementary stream")
+    any(==(0x15), types) &&
+        error("open-GOP HEVC (CRA) is not GOP-seekable — transcode to closed GOPs first")
+    nalbytes(k) = bits[starts[k]:(k < length(starts) ? starts[k + 1] - 1 : n)]
+    vps = findfirst(==(0x20), types); sps = findfirst(==(0x21), types); pps = findfirst(==(0x22), types)
+    lead = (vps === nothing || sps === nothing || pps === nothing) ? UInt8[] :
+           vcat(nalbytes(vps), nalbytes(sps), nalbytes(pps))
+    gopstart = Int[]
+    for j in eachindex(types)
+        types[j] in (0x13, 0x14) || continue
+        k = j
+        while k > 1 && types[k - 1] in (0x20, 0x21, 0x22, 0x27); k -= 1; end
+        push!(gopstart, k)
+    end
+    isempty(gopstart) && error("no IDR frames found (stream not seekable)")
+    gops = Gop[]; frame0 = 0
+    for (gi, k) in enumerate(gopstart)
+        khi = gi < length(gopstart) ? gopstart[gi + 1] - 1 : length(types)
+        b0 = starts[k]
+        b1 = gi < length(gopstart) ? starts[gopstart[gi + 1]] - 1 : n
+        nf = count(@view firsts[k:khi])
+        push!(gops, Gop(b0:b1, frame0, nf))
+        frame0 += nf
+    end
+    return gops, lead
+end
+
 "Index of the GOP owning display frame `n` (clamped to the stream)."
 function gopof(s::GpuVideoStream, n::Integer)
     for (g, gop) in enumerate(s.gops)
@@ -325,15 +388,21 @@ function exactframeat!(s::GpuVideoStream, n::Integer)
     return s.ring[n]
 end
 
+"First NAL of a GOP slice is a parameter set (so the GOP is self-decodable)."
+startswithparams(s::GpuVideoStream, bytes) =
+    s.codec === :hevc ? ((bytes[4] >> 1) & 0x3f) == 0x20 : naltype(bytes, 1) == 0x07
+
 "Begin the incremental feed of GOP `g` on the stream's persistent decode session."
 function startfeed!(s::GpuVideoStream, g::Integer)
     if s.dec === nothing
         params = isempty(s.leadparams) ? s.bitstream[s.gops[1].bytes] : s.leadparams
-        s.dec = Lava.VideoDecode.H264Decoder(Lava.vk_context(), params; chroma = true)
+        ctx = Lava.vk_context()
+        s.dec = s.codec === :hevc ? Lava.VideoDecode.H265Decoder(ctx, params; chroma = true) :
+                                    Lava.VideoDecode.H264Decoder(ctx, params; chroma = true)
     end
     gop = s.gops[g]
     bytes = s.bitstream[gop.bytes]
-    naltype(bytes, 1) == 0x07 || (bytes = vcat(s.leadparams, bytes))   # ensure SPS/PPS present
+    startswithparams(s, bytes) || (bytes = vcat(s.leadparams, bytes))
     Lava.VideoDecode.feed!(s.dec, bytes)
     s.feedgop = g
     s.feednext = gop.firstframe

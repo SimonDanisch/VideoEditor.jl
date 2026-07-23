@@ -309,9 +309,69 @@ function preloadgpu!(player::Player, source::VideoSource)
         end
     catch e
         stream === nothing || (try; close(stream); catch; end)
+        # silent degradation hid a whole codec gap once — say it where the user
+        # looks, and where the source is merely not DIRECTLY streamable (codec,
+        # open GOPs, profile) start the one-time mezzanine transcode instead of
+        # settling for the CPU tier
+        msg = sprint(showerror, e)
+        if occursin("VRAM budget", msg)
+            setstatus!(player, "$(basename(source.path)): CPU decode — $msg")
+        else
+            setstatus!(player, "$(basename(source.path)): not GPU-streamable ($msg)")
+            startmezzanine!(player, source)
+        end
         @warn "GPU stream unavailable; staying on CPU decode" exception = e
     finally
         Threads.atomic_sub!(player.gpubusy, 1)
+    end
+    return nothing
+end
+
+"""
+Transcode `source` into the editing mezzanine in the background (footer
+progress) and, when done, open the GPU stream ON the mezzanine file — keyed by
+the ORIGINAL source, so playback flips from the CPU tier to pure-GPU streaming
+transparently. Export keeps reading the original (no generation loss).
+"""
+function startmezzanine!(player::Player, source::VideoSource)
+    jobs = get!(() -> Set{String}(), player.fxwidgets, :mezzjobs)
+    source.path in jobs && return nothing
+    push!(jobs, source.path)
+    Threads.@spawn try
+        setstatus!(player, "$(basename(source.path)): preparing editing mezzanine…")
+        player.jobprogress[] = 0.0
+        mezz = generatemezzanine(source;
+            progress = (d, t) -> (player.jobprogress[] = d / max(t, 1)))
+        player.jobprogress[] = NaN
+        gp = player.gpupreview
+        (gp isa GPUPreview && !gp.failed) || return nothing
+        Threads.atomic_add!(player.gpubusy, 1)
+        stream = nothing
+        try
+            stream = openstream(player.analysisbackend, mezz, source.width, source.height;
+                                capacity = GPU_STREAM_CAPACITY)
+            ok = rungpusync(player) do
+                f = frameat!(stream, 0)
+                size(f.y) == (source.width, source.height)
+            end
+            if ok
+                player.gpucache[source] = stream
+                setstatus!(player, "$(basename(source.path)) — GPU streaming via mezzanine")
+                player.playing[] || put!(player.uiqueue, () -> notify(player.playhead))
+            else
+                close(stream)
+            end
+        catch e
+            stream === nothing || (try; close(stream); catch; end)
+            setstatus!(player, "$(basename(source.path)): mezzanine stream failed — CPU decode " *
+                               "($(sprint(showerror, e)))")
+        finally
+            Threads.atomic_sub!(player.gpubusy, 1)
+        end
+    catch e
+        player.jobprogress[] = NaN
+        setstatus!(player, "mezzanine transcode failed: $(sprint(showerror, e))")
+        @error "mezzanine transcode failed" exception = (e, catch_backtrace())
     end
     return nothing
 end

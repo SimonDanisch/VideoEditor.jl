@@ -23,30 +23,41 @@ function VideoSource(path::AbstractString)
     fps = Float64(VideoIO.framerate(reader))
     close(reader)
     duration = VideoIO.get_duration(path)
+    keyframes, npackets = scan_packets(path)
     counted = VideoIO.get_number_frames(path)
-    nframes = counted === nothing ? round(Int, duration * fps) : counted
-    return VideoSource(String(path), width, height, fps, duration, nframes, scan_keyframes(path))
+    nframes = something(counted, npackets > 0 ? npackets : round(Int, duration * fps))
+    # containers may claim a track rate the stream doesn't deliver (YouTube mkv
+    # remuxes report 29.97 while frames actually arrive at 23.976) — when the
+    # true frame count disagrees with duration × claimed rate, the EFFECTIVE
+    # rate is the one every frame↔time mapping (and the proxy check) must use
+    if nframes > 0 && duration > 0 && abs(nframes / duration - fps) / fps > 0.01
+        fps = nframes / duration
+    end
+    return VideoSource(String(path), width, height, fps, duration, nframes, keyframes)
 end
 
 """
-    scan_keyframes(path) -> Vector{Float64}
+    scan_packets(path) -> (keyframe_times::Vector{Float64}, npackets::Int)
 
-Keyframe timestamps in seconds, read from packet flags via ffprobe.
-Demux only — no decoding, fast even for long files.
+Keyframe timestamps in seconds plus the TRUE packet count, read from packet
+flags via ffprobe. Demux only — no decoding, fast even for long files. The
+count is authoritative where containers (mkv!) carry no `nb_frames`.
 """
-function scan_keyframes(path::AbstractString)
+function scan_packets(path::AbstractString)
     cmd = `$(FFMPEG_jll.ffprobe()) -v error -select_streams v:0 -show_entries packet=pts_time,flags -of csv=p=0 $path`
     times = Float64[]
+    n = 0
     for line in eachline(cmd)
         parts = split(line, ',')
         length(parts) >= 2 || continue
+        n += 1
         if occursin('K', parts[2])
             t = tryparse(Float64, parts[1])
             t === nothing || push!(times, t)
         end
     end
     sort!(times)
-    return times
+    return times, n
 end
 
 frametime(src::VideoSource, n::Integer) = n / src.framerate

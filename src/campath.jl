@@ -105,19 +105,25 @@ VideoIO. Feed frames with [`grayinto!`](@ref)/[`hostgray!`](@ref)/[`rgbinto!`](@
 """
 graysource(backend::KA.CPU, source::VideoSource) = GrayReader(source)
 function graysource(backend, source::VideoSource)
-    try
-        s = openstream(backend, source.path, source.width, source.height)
+    mezz = mezzaninepath(source)
+    for path in (source.path, mezz)   # prefer the original; fall back to a mezzanine
+        (path == mezz && !isfile(mezz)) && continue
         try
-            exactframeat!(s, 0)   # probe: `openstream` only demuxes — unsupported
-        catch                     # profiles (e.g. 4:4:4) surface at the first decode
-            close(s)
-            rethrow()
+            s = openstream(backend, path, source.width, source.height)
+            try
+                exactframeat!(s, 0)   # probe: `openstream` only demuxes — unsupported
+            catch                     # profiles (e.g. 4:4:4) surface at the first decode
+                close(s)
+                rethrow()
+            end
+            return StreamGraySource(s, backend)
+        catch e
+            path == mezz &&
+                @warn "GPU stream unavailable for analysis — CPU decode" source exception = e
         end
-        StreamGraySource(s, backend)
-    catch e
-        @warn "GPU stream unavailable for analysis — CPU decode" source = source.path exception = e
-        GrayReader(source)
     end
+    isfile(mezz) || @warn "GPU stream unavailable for analysis — CPU decode" source = source.path
+    return GrayReader(source)
 end
 
 "Decode source frame `sf` into the HOST RGB buffer `frame` (color/loop analyses)."
