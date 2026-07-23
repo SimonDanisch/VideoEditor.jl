@@ -37,6 +37,164 @@ function deoutlier(v::Vector{Float64}, w::Integer, thresh::Real)
 end
 
 # Pass 1: frame-to-frame similarity accumulation via GPU Lucas-Kanade tracking.
+"""
+CPU grayscale source for the analysis passes: VideoIO decode + host grayscale.
+The GPU counterpart is a [`GpuVideoStream`](@ref) — see [`grayinto!`](@ref).
+"""
+struct GrayReader
+    sr::SequentialReader
+    frame::RGBFrame
+    host::Matrix{Float32}
+end
+GrayReader(source::VideoSource) =
+    GrayReader(SequentialReader(source), RGBFrame(undef, source.width, source.height),
+               Matrix{Float32}(undef, source.width, source.height))
+Base.close(r::GrayReader) = close(r.sr)
+
+"""
+GPU grayscale source for the analysis passes: the chunked [`GpuVideoStream`](@ref)
+plus device scratch. Decoded NV12 converts to RGB on-device and THEN to grayscale —
+the same gray the CPU path computes (grayscale of chroma-reconstructed RGB), so the
+CPU/GPU tracks stay in sub-pixel parity; tracking straight on the luma plane
+differs at chroma edges and drifts the comparison.
+"""
+struct StreamGraySource
+    s::GpuVideoStream
+    rgb::Any    # device RGB scratch (source-sized)
+    gray::Any   # device Float32 scratch for host handoff
+end
+StreamGraySource(s::GpuVideoStream, backend) =
+    StreamGraySource(s, KA.allocate(backend, RGB{N0f8}, (s.width, s.height)),
+                     KA.allocate(backend, Float32, (s.width, s.height)))
+Base.close(src::StreamGraySource) = close(src.s)
+
+"""
+    grayinto!(g, decoder, srcframe) -> g
+
+Source frame `srcframe` as Float32 grayscale in `g` (usually a device array), by
+decoder type: a [`StreamGraySource`](@ref) decodes and converts entirely on-device;
+a [`GrayReader`](@ref) decodes via VideoIO on the host and uploads; a prefetched
+device-frame vector converts its RGB in place. All land in the same 0..1 range.
+"""
+function grayinto!(g, src::StreamGraySource, sf::Integer)
+    f = exactframeat!(src.s, sf)
+    nv12torgb!(src.rgb, f.y, f.uv; bt601 = src.s.bt601)
+    grayscale!(g, src.rgb)
+    return g
+end
+grayinto!(g, r::GrayReader, sf::Integer) =
+    (readframe!(r.frame, r.sr, sf); grayscale!(r.host, r.frame); copyto!(g, r.host); g)
+grayinto!(g, frames::AbstractVector, sf::Integer) = (grayscale!(g, frames[sf + 1]); g)
+
+"Like [`grayinto!`](@ref) but into a HOST matrix (NCC template cutting needs it)."
+hostgray!(host::Matrix{Float32}, src::StreamGraySource, sf::Integer) =
+    (grayinto!(src.gray, src, sf); copyto!(host, src.gray); host)
+hostgray!(host::Matrix{Float32}, r::GrayReader, sf::Integer) =
+    (readframe!(r.frame, r.sr, sf); grayscale!(host, r.frame); host)
+hostgray!(host::Matrix{Float32}, frames::AbstractVector, sf::Integer) =
+    (grayscale!(host, Array(frames[sf + 1])); host)
+
+"""
+    graysource(backend, source) -> StreamGraySource | GrayReader
+
+Frame source for an analysis pass over `source`: a GPU backend decodes through
+its own chunked [`GpuVideoStream`](@ref) (falling back to VideoIO with a warning
+when the stream won't open — unsupported codec, VRAM); the CPU backend reads via
+VideoIO. Feed frames with [`grayinto!`](@ref)/[`hostgray!`](@ref)/[`rgbinto!`](@ref);
+`close` when done.
+"""
+graysource(backend::KA.CPU, source::VideoSource) = GrayReader(source)
+function graysource(backend, source::VideoSource)
+    try
+        s = openstream(backend, source.path, source.width, source.height)
+        try
+            exactframeat!(s, 0)   # probe: `openstream` only demuxes — unsupported
+        catch                     # profiles (e.g. 4:4:4) surface at the first decode
+            close(s)
+            rethrow()
+        end
+        StreamGraySource(s, backend)
+    catch e
+        @warn "GPU stream unavailable for analysis — CPU decode" source = source.path exception = e
+        GrayReader(source)
+    end
+end
+
+"Decode source frame `sf` into the HOST RGB buffer `frame` (color/loop analyses)."
+rgbinto!(frame::RGBFrame, r::GrayReader, sf::Integer) = (readframe!(frame, r.sr, sf); frame)
+function rgbinto!(frame::RGBFrame, src::StreamGraySource, sf::Integer)
+    f = exactframeat!(src.s, sf)
+    nv12torgb!(src.rgb, f.y, f.uv; bt601 = src.s.bt601)
+    copyto!(frame, src.rgb)
+    return frame
+end
+
+"RGB frame of `sf` ON the decoder's backend for whole-frame reductions: the
+stream converts into its device scratch (nothing crosses the bus); the reader
+returns its host frame."
+function rgbframe!(src::StreamGraySource, sf::Integer)
+    f = exactframeat!(src.s, sf)
+    nv12torgb!(src.rgb, f.y, f.uv; bt601 = src.s.bt601)
+    return src.rgb
+end
+rgbframe!(r::GrayReader, sf::Integer) = (readframe!(r.frame, r.sr, sf); r.frame)
+
+"""
+    smallrgbinto!(small, ws, decoder, sf) -> small
+
+Area-averaged downscale of source frame `sf` into the HOST `small` (loop
+matching): the stream converts + downscales on-device and only the small
+frame crosses the bus; the reader decodes and downscales on the host.
+"""
+function smallrgbinto!(small::RGBFrame, ws, src::StreamGraySource, sf::Integer)
+    f = exactframeat!(src.s, sf)
+    nv12torgb!(src.rgb, f.y, f.uv; bt601 = src.s.bt601)
+    areadownscale!(ws.small, src.rgb)
+    copyto!(small, ws.small)
+    return small
+end
+smallrgbinto!(small::RGBFrame, ws, r::GrayReader, sf::Integer) =
+    (readframe!(r.frame, r.sr, sf); copyto!(small, downscale(r.frame, size(small)...)); small)
+
+"Downscale staging for [`smallrgbinto!`](@ref) — device scratch for a stream."
+smallrgbws(src::StreamGraySource, backend, dims) =
+    (small = KA.allocate(backend, RGB{N0f8}, dims),)
+smallrgbws(r::GrayReader, backend, dims) = NamedTuple()
+
+"""
+    smallgrayinto!(g, ws, decoder, sf) -> g
+
+Downscaled Float32 grayscale of source frame `sf` into `g` for the flow
+analyses, staged through the workspace from [`smallgrayws`](@ref): a stream
+decodes, downscales and grays entirely on-device; a [`GrayReader`](@ref) stays
+on the host and uploads only the small gray.
+"""
+function smallgrayinto!(g, ws, src::StreamGraySource, sf::Integer)
+    f = exactframeat!(src.s, sf)
+    nv12torgb!(src.rgb, f.y, f.uv; bt601 = src.s.bt601)
+    warp!(ws.small, src.rgb, (0.0, 0.0, 1.0, 1.0))
+    grayscale!(g, ws.small)
+    return g
+end
+function smallgrayinto!(g, ws, r::GrayReader, sf::Integer)
+    readframe!(r.frame, r.sr, sf)
+    warp!(ws.small, r.frame, (0.0, 0.0, 1.0, 1.0))
+    grayscale!(ws.gray, ws.small)
+    copyto!(g, ws.gray)
+    return g
+end
+
+"Downscale staging buffers for [`smallgrayinto!`](@ref), on the decoder's side of the bus."
+smallgrayws(src::StreamGraySource, backend, dims) =
+    (small = KA.allocate(backend, RGB{N0f8}, dims),)
+smallgrayws(r::GrayReader, backend, dims) =
+    (small = RGBFrame(undef, dims...), gray = Matrix{Float32}(undef, dims...))
+
+"Host copy of an analysis frame for host-side work (template cutting) —
+already-host arrays pass through untouched."
+hostcopy(g::Matrix{Float32}) = g
+hostcopy(g) = Array(g)
+
 function trackcampath(clip::Clip, n::Integer; window::Integer, iters::Integer,
                       minfeatures::Integer, maxfeatures::Integer, ransacpx::Real,
                       fbmax::Real, redetectevery::Integer, backend, progress, frames = nothing)
@@ -44,16 +202,8 @@ function trackcampath(clip::Clip, n::Integer; window::Integer, iters::Integer,
     W, H = source.width, source.height
     g0 = KA.allocate(backend, Float32, (W, H)); g1 = similar(g0)
     ix0 = similar(g0); iy0 = similar(g0); ix1 = similar(g0); iy1 = similar(g0)
-    # `frames` (device-resident RGB, whole source) → Rec.709 grayscale on the GPU;
-    # otherwise CPU decode + the same grayscale + upload. Identical grayscale on both
-    # paths (GPU RGB matches VideoIO to ~1 level), so tracking is unchanged.
-    usevio = frames === nothing
-    sr = usevio ? SequentialReader(source) : nothing
-    frame = usevio ? RGBFrame(undef, W, H) : nothing
-    host = usevio ? Matrix{Float32}(undef, W, H) : nothing
-    loadgray!(g, k) = usevio ?
-        (readframe!(frame, sr, clip.src_in + k - 1); grayscale!(host, frame); copyto!(g, host)) :
-        grayscale!(g, frames[clip.src_in + k])
+    dec = frames === nothing ? GrayReader(source) : frames
+    loadgray!(g, k) = grayinto!(g, dec, clip.src_in + k - 1)
     transforms = fill(Mat3f(1, 0, 0, 0, 1, 0, 0, 0, 1), n)
     try
         loadgray!(g0, 1)
@@ -100,7 +250,7 @@ function trackcampath(clip::Clip, n::Integer; window::Integer, iters::Integer,
             progress === nothing || (k % 30 == 0 && progress(k, 2n))
         end
     finally
-        usevio && close(sr)
+        frames === nothing && close(dec)
     end
     return transforms
 end
@@ -111,31 +261,19 @@ function refinecampath(clip::Clip, seed::Vector{Mat3f}, n::Integer; window::Inte
                        maxfeatures::Integer, backend, progress, frames = nothing)
     source = clip.source
     W, H = source.width, source.height
-    usevio = frames === nothing
-    sr = usevio ? SequentialReader(source) : nothing
-    frame = usevio ? RGBFrame(undef, W, H) : nothing
+    dec = frames === nothing ? GrayReader(source) : frames
     host = Matrix{Float32}(undef, W, H)   # PatchTracker (template cut) needs host
-    # GPU path: grayscale each RGB frame on-device and hand matchpatches! the device
-    # array — it copies device→device (no per-frame host download / re-upload).
-    dg = usevio ? nothing : KA.allocate(backend, Float32, (W, H))
+    dg = KA.allocate(backend, Float32, (W, H))
     A = copy(seed)
     try
-        if usevio
-            readframe!(frame, sr, clip.src_in); grayscale!(host, frame)
-        else
-            grayscale!(host, Array(frames[clip.src_in + 1]))   # one download, for the templates
-        end
+        hostgray!(host, dec, clip.src_in)
         dg0 = KA.allocate(backend, Float32, (W, H)); copyto!(dg0, host)
         feats = goodfeatures(backend, dg0; maxpoints = maxfeatures, border = radius + window)
         length(feats) >= 6 || return A
         tracker = PatchTracker(backend, host, feats; window = window,
                                maxradius = radius + 18, minstd = 0.0)
         for k in 2:n
-            gray = if usevio
-                readframe!(frame, sr, clip.src_in + k - 1); grayscale!(host, frame); host
-            else
-                grayscale!(dg, frames[clip.src_in + k]); dg
-            end
+            gray = grayinto!(dg, dec, clip.src_in + k - 1)
             good = [m for m in matchpatches!(tracker, gray, seed[k]; radius = radius)
                     if m.score >= minscore && m.margin >= minmargin]
             if length(good) >= 6
@@ -145,7 +283,7 @@ function refinecampath(clip::Clip, seed::Vector{Mat3f}, n::Integer; window::Inte
             progress === nothing || (k % 30 == 0 && progress(n + k, 2n))
         end
     finally
-        usevio && close(sr)
+        frames === nothing && close(dec)
     end
     return A
 end
@@ -168,27 +306,18 @@ function similaritypath!(clip::Clip; window::Integer = 11, iters::Integer = 15,
                          backend = KA.CPU(), progress = nothing)
     n = cliplength(clip)
     n >= 2 || return nothing
-    # Decode the whole source GPU-resident once (RGB), reused by both passes (no
-    # per-frame CPU decode / grayscale / upload). Falls back to CPU decode for
-    # unsupported streams (non-4:2:0, single-reference) or non-Lava backends.
-    frames = nothing
-    if gpu_decode_available(backend)
-        try
-            w, h, fr = gpu_decode_rgb(backend, clip.source.path)
-            if (w, h) == (clip.source.width, clip.source.height) && length(fr) >= clip.src_in + n
-                frames = fr
-            end
-        catch
-            frames = nothing
-        end
-    end
+    # Feed both passes from the backend's frame source: on the GPU the chunked
+    # stream decodes on-device with bounded VRAM. Replaces the old whole-source
+    # RGB predecode, which needed ~GBs and fell back to CPU decode on long
+    # clips — leaving the analysis decode-bound at high resolutions.
+    frames = graysource(backend, clip.source)
     A = try
         A = trackcampath(clip, n; window, iters, minfeatures, maxfeatures, ransacpx,
                          fbmax, redetectevery, backend, progress, frames)
         refinecampath(clip, A, n; window = refwindow, radius = refradius, minscore = 0.5,
                       minmargin = 0.05, thresh = 2.0, maxfeatures = 400, backend, progress, frames)
     finally
-        gpu_free_frames!(frames)   # release the ~GBs of GPU-resident frames now
+        close(frames)
     end
     # scrub single-frame glitches in (scale, rotation, translation) — WITHOUT
     # attenuating real motion, which a lock must fully cancel rather than smooth

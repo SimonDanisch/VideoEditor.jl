@@ -81,35 +81,49 @@ function composetiles(trange, vrange, pps, bandheight, s0, thumbs, (tw, th), fal
     lo, hi = max(t0, vrange[1]), min(t1, vrange[2])
     (lo < hi && pps > 0) || return (placeholder(), (t0, t0 + 1.0e-6), false)
 
-    spacing = 2.0^clamp(ceil(Int, log2(tw / pps)), -6, 12)
-    # the whole strip is stretched uniformly to its on-screen rectangle, so the
-    # tile CANVAS must carry the slot's screen aspect for the thumbnail to keep
-    # its own. A full tile's slot is (spacing*pps) px wide × bandheight px tall.
-    slotaspect = spacing * pps / max(bandheight, 1.0)
-    thumbaspect = tw / th
-    Wc, Hc = slotaspect >= thumbaspect ?
-             (max(round(Int, th * slotaspect), tw), th) :        # pillarbox
-             (tw, max(round(Int, tw / slotaspect), th))          # letterbox
-    firsttile = max(floor(Int, (lo - t0) / spacing), 0)
-    lasttile = floor(Int, (hi - t0 - 1.0e-9) / spacing)
+    # a gapless, UNDISTORTED filmstrip: every tile keeps the frame's aspect at
+    # the lane height, so the tile pitch (in seconds) is exactly the width an
+    # aspect-correct lane-height tile covers on screen — zooming in repeats
+    # frames, zooming out skips them, tiles always butt against each other
+    pitch = max(bandheight, 8.0) * (tw / th) / pps
+    firsttile = max(floor(Int, (lo - t0) / pitch), 0)
+    lasttile = floor(Int, (hi - t0 - 1.0e-9) / pitch)
+    lasttile = min(lasttile, firsttile + 600)   # runaway guard at absurd zoom
     parts = Matrix{RGB{N0f8}}[]
     for k in firsttile:lasttile
-        second = floor(Int, s0 + k * spacing)
+        second = floor(Int, s0 + k * pitch)
         img = something(thumbs === nothing ? nothing : thumbs(second), placeholder())
-        w = Wc
-        tilend = t0 + (k + 1) * spacing
+        tilend = t0 + (k + 1) * pitch
         if tilend > t1  # partial tail tile at a cut: slice, don't squeeze
-            frac = (t1 - (t0 + k * spacing)) / spacing
+            frac = (t1 - (t0 + k * pitch)) / pitch
             img = img[1:max(round(Int, size(img, 1) * frac), 1), :]
-            w = max(round(Int, Wc * frac), 1)
         end
-        push!(parts, fittile(img, w, Hc, fill3))
+        push!(parts, collect(img))
     end
     isempty(parts) && return (placeholder(), (t0, t0 + 1.0e-6), false)
     strip = vcat(parts...)  # (w, h) layout: horizontal concat is along dim 1
-    xstart = t0 + firsttile * spacing
-    xend = min(t0 + (lasttile + 1) * spacing, t1)
+    xstart = t0 + firsttile * pitch
+    xend = min(t0 + (lasttile + 1) * pitch, t1)
     return (strip, (xstart, xend), true)
+end
+
+"Fill a `Wc × Hc` canvas with `img` scaled-to-cover and center-cropped
+(aspect-preserving, no padding) — filmstrip tiles butt against each other."
+function covertile(img::AbstractMatrix{RGB{N0f8}}, Wc::Integer, Hc::Integer)
+    iw, ih = size(img)
+    (iw == Wc && ih == Hc) && return collect(img)
+    s = max(Wc / iw, Hc / ih)
+    x0 = (iw - Wc / s) / 2
+    y0 = (ih - Hc / s) / 2
+    canvas = Matrix{RGB{N0f8}}(undef, Wc, Hc)
+    for j in 1:Hc
+        sj = clamp(ceil(Int, y0 + j / s), 1, ih)
+        for i in 1:Wc
+            si = clamp(ceil(Int, x0 + i / s), 1, iw)
+            canvas[i, j] = img[si, sj]
+        end
+    end
+    return canvas
 end
 
 "Center `img` in a `Wc × Hc` canvas, padding with `fill3` (aspect-preserving)."

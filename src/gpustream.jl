@@ -45,32 +45,158 @@ mutable struct GpuVideoStream
     ring      ::Dict{Int, Nv12Frame}      # display-frame index → VRAM NV12 frame
     resident  ::Vector{Int}               # resident GOP indices, LRU order (front = oldest)
     capacity  ::Int
+    dec       ::Any                       # lazy persistent Lava H264Decoder (chroma)
+    feedgop   ::Int                       # GOP being incrementally decoded (0 = none)
+    feednext  ::Int                       # display index the active feed emits next
 end
 
 "Total display frames in the stream."
 nframes(s::GpuVideoStream) = isempty(s.gops) ? 0 : s.gops[end].firstframe + s.gops[end].nframes
 
+"Whether display frame `n` is decoded and VRAM-resident right now."
+hasframe(s::GpuVideoStream, n::Integer) = haskey(s.ring, n)
+
 """
-    openstream(backend, path, width, height; capacity=120) -> GpuVideoStream
+    openstream(backend, path, width, height; capacity=120, vrambudget=3 * 2^30) -> GpuVideoStream
 
 Demux `path` to an Annex-B temp file, `mmap` it, and index its GOPs. `width`×`height`
-is the display size (from the source). `capacity` bounds VRAM-resident frames. Pure
-CPU — no decode happens until [`frameat!`](@ref).
+is the display size (from the source). Pure CPU — no decode happens until
+[`frameat!`](@ref).
+
+`capacity` is a FLOOR for the VRAM-resident frame count: a GOP decodes as a unit, so
+the ring is sized to hold TWO of the stream's largest GOPs (current + prefetched next)
+— a smaller ring would evict the very GOP being played and re-decode it every present.
+`vrambudget` caps that in bytes — but grows itself to the decode-ahead need when the
+driver reports enough free device memory (a stingy default must not hitch a 20 GB
+card). If even one GOP exceeds the final budget the stream refuses to open (the
+caller falls back to CPU decode) rather than thrash.
 """
 function openstream(backend::LavaBackend, path::AbstractString, width::Integer, height::Integer;
-                    capacity::Integer = 120)
+                    capacity::Integer = 120, vrambudget::Integer = 3 * 2^30)
     tmp = tempname() * ".h264"
     run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -v error -i $path -map 0:v:0 -c:v copy -bsf:v h264_mp4toannexb -f h264 $tmp`))
     io = open(tmp, "r")
     bits = Mmap.mmap(io, Vector{UInt8})
     close(io)
     gops, lead = index_gops(bits)
+    # honor the container's EDIT LIST: the mp4 may cut leading coded frames (phone
+    # footage typically trims a couple) — every other decoder (ffmpeg, VideoIO,
+    # players) shows the video WITHOUT them, so the raw Annex-B stream must shift
+    # its display indexing accordingly or the app's two decode paths disagree
+    skip = editlistlead(path)
+    skip > 0 && (gops = [Gop(g.bytes, g.firstframe - skip, g.nframes) for g in gops])
+    maxgop = maximum(g -> g.nframes, gops)
+    framebytes = Int(width) * Int(height) * 3 ÷ 2
+    # decode-ahead needs 2 GOPs (+ prefetch margin) resident: a conservative
+    # `vrambudget` must not cause GOP-boundary hitches when the card has the
+    # headroom — grow it whenever the driver reports twice the need free
+    budget = Int(vrambudget)
+    need = (2 * maxgop + 8) * framebytes
+    if need > budget
+        free = freedevicevram(backend)
+        free > 2 * need && (budget = need)
+    end
+    fit = max(budget ÷ framebytes, 1)   # NV12 frames in budget
+    maxgop <= fit || error("largest GOP ($maxgop frames) exceeds the VRAM budget " *
+                           "($fit frames) — staying on CPU decode")
+    cap = min(max(Int(capacity), 2 * maxgop), fit)
+    cap < 2 * maxgop &&
+        @warn "VRAM too tight for decode-ahead — expect brief GOP-boundary hitches" maxgop fit
     return GpuVideoStream(backend, tmp, bits, lead, gops, Int(width), Int(height),
-                          video_is_bt601(path), Dict{Int, Nv12Frame}(), Int[], Int(capacity))
+                          video_is_bt601(path), Dict{Int, Nv12Frame}(), Int[], cap,
+                          nothing, 0, 0)
+end
+
+"""
+Free device-local VRAM in bytes — the driver's budget minus its usage
+(VK_EXT_memory_budget); half the heap size when the extension is missing,
+0 when no context is up (callers treat that as "don't grow").
+"""
+function freedevicevram(backend::LavaBackend)
+    try
+        heaps = Lava.probe_device_memory_budget(Lava.vk_context())
+        free = 0
+        for h in heaps
+            h.device_local || continue
+            avail = h.budget > 0 ? h.budget - h.usage : h.size ÷ 2
+            free = max(free, avail)
+        end
+        return free
+    catch
+        return 0
+    end
 end
 
 "NAL type of the NAL whose 3-byte start code begins at `i` (0 if out of range)."
 naltype(bits, i) = i + 3 <= length(bits) ? (bits[i + 3] & 0x1f) : 0x00
+
+"""
+    editlistlead(path) -> Int
+
+Leading video frames the mp4's EDIT LIST actually cuts off. An `elst` whose
+`media_time` merely equals the first sample's composition offset (`ctts`) is the
+standard B-frame pts alignment and trims NOTHING — only the excess beyond that
+offset is a real trim: `(media_time - first_ctts) ÷ sample_delta`. Read straight
+from the container boxes; 0 without an edit list (or a non-mp4 container).
+"""
+function editlistlead(path::AbstractString)
+    bytes = try
+        open(io -> Mmap.mmap(io, Vector{UInt8}), path)   # moov sits at either end — walk it all
+    catch
+        return 0
+    end
+    be32(o) = (Int(bytes[o]) << 24) | (Int(bytes[o+1]) << 16) | (Int(bytes[o+2]) << 8) | Int(bytes[o+3])
+    boxtype(o) = String(bytes[o+4:o+7])
+    # walk boxes for the VIDEO track's edts/elst media_time and stts sample delta
+    function walk(f, lo, hi, want)
+        o = lo
+        while o + 8 <= hi
+            sz = be32(o)
+            body = o + 8                                    # after size + type
+            if sz == 1                                      # 64-bit largesize (mdat)
+                o + 16 <= hi || return
+                sz = (Int(be32(o + 8)) << 32) | be32(o + 12)
+                body = o + 16
+            elseif sz == 0                                  # box extends to EOF
+                sz = hi - o + 1
+            end
+            sz < 8 && return
+            boxtype(o) == want && f(body, min(o + sz - 1, hi))
+            o += sz
+        end
+    end
+    lead = 0
+    walk(1, length(bytes) - 7, "moov") do mlo, mhi
+        walk(mlo, mhi, "trak") do tlo, thi
+            isvideo = Ref(false); mtime = Ref(0); delta = Ref(0); ctts0 = Ref(0)
+            walk(tlo, thi, "mdia") do dlo, dhi
+                walk(dlo, dhi, "hdlr") do hlo, hhi
+                    hlo + 11 <= hhi && String(bytes[hlo+8:hlo+11]) == "vide" && (isvideo[] = true)
+                end
+                walk(dlo, dhi, "minf") do ilo, ihi
+                    walk(ilo, ihi, "stbl") do slo, shi
+                        walk(slo, shi, "stts") do xlo, xhi
+                            xlo + 15 <= xhi && (delta[] = be32(xlo + 12))   # first entry's sample delta
+                        end
+                        walk(slo, shi, "ctts") do xlo, xhi
+                            xlo + 15 <= xhi && (ctts0[] = be32(xlo + 12))  # first composition offset
+                        end
+                    end
+                end
+            end
+            walk(tlo, thi, "edts") do elo, ehi
+                walk(elo, ehi, "elst") do llo, lhi
+                    llo + 15 <= lhi || return
+                    version = bytes[llo]
+                    mtime[] = version == 1 ? Int(be32(llo + 16)) << 32 | be32(llo + 20) :
+                                             be32(llo + 12)    # first entry's media_time
+                end
+            end
+            isvideo[] && delta[] > 0 && (lead = max(0, mtime[] - ctts0[]) ÷ delta[])
+        end
+    end
+    return lead
+end
 
 """
 Index the Annex-B `bits` into closed GOPs at IDR (type 5) boundaries — each GOP backed
@@ -126,41 +252,126 @@ function gopof(s::GpuVideoStream, n::Integer)
 end
 
 """
-    frameat!(s, n) -> Nv12Frame
+    frameat!(s, n; prefetch=false) -> Nv12Frame
 
-The device-resident NV12 frame at display index `n`. Decodes its owning GOP into the
-ring on a miss (evicting the least-recently-used GOP to stay within `capacity`), and
-prefetches the next GOP for smooth forward playback. Runs on the caller's GPU thread.
+The device-resident NV12 frame at display index `n`, decoded INCREMENTALLY: a miss
+starts (or continues) a chunked feed of `n`'s GOP through the stream's persistent
+[`Lava.VideoDecode.H264Decoder`] — at most ~5 chunks (≈90 ms) per call, then the
+nearest already-decoded frame is served. Callers that need exactness poll
+[`hasframe`](@ref) and re-present (the player's retry loop refines a scrub to the
+exact frame across a few calls instead of stalling one call for a whole GOP).
+
+With `prefetch` (pass it during sequential playback) the NEXT GOP starts feeding
+once `n` is half-way into the current one, and every present advances the feed by a
+~10 ms chunk — a 250-frame GOP decodes spread invisibly across ~2 s of playback
+instead of as one ~600 ms stall at the boundary. Runs on the caller's GPU thread.
 """
-function frameat!(s::GpuVideoStream, n::Integer)
+function frameat!(s::GpuVideoStream, n::Integer; prefetch::Bool = false)
     g = gopof(s, n)
-    haskey(s.ring, n) ? touchgop!(s, g) : decodegop!(s, g)
-    g < length(s.gops) && prefetchgop!(s, g + 1)   # keep playback ahead by one GOP
-    return get(s.ring, n, s.ring[clamp(n, s.gops[g].firstframe, s.gops[g].firstframe + s.gops[g].nframes - 1)])
+    gop = s.gops[g]
+    if haskey(s.ring, n)
+        touchgop!(s, g)
+    else
+        if s.feedgop != g
+            abandonfeed!(s)
+            startfeed!(s, g)
+        end
+        spent = 0
+        while !haskey(s.ring, n) && s.feedgop == g && spent < 5
+            decodechunk!(s) == 0 && break
+            spent += 1
+        end
+    end
+    if prefetch
+        # as soon as nothing is in flight, chain the NEXT GOP's feed — maximal runway
+        # (startfeed!'s LRU eviction makes the room; the played GOP stays touched-recent)
+        if s.feedgop == 0 && g < length(s.gops) && !(g + 1 in s.resident) &&
+           s.gops[g + 1].nframes <= s.capacity
+            startfeed!(s, g + 1)
+        end
+        s.feedgop == 0 || decodechunk!(s; frames = 4)   # ~10 ms of ahead-work per present
+    end
+    haskey(s.ring, n) && return s.ring[n]
+    # nearest decoded frame of this GOP (feeds fill front-to-back, so search outward)
+    for k in 1:gop.nframes
+        for m in (n - k, n + k)
+            gop.firstframe <= m < gop.firstframe + gop.nframes &&
+                haskey(s.ring, m) && return s.ring[m]
+        end
+    end
+    decodechunk!(s)                       # freshly-started feed: land the first chunk
+    return s.ring[gop.firstframe]
 end
 
-"Decode GOP `g` fully into the ring (no-op if already resident), then evict LRU GOPs."
-function decodegop!(s::GpuVideoStream, g::Integer)
-    if g in s.resident
-        touchgop!(s, g); return nothing
+"""
+    exactframeat!(s, n) -> Nv12Frame
+
+The frame at display index `n`, decoding as much as it takes — the sequential-
+export counterpart to the latency-bounded [`frameat!`](@ref): no approximate
+serves, no decode-ahead margin. Errors if the stream cannot produce the frame
+(truncated bitstream) instead of silently substituting a neighbour.
+"""
+function exactframeat!(s::GpuVideoStream, n::Integer)
+    g = gopof(s, n)
+    if !haskey(s.ring, n)
+        s.feedgop == g || (abandonfeed!(s); startfeed!(s, g))
+        while !haskey(s.ring, n) && s.feedgop == g
+            # no latency budget here — large chunks amortize the per-submit wait
+            decodechunk!(s; frames = 32) == 0 && break
+        end
+        haskey(s.ring, n) || error("stream could not decode frame $n (GOP $g)")
+    end
+    touchgop!(s, g)
+    return s.ring[n]
+end
+
+"Begin the incremental feed of GOP `g` on the stream's persistent decode session."
+function startfeed!(s::GpuVideoStream, g::Integer)
+    if s.dec === nothing
+        params = isempty(s.leadparams) ? s.bitstream[s.gops[1].bytes] : s.leadparams
+        s.dec = Lava.VideoDecode.H264Decoder(Lava.vk_context(), params; chroma = true)
     end
     gop = s.gops[g]
     bytes = s.bitstream[gop.bytes]
     naltype(bytes, 1) == 0x07 || (bytes = vcat(s.leadparams, bytes))   # ensure SPS/PPS present
-    _, _, ys, uvs = Lava.decode_h264_nv12(bytes)
-    for k in eachindex(ys)
-        idx = gop.firstframe + k - 1
-        s.ring[idx] = Nv12Frame(ys[k], uvs[k])
-    end
-    push!(s.resident, g)
-    evict!(s)
+    Lava.VideoDecode.feed!(s.dec, bytes)
+    s.feedgop = g
+    s.feednext = gop.firstframe
+    g in s.resident || push!(s.resident, g)   # partially resident from the first chunk on
+    evict!(s)   # abandoned partial GOPs must not accumulate (scrubs retarget feeds often)
     return nothing
 end
 
-"Decode GOP `g` ahead of time if not resident and there's room (best-effort prefetch)."
-function prefetchgop!(s::GpuVideoStream, g::Integer)
-    (g in s.resident || length(s.ring) + s.gops[g].nframes > s.capacity) && return nothing
-    decodegop!(s, g)
+"""
+Advance the active feed by up to `frames` access units, moving display-ready frames
+into the ring. Emitted frames are display-contiguous (verified bit-exact against the
+batch decoder), so ring indices just count up from the GOP's first frame. Returns
+the number of frames landed; completes the feed (and applies eviction) at GOP end.
+"""
+function decodechunk!(s::GpuVideoStream; frames::Integer = 7)
+    s.feedgop == 0 && return 0
+    out = Lava.VideoDecode.decodemore!(s.dec, frames)
+    for (y, uv) in out
+        idx = s.feednext
+        s.feednext += 1
+        idx < 0 && continue   # edit-list lead-in: decoded (refs need it), never shown
+        s.ring[idx] = Nv12Frame(y, uv)
+    end
+    if Lava.VideoDecode.remaining(s.dec) == 0
+        s.feedgop = 0
+        evict!(s)
+    end
+    return length(out)
+end
+
+"Drop an unfinished feed (scrub retargeted): decoded-but-unemitted frames can't be
+placed without their display predecessors, so they are discarded with the tail."
+function abandonfeed!(s::GpuVideoStream)
+    s.feedgop == 0 && return nothing
+    empty!(s.dec.pending)
+    empty!(s.dec.aus)
+    s.dec.nextau = 1
+    s.feedgop = 0
     return nothing
 end
 
@@ -187,6 +398,8 @@ function evict!(s::GpuVideoStream)
 end
 
 function Base.close(s::GpuVideoStream)
+    s.dec === nothing || (close(s.dec); s.dec = nothing)
+    s.feedgop = 0
     for f in values(s.ring); Lava.unsafe_free!(f.y); Lava.unsafe_free!(f.uv); end
     empty!(s.ring); empty!(s.resident)
     finalize(s.bitstream)                       # unmap

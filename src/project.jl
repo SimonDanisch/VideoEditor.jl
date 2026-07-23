@@ -42,6 +42,7 @@ function clipdict(clip::Clip)
     if clip.colortrack !== nothing
         cd["colortrack"] = Dict{String, Any}(
             "src_in" => clip.colortrack.src_in,
+            "strength" => Float64(clip.colortrack.strength),
             "gains" => [Float64.(collect(g)) for g in clip.colortrack.gains],
             "offsets" => [Float64.(collect(o)) for o in clip.colortrack.offsets])
     end
@@ -82,7 +83,8 @@ function loadproject(path::AbstractString)
             ct = cd["colortrack"]
             clip.colortrack = ColorTrack(
                 [Vec3f(Float32.(v)...) for v in ct["gains"]],
-                [Vec3f(Float32.(v)...) for v in ct["offsets"]], Int(ct["src_in"]))
+                [Vec3f(Float32.(v)...) for v in ct["offsets"]], Int(ct["src_in"]),
+                Float32(get(ct, "strength", 1.0)))   # absent in older project files
         end
         for (key, ad) in get(cd, "animations", Dict{String, Any}())
             clip.animations[Symbol(key)] = AnimCurve(

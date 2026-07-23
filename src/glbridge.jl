@@ -17,34 +17,55 @@
 # falls back to the CPU path (with a status message) — `gpupreview` can
 # never make the editor worse than the default.
 
-"Per-resolution GPU presentation state (see `presentgpu!`)."
+"Per-resolution GPU presentation state (see `presentgpu!`). The shared image is
+DOUBLE-BUFFERED: GLMakie's render loop runs as a concurrent task, so blitting
+into the texture it is currently sampling tears — visible as a glitched frame
+whenever consecutive frames differ strongly (a stabilization warp!). Each
+present blits into the texture GLMakie is NOT showing, then swaps."
 mutable struct GPUPreview
     width::Int
     height::Int
     failed::Bool
     inline::Bool   # Lava context is owned by the main thread → run jobs inline
     # worker-owned (Lava)
-    packed::Any     # LavaArray{UInt32,1} — RGBA pack scratch for the blit
-    eimage::Any     # Lava.ExternalImage
-    engine::Any     # FxEngine — owns the effect graph's reusable device buffers
+    packed::Any          # LavaArray{UInt32,1} — RGBA pack scratch for the blit
+    eimages::Vector{Any} # 2 Lava.ExternalImage back/front buffers
+    engine::Any          # FxEngine — owns the effect graph's reusable device buffers
     # main-thread-owned (GL)
-    texid::UInt32
+    gltex::Vector{Any}   # the 2 imported GL texture wrappers
+    cur::Int             # index (1/2) of the buffer GLMakie currently samples
+    doublebuffer::Bool   # live A/B switch: false = pre-2026-07-22 single-buffer blit
+    origtex::Any         # the plot's OWN texture — restored whenever the CPU `frame`
+                         # path presents (scrub thumbs, gap fills, CPU fallback):
+                         # GLMakie's notify-upload writes into the texture the render
+                         # object holds, and uploading linear CPU pixels into the
+                         # imported optimal-tiled external texture shreds the image
 end
-GPUPreview() = GPUPreview(0, 0, false, false, nothing, nothing, nothing, UInt32(0))
+GPUPreview() = GPUPreview(0, 0, false, false, nothing, Any[], nothing, Any[], 1, true, nothing)
 
-"Run `f` on the player's pinned GPU worker and wait for its result."
-function rungpusync(f::Function, player::Player)
-    done = Channel{Any}(1)
-    rungpu(player) do
-        try
-            put!(done, (true, f()))
-        catch e
-            put!(done, (false, e))
+"""
+Run `f` on the player's pinned GPU worker and wait for its result. `long = true`
+marks jobs that hold the worker for more than a frame period (stream warmup,
+cold kernel compiles): while any is queued or running, `gpuready` turns false
+and presents take the CPU lane instead of stalling behind it in the job queue.
+"""
+function rungpusync(f::Function, player::Player; long::Bool = false)
+    long && Threads.atomic_add!(player.gpubusy, 1)
+    try
+        done = Channel{Any}(1)
+        rungpu(player) do
+            try
+                put!(done, (true, f()))
+            catch e
+                put!(done, (false, e))
+            end
         end
+        ok, val = take!(done)
+        ok || throw(val)
+        return val
+    finally
+        long && Threads.atomic_sub!(player.gpubusy, 1)
     end
-    ok, val = take!(done)
-    ok || throw(val)
-    return val
 end
 
 """
@@ -78,44 +99,52 @@ current before its texture is replaced).
 function setupgpupreview!(player::Player, gp::GPUPreview, W::Integer, H::Integer)
     # VideoEditor doesn't depend on Lava — reach it through the backend's module
     lavamod = parentmodule(typeof(player.analysisbackend))
-    fd, allocsize = rungpuowned(player, gp) do
+    fds = rungpuowned(player, gp) do
         backend = player.analysisbackend
         gp.engine !== nothing && emptyengine!(gp.engine)   # drop old-resolution graph buffers
         gp.engine = nothing
         gp.packed = KA.allocate(backend, UInt32, Int(W) * Int(H))   # RGBA pack scratch
-        gp.eimage = lavamod.ExternalImage(W, H)
-        (lavamod.memoryfd(gp.eimage), gp.eimage.allocation_size)
+        empty!(gp.eimages)
+        map(1:2) do _   # double buffer: blit into one while GL samples the other
+            img = lavamod.ExternalImage(W, H)
+            push!(gp.eimages, img)
+            (lavamod.memoryfd(img), img.allocation_size)
+        end
     end
 
-    # GL side: import the fd and swap the preview plot's texture (main thread)
+    # GL side: import both fds and swap the preview plot's texture (main thread)
     screen = player.screen
     GLMakie.GLFW.MakeContextCurrent(screen.glscreen)
     getfn(n) = GLMakie.GLFW.GetProcAddress(n)
     GL = GLMakie.ModernGL
-    mo = Ref{UInt32}(0)
-    ccall(getfn("glCreateMemoryObjectsEXT"), Cvoid, (Int32, Ptr{UInt32}), 1, mo)
-    ccall(getfn("glMemoryObjectParameterivEXT"), Cvoid, (UInt32, UInt32, Ptr{Int32}),
-          mo[], 0x9581, Ref{Int32}(1))                       # DEDICATED = TRUE
-    ccall(getfn("glImportMemoryFdEXT"), Cvoid, (UInt32, UInt64, UInt32, Int32),
-          mo[], UInt64(allocsize), 0x9586, Int32(fd))        # consumes the fd
-    texid = Ref{UInt32}(0)
-    GL.glGenTextures(1, texid)
-    GL.glBindTexture(GL.GL_TEXTURE_2D, texid[])
-    GL.glTexParameteri(GL.GL_TEXTURE_2D, 0x9580, Int32(0x9584))  # OPTIMAL tiling
-    ccall(getfn("glTexStorageMem2DEXT"), Cvoid,
-          (UInt32, Int32, UInt32, Int32, Int32, UInt32, UInt64),
-          GL.GL_TEXTURE_2D, 1, GL.GL_RGBA8, W, H, mo[], UInt64(0))
-    # single mip level: the default MIN filter would leave the texture incomplete
-    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
-    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
-    GL.glGetError() == 0 || error("GL import of the shared texture failed")
-
     robj = screen.cache[objectid(player.previewplot)]
     old = robj.uniforms[:image]
-    robj.uniforms[:image] = GLMakie.GLAbstraction.Texture{Makie.RGBAf, 2}(
-        old.context, texid[], UInt32(GL.GL_TEXTURE_2D), UInt32(GL.GL_UNSIGNED_BYTE),
-        UInt32(GL.GL_RGBA8), UInt32(GL.GL_RGBA), old.parameters, (Int(W), Int(H)))
-    gp.texid = texid[]
+    gp.origtex === nothing && (gp.origtex = old)   # re-setups see OUR texture here
+    empty!(gp.gltex)
+    for (fd, allocsize) in fds
+        mo = Ref{UInt32}(0)
+        ccall(getfn("glCreateMemoryObjectsEXT"), Cvoid, (Int32, Ptr{UInt32}), 1, mo)
+        ccall(getfn("glMemoryObjectParameterivEXT"), Cvoid, (UInt32, UInt32, Ptr{Int32}),
+              mo[], 0x9581, Ref{Int32}(1))                       # DEDICATED = TRUE
+        ccall(getfn("glImportMemoryFdEXT"), Cvoid, (UInt32, UInt64, UInt32, Int32),
+              mo[], UInt64(allocsize), 0x9586, Int32(fd))        # consumes the fd
+        texid = Ref{UInt32}(0)
+        GL.glGenTextures(1, texid)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, texid[])
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, 0x9580, Int32(0x9584))  # OPTIMAL tiling
+        ccall(getfn("glTexStorageMem2DEXT"), Cvoid,
+              (UInt32, Int32, UInt32, Int32, Int32, UInt32, UInt64),
+              GL.GL_TEXTURE_2D, 1, GL.GL_RGBA8, W, H, mo[], UInt64(0))
+        # single mip level: the default MIN filter would leave the texture incomplete
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+        GL.glGetError() == 0 || error("GL import of the shared texture failed")
+        push!(gp.gltex, GLMakie.GLAbstraction.Texture{Makie.RGBAf, 2}(
+            old.context, texid[], UInt32(GL.GL_TEXTURE_2D), UInt32(GL.GL_UNSIGNED_BYTE),
+            UInt32(GL.GL_RGBA8), UInt32(GL.GL_RGBA), old.parameters, (Int(W), Int(H))))
+    end
+    gp.cur = 1
+    robj.uniforms[:image] = gp.gltex[1]
     gp.width, gp.height = Int(W), Int(H)
     return nothing
 end
@@ -144,14 +173,20 @@ function presentgpu!(player::Player, clip::Clip, srcframe::Integer; stream = not
             notify(player.frame)  # settle plot geometry for the new size first
             setupgpupreview!(player, gp, W, H)
         end
+        nxt = gp.doublebuffer ? 3 - gp.cur : gp.cur   # blit target (see doublebuffer)
         rungpuowned(player, gp) do
             gp.engine === nothing && (gp.engine = FxEngine(player.analysisbackend))
-            render(gp.engine, source, clip, Int(srcframe); applytracks = player.applytracks[]) do out
+            render(gp.engine, source, clip, Int(srcframe); applytracks = player.applytracks[],
+                   playing = player.playing[]) do out
                 gp.packed .= packrgba.(reshape(out, gp.width * gp.height))
-                copyto!(gp.eimage, gp.packed)              # device blit + wait
+                copyto!(gp.eimages[nxt], gp.packed)        # device blit + wait
                 nothing
             end
         end
+        # main thread again: swap the shown texture (the render loop is a sibling
+        # task on this thread, so the swap can't interleave with a GL draw)
+        player.screen.cache[objectid(player.previewplot)].uniforms[:image] = gp.gltex[nxt]
+        gp.cur = nxt
         player.screen.requires_update = true
         return true
     catch e
@@ -179,6 +214,7 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
             notify(player.frame)
             setupgpupreview!(player, gp, W, H)
         end
+        nxt = gp.doublebuffer ? 3 - gp.cur : gp.cur   # same switch as presentgpu!
         rungpuowned(player, gp) do
             gp.engine === nothing && (gp.engine = FxEngine(player.analysisbackend))
             pool = gp.engine.pool
@@ -193,7 +229,7 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
                              filter(e -> !(e isa OpacityEffect), ec.effects),
                              ec.colortrack, ec.motiontrack, ec.animations, ec.track)
                 layer = execute!(graphof(gclip; applytracks = player.applytracks[]), pool,
-                                 FxContext(stream, gclip, srcframe))
+                                 FxContext(stream, gclip, srcframe, player.playing[]))
                 α = Float32(clamp(paramvalue(clip, :opacity, srcframe), 0.0, 1.0))
                 if first
                     warp!(accum, layer, ec.crop)                  # bake crop into the canvas
@@ -209,10 +245,12 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
             end
             KA.synchronize(pool.backend)
             gp.packed .= packrgba.(reshape(accum, W * H))
-            copyto!(gp.eimage, gp.packed)
+            copyto!(gp.eimages[nxt], gp.packed)
             release!(pool, accum)
             nothing
         end
+        player.screen.cache[objectid(player.previewplot)].uniforms[:image] = gp.gltex[nxt]
+        gp.cur = nxt
         player.screen.requires_update = true
         return true
     catch e
@@ -220,6 +258,21 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
         @error "GPU composite failed — falling back" exception = (e, catch_backtrace())
         return false
     end
+end
+
+"""
+Point the preview plot back at its OWN texture before a CPU `frame`-notify present
+(scrub thumbnails, gap fills, the CPU fallback lane). GLMakie's notify-upload writes
+into the texture the render object currently holds — uploading linear CPU pixels
+into the imported optimal-tiled EXTERNAL texture shreds the on-screen image. The
+next GPU present swaps the external texture back in. No-op on CPU-only players.
+"""
+function showcpuframe!(player::Player)
+    gp = player.gpupreview
+    (gp isa GPUPreview && gp.origtex !== nothing) || return nothing
+    player.screen.cache[objectid(player.previewplot)].uniforms[:image] = gp.origtex
+    player.screen.requires_update = true
+    return nothing
 end
 
 "Frames kept VRAM-resident per source stream (a bounded ring; ~a few seconds)."
@@ -238,10 +291,13 @@ function preloadgpu!(player::Player, source::VideoSource)
     (gp isa GPUPreview && !gp.failed) || return nothing
     haskey(player.gpucache, source) && return nothing
     stream = nothing
+    Threads.atomic_add!(player.gpubusy, 1)   # presents stay on the CPU tier during warmup
     try
         stream = openstream(player.analysisbackend, source.path, source.width, source.height;
                             capacity = GPU_STREAM_CAPACITY)
-        ok = rungpusync(player) do   # probe: decode GOP 0, confirm it's supported at the display size
+        # probe: decode GOP 0, confirm it's supported at the display size
+        # (cold this also compiles the decode session + kernels)
+        ok = rungpusync(player) do
             f = frameat!(stream, 0)
             size(f.y) == (source.width, source.height)
         end
@@ -254,6 +310,8 @@ function preloadgpu!(player::Player, source::VideoSource)
     catch e
         stream === nothing || (try; close(stream); catch; end)
         @warn "GPU stream unavailable; staying on CPU decode" exception = e
+    finally
+        Threads.atomic_sub!(player.gpubusy, 1)
     end
     return nothing
 end
@@ -278,6 +336,7 @@ function autodetectgpu!(player::Player)
     capable || return nothing
     player.analysisbackend = LavaBackend()               # wraps the worker-owned context
     player.gpupreview = GPUPreview()
+    setgpurun!(player.timeline, (f; long = false) -> rungpusync(f, player; long))  # GPU thumbnails from here on
     for src in unique(c.source for c in player.sequence.clips)
         Threads.@spawn preloadgpu!(player, src)
     end

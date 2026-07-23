@@ -15,6 +15,24 @@ tooltip follows the cursor; hover brightens a clip's border. Clip edges are
 trim handles: hovering one shows a handle bar, dragging it adjusts the
 in/out point (the tooltip switches to the clip's length).
 """
+# ---- track geometry (shared by the timeline, drag targeting, the media-bin drop
+# ghost and the keyframe overlay): lanes fill axis-y 0.02..0.86; the strip above
+# (0.875..0.99) is the ALWAYS-VISIBLE "+ new track" drop zone.
+"Vertical share of the axis one lane takes with `ntr` stacked tracks."
+trackspan(ntr::Integer) = 0.84 / max(ntr, 1)
+
+"`(lo, hi)` axis-y band of `track` (1 = bottom) out of `ntr` lanes."
+function trackband(track::Integer, ntr::Integer)
+    s = trackspan(ntr)
+    lo = 0.02 + (track - 1) * s
+    return (lo, lo + s)
+end
+
+"Track a drop at axis-y `y` targets; anything above the top lane (the marked
+zone) is `ntr + 1` — a new track."
+trackat(y::Real, ntr::Integer) =
+    clamp(floor(Int, (Float64(y) - 0.02) / trackspan(ntr)) + 1, 1, ntr + 1)
+
 mutable struct Timeline
     const axis::Axis
     const sequence::Sequence
@@ -57,6 +75,17 @@ mutable struct Timeline
     transx::Observable{Vector{Point2f}}         # the bowtie X inside each box
     transplot::Any
     transxplot::Any
+    ntr::Observable{Int}                        # track count (drives lane labels)
+    tracklabelpos::Vector{Observable{Point2f}}  # one V1/V2/… badge per lane
+    tracklabelplots::Vector{Any}
+    newtrackpos::Observable{Point2f}            # "+ new track" hint while dragging
+    newtrackplot::Any
+    newtrackzone::Observable{Rect2f}            # the permanent drop-zone strip above the lanes
+    dragactive::Observable{Bool}                # a clip/bin drag is in flight → highlight the zone
+    zonelabelpos::Observable{Point2f}           # left-anchored zone caption
+    presspick::Union{Nothing, Tuple{Int, Float64, Float64}}  # (clipindex, t, y) of a scrub press —
+                                                # dragging out of the lane converts it to a clip move
+    gpurun::Any   # synchronous GPU-worker runner for thumbnail decoding (nothing = CPU)
 
     function Timeline(gridpos, sequence::Sequence, playhead::Observable{Int},
                       playing::Observable{Bool})
@@ -81,6 +110,7 @@ mutable struct Timeline
                        Observable(""), Observable(Point2f(0, 0)),
                        Threads.Atomic{Bool}(true),
                        nothing, nothing, nothing, 0, 1, false, nothing, identity, identity)
+        timeline.gpurun = nothing
 
         timeline.ghost_plot = poly!(axis, timeline.ghost_rect; color = timeline.ghost_color,
                                     strokecolor = colors.accent, strokewidth = 1.5,
@@ -107,13 +137,49 @@ mutable struct Timeline
         timeline.transxplot = linesegments!(axis, timeline.transx;
                                             color = colors.accent, linewidth = 1.5)
         translate!(timeline.transxplot, 0, 0, 7)
+        # multi-track affordances: V1/V2 lane badges, a "+ new track" hint over the
+        # drag ghost, and a PERMANENT drop-zone strip above the lanes (dotted
+        # outline + caption; fills accent while a drag is in flight) — adding a
+        # track must be visible before you know the gesture, not only during it
+        timeline.presspick = nothing
+        timeline.ntr = Observable(1)
+        timeline.tracklabelpos = Observable{Point2f}[]
+        timeline.tracklabelplots = Any[]
+        timeline.newtrackpos = Observable(Point2f(0, 0))
+        timeline.newtrackplot = text!(axis, timeline.newtrackpos; text = "+ new track",
+                                      color = colors.accent, fontsize = 12, font = :bold,
+                                      align = (:center, :center), visible = false)
+        translate!(timeline.newtrackplot, 0, 0, 11)
+        timeline.newtrackzone = Observable(Rect2f(0, 0.875, 1, 0.115))
+        timeline.dragactive = Observable(false)
+        timeline.zonelabelpos = Observable(Point2f(0, 0.9325))
+        zonefill = poly!(axis, timeline.newtrackzone;
+                         color = map(a -> a ? (colors.accent, 0.12) : (colors.text, 0.0),
+                                     timeline.dragactive), strokewidth = 0)
+        translate!(zonefill, 0, 0, 2)
+        zoneline = lines!(axis, map(timeline.newtrackzone) do r
+                              x0, y0 = r.origin; w, h = r.widths
+                              Point2f[(x0, y0), (x0 + w, y0), (x0 + w, y0 + h),
+                                      (x0, y0 + h), (x0, y0)]
+                          end; linestyle = :dot, linewidth = 1,
+                          color = map(a -> a ? (colors.accent, 1.0) : (colors.text, 0.3),
+                                      timeline.dragactive))
+        translate!(zoneline, 0, 0, 2)
+        zonelabel = text!(axis, timeline.zonelabelpos;
+                          text = "+  new track — drop a clip here",
+                          fontsize = 10, align = (:left, :center),
+                          color = map(a -> a ? (colors.accent, 1.0) : (colors.text, 0.35),
+                                      timeline.dragactive))
+        translate!(zonelabel, 0, 0, 3)
 
         onany(axis.finallimits, axis.scene.viewport) do lims, vp
             x0, x1 = minimum(lims)[1], maximum(lims)[1]
             x1 > x0 || return
             timeline.viewrange[] = (x0, x1)
             timeline.pps[] = vp.widths[1] / (x1 - x0)
-            timeline.bandheight[] = 0.86 * vp.widths[2]  # strip spans y 0.07..0.93
+            timeline.bandheight[] = 0.84 * vp.widths[2]  # the lanes' share of the axis
+            timeline.newtrackzone[] = Rect2f(x0, 0.875, x1 - x0, 0.115)
+            updatetracklabels!(timeline)                 # badges stick to the left edge
             return
         end
         on(_ -> setstates!(timeline), timeline.selected)
@@ -163,7 +229,24 @@ end
 
 "Thumbnail cache for `source`, created (with its worker) on first use."
 cachefor(timeline::Timeline, source::VideoSource) =
-    get!(() -> ThumbnailCache(source), timeline.caches, source)
+    get!(() -> ThumbnailCache(source; gpurun = timeline.gpurun), timeline.caches, source)
+
+"""
+Switch thumbnail decoding to the GPU runner `f`. Caches created before the
+player's GPU worker existed (the initial sources — `relayout!` runs inside the
+Timeline constructor) restart their workers on the GPU loop; decoded thumbs
+and pending requests survive the swap.
+"""
+function setgpurun!(timeline::Timeline, f)
+    timeline.gpurun = f
+    for cache in values(timeline.caches)
+        stop!(cache)
+        cache.gpurun = f
+        cache.running[] = true
+        cache.task = Threads.@spawn gputhumbloop(cache)
+    end
+    return nothing
+end
 
 "On-demand thumbnail provider for a `ClipView` showing `source`."
 function thumbsfor(timeline::Timeline, source::VideoSource)
@@ -217,14 +300,14 @@ function relayout!(timeline::Timeline)
         pop!(timeline.plotsources)
     end
     ntr = ntracks(seq)
-    span = 0.96 / ntr                       # each track's vertical share of the axis
-    g = min(0.02, span * 0.15)              # gap between stacked tracks
+    g = min(0.02, trackspan(ntr) * 0.15)    # gap between stacked tracks
     for (i, clip) in enumerate(seq.clips)
         timeline.clipranges[i][] = (clip.start / fps, clipend(clip) / fps)
         timeline.clipstarts[i][] = clip.src_in / clip.source.framerate
         # higher track sits higher up the axis (on top)
-        timeline.clipplots[i].bandlo = 0.02 + (clip.track - 1) * span + g
-        timeline.clipplots[i].bandhi = 0.02 + clip.track * span - g
+        lo, hi = trackband(clip.track, ntr)
+        timeline.clipplots[i].bandlo = lo + g
+        timeline.clipplots[i].bandhi = hi - g
         timeline.clipplots[i].ntracks = ntr
         if timeline.plotsources[i] !== clip.source  # edits shift clips across plots
             timeline.plotsources[i] = clip.source
@@ -233,10 +316,38 @@ function relayout!(timeline::Timeline)
             timeline.clipplots[i].thumbsize = (cache.thumbwidth, cache.thumbheight)
         end
     end
+    timeline.ntr[] = ntr
+    updatetracklabels!(timeline)
     prunetransitions!(seq)
     refreshtransitions!(timeline)
     cliplimits!(timeline)
     setstates!(timeline)
+    return nothing
+end
+
+"Lane badges (V1, V2, …) at the left edge of each track, and the new-track-zone
+caption pinned to the view's left edge."
+function updatetracklabels!(timeline::Timeline)
+    ntr = timeline.ntr[]
+    while length(timeline.tracklabelplots) < ntr
+        k = length(timeline.tracklabelplots) + 1
+        pos = Observable(Point2f(0, 0))
+        pl = text!(timeline.axis, pos; text = "V$k", color = (timeline.colors.text, 0.6),
+                   fontsize = 11, font = :bold, align = (:left, :center))
+        translate!(pl, 0, 0, 11)
+        push!(timeline.tracklabelpos, pos)
+        push!(timeline.tracklabelplots, pl)
+    end
+    (x0, _) = timeline.viewrange[]
+    xpad = 8 / max(timeline.pps[], 1.0e-9)
+    span = trackspan(ntr)
+    for (k, pl) in enumerate(timeline.tracklabelplots)
+        show = k <= ntr
+        pl.visible = show
+        show || continue
+        timeline.tracklabelpos[k][] = Point2f(x0 + xpad, 0.02 + (k - 0.5) * span)
+    end
+    timeline.zonelabelpos[] = Point2f(x0 + xpad, 0.9325)
     return nothing
 end
 
@@ -246,7 +357,7 @@ function refreshtransitions!(timeline::Timeline)
     fps = seq.framerate
     boxes = Rect2f[]
     xs = Point2f[]
-    y0, y1 = 0.06, 0.94
+    y0, y1 = 0.06, 0.82   # inside the lane area, below the new-track zone
     for t in seq.transitions
         x0 = transstart(t) / fps
         x1 = transstop(t) / fps
@@ -309,11 +420,16 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
                 timeline.trimclip = (seq.clips[edge[1]], edge[2], edge[1])
             else
                 timeline.scrubbing[] = true
+                # remember what the press landed on: dragging OUT of that clip's
+                # lane converts the scrub into a clip move (no Ctrl needed)
+                y = mouseposition(axis.scene)[2]
+                timeline.presspick = (something(i, 0), Float64(t), Float64(y))
                 n == playhead[] || (playhead[] = n)
             end
             return Consume(true)
         elseif event.action == Mouse.release
             timeline.scrubbing[] = false
+            timeline.presspick = nothing
             finishdrag!(timeline)
             if timeline.trimclip !== nothing
                 timeline.trimclip = nothing
@@ -331,7 +447,25 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
         elseif timeline.trimclip !== nothing
             trimto!(timeline, mouseposition(axis.scene)[1])
         elseif timeline.scrubbing[]
-            t = mouseposition(axis.scene)[1]
+            mp = mouseposition(axis.scene)
+            pk = timeline.presspick
+            if pk !== nothing && pk[1] != 0 && inside
+                # the press grabbed a clip and the cursor left its lane → this is
+                # a MOVE (e.g. lifting a cut clip into the new-track zone), not a scrub
+                clip = seq.clips[pk[1]]
+                blo, bhi = trackband(clip.track, ntracks(seq))
+                if mp[2] > bhi + 0.04 || mp[2] < blo - 0.04
+                    timeline.scrubbing[] = false
+                    timeline.presspick = nothing
+                    timeline.dragclip = (clip, timelineframe(timeline, pk[2]) - clip.start)
+                    timeline.dragstart = clip.start
+                    timeline.dragtrack = clip.track
+                    timeline.dragvalid = true
+                    dragto!(timeline, mp[1], mp[2])
+                    return Consume(false)
+                end
+            end
+            t = mp[1]
             n = timelineframe(timeline, t)
             n == playhead[] || (playhead[] = n)
         elseif inside
@@ -410,7 +544,7 @@ function edgemark!(timeline::Timeline, edge)
         clip = timeline.sequence.clips[edge[1]]
         fps = timeline.sequence.framerate
         e = edge[2] === :left ? clip.start / fps : clipend(clip) / fps
-        append!(pts, (Point2f(e, 0.02), Point2f(e, 0.98)))
+        append!(pts, (Point2f(e, 0.02), Point2f(e, 0.86)))
     end
     (isempty(pts) && isempty(timeline.edgeline[])) || (timeline.edgeline[] = pts)
     return nothing
@@ -434,21 +568,32 @@ function dragto!(timeline::Timeline, t::Real, y::Real = NaN)
     end
     snapped, didsnap = snappedstart(rawstart, cliplength(clip), snapframes, targets)
 
-    # target track from cursor height (bands match relayout!); above the top → new track
-    ntr = ntracks(seq); span = 0.96 / ntr
-    track = isnan(y) ? clip.track : clamp(floor(Int, (Float64(y) - 0.02) / span) + 1, 1, ntr + 1)
+    # target track from cursor height (bands match relayout!); the marked zone
+    # above the top lane targets a NEW track
+    ntr = ntracks(seq)
+    track = isnan(y) ? clip.track : trackat(y, ntr)
     timeline.dragstart = snapped
     timeline.dragtrack = track
     timeline.dragvalid = canplace(seq, clip, snapped, track)
+    timeline.dragactive[] = true
 
-    g = min(0.02, span * 0.15)
-    ghostspan = 0.96 / max(ntr, track)              # if dropping on a new track, shrink to fit
-    lo = 0.02 + (track - 1) * ghostspan + g; hi = 0.02 + track * ghostspan - g
+    n2 = max(ntr, track)                            # if dropping on a new track, shrink to fit
+    g = min(0.02, trackspan(n2) * 0.15)
+    lo, hi = trackband(track, n2)
+    lo += g; hi -= g
     timeline.ghost_rect[] = Rect2f(snapped / fps, lo, cliplength(clip) / fps, hi - lo)
     timeline.ghost_color[] = timeline.dragvalid ? (timeline.colors.accent_subtle, 0.55) :
                              (RGBf(0.75, 0.2, 0.2), 0.4)
     timeline.ghost_plot.visible = true
     timeline.snapline[] = didsnap && timeline.dragvalid ? [snapped / fps] : Float64[]
+    # say it, don't imply it: dropping above the top lane creates a NEW track
+    if track > ntr
+        timeline.newtrackpos[] = Point2f(snapped / fps + cliplength(clip) / fps / 2,
+                                         (lo + hi) / 2)
+        timeline.newtrackplot.visible = true
+    else
+        timeline.newtrackplot.visible = false
+    end
     return nothing
 end
 
@@ -479,7 +624,7 @@ function trimto!(timeline::Timeline, t::Real)
     end
     timeline.clipranges[i][] = (clip.start / fps, clipend(clip) / fps)
     e = (side === :right ? clipend(clip) : clip.start) / fps
-    timeline.edgeline[] = Point2f[Point2f(e, 0.02), Point2f(e, 0.98)]  # handle follows
+    timeline.edgeline[] = Point2f[Point2f(e, 0.02), Point2f(e, 0.86)]  # handle follows
     notify(timeline.playhead)  # live preview while trimming
     return nothing
 end
@@ -491,6 +636,8 @@ function finishdrag!(timeline::Timeline)
     clip, _ = drag
     timeline.dragclip = nothing
     timeline.ghost_plot.visible = false
+    timeline.newtrackplot.visible = false
+    timeline.dragactive[] = false
     timeline.snapline[] = Float64[]
     if timeline.dragvalid && (timeline.dragstart != clip.start || timeline.dragtrack != clip.track)
         timeline.onedit()

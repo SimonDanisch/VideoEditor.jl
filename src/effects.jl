@@ -31,6 +31,21 @@ isneutral(e::BlurEffect) = e.σ <= 0
 isneutral(e::SharpenEffect) = e.amount <= 0
 isneutral(e::OpacityEffect) = e.α >= 0.999f0
 
+"""
+    Bypassed(effect)
+
+A disabled effect in the stack: it is `isneutral`, so every render path (the
+CPU stack, the GPU graph, the compositor, export) skips it — but it keeps its
+parameters, so the inspector's enable toggle switches it back on losslessly.
+"""
+struct Bypassed <: Effect
+    e::Effect
+end
+isneutral(::Bypassed) = true
+"The effect itself, seen through a [`Bypassed`](@ref) wrapper."
+uneffect(e::Effect) = e
+uneffect(b::Bypassed) = b.e
+
 "Apply `clip`'s effect stack to `buf` in place, using two same-size scratch buffers."
 function applyeffects!(buf::AnyRGBFrame, tmp1::AnyRGBFrame, tmp2::AnyRGBFrame, clip::Clip)
     any(e -> !isneutral(e), clip.effects) || return buf
@@ -60,9 +75,11 @@ effectdict(e::BlurEffect) = Dict{String, Any}("type" => "blur", "sigma" => e.σ)
 effectdict(e::SharpenEffect) =
     Dict{String, Any}("type" => "sharpen", "sigma" => e.σ, "amount" => e.amount)
 effectdict(e::OpacityEffect) = Dict{String, Any}("type" => "opacity", "alpha" => e.α)
+effectdict(b::Bypassed) = Dict{String, Any}("type" => "bypassed", "inner" => effectdict(b.e))
 
 function effectfromdict(d::AbstractDict)
     t = d["type"]
+    t == "bypassed" && return Bypassed(effectfromdict(d["inner"]))
     t == "color" && return ColorEffect(; brightness = d["brightness"], contrast = d["contrast"],
                                        saturation = d["saturation"], temperature = d["temperature"])
     t == "blur" && return BlurEffect(Float32(d["sigma"]))
@@ -81,8 +98,10 @@ function findeffect(clip::Clip, ::Type{T}) where {T <: Effect}
 end
 
 # Effects upsert by identity: one instance per type — except plugin effects, which
-# share a type, so they upsert per plugin name (see plugins.jl).
+# share a type, so they upsert per plugin name (see plugins.jl). A bypassed
+# effect keeps its inner key, so writing that kind replaces (and re-enables) it.
 effectkey(e::Effect) = typeof(e)
+effectkey(b::Bypassed) = effectkey(b.e)
 
 "Replace the clip's effect with the same key, or append it."
 function seteffect!(clip::Clip, e::Effect)

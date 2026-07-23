@@ -172,7 +172,9 @@ function calltool(srv::MCPServer, name::String, args)
     elseif name == "export"
         # runs on the HTTP task: only reads edit metadata, and must not
         # starve the editor's executor (and with it the render loop) for its
-        # multi-second duration
+        # multi-second duration. Stays on the CPU backend — GPU dispatches
+        # would have to come from the pinned worker, and this call must
+        # return the path synchronously.
         fmt = lowercase(String(get(args, "format", "mp4")))
         path = if fmt == "gif"
             exportgif(String(args["path"]), seq; fps = Int(get(args, "fps", 15)),
@@ -186,8 +188,11 @@ function calltool(srv::MCPServer, name::String, args)
         # decode-heavy read of the source; safe off the editor task
         clip = clipattime(args["time"])
         clip === nothing && return textcontent("no clip at that time")
-        a, b, score = findloop(clip; minseconds = Float64(get(args, "min_seconds", 1.5)),
-                               maxseconds = Float64(get(args, "max_seconds", 6.0)))
+        a, b, score = runanalysissync(player) do   # GPU decode runs on the worker
+            findloop(clip; minseconds = Float64(get(args, "min_seconds", 1.5)),
+                     maxseconds = Float64(get(args, "max_seconds", 6.0)),
+                     backend = player.analysisbackend)
+        end
         fps = seq.framerate
         # clip-relative source offsets → timeline seconds
         t0 = (clip.start + a) / fps
@@ -268,7 +273,7 @@ function calltool(srv::MCPServer, name::String, args)
         elseif name == "analyze_color"
             clip = clipattime(args["time"])
             clip === nothing && return "no clip at that time"
-            Threads.@spawn analyzecolor!(clip)
+            runanalysis(() -> analyzecolor!(clip; backend = player.analysisbackend), player)
             "color analysis started — poll get_state"
         elseif name == "analyze_motion"
             clip = clipattime(args["time"])
@@ -285,8 +290,7 @@ function calltool(srv::MCPServer, name::String, args)
             catch e
                 @error "motion analysis failed" exception = (e, catch_backtrace())
             end
-            # GPU dispatches must all come from the pinned worker (Lava is single-writer)
-            player.analysisbackend isa KA.CPU ? Threads.@spawn(job()) : rungpu(job, player)
+            runanalysis(job, player)
             "motion analysis ($mode) started — poll get_state"
         elseif name == "analyze_object"
             clip = clipattime(args["time"])
@@ -294,7 +298,7 @@ function calltool(srv::MCPServer, name::String, args)
             point = (Float64(args["x"]) * clip.source.width,
                      Float64(args["y"]) * clip.source.height)
             job = () -> analyzeobject!(clip, point; backend = player.analysisbackend)
-            player.analysisbackend isa KA.CPU ? Threads.@spawn(job()) : rungpu(job, player)
+            runanalysis(job, player)
             "object lock analysis started — poll get_state"
         elseif name == "save_project"
             isempty(seq.clips) && return "nothing to save — the timeline is empty"

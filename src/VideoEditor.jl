@@ -42,14 +42,14 @@ include("player.jl")
 include("glbridge.jl")
 include("audiopreview.jl")
 include("audio.jl")
-include("export.jl")
 include("colorstab.jl")
 include("motionstab.jl")
-include("campath.jl")
 include("bundlestab.jl")
 include("gpudecode.jl")
 include("gpustream.jl")
 include("gpugraph.jl")
+include("export.jl")   # decodeinto! dispatches on GpuVideoStream — needs the type
+include("campath.jl")  # GrayReader wraps export's SequentialReader; grayinto! needs GpuVideoStream
 include("plugins.jl")
 include("mcp.jl")
 

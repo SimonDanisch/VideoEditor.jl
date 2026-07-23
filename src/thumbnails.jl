@@ -23,16 +23,17 @@ mutable struct ThumbnailCache
     const dirty::Threads.Atomic{Bool}
     counter::Int
     maxthumbs::Int
+    gpurun::Any   # synchronous GPU-worker runner (f -> f's result) — nothing = CPU decode
     task::Task
 
     function ThumbnailCache(source::VideoSource; thumbheight::Integer = 88,
-                            maxthumbs::Integer = 2000)
+                            maxthumbs::Integer = 2000, gpurun = nothing)
         thumbwidth = max(round(Int, thumbheight * source.width / source.height), 8)
         cache = new(source, thumbwidth, thumbheight, Dict{Int, RGBFrame}(),
                     Dict{Int, Int}(), Int[], ReentrantLock(),
                     Threads.Atomic{Bool}(true), Threads.Atomic{Bool}(false),
-                    0, maxthumbs)
-        cache.task = Threads.@spawn thumbloop(cache)
+                    0, maxthumbs, gpurun)
+        cache.task = Threads.@spawn (gpurun === nothing ? thumbloop(cache) : gputhumbloop(cache))
         return cache
     end
 end
@@ -99,6 +100,69 @@ function storethumb!(cache::ThumbnailCache, s::Integer, thumb::RGBFrame)
         end
     end
     cache.dirty[] = true
+    return nothing
+end
+
+"""
+GPU thumbnail worker: decodes through its OWN small [`GpuVideoStream`](@ref)
+(never evicting the playback ring) and area-averages on-device — only the tiny
+finished thumb crosses to the host. Every GPU touch goes through `cache.gpurun`
+(the player's pinned worker — Lava is single-writer). Falls back to the CPU
+loop when the stream won't open.
+"""
+function gputhumbloop(cache::ThumbnailCache)
+    source = cache.source
+    stream = dev = thumbdev = nothing
+    ok = try
+        # `long`: cold this compiles decode + convert + downscale — warm them all
+        # HERE so the per-thumb jobs below stay bounded and presents interleave
+        cache.gpurun(; long = true) do
+            stream = openstream(LavaBackend(), source.path, source.width, source.height;
+                                vrambudget = 2^30)
+            dev = KA.allocate(LavaBackend(), RGB{N0f8}, (source.width, source.height))
+            thumbdev = KA.allocate(LavaBackend(), RGB{N0f8}, (cache.thumbwidth, cache.thumbheight))
+            f = exactframeat!(stream, 0)
+            nv12torgb!(dev, f.y, f.uv; bt601 = stream.bt601)
+            areadownscale!(thumbdev, dev)
+            nothing
+        end
+        true
+    catch e
+        @warn "GPU thumbnails unavailable — CPU decode" source = source.path exception = e
+        false
+    end
+    ok || return thumbloop(cache)
+    host = RGBFrame(undef, cache.thumbwidth, cache.thumbheight)
+    try
+        while cache.running[]
+            s = lock(() -> isempty(cache.wishlist) ? nothing : popfirst!(cache.wishlist), cache.lock)
+            if s === nothing
+                sleep(0.03)
+                continue
+            end
+            n = clamp(frameindex(source, Float64(s)), 0, source.nframes - 1)
+            # decode in LATENCY-BOUNDED jobs (≤ ~90 ms each) so playback presents
+            # interleave with the thumbnail's GOP decode on the shared worker
+            while cache.running[] && !cache.gpurun(() -> (frameat!(stream, n); hasframe(stream, n)))
+            end
+            cache.running[] || break
+            cache.gpurun() do
+                f = frameat!(stream, n)              # resident now — pure ring hit
+                nv12torgb!(dev, f.y, f.uv; bt601 = stream.bt601)
+                areadownscale!(thumbdev, dev)
+                copyto!(host, thumbdev)
+                nothing
+            end
+            storethumb!(cache, Int(s), copy(host))
+        end
+    catch e
+        @error "GPU thumbnail worker died" exception = (e, catch_backtrace())
+    finally
+        try
+            cache.gpurun() do; close(stream); nothing; end
+        catch
+        end
+    end
     return nothing
 end
 

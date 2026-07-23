@@ -1,12 +1,17 @@
 """
 Per-source-frame color stabilization corrections (see `analyzecolor!`).
 Keyed by absolute source frame via `src_in`, so tracks survive clip splits.
+`strength` scales the correction toward identity (1 = full fix, 0 = off) at
+APPLY time — adjustable live, no re-analysis needed.
 """
-struct ColorTrack
-    gains::Vector{Vec3f}
-    offsets::Vector{Vec3f}
-    src_in::Int
+mutable struct ColorTrack
+    const gains::Vector{Vec3f}
+    const offsets::Vector{Vec3f}
+    const src_in::Int
+    strength::Float32
 end
+ColorTrack(gains::Vector{Vec3f}, offsets::Vector{Vec3f}, src_in::Integer) =
+    ColorTrack(gains, offsets, src_in, 1.0f0)
 
 """
 Per-source-frame camera stabilization warps in source pixel coordinates
@@ -221,6 +226,36 @@ function split!(seq::Sequence, n::Integer)
 end
 
 """
+    joinclips!(seq, n) -> Union{Clip, Nothing}
+
+Merge the clip at frame `n` with the clip that follows it on the same track,
+when the two are halves of one cut: same source, timeline-contiguous and
+source-contiguous (`left.src_out == right.src_in`). The left half's effects
+and analyses win; the right half's keyframes (keyed by absolute source frame)
+carry over where the left has none. The inverse of [`split!`](@ref).
+"""
+function joinclips!(seq::Sequence, n::Integer)
+    i = clipat(seq, n)
+    i === nothing && return nothing
+    c = seq.clips[i]
+    j = findfirst(o -> o !== c && o.track == c.track && o.source === c.source &&
+                       o.start == clipend(c) && o.src_in == c.src_out, seq.clips)
+    j === nothing && return nothing
+    nxt = seq.clips[j]
+    removetransition!(seq, nxt.start)     # a dissolve on the joined cut is gone with it
+    for (key, curve) in nxt.animations    # carry the right half's keys over
+        if haskey(c.animations, key)
+            foreach(k -> setkey!(c.animations[key], k.frame, k.value), curve.keys)
+        else
+            c.animations[key] = curve
+        end
+    end
+    c.src_out = nxt.src_out
+    deleteat!(seq.clips, j)
+    return c
+end
+
+"""
     deleteclip!(seq, n; ripple=true) -> Union{Clip, Nothing}
 
 Delete the clip containing timeline frame `n`. With `ripple`, later clips
@@ -276,6 +311,19 @@ function snappedstart(newstart::Integer, len::Integer, snap::Integer, targets::V
         end
     end
     return max(best, 0), didsnap
+end
+
+"""
+First track at or above `want` where `[at, at + len)` is free — dropping onto an
+occupied spot stacks the clip on the lane above instead of failing (a NEW top
+track always fits, so this always returns ≤ `ntracks + 1`).
+"""
+function freetrack(seq::Sequence, at::Integer, len::Integer, want::Integer)
+    for tr in max(Int(want), 1):(ntracks(seq) + 1)
+        any(c -> c.track == tr && at < clipend(c) && at + len > c.start, seq.clips) ||
+            return tr
+    end
+    return ntracks(seq) + 1
 end
 
 "Whether `clip` can sit at `newstart` without overlapping another clip."

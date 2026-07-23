@@ -51,23 +51,27 @@ end
 """
 Per-frame inputs the graph pulls from: the frame `source` (a `GpuVideoStream` for
 disk→VRAM decode, or a CPU `RGBFrame` uploaded once), the `clip` (for track
-transforms and effect params), and the frame index. Size and colour range are
-derived from the source — nothing else to pass.
+transforms and effect params), the frame index, and whether this render is part of
+sequential `playing` (a streaming source then prefetches the next GOP; scrubs and
+paused presents skip that speculative decode). Size and colour range are derived
+from the source — nothing else to pass.
 """
 struct FxContext
     source::Any
     clip::Clip
     frame::Int
+    playing::Bool
 end
+FxContext(source, clip::Clip, frame::Integer) = FxContext(source, clip, Int(frame), false)
 framesize(s) = size(s)                                   # a CPU RGBFrame
 framesize(s::GpuVideoStream) = (s.width, s.height)
 frameisbt601(::Any) = false
 frameisbt601(s::GpuVideoStream) = s.bt601
 
 # fill `out` with the decoded source frame (device-resident decode, or one upload)
-sourceinto!(out, s::GpuVideoStream, frame) =
-    (f = frameat!(s, frame); nv12torgb!(out, f.y, f.uv; bt601 = s.bt601); out)
-sourceinto!(out, s, frame) = copyto!(out, s)             # CPU frame → device upload
+sourceinto!(out, s::GpuVideoStream, frame; prefetch::Bool = false) =
+    (f = frameat!(s, frame; prefetch); nv12torgb!(out, f.y, f.uv; bt601 = s.bt601); out)
+sourceinto!(out, s, frame; prefetch::Bool = false) = copyto!(out, s)   # CPU frame → device upload
 
 # ---------------------------------------------------------------- effect callbacks
 
@@ -144,7 +148,7 @@ pointwiseop(n::PixelNode) = n.kind isa Pointwise
 # overwrite `ins[1]` in place (its last consumer is this node).
 function eval_node!(::SourceNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
     out = acquire!(pool, framesize(ctx.source))
-    return sourceinto!(out, ctx.source, ctx.frame)
+    return sourceinto!(out, ctx.source, ctx.frame; prefetch = ctx.playing)
 end
 function eval_node!(n::MotionNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
     out = canmutate ? ins[1] : copyacquire!(pool, ins[1])
@@ -242,7 +246,8 @@ nodefor(e::Effect, input) = PixelNode(input, fxkind(e))              # callback 
 
 Compile `clip`'s render — source → motion/colour stabilization → effect stack — into
 a graph. Pass the keyframe-sampled `effectiveclip` so the effect params are current.
-Neutral effects are dropped.
+Neutral effects are dropped. `applytracks = false` is the hold-to-compare bypass:
+it shows the ORIGINAL frame, so it skips the effect stack too, not just the tracks.
 """
 function graphof(clip::Clip; applytracks::Bool = true)
     nodes = FxNode[SourceNode()]
@@ -253,9 +258,11 @@ function graphof(clip::Clip; applytracks::Bool = true)
     if applytracks && clip.colortrack !== nothing
         push!(nodes, ColorTrackNode(cur)); cur = length(nodes)
     end
-    for e in clip.effects
-        isneutral(e) && continue
-        push!(nodes, nodefor(e, cur)); cur = length(nodes)
+    if applytracks
+        for e in clip.effects
+            isneutral(e) && continue
+            push!(nodes, nodefor(e, cur)); cur = length(nodes)
+        end
     end
     return compilegraph(nodes, cur)
 end
@@ -274,16 +281,18 @@ FxEngine(backend) = FxEngine(backend, BufferPool(backend))
 emptyengine!(e::FxEngine) = emptypool!(e.pool)
 
 """
-    render(f, engine, source, clip, frame; applytracks=true)
+    render(f, engine, source, clip, frame; applytracks=true, playing=false)
 
 Render `clip` at `frame` from `source` (a `GpuVideoStream` or a CPU `RGBFrame`) and
 call `f(out)` with the finished device image. The buffer is released to the engine's
 pool afterwards, so `f` must consume it (blit/download) before returning — never hold
-it. All buffer management is internal.
+it. All buffer management is internal. `playing` marks sequential playback — a
+streaming source then prefetches its next GOP (see [`frameat!`](@ref)).
 """
-function render(f, engine::FxEngine, source, clip::Clip, frame::Integer; applytracks::Bool = true)
+function render(f, engine::FxEngine, source, clip::Clip, frame::Integer;
+                applytracks::Bool = true, playing::Bool = false)
     graph = graphof(clip; applytracks = applytracks)
-    out = execute!(graph, engine.pool, FxContext(source, clip, Int(frame)))
+    out = execute!(graph, engine.pool, FxContext(source, clip, Int(frame), playing))
     try
         return f(out)
     finally

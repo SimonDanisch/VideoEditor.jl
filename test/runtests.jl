@@ -162,6 +162,38 @@ end
     @test sort([c.track for c in loadproject(path).clips]) == [1, 2, 2]
 end
 
+@testset "join clips + effect bypass" begin
+    src = VideoSource(testvideo)
+    seq = Sequence(src)
+    n0 = src.nframes
+    right = split!(seq, 40)
+    @test length(seq.clips) == 2
+    # a key on the right half must survive the join (absolute-frame keyed)
+    VE.setkey!(get!(() -> VE.AnimCurve(), right.animations, :opacity), 50, 0.5)
+    joined = VE.joinclips!(seq, 10)
+    @test joined !== nothing
+    @test length(seq.clips) == 1
+    @test seq.clips[1].src_out == n0
+    @test haskey(seq.clips[1].animations, :opacity)
+    @test VE.joinclips!(seq, 10) === nothing          # nothing left to join
+    # a trim that breaks source-contiguity refuses to join (not one cut anymore)
+    seq2 = Sequence(VideoSource(testvideo))
+    r2 = split!(seq2, 40)
+    r2.src_in += 5
+    r2.start += 5
+    @test VE.joinclips!(seq2, 10) === nothing
+
+    # bypass: wrapped effect is neutral for every render path but keeps params
+    c = seq.clips[1]
+    push!(c.effects, ColorEffect(saturation = 1.8))
+    c.effects[1] = VE.Bypassed(c.effects[1])
+    @test VE.isneutral(c.effects[1])
+    @test VE.uneffect(c.effects[1]).adj.saturation == 1.8f0
+    d = VE.effectdict(c.effects[1])                   # project-file roundtrip
+    e2 = VE.effectfromdict(d)
+    @test e2 isa VE.Bypassed && VE.uneffect(e2).adj.saturation == 1.8f0
+end
+
 @testset "plugin registry + MCP authoring" begin
     # register a plugin directly (any package can) — it becomes an effect kind
     VE.registerplugin!(:testfx, "Test FX", [VE.FxParam(:k, "k", 0.0, 1.0, 1.0)],
@@ -404,6 +436,27 @@ end
     close(sr)
     # flicker (temporal std of the channel mean) must drop hard
     @test std(fixed) < std(raw) / 3
+
+    # strength scales the correction at APPLY time: 0 = untouched original
+    # (frame 2 sits near the flicker peak — frame 10 would be a sine zero-crossing)
+    sr2 = VE.SequentialReader(src)
+    VE.readframe!(buf, sr2, 2)
+    before = copy(buf)
+    track.strength = 0.0f0
+    VE.applycolortrack!(buf, clip, 2)
+    @test buf == before
+    track.strength = 1.0f0
+    VE.applycolortrack!(buf, clip, 2)
+    @test buf != before
+    close(sr2)
+
+    # strength roundtrips through the project file (older files default to 1)
+    track.strength = 0.4f0
+    seqct = Sequence([clip], src.framerate)
+    ctpath = joinpath(mktempdir(), "ct.videoedit.toml")
+    saveproject(ctpath, seqct)
+    @test loadproject(ctpath).clips[1].colortrack.strength ≈ 0.4f0
+    track.strength = 1.0f0
 end
 
 @testset "Motion stabilization" begin

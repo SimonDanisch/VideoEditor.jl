@@ -14,6 +14,10 @@ Keywords:
   (default H.264, `crf=20, preset="medium"`).
 - `audio`: mux the sources' audio along the cut list (see [`muxaudio`](@ref));
   on by default, skipped automatically when no source has an audio stream.
+- `backend`: KA backend for the render chain. A GPU backend (e.g. `LavaBackend()`)
+  runs tracks, effects, blends and the crop warp on device buffers — decode and
+  encode stay on the CPU with one upload/download per frame. Same kernels either
+  way, so the output is identical.
 - `progress`: called as `progress(done, total)` every 30 frames.
 
 Gaps render black (and sound silent).
@@ -24,6 +28,7 @@ function exportvideo(path::AbstractString, seq::Sequence;
                      codec_name::Union{Nothing, String} = nothing,
                      encoder_options::NamedTuple = (crf = 20, preset = "medium"),
                      audio::Bool = true,
+                     backend = KA.CPU(),
                      progress = nothing)
     total = seqlength(seq)
     total > 0 || error("empty sequence")   # before canvassize: it indexes clips[1]
@@ -31,11 +36,13 @@ function exportvideo(path::AbstractString, seq::Sequence;
     wantaudio = audio && any(hasaudio, unique(c.source.path for c in seq.clips))
     videopath = wantaudio ? tempname() * ".mp4" : path
 
-    outbuf = zeros(RGB{N0f8}, canvas[1], canvas[2])
-    transbuf = RGBFrame(undef, canvas[1], canvas[2])  # incoming side of a transition
-    layerbuf = RGBFrame(undef, canvas[1], canvas[2])  # one track layer while compositing
-    readers = Dict{String, SequentialReader}()
-    fxbufs = Dict{String, NTuple{3, RGBFrame}}()  # per-source full-res scratch
+    outbuf = alloccanvas(backend, (canvas[1], canvas[2]))
+    transbuf = allocframe(backend, (canvas[1], canvas[2]))   # incoming side of a transition
+    layerbuf = allocframe(backend, (canvas[1], canvas[2]))   # one track layer while compositing
+    hostout = zeros(RGB{N0f8}, canvas[1], canvas[2])         # encode staging (download target)
+    blackhost = zeros(RGB{N0f8}, canvas[1], canvas[2])       # gap/composite base for device canvases
+    readers = Dict{String, Any}()   # per-source decoder: GpuVideoStream or SequentialReader
+    fxbufs = Dict{String, NTuple{4, AnyRGBFrame}}()  # per-source (host, chain triple)
 
     writer = VideoIO.open_video_out(videopath, RGB{N0f8}, (canvas[2], canvas[1]);
                                     framerate = framerate, codec_name = codec_name,
@@ -50,7 +57,7 @@ function exportvideo(path::AbstractString, seq::Sequence;
                 rendercanvas!(transbuf, right, srcB, readers, fxbufs)
                 blend!(outbuf, outbuf, transbuf, p)
             elseif ntracks(seq) > 1 && length(clipsat(seq, n)) > 1
-                fill!(outbuf, RGB{N0f8}(0, 0, 0))               # composite the track stack
+                fillblack!(outbuf, blackhost)                   # composite the track stack
                 for clip in clipsat(seq, n)                     # bottom → top
                     sf = clip.src_in + (n - clip.start)
                     rendercanvas!(layerbuf, clip, sf, readers, fxbufs; skipopacity = true)
@@ -58,10 +65,10 @@ function exportvideo(path::AbstractString, seq::Sequence;
                 end
             else
                 loc = locate(seq, n)
-                loc === nothing ? fill!(outbuf, RGB{N0f8}(0, 0, 0)) :
+                loc === nothing ? fillblack!(outbuf, blackhost) :
                                   rendercanvas!(outbuf, loc[1], loc[2], readers, fxbufs)
             end
-            write(writer, PermutedDimsArray(outbuf, (2, 1)))
+            writeframe!(writer, outbuf, hostout, backend)
             progress === nothing || n % 30 == 0 && progress(n + 1, total)
         end
     finally
@@ -88,12 +95,12 @@ once, `n` repeats `n` extra times.
 """
 function exportgif(path::AbstractString, seq::Sequence; fps::Real = 15,
                    loop::Integer = 0, width::Union{Nothing, Integer} = nothing,
-                   progress = nothing)
+                   backend = KA.CPU(), progress = nothing)
     seqlength(seq) > 0 || error("empty sequence")
     tmp = tempname() * ".mp4"
     palette = tempname() * ".png"
     try
-        exportvideo(tmp, seq; audio = false, progress = progress)
+        exportvideo(tmp, seq; audio = false, backend = backend, progress = progress)
         scale = width === nothing ? "scale=trunc(iw/2)*2:-2:flags=lanczos" :
                 "scale=$(Int(width)):-2:flags=lanczos"
         vf = "fps=$(fps),$(scale)"
@@ -138,18 +145,82 @@ mutable struct SequentialReader
     end
 end
 
+"Frame-sized working buffer on `backend` (a plain host frame on the CPU)."
+allocframe(::KA.CPU, dims::NTuple{2, Int}) = RGBFrame(undef, dims...)
+allocframe(backend, dims::NTuple{2, Int}) = KA.allocate(backend, RGB{N0f8}, dims)
+
+"The export canvas (downloaded to the host every frame; stays device-local —
+BAR/unified memory reads ~70 MB/s from the CPU, 8× slower than staged readback)."
+alloccanvas(::KA.CPU, dims::NTuple{2, Int}) = zeros(RGB{N0f8}, dims...)
+alloccanvas(backend, dims::NTuple{2, Int}) = KA.allocate(backend, RGB{N0f8}, dims)
+
+"Black canvas for gaps and the composite base (device canvases copy a host zero frame)."
+fillblack!(buf::RGBFrame, blackhost) = fill!(buf, RGB{N0f8}(0, 0, 0))
+fillblack!(buf, blackhost) = copyto!(buf, blackhost)
+
+"Publish the composed canvas to the encoder (device canvases download via `hostout`)."
+writeframe!(writer, canvas::RGBFrame, hostout, backend) =
+    write(writer, PermutedDimsArray(canvas, (2, 1)))
+function writeframe!(writer, canvas, hostout, backend)
+    KA.synchronize(backend)
+    copyto!(hostout, canvas)
+    write(writer, PermutedDimsArray(hostout, (2, 1)))
+end
+
+"""
+The per-source export decoder: a [`GpuVideoStream`](@ref) on a GPU backend when the
+source hardware-decodes (frames land device-resident through the chunked session —
+no host round-trip, the biggest export cost on the CPU path), else the CPU
+[`SequentialReader`](@ref).
+"""
+function opendecoder(source::VideoSource, backend)
+    backend isa KA.CPU && return SequentialReader(source)
+    try
+        return openstream(backend, source.path, source.width, source.height)
+    catch e
+        @warn "GPU stream unavailable for export — CPU decode" source = source.path exception = e
+        return SequentialReader(source)
+    end
+end
+
+"""
+    decodeinto!(dest, host, decoder, srcframe)
+
+Decode source frame `srcframe` into `dest`, EXACTLY — an export must never get a
+nearest-frame stand-in. Dispatches on the decoder: a [`GpuVideoStream`](@ref)
+decodes device-resident via [`exactframeat!`](@ref); a [`SequentialReader`](@ref)
+decodes into the `host` staging buffer and uploads only when `dest` lives on a
+device.
+"""
+function decodeinto!(dest::AnyRGBFrame, host::RGBFrame, s::GpuVideoStream, srcframe::Integer)
+    f = exactframeat!(s, srcframe)
+    nv12torgb!(dest, f.y, f.uv; bt601 = s.bt601)
+    return dest
+end
+
+function decodeinto!(dest::AnyRGBFrame, host::RGBFrame, sr::SequentialReader, srcframe::Integer)
+    readframe!(host, sr, srcframe)
+    dest === host || copyto!(dest, host)
+    return dest
+end
+
 """
 Render `clip` at source frame `srcframe` — decode, motion/color tracks, effect
 stack, then warp its crop into `dest` (a canvas-sized buffer). `readers`/`fxbufs`
-cache one reader and one scratch triple per source path.
+cache one decoder and one scratch triple per source path.
 """
-function rendercanvas!(dest::RGBFrame, clip::Clip, srcframe::Integer,
-                       readers::Dict{String, SequentialReader},
-                       fxbufs::Dict{String, NTuple{3, RGBFrame}}; skipopacity::Bool = false)
-    sr = get!(() -> SequentialReader(clip.source), readers, clip.source.path)
-    frame, fx1, fx2 = get!(() -> ntuple(_ -> RGBFrame(undef, clip.source.width, clip.source.height), 3),
-                           fxbufs, clip.source.path)
-    readframe!(frame, sr, srcframe)
+function rendercanvas!(dest::AnyRGBFrame, clip::Clip, srcframe::Integer,
+                       readers::Dict{String, Any},
+                       fxbufs::Dict{String, NTuple{4, AnyRGBFrame}}; skipopacity::Bool = false)
+    bk = KA.get_backend(dest)
+    sr = get!(() -> opendecoder(clip.source, bk), readers, clip.source.path)
+    host, frame, fx1, fx2 = get!(fxbufs, clip.source.path) do
+        w, h = clip.source.width, clip.source.height
+        host = RGBFrame(undef, w, h)                  # decode target (VideoIO needs host memory)
+        mk() = bk isa KA.CPU ? RGBFrame(undef, w, h) : KA.allocate(bk, RGB{N0f8}, (w, h))
+        (host, bk isa KA.CPU ? host : mk(), mk(), mk())   # on CPU the chain runs in `host` itself
+    end
+    decodeinto!(frame, host, sr, srcframe)
     clip = effectiveclip(clip, srcframe)  # keyframed params baked at this frame
     applymotiontrack!(frame, fx1, clip, srcframe)
     applycolortrack!(frame, clip, srcframe)

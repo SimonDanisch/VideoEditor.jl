@@ -40,10 +40,8 @@ function analyzemotion!(clip::Clip; mode::Symbol = :similarity, analysis_width::
     ah = max(round(Int, source.height / source.width * aw), 24)
     scale = Float32(source.width / aw)
 
-    sr = SequentialReader(source)
-    frame = RGBFrame(undef, source.width, source.height)
-    small = RGBFrame(undef, aw, ah)
-    ghost = Matrix{Float32}(undef, aw, ah)          # CPU staging
+    dec = graysource(backend, source)               # GPU stream on a GPU backend
+    ws = smallgrayws(dec, backend, (aw, ah))
     gref = KA.allocate(backend, Float32, (aw, ah))  # device buffers
     gprev = KA.allocate(backend, Float32, (aw, ah))
     gcur = KA.allocate(backend, Float32, (aw, ah))
@@ -55,10 +53,7 @@ function analyzemotion!(clip::Clip; mode::Symbol = :similarity, analysis_width::
     path = zeros(Float32, n, 2)  # smooth mode: translation path relative to frame 1
     try
         for i in 1:n
-            readframe!(frame, sr, clip.src_in + i - 1)
-            warp!(small, frame, (0.0, 0.0, 1.0, 1.0))  # downscale
-            grayscale!(ghost, small)
-            copyto!(gcur, ghost)
+            smallgrayinto!(gcur, ws, dec, clip.src_in + i - 1)  # decode+downscale+gray
             if i == 1
                 copyto!(gref, gcur)
             elseif mode !== :smooth
@@ -75,7 +70,7 @@ function analyzemotion!(clip::Clip; mode::Symbol = :similarity, analysis_width::
             progress === nothing || i % 60 == 0 && progress(i, n)
         end
     finally
-        close(sr)
+        close(dec)
     end
 
     if mode === :smooth
@@ -167,13 +162,17 @@ function clampsimilarity(F::Mat3f; maxdθ::Real = 0.5, maxds::Real = 0.005,
                  F[1, 3] * f, F[2, 3] * f, 1)
 end
 
-"Detect Shi-Tomasi corners on `backend`; uploads the host gray for a GPU pass."
-function detectfeatures(backend, gray::AbstractMatrix{Float32}, maxpoints::Integer,
+"Detect Shi-Tomasi corners on `backend`. A host gray uploads for a GPU pass;
+a device-resident gray is used in place (the GPU-decode analyses keep the
+frame on the device — no transfer at all)."
+function detectfeatures(backend, gray::Matrix{Float32}, maxpoints::Integer,
                         border::Integer)
     gdev = backend isa KA.CPU ? gray :
            (d = KA.allocate(backend, Float32, size(gray)); copyto!(d, gray); d)
     return goodfeatures(backend, gdev; maxpoints = maxpoints, border = border)
 end
+detectfeatures(backend, gray::AbstractMatrix{Float32}, maxpoints::Integer, border::Integer) =
+    goodfeatures(backend, gray; maxpoints = maxpoints, border = border)
 
 """
     cameralock!(clip; point=nothing, ...) -> MotionTrack
@@ -219,9 +218,12 @@ function cameralock!(clip::Clip; point = nothing, window::Integer = 96,
     iseven(window) || (window -= 1)
     lostradius = min(Int(lostradius), window)
     searchradius = min(Int(searchradius), lostradius)
-    sr = SequentialReader(source)
-    frame = RGBFrame(undef, source.width, source.height)
-    gray = Matrix{Float32}(undef, source.width, source.height)
+    dec = graysource(backend, source)   # GPU decode+grayscale on a GPU backend
+    # the frame stays on the analysis backend end-to-end: the stream grays it
+    # on-device and the NCC/detect kernels read it in place — the only per-frame
+    # transfers left are the 4×K match results (host copies only at the rare
+    # template re-cuts)
+    gray = KA.allocate(backend, Float32, (source.width, source.height))
     transforms = fill(Mat3f(1, 0, 0, 0, 1, 0, 0, 0, 1), n)
     anchor = nothing
     fillt = nothing
@@ -238,14 +240,14 @@ function cameralock!(clip::Clip; point = nothing, window::Integer = 96,
     lastdetect = 1
     try
         for i in 1:n
-            readframe!(frame, sr, clip.src_in + i - 1)
-            grayscale!(gray, frame)
+            grayinto!(gray, dec, clip.src_in + i - 1)
             if i == 1
                 margin = window ÷ 2 + reacqradius + 4
                 # DETECTED corners (Shi-Tomasi) are trackable through blur/fast
                 # motion where an arbitrary grid isn't; fall back to a grid only
                 # if the frame is too textureless to yield enough.
                 centers = detectfeatures(backend, gray, maxfeatures, margin)
+                h1 = hostcopy(gray)   # template cutting indexes on the host
                 if length(centers) < 2 * mintemplates
                     centers = [(round(Int, x), round(Int, y))
                                for x in range(margin, source.width - margin; length = gridcols)
@@ -256,12 +258,12 @@ function cameralock!(clip::Clip; point = nothing, window::Integer = 96,
                 # snap the lock back when the camera returns near start, e.g. at
                 # a loop end). `fill` = fresh re-detected features that carry the
                 # track through the flight where the anchor set is unmatchable.
-                anchor = PatchTracker(backend, gray, centers; window, maxradius = reacqradius)
+                anchor = PatchTracker(backend, h1, centers; window, maxradius = reacqradius)
                 fillt = anchor
                 if point !== nothing
                     # center-weighted: follow the SUBJECT under the click, not
                     # the background ring around it
-                    obj = PatchTracker(backend, gray, [(px, py)];
+                    obj = PatchTracker(backend, h1, [(px, py)];
                                        window = ow, maxradius = 2 * searchradius,
                                        minstd = 0.0, centerweight = true)
                 end
@@ -329,8 +331,8 @@ function cameralock!(clip::Clip; point = nothing, window::Integer = 96,
                     ref = [(round(Int, Mi[1, 1] * px2 + Mi[1, 2] * py2 + Mi[1, 3]),
                             round(Int, Mi[2, 1] * px2 + Mi[2, 2] * py2 + Mi[2, 3]))
                            for (px2, py2) in pcur]
-                    fillt = PatchTracker(backend, gray, pcur; window, maxradius = reacqradius,
-                                        refcenters = ref)
+                    fillt = PatchTracker(backend, hostcopy(gray), pcur;
+                                         window, maxradius = reacqradius, refcenters = ref)
                     lastdetect = i
                     nmatch >= mintemplates || (lost = 1)  # give the fresh set a chance
                 end
@@ -347,7 +349,7 @@ function cameralock!(clip::Clip; point = nothing, window::Integer = 96,
             progress === nothing || i % 60 == 0 && progress(i, n)
         end
     finally
-        close(sr)
+        close(dec)
     end
     clip.motiontrack = MotionTrack(transforms, clip.src_in,
                                    point === nothing ? :similarity : :objectlock)
@@ -444,7 +446,7 @@ not a reverse/boomerang.
 """
 function findloop(clip::Clip; minseconds::Real = 1.5, maxseconds::Real = 6.0,
                   matchwidth::Integer = 64, step::Integer = 2, lengthbias::Real = 0.0,
-                  progress = nothing)
+                  backend = KA.CPU(), progress = nothing)
     src = clip.source
     fps = src.framerate
     n = cliplength(clip)
@@ -459,13 +461,13 @@ function findloop(clip::Clip; minseconds::Real = 1.5, maxseconds::Real = 6.0,
     gw = Int(matchwidth)
     gh = max(round(Int, gw * (cy1 - cy0 + 1) / (cx1 - cx0 + 1)), 1)
     frames = Array{Float32, 3}(undef, gw, gh, n)
-    sr = SequentialReader(src)
-    big = RGBFrame(undef, W, H)
+    dec = graysource(backend, src)             # GPU decode on a GPU backend
+    ws = smallrgbws(dec, backend, (dw, dh))    # stream lane downscales on-device
+    small = RGBFrame(undef, dw, dh)
     stmp = RGBFrame(undef, dw, dh)
     try
         for i in 1:n                           # sequential decode (no per-frame seeks)
-            readframe!(big, sr, clip.src_in + i - 1)
-            small = downscale(big, dw, dh)
+            smallrgbinto!(small, ws, dec, clip.src_in + i - 1)
             applymotiontrack!(small, stmp, clip, clip.src_in + i - 1)
             reg = downscale(collect(@view small[cx0:cx1, cy0:cy1]), gw, gh)
             g = @view frames[:, :, i]
@@ -481,7 +483,7 @@ function findloop(clip::Clip; minseconds::Real = 1.5, maxseconds::Real = 6.0,
             progress === nothing || i % 60 == 0 && progress(i, n)
         end
     finally
-        close(sr)
+        close(dec)
     end
     minL = max(round(Int, minseconds * fps), 1)
     maxL = max(round(Int, maxseconds * fps), minL)

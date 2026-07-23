@@ -36,9 +36,11 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
                                     sleep(0.1)
                                 end;
                                 pred())
-        # stabilization controls now live in a modal; open/close it around those beats
-        stabopen() = (p.fxwidgets[:stabmodalopen](); sleep(0.3))
-        stabclose() = (foreach(m -> m.open[] = false, get(p.fxwidgets, :modals, Any[])); sleep(0.1))
+        # stabilization controls live INLINE in the inspector dock (no modal);
+        # stabopen ensures that dock is showing, stabclose is a no-op kept so the
+        # beats read the same as before the restructure
+        stabopen() = (p.fxwidgets[:stabopen](); sleep(0.3))
+        stabclose() = sleep(0.1)
 
         @testset "scrub selects and follows" begin
             @test occursin("Space plays", p.status[])   # onboarding hint on startup
@@ -295,17 +297,19 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test clip.motiontrack.basecrop == (0.0, 0.0, 1.0, 1.0)
             @test waitfor(() -> occursin("object lock", p.stabinfo[]))
 
-            stabopen()                           # reopen to restore the default mode
+            stabopen()
+            # the analysis rebuilt the Stabilization section — re-fetch the live menu
+            menu = p.fxwidgets[:modemenu]
             press(mpos(0.5)); release()
             press(mpos(-0.5)); release()
             @test menu.selection[] == :similarity
-            # modal left open for the remove-stabilization testset
         end
 
         @testset "remove stabilization restores the framing" begin
             clip = VE.locate(p.sequence, p.playhead[])[1]
             @test clip.motiontrack !== nothing   # from the object-lock beat
             @test clip.crop != (0.0, 0.0, 1.0, 1.0)
+            # the Stabilization section header carries the × while a track exists
             rmbtn = p.fxwidgets[:remove]
             bb = rmbtn.layoutobservables.computedbbox[]
             press(Point2f(bb.origin .+ bb.widths ./ 2)); release()
@@ -313,15 +317,13 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test clip.crop == (0.0, 0.0, 1.0, 1.0)          # basecrop restored
             @test occursin("no stabilization", p.stabinfo[])
             @test waitfor(() -> occursin("removed", p.status[]))   # async status queue
-            # removing again reports politely instead of erroring (pause: a
-            # second click at the same spot within the dblclick window would
-            # be swallowed)
-            sleep(0.5)
-            press(Point2f(bb.origin .+ bb.widths ./ 2)); release()
-            @test waitfor(() -> occursin("no stabilization to remove", p.status[]))
-            # let the restore glide + outline flash finish before later beats
+            # with the track gone the × leaves the header — nothing left to misclick
+            @test waitfor(() -> !haskey(p.fxwidgets, :remove))
+            # let the restore glide + outline flash FULLY finish before later beats:
+            # croprect starts empty, so wait for the outline to appear, then clear
+            @test waitfor(() -> !isempty(p.croprect[]))
             @test waitfor(() -> isempty(p.croprect[]))
-            stabclose()   # timeline beats below need the modal backdrop gone
+            stabclose()
         end
 
         @testset "proxy swap keeps the preview consistent" begin
@@ -490,6 +492,28 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test p.tool[] == :none
         end
 
+        @testset "plain-drag lifts a clip to a new track" begin
+            # press mid-clip (starts as a scrub), then drag UP into the marked
+            # new-track zone — the gesture converts into a clip move, no Ctrl
+            clip = p.sequence.clips[1]
+            @test clip.track == 1
+            sleep(0.5)
+            press(tlx(3.0))
+            @test tl.scrubbing[]
+            vp = ax.scene.viewport[]
+            moveto(Point2f(tlx(3.5)[1], vp.origin[2] + 0.93 * vp.widths[2]))
+            @test !tl.scrubbing[]
+            @test tl.dragclip !== nothing        # converted to a move
+            @test tl.dragtrack == 2
+            release()
+            @test clip.track == 2
+            @test VE.ntracks(p.sequence) == 2
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
+            keypress(Keyboard.z)                 # undoable like any edit
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
+            @test p.sequence.clips[1].track == 1
+        end
+
         @testset "export dock panel renders the timeline" begin
             outbtn = first(b for b in fig.content
                            if b isa Makie.Button && b.label[] == "Export")
@@ -500,12 +524,92 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             out = joinpath(mktempdir(), "paneltest.mp4")
             p.fxwidgets[:exportpath][] = out
             gb = p.fxwidgets[:exportgo].layoutobservables.computedbbox[]
-            sleep(0.5)
-            press(Point2f(gb.origin .+ gb.widths ./ 2)); release()
+            # clear the dblclick window fully and HOLD the press briefly — an
+            # instantaneous synthetic press+release this soon after the Export
+            # click above gets swallowed as a double-click
+            sleep(1.2)
+            press(Point2f(gb.origin .+ gb.widths ./ 2)); sleep(0.2); release()
             @test waitfor(() -> occursin("exported", p.status[]) ||
                                 occursin("failed", p.status[]); s = 45)
             @test occursin("exported", p.status[])
             @test isfile(out)
+        end
+
+        @testset "Ctrl+P palette adds any effect" begin
+            press(tlx(2.0)); release()              # playhead onto the clip
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            nfx = length(clip.effects)
+            sleep(0.3)
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
+            keypress(Keyboard.p)
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
+            @test p.fxwidgets[:palettemodal].open[]
+            p.fxwidgets[:palettequery][] = "shar"   # filters down to Sharpen
+            keypress(Keyboard.enter)                # ⏎ applies the top hit
+            @test !p.fxwidgets[:palettemodal].open[]
+            @test length(clip.effects) == nfx + 1
+            @test VE.uneffect(clip.effects[end]) isa VE.SharpenEffect
+            # Stabilization is addable the same way — its section lands in the inspector
+            p.fxwidgets[:paletteopen]()
+            p.fxwidgets[:palettequery][] = "stab"
+            keypress(Keyboard.enter)
+            @test waitfor(() -> any(l -> Makie.to_value(l.text) == "Stabilization",
+                                    p.fxwidgets[:effectrows]))
+        end
+
+        @testset "keyframe overlay edits the param you click" begin
+            press(tlx(2.0)); release()               # playhead onto the clip
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            p.fxwidgets[:paletteopen]()              # a second animatable effect
+            p.fxwidgets[:palettequery][] = "brig"
+            keypress(Keyboard.enter)
+            sleep(0.3)
+            len = clip.src_out - clip.src_in         # frames survive earlier trim tests
+            fkey = clip.src_in + (3 * len) ÷ 4       # keyed frame (both params)
+            ffree = clip.src_in + (2 * len) ÷ 5      # key-free frame for the Alt-add
+            VE.armkeyframe!(p, :brightness)
+            VE.armkeyframe!(p, :sharpen)
+            VE.setkey!(clip.animations[:brightness], fkey, VE.paramspec(:brightness).hi)
+            VE.setkey!(clip.animations[:sharpen], fkey, VE.paramspec(:sharpen).lo)
+            VE.armkeyframe!(p, :brightness)          # focus = brightness
+            notify(p.playhead); sleep(0.3)
+            curvepos(key, sf) = begin                # figure pixel on `key`'s curve at SOURCE frame sf
+                ntr = VE.ntracks(p.sequence)
+                lo, hi = VE.trackband(clip.track, ntr)
+                g = min(0.02, VE.trackspan(ntr) * 0.15); lo += g; hi -= g
+                inset = 0.12 * (hi - lo); lo += inset; hi -= inset
+                c = clip.animations[key]; pr = VE.paramspec(key)
+                v = something(VE.valueat(c, sf), pr.get(clip))
+                y = lo + (hi - lo) * clamp(VE.paramnorm(pr, v), 0.0, 1.0)
+                t = (clip.start + (sf - clip.src_in)) / p.sequence.framerate
+                lims = ax.finallimits[]; vp = ax.scene.viewport[]
+                Point2f(vp.origin[1] + (t - minimum(lims)[1]) /
+                            (maximum(lims)[1] - minimum(lims)[1]) * vp.widths[1],
+                        vp.origin[2] + (y - minimum(lims)[2]) /
+                            (maximum(lims)[2] - minimum(lims)[2]) * vp.widths[2])
+            end
+            # Alt-click near the SHARPEN curve while BRIGHTNESS holds the focus:
+            # the key must land on what was clicked, and the focus must follow
+            nb = length(clip.animations[:brightness].keys)
+            ns = length(clip.animations[:sharpen].keys)
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.press)
+            press(curvepos(:sharpen, ffree)); release()
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.release)
+            sleep(0.2)
+            @test length(clip.animations[:sharpen].keys) == ns + 1
+            @test length(clip.animations[:brightness].keys) == nb
+            @test p.kffocus[] === :sharpen
+            # grabbing a brightness ◆ refocuses it
+            press(curvepos(:brightness, fkey)); release(); sleep(0.2)
+            @test p.kffocus[] === :brightness
+            # right-click deletes exactly the clicked param's key
+            ns2 = length(clip.animations[:sharpen].keys)
+            moveto(curvepos(:sharpen, ffree))
+            ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.press)
+            ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.release)
+            sleep(0.2)
+            @test length(clip.animations[:sharpen].keys) == ns2 - 1
+            @test length(clip.animations[:brightness].keys) == nb
         end
     finally
         close(p)

@@ -1,5 +1,5 @@
 """
-    analyzecolor!(clip; cutoff=0.5, progress=nothing) -> ColorTrack
+    analyzecolor!(clip; cutoff=0.5, backend=KA.CPU(), progress=nothing) -> ColorTrack
 
 Color/exposure stabilization: measure per-channel mean/std for every source
 frame of the clip, low-pass the trajectories (`cutoff` Hz — slow intentional
@@ -10,23 +10,23 @@ The track is keyed by absolute source frame, so it stays valid across
 later splits/moves of the clip. Applied automatically (before user
 effects) in preview and export. Saved with the project.
 """
-function analyzecolor!(clip::Clip; cutoff::Real = 0.5, progress = nothing)
+function analyzecolor!(clip::Clip; cutoff::Real = 0.5, backend = KA.CPU(), progress = nothing)
     n = cliplength(clip)
     n >= 24 || return nothing  # too short to separate flicker from content
     means = Matrix{Float32}(undef, n, 3)
     stds = Matrix{Float32}(undef, n, 3)
-    sr = SequentialReader(clip.source)
-    frame = RGBFrame(undef, clip.source.width, clip.source.height)
+    dec = graysource(backend, clip.source)   # GPU decode on a GPU backend
     try
         for i in 1:n
-            readframe!(frame, sr, clip.src_in + i - 1)
-            μ, σ = channelstats(frame)
+            # stats reduce ON the decoder's backend — with a stream nothing but
+            # the six floats ever crosses the bus
+            μ, σ = channelstats(rgbframe!(dec, clip.src_in + i - 1))
             means[i, :] .= Tuple(μ)
             stds[i, :] .= Tuple(σ)
             progress === nothing || i % 60 == 0 && progress(i, n)
         end
     finally
-        close(sr)
+        close(dec)
     end
 
     fps = clip.source.framerate
@@ -52,13 +52,19 @@ function analyzecolor!(clip::Clip; cutoff::Real = 0.5, progress = nothing)
     return clip.colortrack
 end
 
-"Apply the clip's color stabilization for `srcframe`, if analyzed."
+"Apply the clip's color stabilization for `srcframe`, if analyzed. The track's
+`strength` scales the correction toward identity (used by the CPU path AND the
+GPU graph's ColorTrackNode, which calls this same function)."
 function applycolortrack!(buf::AnyRGBFrame, clip::Clip, srcframe::Integer)
     track = clip.colortrack
     track === nothing && return buf
     i = srcframe - track.src_in + 1
     1 <= i <= length(track.gains) || return buf
-    channellinear!(buf, track.gains[i], track.offsets[i])
+    s = clamp(track.strength, 0.0f0, 1.0f0)
+    s <= 0.0f0 && return buf
+    g = 1.0f0 .+ s .* (track.gains[i] .- 1.0f0)
+    o = s .* track.offsets[i]
+    channellinear!(buf, Vec3f(g), Vec3f(o))
     KA.synchronize(KA.get_backend(buf))
     return buf
 end

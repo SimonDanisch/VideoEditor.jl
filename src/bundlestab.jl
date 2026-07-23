@@ -43,7 +43,8 @@ frame-to-frame with sub-pixel NCC ([`matchpatches!`](@ref)). Tracks that lose
 their match (low score / margin, or leaving the frame) are retired; fresh
 features are seeded every `respawn` frames and whenever live tracks fall below
 `mintracks`, so coverage never collapses. `backend` runs the detection/NCC
-kernels; decode and grayscale stay on the CPU.
+kernels AND the decode: a GPU backend feeds frames from the chunked GPU
+stream (grayscale on-device, only the gray crosses to the host).
 """
 function extracttracks(backend, clip::Clip, gw::Int, gh::Int;
                        window::Integer = 32, searchradius::Integer = 8,
@@ -58,16 +59,18 @@ function extracttracks(backend, clip::Clip, gw::Int, gh::Int;
     R = Int(searchradius)
     margin = half + R + 3
     ident = Mat3f(1, 0, 0, 0, 1, 0, 0, 0, 1)
-    sr = SequentialReader(source)
-    frame = RGBFrame(undef, source.width, source.height)
-    fullgray = Matrix{Float32}(undef, source.width, source.height)
+    dec = graysource(backend, source)   # GPU decode+grayscale on a GPU backend
+    # full-res gray and the resize stay on the analysis backend; only the tiny
+    # gw×gh working image crosses to the host
+    fullgray = KA.allocate(backend, Float32, (source.width, source.height))
+    sgray = KA.allocate(backend, Float32, (gw, gh))
     bufa = Matrix{Float32}(undef, gw, gh)
     bufb = Matrix{Float32}(undef, gw, gh)
     prev, cur = bufa, bufb
     readgray!(dst, f) = begin
-        readframe!(frame, sr, clip.src_in + f - 1)
-        grayscale!(fullgray, frame)
-        bilinearresize!(dst, fullgray)
+        grayinto!(fullgray, dec, clip.src_in + f - 1)
+        bilinearresize!(sgray, fullgray)
+        copyto!(dst, sgray)
     end
     px = Float32[]; py = Float32[]
     active = Track[]
@@ -117,7 +120,7 @@ function extracttracks(backend, clip::Clip, gw::Int, gh::Int;
             progress === nothing || (f % 60 == 0 && progress(f, n))
         end
     finally
-        close(sr)
+        close(dec)
     end
     for t in active
         length(t) >= minlen && push!(finished, t)
