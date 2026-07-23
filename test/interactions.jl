@@ -555,6 +555,13 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             keypress(Keyboard.enter)
             @test waitfor(() -> any(l -> Makie.to_value(l.text) == "Stabilization",
                                     p.fxwidgets[:effectrows]))
+            # PARAMETER labels hit too: "bright" finds the Color kind (Premiere-style)
+            nfx2 = length(clip.effects)
+            p.fxwidgets[:paletteopen]()
+            p.fxwidgets[:palettequery][] = "bright"
+            keypress(Keyboard.enter)
+            @test length(clip.effects) == nfx2 + 1
+            @test VE.uneffect(clip.effects[end]) isa VE.ColorEffect
         end
 
         @testset "keyframe overlay edits the param you click" begin
@@ -602,14 +609,154 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             # grabbing a brightness ◆ refocuses it
             press(curvepos(:brightness, fkey)); release(); sleep(0.2)
             @test p.kffocus[] === :brightness
-            # right-click deletes exactly the clicked param's key
+            # right-click opens the keyframe menu on the clicked ◆; Delete removes
+            # exactly that key (and only it) — the clip context menu stays closed
             ns2 = length(clip.animations[:sharpen].keys)
             moveto(curvepos(:sharpen, ffree))
             ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.press)
             ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.release)
             sleep(0.2)
+            @test p.fxwidgets[:kfmenu].open[]
+            @test p.clipmodal === nothing || !p.clipmodal.open[]
+            notify(p.fxwidgets[:kfmenubtn1].clicks); sleep(0.2)
+            @test !p.fxwidgets[:kfmenu].open[]
             @test length(clip.animations[:sharpen].keys) == ns2 - 1
             @test length(clip.animations[:brightness].keys) == nb
+        end
+
+        @testset "keyframe trio, snap, ease & guards (Premiere parity)" begin
+            Makie.limits!(ax, 0.0, 4.0, 0.0, 1.0)    # deterministic zoom for pixel math
+            press(tlx(2.0)); release(); sleep(0.2)   # playhead onto the clip
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            fps = p.sequence.framerate
+            markerpix(key, sf) = begin               # figure pixel of `key`'s curve at source frame sf
+                ntr = VE.ntracks(p.sequence)
+                lo, hi = VE.trackband(clip.track, ntr)
+                g = min(0.02, VE.trackspan(ntr) * 0.15); lo += g; hi -= g
+                inset = 0.12 * (hi - lo); lo += inset; hi -= inset
+                c = clip.animations[key]; pr = VE.paramspec(key)
+                v = something(VE.valueat(c, sf), pr.get(clip))
+                y = lo + (hi - lo) * clamp(VE.paramnorm(pr, v), 0.0, 1.0)
+                t = (clip.start + (sf - clip.src_in)) / fps
+                lims = ax.finallimits[]; vp = ax.scene.viewport[]
+                Point2f(vp.origin[1] + (t - minimum(lims)[1]) /
+                            (maximum(lims)[1] - minimum(lims)[1]) * vp.widths[1],
+                        vp.origin[2] + (y - minimum(lims)[2]) /
+                            (maximum(lims)[2] - minimum(lims)[2]) * vp.widths[2])
+            end
+            trio() = p.fxwidgets[:kfacc_contrast]    # re-fetch: arming rebuilds the stack
+
+            # --- ◆ arms: first key at the playhead, label flips ◇ → ◆ ---
+            @test !VE.clipanimated(clip, :contrast)
+            @test Makie.to_value(trio()[2].label) == "◇"
+            notify(trio()[2].clicks); sleep(0.3)
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            f1 = VE.playheadframe(p, clip)
+            @test [k.frame for k in clip.animations[:contrast].keys] == [f1]
+            @test Makie.to_value(trio()[2].label) == "◆"
+            # --- scrub off the key (◇), slider writes a second key (◆ again) ---
+            press(tlx(2.8)); release(); sleep(0.3)
+            @test Makie.to_value(trio()[2].label) == "◇"
+            ghost0 = sum(length(c.keys) for (k, c) in clip.animations if k !== :contrast; init = 0)
+            Makie.set_close_to!(p.fxsliders[:contrast], 1.6); sleep(0.4)
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            f2 = VE.playheadframe(p, clip)
+            @test length(clip.animations[:contrast].keys) == 2
+            # a gesture on ONE slider must not stamp ghost keys on other animated params
+            @test sum(length(c.keys) for (k, c) in clip.animations if k !== :contrast; init = 0) == ghost0
+            @test Makie.to_value(trio()[2].label) == "◆"
+            # --- ◀ ▶ jump between keys ---
+            notify(trio()[1].clicks); sleep(0.3)
+            @test VE.playheadframe(p, VE.locate(p.sequence, p.playhead[])[1]) == f1
+            notify(trio()[3].clicks); sleep(0.3)
+            @test VE.playheadframe(p, VE.locate(p.sequence, p.playhead[])[1]) == f2
+            # --- ◆ ON a key removes it; removing the last key un-animates ---
+            notify(trio()[2].clicks); sleep(0.3)
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            @test [k.frame for k in clip.animations[:contrast].keys] == [f1]
+            notify(trio()[1].clicks); sleep(0.3)     # ◀ back onto the remaining key
+            notify(trio()[2].clicks); sleep(0.3)
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            @test !VE.clipanimated(clip, :contrast)
+            @test Makie.to_value(trio()[2].label) == "◇"
+
+            # --- rebuild a 2-key ramp for the gesture checks ---
+            notify(trio()[2].clicks); sleep(0.3)                    # key at f1'
+            press(tlx(2.8)); release(); sleep(0.2)
+            Makie.set_close_to!(p.fxsliders[:contrast], 1.6); sleep(0.4)
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            ka, kb = (k.frame for k in clip.animations[:contrast].keys)
+
+            # --- dragging a ◆ snaps onto the playhead when within reach: aim 9 px
+            # right of it (>½ frame at this zoom, so WITHOUT the snap the key would
+            # round to mid+1; within the 12 px magnet, so WITH it it lands on mid) ---
+            mid = ka + (kb - ka) ÷ 2
+            VE.seek!(p, clip.start + (mid - clip.src_in)); sleep(0.2)
+            from = markerpix(:contrast, kb)
+            near = markerpix(:contrast, mid) .+ Point2f(9, 0)
+            press(from); moveto(from .+ Point2f(-30, 0)); moveto(near); release(); sleep(0.3)
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            @test any(k -> k.frame == mid, clip.animations[:contrast].keys)
+
+            # --- hidden curves are INERT: the same grab must scrub, not retime ---
+            p.kfvisible[] = false; sleep(0.2)
+            VE.seek!(p, clip.start); sleep(0.2)
+            keysbefore = [(k.frame, k.value) for k in clip.animations[:contrast].keys]
+            hidden = markerpix(:contrast, mid)
+            press(hidden); moveto(hidden .+ Point2f(-40, 0)); release(); sleep(0.3)
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            @test p.playhead[] != clip.start                       # it scrubbed
+            @test [(k.frame, k.value) for k in clip.animations[:contrast].keys] == keysbefore
+            p.kfvisible[] = true; sleep(0.2)
+
+            # --- Alt-click with no animated curve nearby only hints ---
+            saved = copy(clip.animations); empty!(clip.animations)
+            notify(p.playhead); sleep(0.2)
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.press)
+            press(tlx((clip.start + (mid - clip.src_in)) / fps)); release()   # same clip, no curves
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.release)
+            sleep(0.2)
+            @test isempty(clip.animations)                         # nothing invented
+            merge!(clip.animations, saved); notify(p.playhead); sleep(0.2)
+
+            # --- right-click ◆ → Ease toggles smoothstep interpolation ---
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            c = clip.animations[:contrast]
+            ka, kb = (k.frame for k in c.keys)
+            va, vb = (k.value for k in c.keys)
+            fq = ka + (kb - ka) ÷ 4
+            tq = (fq - ka) / (kb - ka)
+            rc = markerpix(:contrast, kb)
+            ev.mouseposition[] = Tuple(rc)
+            ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.press)
+            ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.release)
+            sleep(0.2)
+            @test p.fxwidgets[:kfmenu].open[]
+            notify(p.fxwidgets[:kfmenubtn2].clicks); sleep(0.2)    # "Ease curve"
+            @test c.interp === :smooth
+            @test VE.valueat(c, fq) ≈ va + (vb - va) * tq^2 * (3 - 2tq) atol = 1.0e-9
+            # --- and Clear-all makes the parameter static again ---
+            rc = markerpix(:contrast, kb)
+            ev.mouseposition[] = Tuple(rc)
+            ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.press)
+            ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.release)
+            sleep(0.2)
+            @test Makie.to_value(p.fxwidgets[:kfmenubtn2].label) == "Linear curve"
+            notify(p.fxwidgets[:kfmenubtn3].clicks); sleep(0.3)
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            @test !VE.clipanimated(clip, :contrast)
+
+            # --- E2E: the keys really drive the render — sampled ends of the ramp ---
+            notify(trio()[2].clicks); sleep(0.3)                   # re-arm at the playhead
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            sf0 = VE.playheadframe(p, clip)
+            VE.setkey!(clip.animations[:contrast], sf0, 0.2)
+            VE.setkey!(clip.animations[:contrast], clip.src_out - 1, 1.9)
+            notify(p.playhead); sleep(0.3)
+            @test VE.paramspec(:contrast).get(VE.effectiveclip(clip, sf0)) ≈ 0.2 atol = 1.0e-6
+            @test VE.paramspec(:contrast).get(VE.effectiveclip(clip, clip.src_out - 1)) ≈ 1.9 atol = 1.0e-6
+            delete!(clip.animations, :contrast)                    # leave the state clean
+            notify(p.playhead); sleep(0.2)
         end
 
         @testset "GUI tools: loop hints + blend" begin

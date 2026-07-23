@@ -1427,6 +1427,8 @@ function wirekeys(player::Player)
             activetool(player) === nothing || deactivatetool!(player)
             player.clipmodal !== nothing && player.clipmodal.open[] &&
                 close!(player.clipmodal)
+            kfm = get(player.fxwidgets, :kfmenu, nothing)
+            kfm !== nothing && kfm.open[] && close!(kfm)
             if player.onpick !== nothing
                 player.onpick = nothing
                 setstatus!(player, "object lock cancelled")
@@ -1991,13 +1993,23 @@ function buildkeyframeoverlay!(player::Player)
     on(_ -> refresh(), player.kffocus)
     refresh()
 
-    # ---- editing on the overlay: drag a ◆, Alt-click to add, right-click to delete.
-    # PARAM-AWARE: the marker/curve you actually hit picks the parameter (and takes
-    # the focus with it) — never a hidden "currently focused" one. Conservative:
-    # only consumes near a marker (or with Alt), so scrub / clip-drag / trim / the
+    # ---- editing on the overlay: drag a ◆ (snaps to the playhead, live readout),
+    # Alt-click ON a curve to add, Ctrl-click a ◆ to delete, right-click a ◆ for
+    # the keyframe menu (delete · ease · clear). PARAM-AWARE: the marker/curve you
+    # actually hit picks the parameter (and takes the focus with it) — never a
+    # hidden "currently focused" one. Everything is gated on `kfvisible`: hidden
+    # curves are INERT, so they can't hijack a scrub. Conservative: only consumes
+    # near a marker (or Alt near a curve), so scrub / clip-drag / trim / the
     # right-click menu are untouched everywhere else.
     tl = player.timeline
     dragref = Ref{Any}(nothing)                          # (curve, index, clip, paramspec)
+    dragtippos = Observable(Point2f(0, 0))               # value/time readout while dragging
+    dragtiptext = Observable("")
+    dragtip = text!(ax, dragtippos; text = dragtiptext, visible = false,
+                    fontsize = 12, font = :bold, color = :white,
+                    strokecolor = (:black, 0.8), strokewidth = 2,
+                    offset = (10, 10), align = (:left, :bottom))
+    translate!(dragtip, 0, 0, 7)
     function nearestmarker(t, y)                         # markmeta index near (t,y), else 0
         pts = markpts[]; isempty(pts) && return 0
         vp = ax.scene.viewport[]; (x0, x1) = tl.viewrange[]
@@ -2009,9 +2021,11 @@ function buildkeyframeoverlay!(player::Player)
         end
         return best
     end
-    # the animated param whose curve passes closest to (t, y) on the clicked clip
-    function nearestcurve(clip, sf, y)
-        best = nothing; bestd = Inf
+    # the animated param whose curve passes within `maxpx` of (t, y) on the clicked
+    # clip — Alt-adding requires actually AIMING at a curve, like Premiere's pen
+    function nearestcurve(clip, sf, y; maxpx = 22.0)
+        vp = ax.scene.viewport[]
+        best = nothing; bestd = maxpx / max(vp.widths[2], 1)
         for (key, c) in clip.animations
             isempty(c) && continue
             p = paramspec(key)
@@ -2020,7 +2034,51 @@ function buildkeyframeoverlay!(player::Player)
         end
         return best
     end
+    function deletekey!(clip, key, kidx)
+        c = clip.animations[key]
+        snapshot!(player); deleteat!(c.keys, kidx)
+        isempty(c) && (delete!(clip.animations, key);
+                       setstatus!(player, "$(paramspec(key).label): last keyframe removed — back to a static value"))
+        notify(player.playhead)
+        return
+    end
+    # right-click ◆ → keyframe menu at the cursor (Premiere-style)
+    kfmenu = Modal(player.fig; title = "Keyframe", min_size = (200, 10),
+                   backdrop_color = (:black, 0.15))
+    kfmenuctx = Ref{Any}(nothing)                        # (clip, key, kidx)
+    easelabel = Observable("Ease curve")
+    for (row, (lbl, action)) in enumerate([
+        ("Delete keyframe", () -> begin
+            clip, key, kidx = kfmenuctx[]
+            deletekey!(clip, key, kidx)
+        end),
+        (easelabel, () -> begin
+            clip, key, _ = kfmenuctx[]
+            c = clip.animations[key]
+            snapshot!(player)
+            c.interp = c.interp === :smooth ? :linear : :smooth
+            setstatus!(player, "$(paramspec(key).label): $(c.interp === :smooth ? "eased (smooth)" : "linear") interpolation")
+            notify(player.playhead)
+        end),
+        ("Clear all keys of this parameter", () -> begin
+            clip, key, _ = kfmenuctx[]
+            snapshot!(player)
+            n = length(clip.animations[key].keys)
+            delete!(clip.animations, key)
+            syncsliders!(player, clip)
+            setstatus!(player, "$(paramspec(key).label): cleared $n keyframe$(n == 1 ? "" : "s") (Ctrl+Z to restore)")
+            notify(player.playhead)
+        end)])
+        btn = Button(kfmenu[row, 1]; label = lbl, tellwidth = false)
+        on(btn.clicks) do _
+            close!(kfmenu)
+            kfmenuctx[] === nothing || action()
+        end
+        player.fxwidgets[Symbol(:kfmenubtn, row)] = btn   # delete · ease · clear
+    end
+    player.fxwidgets[:kfmenu] = kfmenu
     on(events(ax.scene).mousebutton; priority = 20) do event
+        player.kfvisible[] || return Consume(false)      # hidden curves are inert
         is_mouseinside(ax.scene) || return Consume(false)
         t, y = mouseposition(ax.scene)
         if event.button == Mouse.left && event.action == Mouse.press
@@ -2028,7 +2086,13 @@ function buildkeyframeoverlay!(player::Player)
                 loc = locate(seq, timelineframe(tl, t)); loc === nothing && return Consume(false)
                 clip = loc[1]
                 sf = clip.src_in + (timelineframe(tl, t) - clip.start)
-                key = something(nearestcurve(clip, sf, y), player.kffocus[])
+                key = nearestcurve(clip, sf, y)
+                if key === nothing                       # not aiming at any curve
+                    setstatus!(player, isempty(clip.animations) ?
+                        "no animated parameter here — arm one with its ◆ in the Inspector first" :
+                        "Alt-click ON a curve to add a keyframe to it")
+                    return Consume(true)
+                end
                 player.kffocus.val = key                 # adding targets the curve you aim at
                 p = paramspec(key)
                 snapshot!(player)
@@ -2037,20 +2101,32 @@ function buildkeyframeoverlay!(player::Player)
             end
             i = nearestmarker(t, y); i == 0 && return Consume(false)   # else fall through to scrub
             key, kidx, clip = markmeta[i]
+            if ispressed(ax.scene, Keyboard.left_control | Keyboard.right_control)
+                deletekey!(clip, key, kidx)              # Ctrl-click = instant delete
+                return Consume(true)
+            end
             player.kffocus.val = key                     # grabbing a ◆ focuses its param
             snapshot!(player)
             dragref[] = (clip.animations[key], kidx, clip, paramspec(key))
             notify(player.kffocus)
             return Consume(true)
         elseif event.button == Mouse.left && event.action == Mouse.release && dragref[] !== nothing
-            dragref[] = nothing; return Consume(true)
+            dragref[] = nothing
+            dragtip.visible = false
+            return Consume(true)
         elseif event.button == Mouse.right && event.action == Mouse.press
             i = nearestmarker(t, y); i == 0 && return Consume(false)   # else the clip menu opens
             key, kidx, clip = markmeta[i]
-            c = clip.animations[key]
-            snapshot!(player); deleteat!(c.keys, kidx)
-            isempty(c) && delete!(clip.animations, key)
-            notify(player.playhead); return Consume(true)
+            kfmenuctx[] = (clip, key, kidx)
+            k = clip.animations[key].keys[kidx]
+            kfmenu.title = "◆ $(paramspec(key).label) · $(timestring((clip.start + (k.frame - clip.src_in)) / fps))"
+            easelabel[] = clip.animations[key].interp === :smooth ? "Linear curve" : "Ease curve"
+            mp = events(player.fig).mouseposition[]      # pop up AT the cursor
+            vp = player.fig.scene.viewport[]
+            kfmenu.halign = clamp(mp[1] / max(vp.widths[1], 1), 0.0, 1.0)
+            kfmenu.valign = clamp(mp[2] / max(vp.widths[2], 1), 0.0, 1.0)
+            open!(kfmenu)
+            return Consume(true)
         end
         return Consume(false)
     end
@@ -2059,8 +2135,19 @@ function buildkeyframeoverlay!(player::Player)
         c, i, clip, p = dragref[]
         t, y = mouseposition(ax.scene)
         f = clamp(clip.src_in + (timelineframe(tl, t) - clip.start), clip.src_in, clip.src_out)
-        movekey!(c, i, f, yval(clip, p, y))
+        # snap to the playhead when close (Premiere-style) — RAW pixel distance, not
+        # the frame-quantized one (a frame can already be wider than the threshold)
+        vp = ax.scene.viewport[]; (x0, x1) = tl.viewrange[]
+        pxpersec = max(vp.widths[1], 1) / max(x1 - x0, 1.0e-9)
+        phf = clamp(playheadframe(player, clip), clip.src_in, clip.src_out)
+        pht = (clip.start + (phf - clip.src_in)) / fps
+        abs(t - pht) * pxpersec < 12 && (f = phf)
+        v = yval(clip, p, y)
+        movekey!(c, i, f, v)
         j = findfirst(k -> k.frame == f, c.keys); j === nothing || (dragref[] = (c, j, clip, p))
+        dragtippos[] = Point2f((clip.start + (f - clip.src_in)) / fps, yat(clip, p, v))
+        dragtiptext[] = "$(p.label)  $(round(v; digits = 2)) · $(timestring((clip.start + (f - clip.src_in)) / fps))"
+        dragtip.visible = true
         notify(player.playhead); return Consume(true)
     end
 
@@ -2154,6 +2241,26 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     loopbtn = Button(panel[7, 1]; label = "Make seamless loop", tellwidth = false,
                      width = Makie.Relative(1.0))
     on(_ -> findlooptrim!(player), loopbtn.clicks)
+
+    # ◀◆▶ accessory state: ONE persistent (label, color) pair per param, shared by
+    # every rebuild of its button and driven by a single playhead listener —
+    # ◇ off-key, ◆ when the playhead sits ON a key, param color while animated
+    kfaccstate = Dict{Symbol, NamedTuple}()
+    function updatekfaccs()
+        loc = locate(player.sequence, player.playhead[])
+        clip = loc === nothing ? nothing : loc[1]
+        for (key, st) in kfaccstate
+            anim = clip !== nothing && clipanimated(clip, key)
+            onkey = anim && any(k -> k.frame == playheadframe(player, clip),
+                                clip.animations[key].keys)
+            lbl = onkey ? "◆" : "◇"
+            col = anim ? paramcolor(key) : uicolors.text_muted
+            st.label[] == lbl || (st.label[] = lbl)
+            st.color[] == col || (st.color[] = col)
+        end
+        return
+    end
+    on(_ -> updatekfaccs(), player.playhead)
 
     # the section stack; rebuilt when the clip, its effects, its keyframed-param
     # set or its analyses change — and on collapse toggles (force)
@@ -2260,24 +2367,43 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
                 fieldsym(pr) = Symbol(pr.label)
                 spec = NamedTuple(fieldsym(pr) => (Float64(cur0[pr.name]), Makie.Between(pr.min, pr.max))
                                   for pr in k.params)
-                accessory = (field, pos) -> begin   # ◆ = keyframe this parameter
+                accessory = (field, pos) -> begin   # Premiere-style ◀ ◆ ▶ per parameter
                     key = k.kfkeys[findfirst(pr -> fieldsym(pr) === field, k.params)]
-                    kf = Button(pos; label = "◆", width = 22, tellwidth = false,
-                                labelcolor = clipanimated(clip, key) ? paramcolor(key) :
-                                             uicolors.text_muted)
-                    on(_ -> armkeyframe!(player, key), kf.clicks)
-                    kf
+                    st = get!(() -> (label = Observable("◇"),
+                                     color = Observable{Any}(uicolors.text_muted)),
+                              kfaccstate, key)
+                    acc = GridLayout(pos)
+                    prevb = Button(acc[1, 1]; label = "◀", width = 16, fontsize = 8,
+                                   labelcolor = uicolors.text_muted)
+                    kf = Button(acc[1, 2]; label = st.label, width = 22,
+                                labelcolor = st.color)
+                    nextb = Button(acc[1, 3]; label = "▶", width = 16, fontsize = 8,
+                                   labelcolor = uicolors.text_muted)
+                    colgap!(acc, 1)
+                    on(_ -> gotokey!(player, key, -1), prevb.clicks)
+                    on(_ -> togglekey!(player, key), kf.clicks)
+                    on(_ -> gotokey!(player, key, 1), nextb.clicks)
+                    player.fxwidgets[Symbol(:kfacc_, key)] = (prevb, kf, nextb)
+                    acc
                 end
                 pf = Makie.ParamForm(body[1, 1], spec, accessory; labelwidth = 88,
-                                     widgetwidth = 168, accessorywidth = 26, rowgap = 4,
+                                     widgetwidth = 132, accessorywidth = 62, rowgap = 4,
                                      halign = :left)
+                updatekfaccs()   # seed the fresh buttons' ◇/◆ state
                 push!(forms, pf)
                 for (j, pr) in enumerate(k.params)   # scrub-sync registry
                     w = get(pf.widgets, fieldsym(pr), nothing)
                     w isa Slider && (player.fxsliders[k.kfkeys[j]] = w)
                 end
-                on(pf.graph[:values]) do vals        # live-apply (keyframe- and bypass-aware)
-                    player.fxsyncing[] && return
+                # live-apply (keyframe- and bypass-aware). The handler receives the
+                # WHOLE form tuple, so only params whose OWN slider moved since the
+                # last fire may act — anything else is a synced echo (scrub keeps
+                # animated sliders on their curves, quantized to the slider step);
+                # treating those as edits stamped ghost keys on untouched params.
+                lastvals = Ref{Any}(nothing)
+                on(pf.graph[:values]) do vals
+                    prevvals = lastvals[]; lastvals[] = vals
+                    player.fxsyncing[] && return         # sync: just refresh the baseline
                     (1 <= i <= length(clip.effects)) || return
                     cur = clip.effects[i]
                     k.matches(uneffect(cur)) || return
@@ -2285,11 +2411,16 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
                     changedstatic = NamedTuple()
                     for (j, pr) in enumerate(k.params)
                         v = Float64(vals[fieldsym(pr)])
-                        abs(v - Float64(prev[pr.name])) < 1.0e-9 && continue
+                        key = k.kfkeys[j]
+                        moved = prevvals === nothing ?   # before any fire: value baselines
+                            abs(v - (clipanimated(clip, key) ?
+                                     paramvalue(clip, key, playheadframe(player, clip)) :
+                                     Float64(prev[pr.name]))) > 1.0e-9 :
+                            v != Float64(prevvals[fieldsym(pr)])
+                        moved || continue
                         if time() - player.lastslidersnap > 1.5   # one undo entry per gesture
                             snapshot!(player); player.lastslidersnap = time()
                         end
-                        key = k.kfkeys[j]
                         if clipanimated(clip, key)   # animated param: the slider writes a key
                             setkey!(clip.animations[key], playheadframe(player, clip), v)
                         else
@@ -2446,8 +2577,18 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
           halign = :left, font = :bold, tellwidth = false)
     palrows = GridLayout(pal[2, 1])
     pallist = Ref{Any}(nothing)
-    palhits() = [o for o in menuopts()
-                 if isempty(palquery[]) || occursin(lowercase(palquery[]), lowercase(o[1]))]
+    function palhits()
+        q = lowercase(palquery[])
+        hits = [o for o in menuopts() if isempty(q) || occursin(q, lowercase(o[1]))]
+        if !isempty(q)   # a parameter label ("brightness") finds its owning kind
+            for k in effectkinds(), pr in k.params
+                occursin(q, lowercase(pr.label)) || continue
+                any(h -> h[2] === k.name, hits) && continue
+                push!(hits, ("$(k.label) · $(pr.label)", k.name))
+            end
+        end
+        return hits
+    end
     function palrefresh()
         pallist[] === nothing || Makie.clear!(pallist[])
         gl = GridLayout(palrows[1, 1]); pallist[] = gl
@@ -2479,7 +2620,8 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
         elseif ev.key == Keyboard.enter
             hits = palhits()
             close!(pal)
-            isempty(hits) || addbyname!(hits[1][2])
+            isempty(hits) ? setstatus!(player, "no effect matches “$(palquery[])”") :
+                            addbyname!(hits[1][2])
         elseif ev.key == Keyboard.escape
             close!(pal)
         end
@@ -2616,11 +2758,63 @@ function armkeyframe!(player::Player, key::Symbol)
         setkey!(get!(() -> AnimCurve(), clip.animations, key), playheadframe(player, clip), p.get(clip))
         setstatus!(player, "$(p.label): keyframing on — scrub + move the slider to add keys (curve on the clip)")
     else
-        setstatus!(player, "$(p.label): its ◆ keys are on the clip — drag to move, Alt-click adds, right-click deletes")
+        setstatus!(player, "$(p.label): its ◆ keys are on the clip — drag moves · Alt-click adds · Ctrl-click deletes · right-click eases")
     end
     player.kffocus[] = key
     player.kfvisible[] = true
     notify(player.playhead)
+    return nothing
+end
+
+"""
+The ◆ of the inspector's ◀◆▶ trio, Premiere semantics: arm the parameter if it
+isn't animated yet (first key = current value); otherwise ADD a key at the
+playhead — or REMOVE the one sitting there (removing the last key makes the
+parameter static again).
+"""
+function togglekey!(player::Player, key::Symbol)
+    loc = locate(player.sequence, player.playhead[])
+    loc === nothing && return nothing
+    clip = loc[1]
+    clipanimated(clip, key) || return armkeyframe!(player, key)
+    p = paramspec(key)
+    c = clip.animations[key]
+    sf = playheadframe(player, clip)
+    snapshot!(player)
+    if any(k -> k.frame == sf, c.keys)
+        removekey!(c, sf)
+        if isempty(c)
+            delete!(clip.animations, key)
+            syncsliders!(player, clip)
+            setstatus!(player, "$(p.label): last keyframe removed — back to a static value")
+        else
+            setstatus!(player, "$(p.label): keyframe removed")
+        end
+    else
+        setkey!(c, sf, paramvalue(clip, key, sf))
+        setstatus!(player, "$(p.label): keyframe added at the playhead")
+    end
+    player.kffocus[] = key
+    notify(player.playhead)
+    return nothing
+end
+
+"Jump the playhead to the previous (`dir < 0`) or next keyframe of `key` on the
+clip under it — the ◀ ▶ of the inspector trio."
+function gotokey!(player::Player, key::Symbol, dir::Integer)
+    loc = locate(player.sequence, player.playhead[])
+    loc === nothing && return nothing
+    clip = loc[1]
+    p = paramspec(key)
+    clipanimated(clip, key) || return setstatus!(player, "$(p.label): no keyframes yet — ◆ adds one")
+    sf = playheadframe(player, clip)
+    ks = filter(k -> clip.src_in <= k.frame <= clip.src_out, clip.animations[key].keys)
+    cand = dir < 0 ? filter(k -> k.frame < sf, ks) : filter(k -> k.frame > sf, ks)
+    isempty(cand) && return setstatus!(player,
+        "$(p.label): no keyframe $(dir < 0 ? "before" : "after") the playhead")
+    k = dir < 0 ? last(cand) : first(cand)
+    player.kffocus[] = key
+    seek!(player, clamp(clip.start + (k.frame - clip.src_in), 0, seqlength(player.sequence) - 1))
     return nothing
 end
 

@@ -176,6 +176,13 @@ end
     @test seq.clips[1].src_out == n0
     @test haskey(seq.clips[1].animations, :opacity)
     @test VE.joinclips!(seq, 10) === nothing          # nothing left to join
+    # split COPIES curves — the halves must edit independently (Premiere razor)
+    VE.setkey!(get!(() -> VE.AnimCurve(), seq.clips[1].animations, :opacity), 20, 0.8)
+    r3 = split!(seq, 40)
+    @test r3.animations[:opacity] !== seq.clips[1].animations[:opacity]
+    VE.setkey!(seq.clips[1].animations[:opacity], 20, 0.1)
+    @test VE.valueat(r3.animations[:opacity], 20) == 0.8
+    VE.joinclips!(seq, 10)
     # a trim that breaks source-contiguity refuses to join (not one cut anymore)
     seq2 = Sequence(VideoSource(testvideo))
     r2 = split!(seq2, 40)

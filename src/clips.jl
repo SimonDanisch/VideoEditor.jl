@@ -219,7 +219,9 @@ function split!(seq::Sequence, n::Integer)
     append!(right.effects, clip.effects)  # elements are immutable, sharing is safe
     right.colortrack = clip.colortrack    # keyed by absolute source frame, still valid
     right.motiontrack = clip.motiontrack
-    merge!(right.animations, clip.animations)  # curves too are absolute-frame keyed
+    for (key, curve) in clip.animations   # absolute-frame keyed, but each half gets
+        right.animations[key] = AnimCurve(copy(curve.keys), curve.interp)
+    end                                   # its OWN copy — halves must edit independently
     clip.src_out = clip.src_in + offset
     insert!(seq.clips, i + 1, right)
     return right
