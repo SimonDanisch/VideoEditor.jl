@@ -622,21 +622,36 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             end
             press(tlx(2.0)); release()               # playhead onto the clip
             nbefore = VE.seqlength(p.sequence)
+            nclips0 = length(p.sequence.clips)
+            VE.opendock!(p, :tools)                  # card clicks need the dock open
             VE.activatetool!(p, :loopfinder)
             @test VE.activetoolname(p)[] === :loopfinder
             ctx = VE.activetool(p)[2]
-            @test waitfor(() -> ctx.state !== nothing && haskey(ctx.state, :sig); s = 25)
-            sleep(0.4)                               # uiqueue draws the hints
-            hints = ctx.state[:hints]
-            @test !isempty(hints)
+            @test waitfor(() -> ctx.state !== nothing && !isempty(ctx.state[:refs]); s = 25)
+            sleep(0.4)                               # uiqueue draws card + hints
+            @test length(p.fxwidgets[:toolcards][3]) == 1   # reference card added
             pts = ctx.state[:hintpts][]
-            @test length(pts) == length(hints)
+            @test !isempty(pts)
+            # ▼ click CUTS there — the timeline keeps its length, the tool stays armed
             press(datapos(pts[1][1], pts[1][2])); release(); sleep(0.3)
-            @test length(p.sequence.clips) == 1      # timeline trimmed to the loop
-            @test VE.seqlength(p.sequence) < nbefore
-            @test VE.activetoolname(p)[] === :none   # tool put itself away
-            VE.undo!(p); sleep(0.2)
+            @test length(p.sequence.clips) == nclips0 + 1
             @test VE.seqlength(p.sequence) == nbefore
+            @test VE.activetoolname(p)[] === :loopfinder
+            # Find adds a SECOND reference card (signatures cached — instant)
+            press(tlx(1.0)); release()               # another playhead frame
+            p.fxwidgets[:toolaction][3][]()          # the panel's Find action
+            sleep(0.3)
+            cards = p.fxwidgets[:toolcards][3]
+            @test length(cards) == 2
+            @test ctx.state[:active][] == 2
+            # clicking the FIRST card highlights its markers again
+            bb = cards[1][2].layoutobservables.computedbbox[]
+            press(Point2f(bb.origin .+ bb.widths ./ 2)); release(); sleep(0.2)
+            @test ctx.state[:active][] == 1
+            VE.undo!(p); sleep(0.2)                  # undo the hint cut
+            @test length(p.sequence.clips) == nclips0
+            VE.deactivatetool!(p)
+            @test isempty(p.fxwidgets[:toolcards][3])   # cards cleaned up
 
             # blend: split, click both halves, expect a dissolve at their cut.
             # undo keeps the loop-trim's zoomed-in view (zoom survives undo by

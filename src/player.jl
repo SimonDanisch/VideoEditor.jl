@@ -367,7 +367,13 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     end
     player.previewplot = previewplot
     @async for f in player.uiqueue      # main-thread consumer: threads → UI actions
-        Base.invokelatest(f)
+        try
+            Base.invokelatest(f)
+        catch e
+            # a throwing action must not kill the consumer — that silently
+            # freezes every future cross-thread UI update
+            @error "uiqueue action failed" exception = (e, catch_backtrace())
+        end
     end
     @async begin  # job-progress poller: worker threads write the atomic, the UI animates
         spin = ('◐', '◓', '◑', '◒')
