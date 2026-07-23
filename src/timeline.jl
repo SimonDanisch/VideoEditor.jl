@@ -52,7 +52,8 @@ mutable struct Timeline
     const clipstates::Vector{Observable{Symbol}}
     const plotsources::Vector{Any}  # VideoSource behind each plot's thumbs
     # interaction feedback
-    const selected::Observable{Int}          # clip index, 0 = none
+    const selected::Observable{Int}          # clip index, 0 = none (primary/last clicked)
+    const selection::Observable{Vector{Int}} # shift-click multi-select (clip indices)
     const hovered::Base.RefValue{Int}
     const ghost_rect::Observable{Rect2f}
     const ghost_color::Observable{Any}
@@ -104,7 +105,7 @@ mutable struct Timeline
                        Observable(100.0), Observable(72.0), Observable(0),
                        Any[], Observable{Tuple{Float64, Float64}}[],
                        Observable{Float64}[], Observable{Symbol}[], Any[],
-                       Observable(0), Ref(0),
+                       Observable(0), Observable(Int[]), Ref(0),
                        Observable(Rect2f(0, 0, 0, 0)), Observable{Any}(colors.accent_subtle),
                        Observable(Float64[]), Observable(Point2f[]),
                        Observable(""), Observable(Point2f(0, 0)),
@@ -183,6 +184,7 @@ mutable struct Timeline
             return
         end
         on(_ -> setstates!(timeline), timeline.selected)
+        on(_ -> setstates!(timeline), timeline.selection)
         wiretimelinemouse(timeline, playhead)
 
         # re-pull thumbnails as the background decoders fill the caches
@@ -299,6 +301,9 @@ function relayout!(timeline::Timeline)
         pop!(timeline.clipstates)
         pop!(timeline.plotsources)
     end
+    # edits shift clip indices — drop marks that no longer point at a clip
+    sel = filter(i -> 1 <= i <= length(seq.clips), timeline.selection[])
+    length(sel) == length(timeline.selection[]) || (timeline.selection[] = sel)
     ntr = ntracks(seq)
     g = min(0.02, trackspan(ntr) * 0.15)    # gap between stacked tracks
     for (i, clip) in enumerate(seq.clips)
@@ -385,7 +390,7 @@ end
 "Hover/selection feedback without touching geometry."
 function setstates!(timeline::Timeline)
     for i in eachindex(timeline.clipstates)
-        state = i == timeline.selected[] ? :selected :
+        state = i == timeline.selected[] || i in timeline.selection[] ? :selected :
                 i == timeline.hovered[] ? :hovered : :idle
         timeline.clipstates[i][] = state
     end
@@ -407,6 +412,19 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
             t = mouseposition(axis.scene)[1]
             n = timelineframe(timeline, t)
             i = clipat(seq, n)
+            # Shift+click MARKS clips (toggle in the multi-selection) without
+            # scrubbing; a plain click collapses the marks to the one clip
+            if ispressed(axis.scene, Keyboard.left_shift | Keyboard.right_shift) && i !== nothing
+                sel = copy(timeline.selection[])
+                isempty(sel) && timeline.selected[] > 0 && timeline.selected[] != i &&
+                    push!(sel, timeline.selected[])   # extend FROM the primary
+                j = findfirst(==(i), sel)
+                j === nothing ? push!(sel, i) : deleteat!(sel, j)
+                timeline.selection[] = sel
+                timeline.selected[] = i
+                return Consume(true)
+            end
+            isempty(timeline.selection[]) || (timeline.selection[] = Int[])
             timeline.selected[] = something(i, 0)
             edge = edgeat(timeline, t)
             if ispressed(axis.scene, Keyboard.left_control | Keyboard.right_control) && i !== nothing

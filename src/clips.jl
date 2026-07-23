@@ -264,7 +264,14 @@ shift left to close the gap.
 function deleteclip!(seq::Sequence, n::Integer; ripple::Bool = true)
     i = clipat(seq, n)
     i === nothing && return nothing
-    clip = seq.clips[i]
+    return deleteclip!(seq, seq.clips[i]; ripple)
+end
+
+"Delete `clip` ITSELF (by identity — track-safe where a frame is ambiguous)
+with the same ripple semantics."
+function deleteclip!(seq::Sequence, clip::Clip; ripple::Bool = true)
+    i = findfirst(c -> c === clip, seq.clips)
+    i === nothing && return nothing
     deleteat!(seq.clips, i)
     if ripple
         len = cliplength(clip)

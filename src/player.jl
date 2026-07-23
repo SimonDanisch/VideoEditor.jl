@@ -1002,9 +1002,24 @@ function split!(player::Player)
 end
 
 function Base.deleteat!(player::Player)
+    seq = player.sequence
+    marked = player.timeline.selection[]
+    if length(marked) > 1              # shift-click marks: delete the whole set
+        clips = [seq.clips[i] for i in marked if 1 <= i <= length(seq.clips)]
+        isempty(clips) && return nothing
+        snapshot!(player)
+        for c in clips                 # by identity — ripple keeps the rest current
+            deleteclip!(seq, c)
+        end
+        player.timeline.selection[] = Int[]
+        player.playhead[] = clamp(player.playhead[], 0, max(seqlength(seq) - 1, 0))
+        setstatus!(player, "$(length(clips)) clips deleted — Ctrl+Z undoes")
+        refreshedit!(player)
+        return nothing
+    end
     snapshot!(player)
-    deleteclip!(player.sequence, player.playhead[]) === nothing && return (pop!(player.undostack); nothing)
-    player.playhead[] = clamp(player.playhead[], 0, max(seqlength(player.sequence) - 1, 0))
+    deleteclip!(seq, player.playhead[]) === nothing && return (pop!(player.undostack); nothing)
+    player.playhead[] = clamp(player.playhead[], 0, max(seqlength(seq) - 1, 0))
     refreshedit!(player)
     return nothing
 end

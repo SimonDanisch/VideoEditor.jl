@@ -675,6 +675,32 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             VE.removetransition!(p.sequence, p.sequence.transitions[1].at)
             VE.undo!(p); VE.undo!(p); sleep(0.2)     # blend snapshot, then the split
         end
+
+        @testset "shift-click marks multiple clips" begin
+            Makie.limits!(ax, 0.0, VE.seqduration(p.sequence), 0.0, 1.0); sleep(0.2)
+            nbefore = VE.seqlength(p.sequence)
+            VE.seek!(p, VE.seqlength(p.sequence) ÷ 2)
+            VE.split!(p); sleep(0.2)
+            c1 = p.sequence.clips[1]; c2 = p.sequence.clips[2]
+            fps = p.sequence.framerate
+            press(tlx((c1.start + VE.cliplength(c1) / 2) / fps)); release()
+            @test tl.selected[] == 1
+            ph = p.playhead[]
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_shift, Keyboard.press)
+            press(tlx((c2.start + VE.cliplength(c2) / 2) / fps)); release()
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_shift, Keyboard.release)
+            sleep(0.2)
+            @test sort(tl.selection[]) == [1, 2]     # both marked…
+            @test tl.clipstates[1][] === :selected && tl.clipstates[2][] === :selected
+            @test p.playhead[] == ph                 # …and marking didn't scrub
+            deleteat!(p); sleep(0.2)                 # X deletes the whole set
+            @test isempty(p.sequence.clips)
+            @test isempty(tl.selection[])
+            VE.undo!(p); sleep(0.2)
+            @test length(p.sequence.clips) == 2
+            VE.undo!(p); sleep(0.2)                  # and the split
+            @test VE.seqlength(p.sequence) == nbefore
+        end
     finally
         close(p)
     end
