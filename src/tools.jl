@@ -8,21 +8,28 @@
     ToolContext
 
 What an active tool works with: the `player`, plus bookkeeping so everything
-the tool adds — plots on the timeline axis, event handlers — is removed on
-deactivation. Overlays draw in TIMELINE coordinates: x is seconds
+the tool adds — overlay plots, event handlers — is removed on deactivation.
+Timeline overlays draw in TIMELINE coordinates: x is seconds
 ([`tooltime`](@ref)), y is the 0..1 track span ([`toolband`](@ref) for a
-clip's band). Record plots with [`toolplot!`](@ref) and wire observables with
+clip's band); preview overlays draw on `player.previewaxis` in source pixels.
+Record plots with [`toolplot!`](@ref) and wire observables with
 [`ontool!`](@ref); `state` is tool-private scratch.
 """
 mutable struct ToolContext
     const player::Player
-    const plots::Vector{Any}
+    const plots::Vector{Any}    # (parent, plot) pairs for removal
     const handlers::Vector{Any}
     state::Any
 end
 
-"Record a plot the tool drew, so deactivation removes it."
-toolplot!(ctx::ToolContext, plt) = (push!(ctx.plots, plt); plt)
+"""
+    toolplot!(ctx, plt; parent = ctx.player.timeline.axis) -> plt
+
+Record a plot the tool drew, so deactivation removes it — from the timeline
+axis by default, or from any other `parent` (e.g. `ctx.player.previewaxis`
+for hints over the video itself)."""
+toolplot!(ctx::ToolContext, plt; parent = ctx.player.timeline.axis) =
+    (push!(ctx.plots, (parent, plt)); plt)
 
 "`Makie.on` with auto-`off` at tool deactivation."
 function ontool!(f::Function, ctx::ToolContext, obs; priority::Integer = 25)
@@ -91,9 +98,9 @@ function deactivatetool!(player::Player)
     end
     foreach(Observables.off, ctx.handlers)
     empty!(ctx.handlers)
-    for p in ctx.plots
+    for (parent, p) in ctx.plots
         try
-            Makie.delete!(player.timeline.axis, p)
+            Makie.delete!(parent, p)
         catch
         end
     end
