@@ -611,6 +611,55 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test length(clip.animations[:sharpen].keys) == ns2 - 1
             @test length(clip.animations[:brightness].keys) == nb
         end
+
+        @testset "GUI tools: loop hints + blend" begin
+            datapos(t, y) = begin                    # timeline data coords → figure pixel
+                lims = ax.finallimits[]; vp = ax.scene.viewport[]
+                Point2f(vp.origin[1] + (t - minimum(lims)[1]) /
+                            (maximum(lims)[1] - minimum(lims)[1]) * vp.widths[1],
+                        vp.origin[2] + (y - minimum(lims)[2]) /
+                            (maximum(lims)[2] - minimum(lims)[2]) * vp.widths[2])
+            end
+            press(tlx(2.0)); release()               # playhead onto the clip
+            nbefore = VE.seqlength(p.sequence)
+            VE.activatetool!(p, :loopfinder)
+            @test VE.activetoolname(p)[] === :loopfinder
+            ctx = VE.activetool(p)[2]
+            @test waitfor(() -> ctx.state !== nothing && haskey(ctx.state, :sig); s = 25)
+            sleep(0.4)                               # uiqueue draws the hints
+            hints = ctx.state[:hints]
+            @test !isempty(hints)
+            pts = ctx.state[:hintpts][]
+            @test length(pts) == length(hints)
+            press(datapos(pts[1][1], pts[1][2])); release(); sleep(0.3)
+            @test length(p.sequence.clips) == 1      # timeline trimmed to the loop
+            @test VE.seqlength(p.sequence) < nbefore
+            @test VE.activetoolname(p)[] === :none   # tool put itself away
+            VE.undo!(p); sleep(0.2)
+            @test VE.seqlength(p.sequence) == nbefore
+
+            # blend: split, click both halves, expect a dissolve at their cut.
+            # undo keeps the loop-trim's zoomed-in view (zoom survives undo by
+            # design) — reset it so tlx() clicks can reach the whole sequence
+            Makie.limits!(ax, 0.0, VE.seqduration(p.sequence), 0.0, 1.0)
+            sleep(0.2)
+            nclips = length(p.sequence.clips)
+            fps = p.sequence.framerate
+            VE.seek!(p, VE.seqlength(p.sequence) ÷ 2)
+            VE.split!(p); sleep(0.3)
+            @test length(p.sequence.clips) == nclips + 1
+            VE.activatetool!(p, :blend)
+            c1 = p.sequence.clips[1]; c2 = p.sequence.clips[2]
+            press(tlx((c1.start + VE.cliplength(c1) / 2) / fps)); release(); sleep(0.2)
+            @test occursin("adjacent", p.status[])   # first pick made, asks for second
+            press(tlx((c2.start + VE.cliplength(c2) / 2) / fps)); release(); sleep(0.2)
+            @test !isempty(p.sequence.transitions)
+            @test occursin("dissolve", p.status[])
+            VE.deactivatetool!(p)
+            # restore for the following beats: drop the dissolve, undo the split
+            VE.removetransition!(p.sequence, p.sequence.transitions[1].at)
+            VE.undo!(p); VE.undo!(p); sleep(0.2)     # blend snapshot, then the split
+        end
     finally
         close(p)
     end

@@ -51,6 +51,7 @@ include("gpugraph.jl")
 include("export.jl")   # decodeinto! dispatches on GpuVideoStream — needs the type
 include("campath.jl")  # GrayReader wraps export's SequentialReader; grayinto! needs GpuVideoStream
 include("plugins.jl")
+include("tools.jl")    # GUI tools: timeline-overlay hints + premade operations
 include("mcp.jl")
 
 export VideoSource, Player, Clip, Sequence
@@ -58,7 +59,10 @@ export play!, pause!, step!
 export split!, deleteclip!, moveclip!, addsource!, saveproject, loadproject
 export ColorEffect, BlurEffect, SharpenEffect, seteffect!
 export registerplugin!, FxParam, FxPlugin, Pointwise, Stencil
+export registertool!, EditorTool, ToolContext, toolplot!, ontool!, tooltime, toolband
+export activatetool!, deactivatetool!
 export exportvideo, exportgif, analyzecolor!, analyzemotion!, analyzeobject!, findloop
+export loopsignatures, similarframes
 export generateproxy, startproxy!
 export mcpserve!
 

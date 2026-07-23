@@ -432,25 +432,18 @@ function cropintersect(a::NTuple{4, Float64}, b::NTuple{4, Float64})
 end
 
 """
-    findloop(clip; minseconds=1.5, maxseconds=6.0, matchwidth=64, step=2, progress) -> (a, b, score)
+    loopsignatures(clip; matchwidth=64, backend=KA.CPU(), progress=nothing) -> gw×gh×n
 
-Find the best seamless-loop cut inside `clip`: two clip-relative frame offsets
-`a < b` whose STABILIZED, brightness-normalized content matches most closely,
-so playing `a…b` and jumping back to `a` loops with the least visible seam. The
-clip's `motiontrack` (if present) locks the camera and its `crop` frames the
-subject before matching; brightness normalization defeats exposure flicker so
-the match is on content (e.g. a bird's pose), not lighting. Returns the offsets
-(0-based, into the clip's source range) and the seam score (lower = better).
-Search is sub-sampled by `step` frames for speed. This is a real content match,
-not a reverse/boomerang.
+Per-frame appearance signatures of the clip's STABILIZED, cropped content —
+the domain both the loop search and the loop TOOL score frame similarity in.
+Each frame decodes (GPU stream on a GPU backend), warps through the motion
+track, crops, downscales to `matchwidth` and is normalized to zero mean/unit
+std, so lighting drift doesn't dominate the comparison.
 """
-function findloop(clip::Clip; minseconds::Real = 1.5, maxseconds::Real = 6.0,
-                  matchwidth::Integer = 64, step::Integer = 2, lengthbias::Real = 0.0,
-                  backend = KA.CPU(), progress = nothing)
+function loopsignatures(clip::Clip; matchwidth::Integer = 64,
+                        backend = KA.CPU(), progress = nothing)
     src = clip.source
-    fps = src.framerate
     n = cliplength(clip)
-    n >= 4 || throw(ArgumentError("clip too short to loop"))
     W, H = src.width, src.height
     # warp at a small working resolution (≈90× less work than full res) —
     # applymotiontrack! rescales the transform to the buffer size for us
@@ -485,6 +478,62 @@ function findloop(clip::Clip; minseconds::Real = 1.5, maxseconds::Real = 6.0,
     finally
         close(dec)
     end
+    return frames
+end
+
+"""
+    similarframes(sig, ref; n=6, exclude=30) -> Vector{(frame, score)}
+
+The `n` frames most similar to signature frame `ref` (mean squared signature
+distance, lower = more similar), each at least `exclude` frames away from
+`ref` AND from the other picks — loop candidates, not near-duplicates of one
+another. Frames are 1-based indices into `sig`'s third dimension.
+"""
+function similarframes(sig::Array{Float32, 3}, ref::Integer;
+                       n::Integer = 6, exclude::Integer = 30)
+    N = size(sig, 3)
+    npx = size(sig, 1) * size(sig, 2)
+    r = @view sig[:, :, ref]
+    d = Vector{Float32}(undef, N)
+    for k in 1:N
+        v = @view sig[:, :, k]
+        s = 0.0f0
+        @inbounds @simd for p in eachindex(v, r)
+            s += (v[p] - r[p])^2
+        end
+        d[k] = s / npx
+    end
+    picks = NamedTuple{(:frame, :score), Tuple{Int, Float32}}[]
+    for k in sortperm(d)
+        abs(k - ref) < exclude && continue
+        any(abs(k - q.frame) < exclude for q in picks) && continue
+        push!(picks, (frame = k, score = d[k]))
+        length(picks) >= n && break
+    end
+    return picks
+end
+
+"""
+    findloop(clip; minseconds=1.5, maxseconds=6.0, matchwidth=64, step=2, progress) -> (a, b, score)
+
+Find the best seamless-loop cut inside `clip`: two clip-relative frame offsets
+`a < b` whose STABILIZED, brightness-normalized content matches most closely,
+so playing `a…b` and jumping back to `a` loops with the least visible seam. The
+clip's `motiontrack` (if present) locks the camera and its `crop` frames the
+subject before matching; brightness normalization defeats exposure flicker so
+the match is on content (e.g. a bird's pose), not lighting. Returns the offsets
+(0-based, into the clip's source range) and the seam score (lower = better).
+Search is sub-sampled by `step` frames for speed. This is a real content match,
+not a reverse/boomerang.
+"""
+function findloop(clip::Clip; minseconds::Real = 1.5, maxseconds::Real = 6.0,
+                  matchwidth::Integer = 64, step::Integer = 2, lengthbias::Real = 0.0,
+                  backend = KA.CPU(), progress = nothing)
+    fps = clip.source.framerate
+    n = cliplength(clip)
+    n >= 4 || throw(ArgumentError("clip too short to loop"))
+    frames = loopsignatures(clip; matchwidth, backend, progress)
+    gw, gh = size(frames, 1), size(frames, 2)
     minL = max(round(Int, minseconds * fps), 1)
     maxL = max(round(Int, maxseconds * fps), minL)
     npx = gw * gh

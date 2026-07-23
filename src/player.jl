@@ -434,13 +434,17 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
         on(_ -> action(), b.clicks)
         push!(onebtns, b)
     end
+    toolsdock = dockpanel!(player, :tools; width = 300)
+    buildtoolspanel!(player, toolsdock[1, 1], uicolors)
+    toolsbtn = toolbarbutton!(player, toolbar[6 + length(oneshots) + 1, 1], "⚒", :tools, uicolors)
     # hover tooltips: hovering a toolbar button shows its name + shortcut to the
     # right of it (detected by mouse-vs-bbox; Makie Buttons have no hover attr).
     tiptargets = vcat([(fxbtn, "Inspector — effects & stabilize"),
                        (binbtn, "Media bin — import & drag clips"),
                        (outbtn, "Export"),
                        (kfbtn, "Keyframe curves on the timeline"),
-                       (splitbtn, "Blade  (S)"), (cropbtn, "Crop  (C)")],
+                       (splitbtn, "Blade  (S)"), (cropbtn, "Crop  (C)"),
+                       (toolsbtn, "Tools — loop finder, blends, …")],
                       [(onebtns[i], oneshots[i][2]) for i in eachindex(onebtns)])
     tip_txt = Observable(" "); tip_pos = Observable(Point2f(0, 0)); tip_vis = Observable(false)
     Makie.text!(fig.scene, tip_pos; text = tip_txt, visible = tip_vis, space = :pixel,
@@ -1405,6 +1409,7 @@ function wirekeys(player::Player)
             player.cropanchor = nothing
             player.croprect[] = Point2f[]
             player.tool[] === :none || (player.tool[] = :none)
+            activetool(player) === nothing || deactivatetool!(player)
             if player.onpick !== nothing
                 player.onpick = nothing
                 setstatus!(player, "object lock cancelled")
@@ -2614,6 +2619,10 @@ end
 
 function Base.close(player::Player)
     pause!(player)   # also stops the audio feed
+    try
+        deactivatetool!(player)   # tool handlers reference the dying scenes
+    catch
+    end
     freegpucache!(player)
     foreach(sp -> stop!(sp.worker), values(player.pools))
     stop!(player.timeline)
