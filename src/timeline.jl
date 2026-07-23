@@ -495,11 +495,15 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
             mp = mouseposition(axis.scene)
             pk = timeline.presspick
             if pk !== nothing && pk[1] != 0 && inside
-                # the press grabbed a clip and the cursor left its lane → this is
-                # a MOVE (e.g. lifting a cut clip into the new-track zone), not a scrub
+                # the press grabbed a clip and the cursor DELIBERATELY left its
+                # lane → a MOVE (e.g. lifting a cut clip into the new-track
+                # zone), not a scrub. Deliberate = well past the band AND well
+                # below/above where the press started: a few pixels of vertical
+                # wobble during a horizontal scrub or an edge trim used to
+                # convert into a surprise clip move ("it moved my clip!")
                 clip = seq.clips[pk[1]]
                 blo, bhi = trackband(clip.track, ntracks(seq))
-                if mp[2] > bhi + 0.04 || mp[2] < blo - 0.04
+                if (mp[2] > bhi + 0.04 || mp[2] < blo - 0.04) && abs(mp[2] - pk[3]) > 0.18
                     timeline.scrubbing[] = false
                     timeline.presspick = nothing
                     timeline.dragclip = (clip, timelineframe(timeline, pk[2]) - clip.start)
@@ -539,7 +543,7 @@ function timestring(t::Real)
 end
 
 "Half-width of the clip-edge trim grab zone, in seconds at the current zoom."
-edgezone(timeline::Timeline) = 8 / max(timeline.pps[], 1.0e-9)
+edgezone(timeline::Timeline) = 12 / max(timeline.pps[], 1.0e-9)
 
 """
 The trim edge within grab range of time `t`: `(clipindex, :left/:right)`, or

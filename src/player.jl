@@ -2507,7 +2507,8 @@ function wireclipmenu!(player::Player)
     # SMALL and contextual: only what has no first-class home elsewhere —
     # splitting/cropping live on the toolbar (✂ ▢), effects and stabilization
     # in the Inspector, tools in the Tools dock
-    modal = Modal(player.fig; title = "Clip actions", min_size = (220, 10))
+    modal = Modal(player.fig; title = "Clip actions", min_size = (220, 10),
+                  backdrop_color = (:black, 0.15))   # popup, not a dialog
     player.clipmodal = modal
     rcframe() = clamp(round(Int, player.rctime * player.sequence.framerate), 0,
                       max(seqlength(player.sequence) - 1, 0))
@@ -2531,6 +2532,11 @@ function wireclipmenu!(player::Player)
     player.timeline.onrightclick = t -> begin
         player.rctime = t
         modal.title = "Clip @ " * timestring(t)
+        # pop up AT the cursor (fractional align, clamped into the window)
+        mp = events(player.fig).mouseposition[]
+        vp = player.fig.scene.viewport[]
+        modal.halign = clamp(mp[1] / max(vp.widths[1], 1), 0.0, 1.0)
+        modal.valign = clamp(mp[2] / max(vp.widths[2], 1), 0.0, 1.0)
         open!(modal)
     end
     return nothing
