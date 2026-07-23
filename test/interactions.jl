@@ -759,6 +759,99 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             notify(p.playhead); sleep(0.2)
         end
 
+        @testset "multi-track keyframes: every lane edits, Alt aims by track" begin
+            Makie.limits!(ax, 0.0, 4.0, 0.0, 1.0)
+            press(tlx(2.0)); release(); sleep(0.2)
+            fps = p.sequence.framerate
+            base = VE.locate(p.sequence, p.playhead[])[1]
+            savedanims = copy(base.animations); empty!(base.animations)   # a clean V1 lane
+            # split base and stack its right half ABOVE it for this testset (restored
+            # by joinclips! at the end) — self-sufficient even on a one-clip timeline
+            c2 = VE.split!(p.sequence, base.start + (VE.clipend(base) - base.start) ÷ 2)
+            c2.start = base.start; c2.track = base.track + 1
+            VE.refreshedit!(p); sleep(0.3)
+            w = min(VE.clipend(base), VE.clipend(c2)) - base.start   # overlap window
+            fA = base.start + w ÷ 3                                  # model key here
+            fB = base.start + 2w ÷ 3                                 # Alt-clicks here
+            overt = fB / fps
+            # a known flat curve on each lane (model setup; the GESTURES are the test)
+            VE.setkey!(get!(() -> VE.AnimCurve(), base.animations, :temperature),
+                       base.src_in + (fA - base.start), 0.0)     # norm 0.5 → band middle
+            VE.setkey!(get!(() -> VE.AnimCurve(), c2.animations, :opacity),
+                       c2.src_in + (fA - c2.start), 0.5)         # ditto — the Alt aims there
+            notify(p.playhead); sleep(0.3)
+            ntr = VE.ntracks(p.sequence)
+            bandmid(tr) = begin
+                lo, hi = VE.trackband(tr, ntr)
+                g = min(0.02, VE.trackspan(ntr) * 0.15)
+                (lo + g + hi - g) / 2
+            end
+            bandpix(t, tr) = begin
+                lims = ax.finallimits[]; vp = ax.scene.viewport[]
+                Point2f(vp.origin[1] + (t - minimum(lims)[1]) /
+                            (maximum(lims)[1] - minimum(lims)[1]) * vp.widths[1],
+                        vp.origin[2] + bandmid(tr) * vp.widths[2])
+            end
+            # Alt-click into the UPPER band adds to c2 only (temperature curve on V1
+            # is at band middle = norm 0.5, opacity curve on V2 near band top)
+            nb = length(base.animations[:temperature].keys)
+            nc = length(c2.animations[:opacity].keys)
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.press)
+            press(bandpix(overt, c2.track)); release()
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.release)
+            sleep(0.3)
+            @test length(c2.animations[:opacity].keys) == nc + 1
+            @test length(base.animations[:temperature].keys) == nb
+            # ...and into the LOWER band adds to base only
+            nc2 = length(c2.animations[:opacity].keys)
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.press)
+            press(bandpix(overt, base.track)); release()
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.release)
+            sleep(0.3)
+            @test length(base.animations[:temperature].keys) == nb + 1
+            @test length(c2.animations[:opacity].keys) == nc2
+            # V1's ◆ markers stay editable even though V2 is on top: drag V1's key
+            press(tlx(overt)); release(); sleep(0.2)   # playhead over the stack
+            k1 = base.animations[:temperature].keys[1]
+            lo, hi = VE.trackband(base.track, ntr)
+            g = min(0.02, VE.trackspan(ntr) * 0.15); lo += g; hi -= g
+            inset = 0.12 * (hi - lo)
+            y1 = (lo + inset) + (hi - lo - 2inset) *
+                 VE.paramnorm(VE.paramspec(:temperature), k1.value)
+            lims = ax.finallimits[]; vp = ax.scene.viewport[]
+            mpix = Point2f(vp.origin[1] + ((base.start + (k1.frame - base.src_in)) / fps -
+                               minimum(lims)[1]) / (maximum(lims)[1] - minimum(lims)[1]) *
+                               vp.widths[1],
+                           vp.origin[2] + y1 * vp.widths[2])
+            f0 = k1.frame
+            press(mpix); moveto(mpix .+ Point2f(-40, 0)); release(); sleep(0.3)
+            @test any(k -> k.frame < f0, base.animations[:temperature].keys)
+            # restore the timeline: unstack the half and join it back onto base
+            empty!(base.animations)
+            empty!(c2.animations)
+            c2.track = base.track
+            c2.start = VE.clipend(base)
+            @test VE.joinclips!(p.sequence, base.start) !== nothing
+            merge!(base.animations, savedanims)
+            VE.refreshedit!(p); notify(p.playhead); sleep(0.3)
+        end
+
+        @testset "slider writes keys while playing (live keying)" begin
+            press(tlx(1.2)); release(); sleep(0.2)
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            VE.armkeyframe!(p, :contrast); sleep(0.3)
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            farm = clip.animations[:contrast].keys[1].frame
+            VE.play!(p); sleep(0.5)                    # playhead advancing
+            Makie.set_close_to!(p.fxsliders[:contrast], 1.8)
+            sleep(0.2); VE.pause!(p); sleep(0.2)
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            ks = clip.animations[:contrast].keys
+            @test any(k -> k.frame > farm && abs(k.value - 1.8) < 0.02, ks)
+            delete!(clip.animations, :contrast)        # leave the state clean
+            notify(p.playhead); sleep(0.2)
+        end
+
         @testset "GUI tools: loop hints + blend" begin
             datapos(t, y) = begin                    # timeline data coords → figure pixel
                 lims = ax.finallimits[]; vp = ax.scene.viewport[]

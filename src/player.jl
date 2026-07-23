@@ -1933,10 +1933,13 @@ function buildkeyframeoverlay!(player::Player)
     function ensureplot!(key)
         get!(curveplots, key) do
             pts = Observable(Point2f[])
+            halo = lines!(ax, pts; color = (:black, 0.55), linewidth = 4.0,
+                          visible = player.kfvisible)  # dark under-halo: keeps the
+            translate!(halo, 0, 0, 3)                  # curve readable on busy thumbs
             pl = lines!(ax, pts; color = paramcolor(key), linewidth = 2.0,
                         visible = player.kfvisible)   # toolbar ◆ shows/hides all curves
             translate!(pl, 0, 0, 4)   # above the thumbnails, below the playhead line
-            (pl, pts)
+            (pl, pts, halo)
         end
     end
     function refresh()
@@ -1965,12 +1968,13 @@ function buildkeyframeoverlay!(player::Player)
         for (key, (_, pts)) in curveplots       # empty curves for params no longer animated
             key in active || isempty(pts[]) || (pts[] = Point2f[])
         end
-        # ◆ markers for every animated param on the clip under the playhead
+        # ◆ markers for every animated param on EVERY clip under the playhead —
+        # multi-track: each lane's clip gets its own editable markers
         empty!(markmeta)
         pts = Point2f[]; cols = RGBAf[]; sizes = Float64[]
-        loc = locate(seq, player.playhead[])
-        if loc !== nothing
-            clip = loc[1]
+        ph = player.playhead[]
+        for clip in seq.clips
+            clip.start <= ph < clipend(clip) || continue
             for (key, c) in clip.animations
                 isempty(c) && continue
                 p = paramspec(key)
@@ -2083,9 +2087,13 @@ function buildkeyframeoverlay!(player::Player)
         t, y = mouseposition(ax.scene)
         if event.button == Mouse.left && event.action == Mouse.press
             if ispressed(ax.scene, Keyboard.left_alt | Keyboard.right_alt)   # Alt-click adds a key
-                loc = locate(seq, timelineframe(tl, t)); loc === nothing && return Consume(false)
-                clip = loc[1]
-                sf = clip.src_in + (timelineframe(tl, t) - clip.start)
+                # resolve by time AND track band — aiming at V2 must never key V1
+                n = timelineframe(tl, t)
+                tr = trackat(y, ntracks(seq))
+                ci = findfirst(c -> c.track == tr && c.start <= n < clipend(c), seq.clips)
+                ci === nothing && return Consume(false)
+                clip = seq.clips[ci]
+                sf = clip.src_in + (n - clip.start)
                 key = nearestcurve(clip, sf, y)
                 if key === nothing                       # not aiming at any curve
                     setstatus!(player, isempty(clip.animations) ?
