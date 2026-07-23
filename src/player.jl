@@ -323,7 +323,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     rowsize!(fig.layout, 2, Makie.Fixed(112))
 
     # onboarding hint; replaced by the first real status update
-    status = Observable("Space plays · S splits · Ctrl+P adds effects · right-click a clip for all actions")
+    status = Observable("Space plays · S splits · Ctrl+P adds effects · Shift+click marks · right-drag pans")
     controls = GridLayout(fig[3, 1:3], tellwidth = false)
     Box(fig[3, 1:3]; color = uicolors.surface_subtle, strokewidth = 0, tellwidth = false, tellheight = false)  # footer bar
     playbtn = Button(controls[1, 1]; label = map(p -> p ? "Pause" : "Play", playing), width = 80)
@@ -412,19 +412,17 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     player.mediasources[] = unique([c.source for c in sequence.clips])
     mediadock = dockpanel!(player, :media)
     buildmediabin!(player, mediadock[1, 1], uicolors)
-    binbtn = toolbarbutton!(player, toolbar[2, 1], "Bin", :media, uicolors)
     exportdock = dockpanel!(player, :export)
     buildexportpanel!(player, exportdock[1, 1], uicolors)
-    outbtn = toolbarbutton!(player, toolbar[3, 1], "Out", :export, uicolors)
+    # toolbar in three groups: the DOCKS (FX · Tools · Bin · Out), the armable
+    # edit tools (✂ ▢), the one-shots (✕ ↶ ↷). The keyframe-curve toggle lives
+    # in the Inspector now — it configures the overlay, it is not a tool.
+    toolsdock = dockpanel!(player, :tools; width = 300)
+    buildtoolspanel!(player, toolsdock[1, 1], uicolors)
+    toolsbtn = toolbarbutton!(player, toolbar[2, 1], "⚒", :tools, uicolors)
+    binbtn = toolbarbutton!(player, toolbar[3, 1], "Bin", :media, uicolors)
+    outbtn = toolbarbutton!(player, toolbar[4, 1], "Out", :export, uicolors)
     buildkeyframeoverlay!(player)   # THE keyframe editor: curves + ◆ on the clips
-    kfbtn = Button(toolbar[4, 1]; label = "◆", width = 40, height = 40)
-    on(_ -> (player.kfvisible[] = !player.kfvisible[]), kfbtn.clicks)
-    on(player.kfvisible; update = true) do o
-        kfbtn.buttoncolor[] = o ? uicolors.accent : uicolors.surface
-        kfbtn.labelcolor[] = o ? uicolors.text_on_accent : uicolors.text
-    end
-    # tool strip: ✂ split and ▢ crop ARM (change the cursor + act where you
-    # click/drag); ✕ ↶ ↷ are one-shot at the playhead
     splitbtn = Button(toolbar[5, 1]; label = "✂", width = 40, height = 40)
     cropbtn = Button(toolbar[6, 1]; label = "▢", width = 40, height = 40)
     on(_ -> armtool!(player, :split), splitbtn.clicks)
@@ -440,17 +438,13 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
         on(_ -> action(), b.clicks)
         push!(onebtns, b)
     end
-    toolsdock = dockpanel!(player, :tools; width = 300)
-    buildtoolspanel!(player, toolsdock[1, 1], uicolors)
-    toolsbtn = toolbarbutton!(player, toolbar[6 + length(oneshots) + 1, 1], "⚒", :tools, uicolors)
     # hover tooltips: hovering a toolbar button shows its name + shortcut to the
     # right of it (detected by mouse-vs-bbox; Makie Buttons have no hover attr).
     tiptargets = vcat([(fxbtn, "Inspector — effects & stabilize"),
+                       (toolsbtn, "Tools — loop finder, blends, …"),
                        (binbtn, "Media bin — import & drag clips"),
                        (outbtn, "Export"),
-                       (kfbtn, "Keyframe curves on the timeline"),
-                       (splitbtn, "Blade  (S)"), (cropbtn, "Crop  (C)"),
-                       (toolsbtn, "Tools — loop finder, blends, …")],
+                       (splitbtn, "Blade  (S)"), (cropbtn, "Crop  (C)")],
                       [(onebtns[i], oneshots[i][2]) for i in eachindex(onebtns)])
     tip_txt = Observable(" "); tip_pos = Observable(Point2f(0, 0)); tip_vis = Observable(false)
     Makie.text!(fig.scene, tip_pos; text = tip_txt, visible = tip_vis, space = :pixel,
@@ -1431,6 +1425,8 @@ function wirekeys(player::Player)
             player.croprect[] = Point2f[]
             player.tool[] === :none || (player.tool[] = :none)
             activetool(player) === nothing || deactivatetool!(player)
+            player.clipmodal !== nothing && player.clipmodal.open[] &&
+                close!(player.clipmodal)
             if player.onpick !== nothing
                 player.onpick = nothing
                 setstatus!(player, "object lock cancelled")
@@ -2088,7 +2084,16 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     fxscroll = Subfigure(gridpos; scrollbar_thumb_color = uicolors.border)
     player.fxwidgets[:fxscroll] = fxscroll
     panel = GridLayout(fxscroll[1, 1]; valign = :top)
-    Label(panel[1, 1], "Inspector"; font = :bold, halign = :left, tellwidth = false)
+    head = GridLayout(panel[1, 1])
+    Label(head[1, 1], "Inspector"; font = :bold, halign = :left, tellwidth = false)
+    # keyframe-curve overlay toggle — it configures the timeline overlay the
+    # Inspector's ◆ accessories feed, so it lives here, not in the toolbar
+    kfb = Button(head[1, 2]; label = "◆", width = 30, height = 24, halign = :right)
+    on(_ -> (player.kfvisible[] = !player.kfvisible[]), kfb.clicks)
+    on(player.kfvisible; update = true) do o
+        kfb.buttoncolor[] = o ? uicolors.accent : uicolors.surface
+        kfb.labelcolor[] = o ? uicolors.text_on_accent : uicolors.text
+    end
     target = map(player.playhead) do n
         loc = locate(player.sequence, n)
         loc === nothing && return "▸ no clip at the playhead"
@@ -2499,25 +2504,21 @@ end
 
 "Right-click context modal on the timeline: clip actions + shortcut reference."
 function wireclipmenu!(player::Player)
-    modal = Modal(player.fig; title = "Clip actions", min_size = (300, 100))
+    # SMALL and contextual: only what has no first-class home elsewhere —
+    # splitting/cropping live on the toolbar (✂ ▢), effects and stabilization
+    # in the Inspector, tools in the Tools dock
+    modal = Modal(player.fig; title = "Clip actions", min_size = (220, 10))
     player.clipmodal = modal
     rcframe() = clamp(round(Int, player.rctime * player.sequence.framerate), 0,
                       max(seqlength(player.sequence) - 1, 0))
     actions = [
-        ("Split here", "S", () -> (split!(player.sequence, rcframe()); refreshedit!(player))),
         ("Join with next clip", "", () -> joinat!(player; at = rcframe())),
         ("Delete clip (ripple)", "X", () -> begin
             deleteclip!(player.sequence, rcframe())
             player.playhead[] = clamp(player.playhead[], 0, max(seqlength(player.sequence) - 1, 0))
             refreshedit!(player)
         end),
-        ("Crop (drag on preview)", "C", () -> (player.cropmode[] = true)),
         ("Reset crop", "R", () -> resetcropat!(player, rcframe())),
-        ("Stabilize clip", "", () -> analyzeat!(player, (c; kw...) -> analyzemotion!(c; backend = player.analysisbackend, kw...), "motion stabilization"; at = rcframe())),
-        ("Remove stabilization", "", () -> removestabilization!(player; at = rcframe())),
-        ("Fix color flicker", "", () -> analyzeat!(player, (c; kw...) ->
-             analyzecolor!(c; backend = player.analysisbackend, kw...),
-             "color stabilization"; at = rcframe())),
     ]
     for (i, (text, key, action)) in enumerate(actions)
         btn = Button(modal[i, 1]; label = isempty(key) ? text : "$text   ·  $key",
@@ -2527,9 +2528,6 @@ function wireclipmenu!(player::Player)
             action()
         end
     end
-    Label(modal[length(actions) + 1, 1],
-          "Scrub: drag  ·  Move clip: Ctrl+drag (drop above the top lane → new track)\nZoom: scroll  ·  Play: Space  ·  Step: ←/→ (Shift ±10)";
-          fontsize = 11, halign = :left, justification = :left)
     player.timeline.onrightclick = t -> begin
         player.rctime = t
         modal.title = "Clip @ " * timestring(t)

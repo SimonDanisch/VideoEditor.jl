@@ -87,6 +87,7 @@ mutable struct Timeline
     presspick::Union{Nothing, Tuple{Int, Float64, Float64}}  # (clipindex, t, y) of a scrub press —
                                                 # dragging out of the lane converts it to a clip move
     gpurun::Any   # synchronous GPU-worker runner for thumbnail decoding (nothing = CPU)
+    rightpress::Any   # (t, px) of a right press — release decides menu vs pan
 
     function Timeline(gridpos, sequence::Sequence, playhead::Observable{Int},
                       playing::Observable{Bool})
@@ -112,6 +113,7 @@ mutable struct Timeline
                        Threads.Atomic{Bool}(true),
                        nothing, nothing, nothing, 0, 1, false, nothing, identity, identity)
         timeline.gpurun = nothing
+        timeline.rightpress = nothing
 
         timeline.ghost_plot = poly!(axis, timeline.ghost_rect; color = timeline.ghost_color,
                                     strokecolor = colors.accent, strokewidth = 1.5,
@@ -402,10 +404,26 @@ end
 function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
     axis, seq = timeline.axis, timeline.sequence
     on(events(axis.scene).mousebutton) do event
-        if event.button == Mouse.right && event.action == Mouse.press &&
-           is_mouseinside(axis.scene)
-            timeline.onrightclick(mouseposition(axis.scene)[1])
-            return Consume(true)
+        if event.button == Mouse.right
+            # right-DRAG pans the view (the axis interaction) — the clip menu
+            # must only open on a STILL click, decided at release, or panning
+            # over a clip would move the view AND pop the menu at once
+            if event.action == Mouse.press && is_mouseinside(axis.scene)
+                lims = axis.finallimits[]
+                timeline.rightpress = (mouseposition(axis.scene)[1],
+                                       Point2f(events(axis.scene).mouseposition[]),
+                                       (minimum(lims)[1], maximum(lims)[1]))
+                return Consume(true)
+            elseif event.action == Mouse.release && timeline.rightpress !== nothing
+                t0, px0, _ = timeline.rightpress
+                timeline.rightpress = nothing
+                mp = events(axis.scene).mouseposition[]
+                if hypot(mp[1] - px0[1], mp[2] - px0[2]) < 4
+                    timeline.onrightclick(t0)
+                end
+                return Consume(true)
+            end
+            return Consume(false)
         end
         event.button == Mouse.left || return Consume(false)
         if event.action == Mouse.press && is_mouseinside(axis.scene)
@@ -460,6 +478,15 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
 
     on(events(axis.scene).mouseposition) do _
         inside = is_mouseinside(axis.scene)
+        if timeline.rightpress !== nothing        # right-drag PANS the view
+            _, px0, lims0 = timeline.rightpress
+            mp = events(axis.scene).mouseposition[]
+            vp = axis.scene.viewport[]
+            dt = (mp[1] - px0[1]) / max(vp.widths[1], 1) * (lims0[2] - lims0[1])
+            abs(mp[1] - px0[1]) > 3 &&
+                limits!(axis, lims0[1] - dt, lims0[2] - dt, 0.0, 1.0)
+            return Consume(true)
+        end
         if timeline.dragclip !== nothing
             mp = mouseposition(axis.scene); dragto!(timeline, mp[1], mp[2])
         elseif timeline.trimclip !== nothing
