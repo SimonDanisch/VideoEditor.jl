@@ -29,9 +29,17 @@ function VideoSource(path::AbstractString)
     # containers may claim a track rate the stream doesn't deliver (YouTube mkv
     # remuxes report 29.97 while frames actually arrive at 23.976) — when the
     # true frame count disagrees with duration × claimed rate, the EFFECTIVE
-    # rate is the one every frame↔time mapping (and the proxy check) must use
+    # rate is the one every frame↔time mapping (and the proxy check) must use.
+    # Snap it to the nearest standard video rate: count/duration carries the
+    # container's rounding noise, and a raw float like 23.975288… later
+    # explodes into a 2^47 denominator when converted to ffmpeg's Int32
+    # AVRational at export time.
     if nframes > 0 && duration > 0 && abs(nframes / duration - fps) / fps > 0.01
-        fps = nframes / duration
+        eff = nframes / duration
+        std = (24000 / 1001, 24.0, 25.0, 30000 / 1001, 30.0, 48.0, 50.0,
+               60000 / 1001, 60.0, 120000 / 1001, 120.0)
+        near = findfirst(r -> abs(eff - r) / r < 0.002, std)
+        fps = near === nothing ? eff : std[near]
     end
     return VideoSource(String(path), width, height, fps, duration, nframes, keyframes)
 end

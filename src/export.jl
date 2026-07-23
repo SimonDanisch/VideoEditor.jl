@@ -44,8 +44,12 @@ function exportvideo(path::AbstractString, seq::Sequence;
     readers = Dict{String, Any}()   # per-source decoder: GpuVideoStream or SequentialReader
     fxbufs = Dict{String, NTuple{4, AnyRGBFrame}}()  # per-source (host, chain triple)
 
+    # ffmpeg takes the rate as an Int32 AVRational: a raw measured float
+    # (23.975288…) converts to an exact Rational with a 2^47 denominator and
+    # overflows — rationalize to the smallest fraction within a millihertz
+    fr = rationalize(Float64(framerate); tol = 1e-6)
     writer = VideoIO.open_video_out(videopath, RGB{N0f8}, (canvas[2], canvas[1]);
-                                    framerate = framerate, codec_name = codec_name,
+                                    framerate = fr, codec_name = codec_name,
                                     encoder_options = encoder_options)
     try
         for n in 0:(total - 1)
