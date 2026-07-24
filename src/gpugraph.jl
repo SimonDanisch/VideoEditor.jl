@@ -61,17 +61,26 @@ struct FxContext
     clip::Clip
     frame::Int
     playing::Bool
+    # The frame the source ACTUALLY delivered. A streaming source under its
+    # latency budget may serve the nearest already-decoded frame instead of
+    # `frame` (see `frameat!`) — the PER-FRAME track transforms must then be
+    # sampled at the SERVED index, or a stabilization transform for `frame`
+    # lands on a different image and the preview jerks wildly while the decode
+    # catches up (export was always exact, so only playback showed it).
+    served::Base.RefValue{Int}
 end
-FxContext(source, clip::Clip, frame::Integer) = FxContext(source, clip, Int(frame), false)
+FxContext(source, clip::Clip, frame::Integer, playing::Bool = false) =
+    FxContext(source, clip, Int(frame), playing, Ref(Int(frame)))
 framesize(s) = size(s)                                   # a CPU RGBFrame
 framesize(s::GpuVideoStream) = (s.width, s.height)
 frameisbt601(::Any) = false
 frameisbt601(s::GpuVideoStream) = s.bt601
 
-# fill `out` with the decoded source frame (device-resident decode, or one upload)
-sourceinto!(out, s::GpuVideoStream, frame; prefetch::Bool = false) =
-    (f = frameat!(s, frame; prefetch); nv12torgb!(out, f.y, f.uv; bt601 = s.bt601); out)
-sourceinto!(out, s, frame; prefetch::Bool = false) = copyto!(out, s)   # CPU frame → device upload
+# fill `out` with the decoded source frame (device-resident decode, or one upload);
+# `served` reports which frame the stream really delivered
+sourceinto!(out, s::GpuVideoStream, frame; prefetch::Bool = false, served = nothing) =
+    (f = frameat!(s, frame; prefetch, served); nv12torgb!(out, f.y, f.uv; bt601 = s.bt601); out)
+sourceinto!(out, s, frame; prefetch::Bool = false, served = nothing) = copyto!(out, s)
 
 # ---------------------------------------------------------------- effect callbacks
 
@@ -148,18 +157,21 @@ pointwiseop(n::PixelNode) = n.kind isa Pointwise
 # overwrite `ins[1]` in place (its last consumer is this node).
 function eval_node!(::SourceNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
     out = acquire!(pool, framesize(ctx.source))
-    return sourceinto!(out, ctx.source, ctx.frame; prefetch = ctx.playing)
+    return sourceinto!(out, ctx.source, ctx.frame; prefetch = ctx.playing,
+                       served = ctx.served)
 end
+# the per-frame tracks sample at the SERVED index (what's actually on screen),
+# not the requested one — the source node runs first, so `served` is set
 function eval_node!(n::MotionNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
     out = canmutate ? ins[1] : copyacquire!(pool, ins[1])
     tmp = acquire!(pool, size(out))
-    applymotiontrack!(out, tmp, ctx.clip, ctx.frame)   # warps `out` using `tmp` as scratch
+    applymotiontrack!(out, tmp, ctx.clip, ctx.served[])   # warps `out`, `tmp` = scratch
     release!(pool, tmp)
     return out
 end
 function eval_node!(n::ColorTrackNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
     out = canmutate ? ins[1] : copyacquire!(pool, ins[1])
-    applycolortrack!(out, ctx.clip, ctx.frame)
+    applycolortrack!(out, ctx.clip, ctx.served[])
     return out
 end
 function eval_node!(n::ColorNode, ins, pool::BufferPool, canmutate, ctx::FxContext)

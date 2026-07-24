@@ -315,7 +315,7 @@ function gopof(s::GpuVideoStream, n::Integer)
 end
 
 """
-    frameat!(s, n; prefetch=false) -> Nv12Frame
+    frameat!(s, n; prefetch=false, served=nothing) -> Nv12Frame
 
 The device-resident NV12 frame at display index `n`, decoded INCREMENTALLY: a miss
 starts (or continues) a chunked feed of `n`'s GOP through the stream's persistent
@@ -329,7 +329,8 @@ once `n` is half-way into the current one, and every present advances the feed b
 ~10 ms chunk — a 250-frame GOP decodes spread invisibly across ~2 s of playback
 instead of as one ~600 ms stall at the boundary. Runs on the caller's GPU thread.
 """
-function frameat!(s::GpuVideoStream, n::Integer; prefetch::Bool = false)
+function frameat!(s::GpuVideoStream, n::Integer; prefetch::Bool = false,
+                  served::Union{Nothing, Base.RefValue{Int}} = nothing)
     g = gopof(s, n)
     gop = s.gops[g]
     if haskey(s.ring, n)
@@ -354,15 +355,23 @@ function frameat!(s::GpuVideoStream, n::Integer; prefetch::Bool = false)
         end
         s.feedgop == 0 || decodechunk!(s; frames = 4)   # ~10 ms of ahead-work per present
     end
-    haskey(s.ring, n) && return s.ring[n]
-    # nearest decoded frame of this GOP (feeds fill front-to-back, so search outward)
+    if haskey(s.ring, n)
+        served === nothing || (served[] = n)
+        return s.ring[n]
+    end
+    # nearest decoded frame of this GOP (feeds fill front-to-back, so search outward).
+    # `served` tells the caller WHICH frame this really is — per-frame consumers
+    # (track transforms) must follow it, or they warp the wrong image.
     for k in 1:gop.nframes
         for m in (n - k, n + k)
-            gop.firstframe <= m < gop.firstframe + gop.nframes &&
-                haskey(s.ring, m) && return s.ring[m]
+            if gop.firstframe <= m < gop.firstframe + gop.nframes && haskey(s.ring, m)
+                served === nothing || (served[] = m)
+                return s.ring[m]
+            end
         end
     end
     decodechunk!(s)                       # freshly-started feed: land the first chunk
+    served === nothing || (served[] = gop.firstframe)
     return s.ring[gop.firstframe]
 end
 
