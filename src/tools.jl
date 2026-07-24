@@ -134,9 +134,11 @@ end
 
 # --------------------------------------------------------------- Tools panel
 
-"The Tools dock: one row per registered tool — click arms it, click again puts
-it away — plus a PREVIEW CARD the active tool can fill (e.g. the loop finder's
-reference frame, via [`toolpreview!`](@ref)). Rebuilt live on [`registertool!`](@ref)."
+"The Tools dock: one CARD per registered tool — the same section visual as the
+inspector's effect stack. The header row [▾ · Tool name] arms the tool (click
+again puts it away); the body holds the tool's description, its OWN action slot
+and its OWN preview cards, so nothing of one tool renders under another's.
+Rebuilt live on [`registertool!`](@ref)."
 function buildtoolspanel!(player::Player, gridpos, uicolors)
     panel = GridLayout(gridpos; tellheight = false, valign = :top)
     Label(panel[1, 1], "Tools"; font = :bold, halign = :left, tellwidth = false)
@@ -144,39 +146,66 @@ function buildtoolspanel!(player::Player, gridpos, uicolors)
     colsize!(panel, 1, Makie.Relative(1.0))
     active = activetoolname(player)
     built = Any[]
+    folded = Dict{Symbol, Bool}()
+    actionslots = Dict{Symbol, Any}()   # tool name → its body action slot
+    cardslots = Dict{Symbol, Any}()     # tool name → its body card rows
+    cardbg = Makie.lerp_oklab(RGBf(Makie.to_color(uicolors.background)),
+                              RGBf(1, 1, 1), 0.075)
     function rebuild()
+        # folding/activating rebuilds everything — put the active tool away
+        # first so its live plots/cards never point into deleted grids
         foreach(Makie.delete!, built)
         empty!(built)
+        empty!(actionslots); empty!(cardslots)
         for (k, tool) in enumerate(TOOLS)
-            btn = Button(rows[2k - 1, 1]; label = tool.label, tellwidth = false,
-                         width = Makie.Relative(1.0), halign = :left)
-            desc = Label(rows[2k, 1], tool.description; fontsize = 11, halign = :left,
-                         color = uicolors.text_muted, tellwidth = false, word_wrap = true)
-            on(_ -> activatetool!(player, tool.name), btn.clicks)
+            open = !get(folded, tool.name, false)
+            card = GridLayout(rows[k, 1])
+            push!(built, card)
+            Box(card[1:(open ? 2 : 1), 1]; color = cardbg,
+                strokecolor = uicolors.border, strokewidth = 1, cornerradius = 6,
+                tellwidth = false, tellheight = false)
+            Box(card[1, 1]; color = uicolors.surface, strokewidth = 0,
+                cornerradius = 5, tellwidth = false, tellheight = false)
+            hgl = GridLayout(card[1, 1]; alignmode = Makie.Outside(8, 8, 5, 5))
+            fold = Button(hgl[1, 1]; label = open ? "▾" : "▸", width = 24)
+            on(fold.clicks) do _
+                folded[tool.name] = open
+                activetoolname(player)[] === tool.name && deactivatetool!(player)
+                rebuild()
+            end
+            arm = Button(hgl[1, 2]; label = tool.label, tellwidth = false,
+                         width = Makie.Relative(1.0), halign = :left, font = :bold)
+            on(_ -> activatetool!(player, tool.name), arm.clicks)
             on(active; update = true) do a
                 armed = a === tool.name
-                btn.buttoncolor[] = armed ? uicolors.accent : uicolors.surface
-                btn.labelcolor[] = armed ? uicolors.text_on_accent : uicolors.text
+                arm.buttoncolor[] = armed ? uicolors.accent : uicolors.surface
+                arm.labelcolor[] = armed ? uicolors.text_on_accent : uicolors.text
             end
-            push!(built, btn, desc)
+            colsize!(card, 1, Makie.Relative(1.0))
+            open || continue
+            body = GridLayout(card[2, 1]; alignmode = Makie.Outside(10, 10, 10, 6))
+            Label(body[1, 1], tool.description; fontsize = 11, halign = :left,
+                  color = uicolors.text_muted, tellwidth = false, word_wrap = true)
+            actionslots[tool.name] = GridLayout(body[2, 1])
+            cardslots[tool.name] = GridLayout(body[3, 1])
         end
         return
     end
     on(_ -> rebuild(), TOOLSVERSION)
     rebuild()
-    # ACTION slot: the active tool can offer one panel action ("Find …") —
-    # the Button is created/deleted on demand (Buttons have no `visible`)
-    actionslot = GridLayout(panel[3, 1])
-    actionbtn = Ref{Any}(nothing)
+    on(active) do a   # activating a folded tool unfolds its card first
+        (a !== :none && get(folded, a, false)) || return
+        folded[a] = false
+        rebuild()
+    end
+    actionbtn = Ref{Any}(nothing)   # created/deleted on demand (Buttons have no `visible`)
     actioncb = Ref{Any}(nothing)
-    # CARD list: the active tool adds preview cards (image + caption, clickable,
-    # highlightable). Images draw on the dock scene over layout Boxes — an Axis
-    # inside a Subfigure won't render (same pattern as the media bin thumbs).
-    cardrows = GridLayout(panel[4, 1])
+    # preview-card images draw on the dock scene over layout Boxes — an Axis
+    # inside a Subfigure won't render (same pattern as the media bin thumbs)
     scene = player.dockpanels[:tools].sf.scene
-    cards = Any[]   # (id, box, im, label, onclick)
-    player.fxwidgets[:toolaction] = (actionslot, actionbtn, actioncb)
-    player.fxwidgets[:toolcards] = (cardrows, scene, cards)
+    cards = Any[]   # (id, box, im, label, onclick, removebtn)
+    player.fxwidgets[:toolaction] = (actionslots, actionbtn, actioncb)
+    player.fxwidgets[:toolcards] = (cardslots, scene, cards)
     # one shared click handler: hit-test the card boxes in figure pixels
     on(events(player.fig).mousebutton; priority = 30) do event
         (event.button == Mouse.left && event.action == Mouse.press &&
@@ -204,9 +233,14 @@ loop finder's "Find similar frames"). Hidden again at deactivation.
 function toolaction!(ctx::ToolContext, label::AbstractString, callback)
     ta = get(ctx.player.fxwidgets, :toolaction, nothing)
     ta === nothing && return nothing
-    slot, btn, cb = ta
+    slots, btn, cb = ta
     btn[] === nothing || Makie.delete!(btn[])
+    btn[] = nothing
     cb[] = callback
+    cur = activetool(ctx.player)
+    cur === nothing && return nothing
+    slot = get(slots, cur[1].name, nothing)   # the tool's OWN card body
+    slot === nothing && return nothing
     b = Button(slot[1, 1]; label = String(label), tellwidth = false,
                width = Makie.Relative(1.0))
     on(_ -> (f = cb[]; f === nothing || f()), b.clicks)
@@ -215,18 +249,24 @@ function toolaction!(ctx::ToolContext, label::AbstractString, callback)
 end
 
 """
-    tooladdcard!(ctx, img; caption = "", onclick = nothing) -> id
+    tooladdcard!(ctx, img; caption = "", onclick = nothing, onremove = nothing) -> id
 
-Append a preview card (image + caption) to the Tools panel — e.g. one loop
-reference frame. `onclick(id)` fires when the card is clicked. Highlight the
-selected card with [`toolhighlight!`](@ref); all cards are removed at
-deactivation.
+Append a preview card (image + caption) to the active tool's card area in its
+Tools-panel section — e.g. one loop reference frame. `onclick(id)` fires when
+the card is clicked; passing `onremove` adds an × next to the caption that
+fires `onremove(id)`. Highlight the selected card with
+[`toolhighlight!`](@ref); all cards are removed at deactivation.
 """
 function tooladdcard!(ctx::ToolContext, img::AbstractMatrix{RGB{N0f8}};
-                      caption::AbstractString = "", onclick = nothing)
+                      caption::AbstractString = "", onclick = nothing,
+                      onremove = nothing)
     tc = get(ctx.player.fxwidgets, :toolcards, nothing)
     tc === nothing && return 0
-    cardrows, scene, cards = tc
+    cardslots, scene, cards = tc
+    cur = activetool(ctx.player)
+    cur === nothing && return 0
+    cardrows = get(cardslots, cur[1].name, nothing)
+    cardrows === nothing && return 0
     colors = ctx.player.timeline.colors
     id = length(cards) + 1
     k = 2id - 1
@@ -235,6 +275,12 @@ function tooladdcard!(ctx::ToolContext, img::AbstractMatrix{RGB{N0f8}};
               cornerradius = 3)
     lbl = Label(cardrows[k + 1, 1], String(caption); fontsize = 11, halign = :left,
                 color = (colors.text, 0.65), tellwidth = false)
+    rm = nothing
+    if onremove !== nothing   # × shares the caption row, clear of the image
+        rm = Button(cardrows[k + 1, 1]; label = "×", width = 22, halign = :right,
+                    tellwidth = false)
+        on(_ -> onremove(id), rm.clicks)
+    end
     imgobs = Observable(reverse(collect(img), dims = 2))   # dock scene is y-up
     xy = lift(box.layoutobservables.computedbbox, scene.viewport) do bb, vp
         all(isfinite, bb.origin) && all(isfinite, bb.widths) || return (0.0, 1.0, 0.0, 1.0)
@@ -245,7 +291,7 @@ function tooladdcard!(ctx::ToolContext, img::AbstractMatrix{RGB{N0f8}};
                 space = :pixel, interpolate = true,
                 visible = lift(d -> d === :tools, ctx.player.dockopen))
     translate!(im, 0, 0, 20)
-    push!(cards, (id, box, im, lbl, onclick))
+    push!(cards, (id, box, im, lbl, onclick, rm))
     return id
 end
 
@@ -254,10 +300,27 @@ function toolhighlight!(ctx::ToolContext, id::Integer)
     tc = get(ctx.player.fxwidgets, :toolcards, nothing)
     tc === nothing && return nothing
     colors = ctx.player.timeline.colors
-    for (cid, box, _, _, _) in tc[3]
+    for (cid, box, _, _, _, _) in tc[3]
         box.strokecolor[] = cid == id ? colors.accent : colors.border
         box.strokewidth[] = cid == id ? 2 : 1
     end
+    return nothing
+end
+
+"Remove all tool cards (kept separate from the action button so a tool can
+re-render its card list in place)."
+function cleartoolcards!(player::Player)
+    tc = get(player.fxwidgets, :toolcards, nothing)
+    tc === nothing && return nothing
+    _, scene, cards = tc
+    for (_, box, im, lbl, _, rm) in cards
+        try
+            Makie.delete!(box); Makie.delete!(lbl); Makie.delete!(scene, im)
+            rm === nothing || Makie.delete!(rm)
+        catch
+        end
+    end
+    empty!(cards)
     return nothing
 end
 
@@ -270,17 +333,7 @@ function cleartoolpanel!(player::Player)
         btn[] = nothing
         cb[] = nothing
     end
-    tc = get(player.fxwidgets, :toolcards, nothing)
-    if tc !== nothing
-        _, scene, cards = tc
-        for (_, box, im, lbl, _) in cards
-            try
-                Makie.delete!(box); Makie.delete!(lbl); Makie.delete!(scene, im)
-            catch
-            end
-        end
-        empty!(cards)
-    end
+    cleartoolcards!(player)
     return nothing
 end
 
@@ -344,6 +397,50 @@ function loopcutat!(ctx::ToolContext, k::Integer)
     return nothing
 end
 
+"One reference card in the Tools panel (image from the thumb track, click
+selects, × removes)."
+function loopcard!(ctx::ToolContext, clip::Clip, ref::Integer)
+    player = ctx.player
+    st = ctx.state
+    cache = cachefor(player.timeline, clip.source)   # same imagery as the thumb track
+    sec = round(Int, (clip.src_in + ref - 1) / clip.source.framerate)
+    th = nearestthumb(cache, sec)
+    fill3 = RGB{N0f8}(player.timeline.colors.surface)
+    img = th === nothing ? fill(fill3, 16, 9) : fitbox(th, 240, 92, fill3)
+    return tooladdcard!(ctx, img;
+        caption = "ref " * timecode(player.sequence, clip.start + ref - 1),
+        onclick = cid -> begin      # clicking a card shows ITS similarity markers
+            st[:active][] = cid
+            toolhighlight!(ctx, cid)
+            showloopmarkers!(ctx)
+        end,
+        onremove = cid -> removeloopref!(ctx, cid))
+end
+
+"Re-render every reference card from `refs` (after a removal) and select `select`."
+function refreshloopcards!(ctx::ToolContext; select::Integer = length(ctx.state[:refs]))
+    st = ctx.state
+    cleartoolcards!(ctx.player)
+    for (clip, ref, _) in st[:refs]
+        loopcard!(ctx, clip, ref)
+    end
+    st[:active][] = clamp(select, 0, length(st[:refs]))
+    st[:active][] == 0 || toolhighlight!(ctx, st[:active][])
+    showloopmarkers!(ctx)
+    return nothing
+end
+
+"× on a reference card: drop that reference and re-render the remaining cards."
+function removeloopref!(ctx::ToolContext, id::Integer)
+    st = ctx.state
+    1 <= id <= length(st[:refs]) || return nothing
+    deleteat!(st[:refs], id)
+    refreshloopcards!(ctx)
+    setstatus!(ctx.player, "Loop finder: reference removed" *
+                           (isempty(st[:refs]) ? " — Find adds a new one" : ""))
+    return nothing
+end
+
 "Card + hints for one reference frame (cheap — the clip's signatures exist)."
 function addloopref!(ctx::ToolContext, clip::Clip, ref::Integer, sig)
     player = ctx.player
@@ -352,18 +449,7 @@ function addloopref!(ctx::ToolContext, clip::Clip, ref::Integer, sig)
     hints = similarframes(sig, clamp(ref, 1, size(sig, 3));
                           n = st[:nhints], exclude = max(round(Int, fps), 2))
     push!(st[:refs], (clip, Int(ref), hints))
-    cache = cachefor(player.timeline, clip.source)   # same imagery as the thumb track
-    sec = round(Int, (clip.src_in + ref - 1) / clip.source.framerate)
-    th = nearestthumb(cache, sec)
-    fill3 = RGB{N0f8}(player.timeline.colors.surface)
-    img = th === nothing ? fill(fill3, 16, 9) : fitbox(th, 240, 92, fill3)
-    id = tooladdcard!(ctx, img;
-        caption = "ref " * timecode(player.sequence, clip.start + ref - 1),
-        onclick = cid -> begin      # clicking a card shows ITS similarity markers
-            st[:active][] = cid
-            toolhighlight!(ctx, cid)
-            showloopmarkers!(ctx)
-        end)
+    id = loopcard!(ctx, clip, ref)
     st[:active][] = id
     toolhighlight!(ctx, id)
     showloopmarkers!(ctx)

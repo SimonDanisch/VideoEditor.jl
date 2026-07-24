@@ -913,6 +913,13 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             bb = cards[1][2].layoutobservables.computedbbox[]
             press(Point2f(bb.origin .+ bb.widths ./ 2)); release(); sleep(0.2)
             @test ctx.state[:active][] == 1
+            # × on the first card removes THAT reference; the second remains
+            @test cards[1][6] !== nothing
+            notify(cards[1][6].clicks); sleep(0.3)
+            @test length(ctx.state[:refs]) == 1
+            @test length(p.fxwidgets[:toolcards][3]) == 1
+            @test ctx.state[:active][] == 1              # selection follows the survivor
+            @test !isempty(ctx.state[:hintpts][])        # its hints still shown
             VE.undo!(p); sleep(0.2)                  # undo the hint cut
             @test length(p.sequence.clips) == nclips0
             VE.deactivatetool!(p)
