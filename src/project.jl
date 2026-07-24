@@ -51,7 +51,8 @@ function clipdict(clip::Clip)
         String(key) => Dict{String, Any}(
             "interp" => String(curve.interp),
             "frames" => [k.frame for k in curve.keys],
-            "values" => [Float64(k.value) for k in curve.keys])
+            "values" => [Float64(k.value) for k in curve.keys],
+            "eases" => [String(k.ease) for k in curve.keys])
         for (key, curve) in clip.animations if !isempty(curve))
     isempty(anims) || (cd["animations"] = anims)
     return cd
@@ -87,8 +88,10 @@ function loadproject(path::AbstractString)
                 Float32(get(ct, "strength", 1.0)))   # absent in older project files
         end
         for (key, ad) in get(cd, "animations", Dict{String, Any}())
+            eases = get(ad, "eases", fill("linear", length(ad["frames"])))  # older files
             clip.animations[Symbol(key)] = AnimCurve(
-                [Keyframe(Int(f), Float64(v)) for (f, v) in zip(ad["frames"], ad["values"])],
+                [Keyframe(Int(f), Float64(v), Symbol(e))
+                 for (f, v, e) in zip(ad["frames"], ad["values"], eases)],
                 Symbol(get(ad, "interp", "linear")))
         end
         clip

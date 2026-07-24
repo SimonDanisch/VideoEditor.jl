@@ -247,7 +247,7 @@ function joinclips!(seq::Sequence, n::Integer)
     removetransition!(seq, nxt.start)     # a dissolve on the joined cut is gone with it
     for (key, curve) in nxt.animations    # carry the right half's keys over
         if haskey(c.animations, key)
-            foreach(k -> setkey!(c.animations[key], k.frame, k.value), curve.keys)
+            foreach(k -> setkey!(c.animations[key], k.frame, k.value, k.ease), curve.keys)
         else
             c.animations[key] = curve
         end

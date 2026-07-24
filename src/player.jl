@@ -1922,14 +1922,21 @@ function buildkeyframeoverlay!(player::Player)
     curveplots = Dict{Symbol, Any}()  # param => (plot, points-observable)
     # ◆ markers for EVERY animated parameter on the clip under the playhead — what
     # you click is what you edit (the focused param's markers just draw bigger)
-    markpts = Observable(Point2f[])
-    markcols = Observable(RGBAf[])
-    marksizes = Observable(Float64[])
+    markpts = Observable(Point2f[])           # shared hit-test list (not rendered)
     markmeta = Tuple{Symbol, Int, Clip}[]     # per marker: (param, key index, clip)
-    marksc = scatter!(ax, markpts; marker = :diamond, markersize = marksizes,
-                      color = markcols, strokecolor = :white, strokewidth = 1.0,
+    # the ease mode shows in the marker SHAPE: ◆ linear · ● smooth · ■ hold. One
+    # scatter per shape (a scatter's marker input type-locks scalar-vs-vector and
+    # mixed sdf shape classes don't batch); markpts/markmeta stay the shared
+    # hit-test list, the per-shape plots only render.
+    markrender = Dict(shape => (pts = Observable(Point2f[]), cols = Observable(RGBAf[]),
+                                sizes = Observable(Float64[]))
+                      for shape in (:diamond, :circle, :rect))
+    for (shape, r) in markrender
+        sc = scatter!(ax, r.pts; marker = shape, markersize = r.sizes,
+                      color = r.cols, strokecolor = :white, strokewidth = 1.0,
                       visible = player.kfvisible)
-    translate!(marksc, 0, 0, 6)
+        translate!(sc, 0, 0, 6)
+    end
     function ensureplot!(key)
         get!(curveplots, key) do
             pts = Observable(Point2f[])
@@ -1971,7 +1978,8 @@ function buildkeyframeoverlay!(player::Player)
         # ◆ markers for every animated param on EVERY clip under the playhead —
         # multi-track: each lane's clip gets its own editable markers
         empty!(markmeta)
-        pts = Point2f[]; cols = RGBAf[]; sizes = Float64[]
+        pts = Point2f[]
+        render = Dict(s => (Point2f[], RGBAf[], Float64[]) for s in keys(markrender))
         ph = player.playhead[]
         for clip in seq.clips
             clip.start <= ph < clipend(clip) || continue
@@ -1982,15 +1990,22 @@ function buildkeyframeoverlay!(player::Player)
                 col = RGBAf(Makie.to_color(paramcolor(key)))
                 for (i, k) in enumerate(c.keys)
                     clip.src_in <= k.frame <= clip.src_out || continue
-                    push!(pts, Point2f((clip.start + (k.frame - clip.src_in)) / fps,
-                                       yat(clip, p, k.value)))
-                    push!(cols, col)
-                    push!(sizes, focused ? 13.0 : 9.0)
+                    pt = Point2f((clip.start + (k.frame - clip.src_in)) / fps,
+                                 yat(clip, p, k.value))
+                    push!(pts, pt)
                     push!(markmeta, (key, i, clip))
+                    ease = keyease(c, k)
+                    rp, rc, rs = render[ease === :hold ? :rect :
+                                        ease === :smooth ? :circle : :diamond]
+                    push!(rp, pt); push!(rc, col); push!(rs, focused ? 13.0 : 9.0)
                 end
             end
         end
-        markpts[] = pts; markcols[] = cols; marksizes[] = sizes
+        markpts[] = pts
+        for (shape, r) in markrender
+            rp, rc, rs = render[shape]
+            r.cols[] = rc; r.sizes[] = rs; r.pts[] = rp
+        end
         return
     end
     on(_ -> refresh(), player.playhead)   # refreshes on edits too (they notify the playhead)
@@ -2046,24 +2061,36 @@ function buildkeyframeoverlay!(player::Player)
         notify(player.playhead)
         return
     end
-    # right-click ◆ → keyframe menu at the cursor (Premiere-style)
+    # right-click ◆ → keyframe menu at the cursor. PER-KEY temporal interpolation,
+    # Premiere-style: each key is a linear corner, a smooth (ease in & out) key,
+    # or a hold (freeze until the next key).
     kfmenu = Modal(player.fig; title = "Keyframe", min_size = (200, 10),
                    backdrop_color = (:black, 0.15))
     kfmenuctx = Ref{Any}(nothing)                        # (clip, key, kidx)
-    easelabel = Observable("Ease curve")
+    easelabel = Observable("Ease in & out")
+    holdlabel = Observable("Hold until the next key")
+    # per-key edits first bake the legacy curve-wide :smooth into the keys, so
+    # un-easing ONE key can actually take effect
+    function retoggle(mode)
+        clip, key, kidx = kfmenuctx[]
+        c = clip.animations[key]
+        snapshot!(player)
+        materializeease!(c)
+        cur = c.keys[kidx].ease
+        new = cur === mode ? :linear : mode
+        setease!(c, kidx, new)
+        setstatus!(player, "$(paramspec(key).label): keyframe is now " *
+                           (new === :smooth ? "eased (in & out)" :
+                            new === :hold ? "held until the next key" : "linear"))
+        notify(player.playhead)
+    end
     for (row, (lbl, action)) in enumerate([
         ("Delete keyframe", () -> begin
             clip, key, kidx = kfmenuctx[]
             deletekey!(clip, key, kidx)
         end),
-        (easelabel, () -> begin
-            clip, key, _ = kfmenuctx[]
-            c = clip.animations[key]
-            snapshot!(player)
-            c.interp = c.interp === :smooth ? :linear : :smooth
-            setstatus!(player, "$(paramspec(key).label): $(c.interp === :smooth ? "eased (smooth)" : "linear") interpolation")
-            notify(player.playhead)
-        end),
+        (easelabel, () -> retoggle(:smooth)),
+        (holdlabel, () -> retoggle(:hold)),
         ("Clear all keys of this parameter", () -> begin
             clip, key, _ = kfmenuctx[]
             snapshot!(player)
@@ -2078,7 +2105,7 @@ function buildkeyframeoverlay!(player::Player)
             close!(kfmenu)
             kfmenuctx[] === nothing || action()
         end
-        player.fxwidgets[Symbol(:kfmenubtn, row)] = btn   # delete · ease · clear
+        player.fxwidgets[Symbol(:kfmenubtn, row)] = btn   # delete · ease · hold · clear
     end
     player.fxwidgets[:kfmenu] = kfmenu
     on(events(ax.scene).mousebutton; priority = 20) do event
@@ -2126,9 +2153,11 @@ function buildkeyframeoverlay!(player::Player)
             i = nearestmarker(t, y); i == 0 && return Consume(false)   # else the clip menu opens
             key, kidx, clip = markmeta[i]
             kfmenuctx[] = (clip, key, kidx)
-            k = clip.animations[key].keys[kidx]
+            c = clip.animations[key]
+            k = c.keys[kidx]
             kfmenu.title = "◆ $(paramspec(key).label) · $(timestring((clip.start + (k.frame - clip.src_in)) / fps))"
-            easelabel[] = clip.animations[key].interp === :smooth ? "Linear curve" : "Ease curve"
+            easelabel[] = keyease(c, k) === :smooth ? "Make linear (corner)" : "Ease in & out"
+            holdlabel[] = k.ease === :hold ? "Interpolate again" : "Hold until the next key"
             mp = events(player.fig).mouseposition[]      # pop up AT the cursor
             vp = player.fig.scene.viewport[]
             kfmenu.halign = clamp(mp[1] / max(vp.widths[1], 1), 0.0, 1.0)

@@ -719,7 +719,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test isempty(clip.animations)                         # nothing invented
             merge!(clip.animations, saved); notify(p.playhead); sleep(0.2)
 
-            # --- right-click ◆ → Ease toggles smoothstep interpolation ---
+            # --- right-click ◆ → per-KEY ease: smoothing kb flattens ITS tangent ---
             clip = VE.locate(p.sequence, p.playhead[])[1]
             c = clip.animations[:contrast]
             ka, kb = (k.frame for k in c.keys)
@@ -732,17 +732,28 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.release)
             sleep(0.2)
             @test p.fxwidgets[:kfmenu].open[]
-            notify(p.fxwidgets[:kfmenubtn2].clicks); sleep(0.2)    # "Ease curve"
-            @test c.interp === :smooth
-            @test VE.valueat(c, fq) ≈ va + (vb - va) * tq^2 * (3 - 2tq) atol = 1.0e-9
+            notify(p.fxwidgets[:kfmenubtn2].clicks); sleep(0.2)    # "Ease in & out"
+            @test c.keys[end].ease === :smooth
+            # hermite: ka linear (m0=1), kb smooth (m1=0) → H(t) = -t³ + t² + t
+            @test VE.valueat(c, fq) ≈ va + (vb - va) * (-tq^3 + tq^2 + tq) atol = 1.0e-9
+            # --- Hold on ka freezes the value until kb ---
+            rc = markerpix(:contrast, ka)
+            ev.mouseposition[] = Tuple(rc)
+            ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.press)
+            ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.release)
+            sleep(0.2)
+            notify(p.fxwidgets[:kfmenubtn3].clicks); sleep(0.2)    # "Hold until the next key"
+            @test c.keys[1].ease === :hold
+            @test VE.valueat(c, fq) == va
+            @test VE.valueat(c, kb) == vb                          # the next key still lands
             # --- and Clear-all makes the parameter static again ---
             rc = markerpix(:contrast, kb)
             ev.mouseposition[] = Tuple(rc)
             ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.press)
             ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.release)
             sleep(0.2)
-            @test Makie.to_value(p.fxwidgets[:kfmenubtn2].label) == "Linear curve"
-            notify(p.fxwidgets[:kfmenubtn3].clicks); sleep(0.3)
+            @test Makie.to_value(p.fxwidgets[:kfmenubtn2].label) == "Make linear (corner)"
+            notify(p.fxwidgets[:kfmenubtn4].clicks); sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             @test !VE.clipanimated(clip, :contrast)
 

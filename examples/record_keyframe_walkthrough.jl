@@ -114,7 +114,7 @@ events = [
     LeftUp(), Wait(0.8),
 
     # right-click a ◆ → the keyframe menu → Ease curve
-    Lazy(_ -> (caption[] = "Right-click a ◆ — ease the curve";
+    Lazy(_ -> (caption[] = "Right-click a ◆ — ease it in & out";
                MouseTo(marker_pos(:brightness, srcframe())))),
     RightClick(), Wait(1.1),
     Lazy(_ -> MouseTo(menubtn_pos(2))),

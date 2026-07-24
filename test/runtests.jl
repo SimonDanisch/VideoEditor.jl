@@ -122,6 +122,45 @@ end
     @test [(k.frame, k.value) for k in a.keys] == [(0, 1.0), (30, 0.25), (59, 0.8)]
     @test VE.valueat(a, 15) ≈ VE.valueat(curve, 15)            # interpolation identical after reload
     @test !isempty(VE.snapshot(seq)[1].animations)             # undo snapshot keeps it too
+    # per-key eases survive the roundtrip too
+    VE.setease!(curve, 2, :hold)
+    saveproject(path, seq)
+    a2 = loadproject(path).clips[1].animations[:opacity]
+    @test [k.ease for k in a2.keys] == [:linear, :hold, :linear]
+end
+
+@testset "per-key ease math (Premiere temporal interpolation)" begin
+    c = VE.AnimCurve()
+    VE.setkey!(c, 0, 0.0); VE.setkey!(c, 100, 1.0)
+    # linear corners on both ends → constant velocity
+    @test VE.valueat(c, 25) ≈ 0.25
+    # smooth on BOTH keys = exactly the legacy smoothstep
+    VE.setease!(c, 1, :smooth); VE.setease!(c, 2, :smooth)
+    @test VE.valueat(c, 25) ≈ 0.25^2 * (3 - 2 * 0.25)
+    legacy = VE.AnimCurve()
+    VE.setkey!(legacy, 0, 0.0); VE.setkey!(legacy, 100, 1.0)
+    legacy.interp = :smooth
+    @test VE.valueat(c, 37) ≈ VE.valueat(legacy, 37)
+    # smooth ONLY at the far key: hermite H(t) = -t³ + t² + t (slow arrival)
+    VE.setease!(c, 1, :linear)
+    t = 0.25
+    @test VE.valueat(c, 25) ≈ -t^3 + t^2 + t
+    # hold freezes until the next key; the endpoints still hit exactly
+    VE.setease!(c, 1, :hold)
+    @test VE.valueat(c, 99) == 0.0
+    @test VE.valueat(c, 100) == 1.0
+    # materializing legacy smooth bakes per-key modes and stops overriding
+    VE.materializeease!(legacy)
+    @test legacy.interp === :linear
+    @test all(k -> k.ease === :smooth, legacy.keys)
+    VE.setease!(legacy, 2, :linear)                    # now editable per key
+    @test VE.valueat(legacy, 25) ≈ (t^3 - 2t^2 + t) * 0 + (-2t^3 + 3t^2) + (t^3 - t^2) * 1
+    # moving and re-setting a key keeps its ease; join carries it across halves
+    VE.setease!(c, 2, :smooth)
+    VE.movekey!(c, 2, 80, 0.9)
+    @test c.keys[2].ease === :smooth
+    VE.setkey!(c, 80, 0.7)
+    @test c.keys[2].ease === :smooth
 end
 
 @testset "transition roundtrip" begin
