@@ -241,7 +241,7 @@ function Player(path::AbstractString; capacity::Integer = 64,
                 frame, playhead, playing; background, uicolors, analysisbackend = backend)
     end
     player.screen = display(player.fig)
-    wantgpu && (player.gpupreview = GPUPreview())
+    wantgpu && (player.gpupreview = GPUPreview(); player.fxwidgets[:lanechip][] = "GPU")
     # thumbnails decode on the GPU too — through the pinned worker (single-writer)
     wantgpu && setgpurun!(player.timeline, (f; long = false) -> rungpusync(f, player; long))
     audiopreview && (player.audio = AudioPreview())
@@ -335,6 +335,11 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
           color = uicolors.text_muted)
     # long-running jobs (stabilize / export / loop search) animate a spinner + progress
     # bar here — every heavy computation has visible, moving feedback
+    # render-backend chip: a DISPLAY of `player.gpupreview` (the declared config,
+    # set explicitly or by autodetect) — never a state of its own
+    lanechip = Observable("CPU")
+    Label(controls[1, 8], lanechip; width = 34, halign = :right, fontsize = 11,
+          color = map(l -> l == "GPU" ? uicolors.accent : uicolors.text_muted, lanechip))
     spintxt = Observable(" ")
     progfrac = Observable(0.0)
     progvis = Observable(false)
@@ -362,6 +367,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     Ref(1.0), Observable(:opacity), Observable(true),
                     Threads.Atomic{Float64}(NaN), Dict{Any, Any}(),
                     Threads.Atomic{Int}(0), FxEngine(KA.CPU()))
+    player.fxwidgets[:lanechip] = lanechip
     @async for s in player.statusqueue  # main-thread consumer: threads → observable
         status[] = s
     end
@@ -691,7 +697,7 @@ the CPU tier for the duration instead of freezing the preview behind it.
 """
 function gpuready(player::Player)
     gp = player.gpupreview
-    return gp isa GPUPreview && !gp.failed && player.gpubusy[] == 0
+    return gp isa GPUPreview && player.gpubusy[] == 0
 end
 
 "Resolve and show timeline frame `n` if possible (gaps show black). Returns success."

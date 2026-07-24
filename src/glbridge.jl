@@ -13,9 +13,12 @@
 # context current. `presentgpu!` does a synchronous round-trip per frame —
 # ~7 ms at 1080p, strictly less than the CPU path it replaces (~15 ms).
 #
-# Any error disables the bridge permanently for the session and playback
-# falls back to the CPU path (with a status message) — `gpupreview` can
-# never make the editor worse than the default.
+# Error policy: a GPU render error is a BUG, not a mode. Playback pauses
+# LOUDLY (status + logged backtrace) and the render backend stays what the
+# config declared — no silent CPU continuation, no error-driven switching.
+# The ONLY CPU tier is the deterministic `gpubusy` gate: while a long GPU
+# job (warmup, analysis, mezzanine) occupies the single-writer worker,
+# presents take the CPU path for the duration instead of queueing behind it.
 
 "Per-resolution GPU presentation state (see `presentgpu!`). The shared image is
 DOUBLE-BUFFERED: GLMakie's render loop runs as a concurrent task, so blitting
@@ -25,7 +28,6 @@ present blits into the texture GLMakie is NOT showing, then swaps."
 mutable struct GPUPreview
     width::Int
     height::Int
-    failed::Bool
     inline::Bool   # Lava context is owned by the main thread → run jobs inline
     # worker-owned (Lava)
     packed::Any          # LavaArray{UInt32,1} — RGBA pack scratch for the blit
@@ -41,7 +43,20 @@ mutable struct GPUPreview
                          # object holds, and uploading linear CPU pixels into the
                          # imported optimal-tiled external texture shreds the image
 end
-GPUPreview() = GPUPreview(0, 0, false, false, nothing, Any[], nothing, Any[], 1, true, nothing)
+GPUPreview() = GPUPreview(0, 0, false, nothing, Any[], nothing, Any[], 1, true, nothing)
+
+"""
+A GPU render error is a BUG, not a mode: playback pauses LOUDLY (status + log)
+and the render backend stays what the config declared — no silent CPU
+continuation, no error-driven lane switching. The frame that errored still
+presents through the CPU tier so the screen isn't stale.
+"""
+function gpurendererror!(player::Player, err)
+    pause!(player)
+    setstatus!(player, "GPU render ERROR — playback paused (details in the log)")
+    @error "GPU render failed" exception = (err, catch_backtrace())
+    return nothing
+end
 
 """
 Run `f` on the player's pinned GPU worker and wait for its result. `long = true`
@@ -190,9 +205,7 @@ function presentgpu!(player::Player, clip::Clip, srcframe::Integer; stream = not
         player.screen.requires_update = true
         return true
     catch e
-        gp.failed = true
-        setstatus!(player, "GPU preview failed — falling back to CPU preview")
-        @error "GPU preview disabled" exception = (e, catch_backtrace())
+        gpurendererror!(player, e)
         return false
     end
 end
@@ -251,8 +264,7 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
         player.screen.requires_update = true
         return true
     catch e
-        gp.failed = true
-        @error "GPU composite failed — falling back" exception = (e, catch_backtrace())
+        gpurendererror!(player, e)
         return false
     end
 end
@@ -285,7 +297,7 @@ UI thread; playback uses the CPU path until the stream is ready.
 """
 function preloadgpu!(player::Player, source::VideoSource)
     gp = player.gpupreview
-    (gp isa GPUPreview && !gp.failed) || return nothing
+    gp isa GPUPreview || return nothing
     haskey(player.gpucache, source) && return nothing
     stream = nothing
     Threads.atomic_add!(player.gpubusy, 1)   # presents stay on the CPU tier during warmup
@@ -341,7 +353,7 @@ function startmezzanine!(player::Player, source::VideoSource)
             progress = (d, t) -> (player.jobprogress[] = d / max(t, 1)))
         player.jobprogress[] = NaN
         gp = player.gpupreview
-        (gp isa GPUPreview && !gp.failed) || return nothing
+        gp isa GPUPreview || return nothing
         Threads.atomic_add!(player.gpubusy, 1)
         stream = nothing
         try
@@ -393,6 +405,7 @@ function autodetectgpu!(player::Player)
     capable || return nothing
     player.analysisbackend = LavaBackend()               # wraps the worker-owned context
     player.gpupreview = GPUPreview()
+    haskey(player.fxwidgets, :lanechip) && (player.fxwidgets[:lanechip][] = "GPU")
     setgpurun!(player.timeline, (f; long = false) -> rungpusync(f, player; long))  # GPU thumbnails from here on
     for src in unique(c.source for c in player.sequence.clips)
         Threads.@spawn preloadgpu!(player, src)

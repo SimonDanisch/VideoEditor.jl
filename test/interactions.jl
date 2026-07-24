@@ -905,9 +905,11 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             # Find adds a SECOND reference card (signatures cached — instant)
             press(tlx(1.0)); release()               # another playhead frame
             p.fxwidgets[:toolaction][3][]()          # the panel's Find action
-            sleep(0.3)
+            # the clip under t=1.0 may be an UNCACHED split half (the ▼ cut position
+            # is content-driven) — the Find then runs a fresh async analysis; wait
+            # for the card like the first Find did instead of a fixed sleep
+            @test waitfor(() -> length(p.fxwidgets[:toolcards][3]) == 2; s = 25)
             cards = p.fxwidgets[:toolcards][3]
-            @test length(cards) == 2
             @test ctx.state[:active][] == 2
             # clicking the FIRST card highlights its markers again
             bb = cards[1][2].layoutobservables.computedbbox[]
