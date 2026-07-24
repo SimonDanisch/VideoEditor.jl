@@ -361,17 +361,18 @@ function renderpreview(player::Player, t::Float64, width::Int)
 
     sp = pool(player, clip.source)
     scratch = RGBFrame(undef, sp.source.width, sp.source.height)
-    tmp1, tmp2 = similar(scratch), similar(scratch)
     settarget!(sp.worker, srcframe)
     deadline = time() + 3.0
     while !fetchframe!(scratch, sp.ring, srcframe)
         sleep(0.01)
         time() > deadline && error("frame $srcframe not decodable within 3s")
     end
-    applymotiontrack!(scratch, tmp1, clip, srcframe)
-    applycolortrack!(scratch, clip, srcframe)
-    applyeffects!(scratch, tmp1, tmp2, clip)
-    warp!(preview, scratch, clip.crop)
-    KA.synchronize(KA.get_backend(preview))
+    # the same graph as preview/export; a private engine — this runs on the MCP
+    # task, the player's cpuengine pool belongs to the render thread
+    ec = effectiveclip(clip, srcframe)
+    render(FxEngine(KA.CPU()), scratch, ec, Int(srcframe)) do out
+        warp!(preview, out, ec.crop)
+        KA.synchronize(KA.get_backend(preview))
+    end
     return preview
 end

@@ -38,6 +38,9 @@ include("project.jl")
 include("thumbnails.jl")
 include("clipview.jl")
 include("timeline.jl")
+include("gpudecode.jl")
+include("gpustream.jl")
+include("gpugraph.jl")   # FxEngine: the Player struct carries the CPU-tier engine
 include("player.jl")
 include("glbridge.jl")
 include("audiopreview.jl")
@@ -45,10 +48,7 @@ include("audio.jl")
 include("colorstab.jl")
 include("motionstab.jl")
 include("bundlestab.jl")
-include("gpudecode.jl")
-include("gpustream.jl")
-include("gpugraph.jl")
-include("export.jl")   # decodeinto! dispatches on GpuVideoStream — needs the type
+include("export.jl")   # sourceinto! dispatches on GpuVideoStream — needs the type
 include("campath.jl")  # GrayReader wraps export's SequentialReader; grayinto! needs GpuVideoStream
 include("plugins.jl")
 include("tools.jl")    # GUI tools: timeline-overlay hints + premade operations

@@ -52,8 +52,6 @@ mutable struct Player
     const previewaxis::Axis
     const cropmode::Base.RefValue{Bool}
     const croprect::Observable{Vector{Point2f}}
-    fxtmp1::RGBFrame  # match the active clip's source resolution
-    fxtmp2::RGBFrame
     composebuf::RGBFrame  # frames are composed HERE and published to `frame` as one
                           # copy of the finished image — GLMakie samples `frame[]`
                           # lazily at render time, so decoding/warping in place there
@@ -94,6 +92,8 @@ mutable struct Player
     const gpubusy::Threads.Atomic{Int}   # long GPU jobs queued/running (stream warmup, analyses);
                                          # presents take the CPU lane while > 0 instead of stalling
                                          # behind them on the single-writer worker
+    const cpuengine::FxEngine            # the CPU-tier render engine — the SAME effect
+                                         # graph as the GPU path, on the KA CPU backend
 end
 
 "Push the current edit state onto the undo stack (clears redo)."
@@ -352,7 +352,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     Observable(true), Observable("no analysis yet"), analysisbackend,
                     fig, ax, Ref(false),
                     Observable(Point2f[]),
-                    similar(frame[]), similar(frame[]), similar(frame[]), Dict{Symbol, Slider}(),
+                    similar(frame[]), Dict{Symbol, Slider}(),
                     Dict{Symbol, Any}(),
                     Ref(false), nothing, (0.0, 0.0, 1.0, 1.0), nothing, nothing, 0.0,
                     nothing, nothing, nothing, nothing, nothing,
@@ -361,7 +361,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     Observable(VideoSource[]), Any[], nothing, Observable(:none),
                     Ref(1.0), Observable(:opacity), Observable(true),
                     Threads.Atomic{Float64}(NaN), Dict{Any, Any}(),
-                    Threads.Atomic{Int}(0))
+                    Threads.Atomic{Int}(0), FxEngine(KA.CPU()))
     @async for s in player.statusqueue  # main-thread consumer: threads → observable
         status[] = s
     end
@@ -628,12 +628,12 @@ function showtransition!(player::Player, sample)
     lclip = effectiveclip(left, srcA)   # keyframed params on each side
     rclip = effectiveclip(right, srcB)
     if player.applytracks[]   # false = hold-to-compare: original frames, no effects
-        applymotiontrack!(bufA, player.fxtmp1, lclip, srcA)
-        applycolortrack!(bufA, lclip, srcA)
-        applymotiontrack!(bufB, player.fxtmp1, rclip, srcB)
-        applycolortrack!(bufB, rclip, srcB)
-        applyeffects!(bufA, player.fxtmp1, player.fxtmp2, lclip)
-        applyeffects!(bufB, player.fxtmp1, player.fxtmp2, rclip)
+        render(player.cpuengine, bufA, lclip, Int(srcA)) do out
+            copyto!(bufA, out)
+        end
+        render(player.cpuengine, bufB, rclip, Int(srcB)) do out
+            copyto!(bufB, out)
+        end
     end
     blend!(bufA, bufA, bufB, p)
     copyto!(player.frame[], bufA)   # publish the finished blend in one copy
@@ -665,18 +665,14 @@ function compositeframe!(player::Player, n::Integer, clips::Vector{Clip})
             time() > deadline && return false            # not buffered yet → single-clip fallback
             sleep(0.004)
         end
-        ec = effectiveclip(clip, srcframe)               # keyframed params at this frame
-        st1 = similar(clipbuf); st2 = similar(clipbuf)
+        ec = withoutopacity(effectiveclip(clip, srcframe))   # opacity = the layer alpha
         if player.applytracks[]                          # false = hold-to-compare bypass
-            applymotiontrack!(clipbuf, st1, ec, srcframe)
-            applycolortrack!(clipbuf, ec, srcframe)
-            for e in ec.effects                          # opacity is the layer alpha, not scale-to-black
-                (e isa OpacityEffect || isneutral(e)) && continue
-                applyeffect!(clipbuf, st1, st2, e)
+            render(player.cpuengine, clipbuf, ec, Int(srcframe)) do out
+                copyto!(clipbuf, out)
             end
         end
-        KA.synchronize(KA.get_backend(clipbuf))
         warp!(warpbuf, clipbuf, ec.crop)                 # bake this layer's crop into canvas space
+        KA.synchronize(KA.get_backend(warpbuf))
         α = Float32(clamp(paramvalue(clip, :opacity, srcframe), 0.0, 1.0))
         blend!(canvas, canvas, warpbuf, α)               # (1-α)·below + α·layer
     end
@@ -755,10 +751,10 @@ function showframe!(player::Player, n::Integer)
                 return true
             end
         end
-        if player.applytracks[]   # false = hold-to-compare: the ORIGINAL frame,
-            applymotiontrack!(buf, player.fxtmp1, eclip, srcframe)
-            applycolortrack!(buf, eclip, srcframe)
-            applyeffects!(buf, player.fxtmp1, player.fxtmp2, eclip)
+        if player.applytracks[]   # false = hold-to-compare: the ORIGINAL frame
+            render(player.cpuengine, buf, eclip, Int(srcframe)) do out
+                copyto!(buf, out)
+            end
         end
         copyto!(player.frame[], buf)       # publish the finished frame in one copy
         showcpuframe!(player)
@@ -800,8 +796,6 @@ end
 function ensureframesize!(player::Player, source::VideoSource)
     size(player.frame[]) == (source.width, source.height) && return nothing
     player.frame.val = RGBFrame(undef, source.width, source.height)  # notified once filled
-    player.fxtmp1 = similar(player.frame[])
-    player.fxtmp2 = similar(player.frame[])
     player.composebuf = similar(player.frame[])
     player.lastcrop = (-1.0, 0.0, 0.0, 0.0)  # force applycrop! (limits are per-source)
     return nothing
