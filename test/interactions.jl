@@ -535,6 +535,20 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test isfile(out)
         end
 
+        @testset "dock cycling keeps panel content alive" begin
+            # regression: a NESTED Subfigure (the inspector inside the dock slot)
+            # lost its content scene forever after switching docks away and back —
+            # generic hide! force-hid the scene, unhide! never re-synced it
+            VE.opendock!(p, :effects); sleep(0.2)
+            for k in (:tools, :media, :effects, :export, :none, :effects)
+                VE.opendock!(p, k); sleep(0.1)
+            end
+            sleep(0.2)
+            @test p.fxwidgets[:fxscroll].scene.visible[]
+            @test p.fxwidgets[:addeffect].blockscene.visible[]
+            @test p.fxwidgets[:compare].blockscene.visible[]
+        end
+
         @testset "Ctrl+P palette adds any effect" begin
             press(tlx(2.0)); release()              # playhead onto the clip
             clip = VE.locate(p.sequence, p.playhead[])[1]
