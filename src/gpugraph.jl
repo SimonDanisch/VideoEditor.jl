@@ -37,11 +37,14 @@ end
 release!(pool::BufferPool, buf) = (push!(get!(() -> [], pool.free, size(buf)), buf); nothing)
 copyacquire!(pool::BufferPool, src) = (b = acquire!(pool, size(src)); copyto!(b, src); b)
 
-"Free every pooled device buffer (call on the GPU worker)."
+"Release one pooled buffer's memory: host arrays belong to the GC, device
+buffers free eagerly."
+freebuffer!(::Array) = nothing
+freebuffer!(b) = Lava.unsafe_free!(b)
+
+"Free every pooled buffer (device pools on the GPU worker; CPU pools just drop)."
 function emptypool!(pool::BufferPool)
-    for stack in values(pool.free), b in stack
-        Lava.unsafe_free!(b)
-    end
+    foreach(stack -> foreach(freebuffer!, stack), values(pool.free))
     empty!(pool.free)
     return nothing
 end
@@ -68,19 +71,28 @@ struct FxContext
     # lands on a different image and the preview jerks wildly while the decode
     # catches up (export was always exact, so only playback showed it).
     served::Base.RefValue{Int}
+    # exact = the EXPORT policy: the source must deliver precisely `frame`
+    # (`exactframeat!`), cost what it may — no latency budget, no stand-ins.
+    exact::Bool
 end
-FxContext(source, clip::Clip, frame::Integer, playing::Bool = false) =
-    FxContext(source, clip, Int(frame), playing, Ref(Int(frame)))
+FxContext(source, clip::Clip, frame::Integer, playing::Bool = false; exact::Bool = false) =
+    FxContext(source, clip, Int(frame), playing, Ref(Int(frame)), exact)
 framesize(s) = size(s)                                   # a CPU RGBFrame
 framesize(s::GpuVideoStream) = (s.width, s.height)
 frameisbt601(::Any) = false
 frameisbt601(s::GpuVideoStream) = s.bt601
 
 # fill `out` with the decoded source frame (device-resident decode, or one upload);
-# `served` reports which frame the stream really delivered
-sourceinto!(out, s::GpuVideoStream, frame; prefetch::Bool = false, served = nothing) =
-    (f = frameat!(s, frame; prefetch, served); nv12torgb!(out, f.y, f.uv; bt601 = s.bt601); out)
-sourceinto!(out, s, frame; prefetch::Bool = false, served = nothing) = copyto!(out, s)
+# `served` reports which frame the stream really delivered. `exact` selects the
+# export policy (exactframeat!) over the preview's latency-bounded serve.
+function sourceinto!(out, s::GpuVideoStream, frame; prefetch::Bool = false,
+                     served = nothing, exact::Bool = false)
+    f = exact ? exactframeat!(s, frame) : frameat!(s, frame; prefetch, served)
+    nv12torgb!(out, f.y, f.uv; bt601 = s.bt601)
+    return out
+end
+sourceinto!(out, s, frame; prefetch::Bool = false, served = nothing, exact::Bool = false) =
+    copyto!(out, s)
 
 # ---------------------------------------------------------------- effect callbacks
 
@@ -158,7 +170,7 @@ pointwiseop(n::PixelNode) = n.kind isa Pointwise
 function eval_node!(::SourceNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
     out = acquire!(pool, framesize(ctx.source))
     return sourceinto!(out, ctx.source, ctx.frame; prefetch = ctx.playing,
-                       served = ctx.served)
+                       served = ctx.served, exact = ctx.exact)
 end
 # the per-frame tracks sample at the SERVED index (what's actually on screen),
 # not the requested one — the source node runs first, so `served` is set
@@ -302,9 +314,9 @@ it. All buffer management is internal. `playing` marks sequential playback — a
 streaming source then prefetches its next GOP (see [`frameat!`](@ref)).
 """
 function render(f, engine::FxEngine, source, clip::Clip, frame::Integer;
-                applytracks::Bool = true, playing::Bool = false)
+                applytracks::Bool = true, playing::Bool = false, exact::Bool = false)
     graph = graphof(clip; applytracks = applytracks)
-    out = execute!(graph, engine.pool, FxContext(source, clip, Int(frame), playing))
+    out = execute!(graph, engine.pool, FxContext(source, clip, Int(frame), playing; exact))
     try
         return f(out)
     finally

@@ -42,7 +42,7 @@ function exportvideo(path::AbstractString, seq::Sequence;
     hostout = zeros(RGB{N0f8}, canvas[1], canvas[2])         # encode staging (download target)
     blackhost = zeros(RGB{N0f8}, canvas[1], canvas[2])       # gap/composite base for device canvases
     readers = Dict{String, Any}()   # per-source decoder: GpuVideoStream or SequentialReader
-    fxbufs = Dict{String, NTuple{4, AnyRGBFrame}}()  # per-source (host, chain triple)
+    engine = FxEngine(backend)      # the SAME effect graph the preview runs, exact policy
 
     # ffmpeg takes the rate as an Int32 AVRational: a raw measured float
     # (23.975288…) converts to an exact Rational with a 2^47 denominator and
@@ -57,20 +57,20 @@ function exportvideo(path::AbstractString, seq::Sequence;
             sample = tr === nothing ? nothing : transitionsample(seq, tr, n)
             if sample !== nothing
                 left, srcA, right, srcB, p = sample
-                rendercanvas!(outbuf, left, srcA, readers, fxbufs)
-                rendercanvas!(transbuf, right, srcB, readers, fxbufs)
+                rendercanvas!(outbuf, left, srcA, readers, engine)
+                rendercanvas!(transbuf, right, srcB, readers, engine)
                 blend!(outbuf, outbuf, transbuf, p)
             elseif ntracks(seq) > 1 && length(clipsat(seq, n)) > 1
                 fillblack!(outbuf, blackhost)                   # composite the track stack
                 for clip in clipsat(seq, n)                     # bottom → top
                     sf = clip.src_in + (n - clip.start)
-                    rendercanvas!(layerbuf, clip, sf, readers, fxbufs; skipopacity = true)
+                    rendercanvas!(layerbuf, clip, sf, readers, engine; skipopacity = true)
                     blend!(outbuf, outbuf, layerbuf, Float32(clamp(paramvalue(clip, :opacity, sf), 0.0, 1.0)))
                 end
             else
                 loc = locate(seq, n)
                 loc === nothing ? fillblack!(outbuf, blackhost) :
-                                  rendercanvas!(outbuf, loc[1], loc[2], readers, fxbufs)
+                                  rendercanvas!(outbuf, loc[1], loc[2], readers, engine)
             end
             writeframe!(writer, outbuf, hostout, backend)
             progress === nothing || n % 30 == 0 && progress(n + 1, total)
@@ -78,6 +78,7 @@ function exportvideo(path::AbstractString, seq::Sequence;
     finally
         VideoIO.close_video_out!(writer)
         foreach(close, values(readers))
+        emptyengine!(engine)
     end
     if wantaudio
         muxaudio(videopath, seq, path)
@@ -136,17 +137,30 @@ end
 
 """
 Synchronous decoder for export: sequential reads, seeking only when the
-requested frame isn't the next one (clip boundaries, gaps).
+requested frame isn't the next one (clip boundaries, gaps). A graph source —
+[`sourceinto!`](@ref) decodes into its host staging buffer and uploads only
+when the graph runs on a device.
 """
 mutable struct SequentialReader
     const source::VideoSource
     const reader::VideoIO.VideoReader
+    const host::RGBFrame   # decode staging (VideoIO needs host memory)
     position::Int  # next frame the reader will produce
 
     function SequentialReader(source::VideoSource)
         reader = VideoIO.openvideo(source.path, target_format = VideoIO.AV_PIX_FMT_RGB24)
-        return new(source, reader, 0)
+        return new(source, reader,
+                   RGBFrame(undef, source.width, source.height), 0)
     end
+end
+
+framesize(sr::SequentialReader) = (sr.source.width, sr.source.height)
+
+function sourceinto!(out, sr::SequentialReader, frame; prefetch::Bool = false,
+                     served = nothing, exact::Bool = false)
+    readframe!(sr.host, sr, frame)   # always exact — sequential decode by construction
+    out === sr.host || copyto!(out, sr.host)
+    return out
 end
 
 "Frame-sized working buffer on `backend` (a plain host frame on the CPU)."
@@ -172,76 +186,37 @@ function writeframe!(writer, canvas, hostout, backend)
 end
 
 """
-The per-source export decoder: a [`GpuVideoStream`](@ref) on a GPU backend when the
-source hardware-decodes (frames land device-resident through the chunked session —
-no host round-trip, the biggest export cost on the CPU path), else the CPU
-[`SequentialReader`](@ref).
+The per-source export decoder — a DETERMINISTIC lane, decided by capability, not
+by catching errors: a GPU backend streams every codec the hardware session
+decodes (frames land device-resident through the chunked session — no host
+round-trip); everything else reads sequentially on the CPU. A failure to open
+the declared lane fails the export loudly instead of silently switching.
 """
+opendecoder(source::VideoSource, ::KA.CPU) = SequentialReader(source)
 function opendecoder(source::VideoSource, backend)
-    backend isa KA.CPU && return SequentialReader(source)
-    try
-        return openstream(backend, source.path, source.width, source.height)
-    catch e
-        @warn "GPU stream unavailable for export — CPU decode" source = source.path exception = e
-        return SequentialReader(source)
-    end
+    videocodec(source.path) in (:h264, :hevc) || return SequentialReader(source)
+    return openstream(backend, source.path, source.width, source.height)
 end
 
 """
-    decodeinto!(dest, host, decoder, srcframe)
-
-Decode source frame `srcframe` into `dest`, EXACTLY — an export must never get a
-nearest-frame stand-in. Dispatches on the decoder: a [`GpuVideoStream`](@ref)
-decodes device-resident via [`exactframeat!`](@ref); a [`SequentialReader`](@ref)
-decodes into the `host` staging buffer and uploads only when `dest` lives on a
-device.
-"""
-function decodeinto!(dest::AnyRGBFrame, host::RGBFrame, s::GpuVideoStream, srcframe::Integer)
-    f = exactframeat!(s, srcframe)
-    nv12torgb!(dest, f.y, f.uv; bt601 = s.bt601)
-    return dest
-end
-
-function decodeinto!(dest::AnyRGBFrame, host::RGBFrame, sr::SequentialReader, srcframe::Integer)
-    readframe!(host, sr, srcframe)
-    dest === host || copyto!(dest, host)
-    return dest
-end
-
-"""
-Render `clip` at source frame `srcframe` — decode, motion/color tracks, effect
-stack, then warp its crop into `dest` (a canvas-sized buffer). `readers`/`fxbufs`
-cache one decoder and one scratch triple per source path.
+Render `clip` at source frame `srcframe` through the SAME effect graph the
+preview uses — only under the export policy (`exact = true`: no nearest-frame
+stand-ins) — then warp its crop into `dest` (a canvas-sized buffer). `readers`
+caches one decoder per source path; the engine pools every working buffer.
 """
 function rendercanvas!(dest::AnyRGBFrame, clip::Clip, srcframe::Integer,
-                       readers::Dict{String, Any},
-                       fxbufs::Dict{String, NTuple{4, AnyRGBFrame}}; skipopacity::Bool = false)
-    bk = KA.get_backend(dest)
-    sr = get!(() -> opendecoder(clip.source, bk), readers, clip.source.path)
-    host, frame, fx1, fx2 = get!(fxbufs, clip.source.path) do
-        w, h = clip.source.width, clip.source.height
-        host = RGBFrame(undef, w, h)                  # decode target (VideoIO needs host memory)
-        mk() = bk isa KA.CPU ? RGBFrame(undef, w, h) : KA.allocate(bk, RGB{N0f8}, (w, h))
-        (host, bk isa KA.CPU ? host : mk(), mk(), mk())   # on CPU the chain runs in `host` itself
-    end
-    decodeinto!(frame, host, sr, srcframe)
-    clip = effectiveclip(clip, srcframe)  # keyframed params baked at this frame
-    applymotiontrack!(frame, fx1, clip, srcframe)
-    applycolortrack!(frame, clip, srcframe)
-    if skipopacity                        # compositing: opacity is the layer alpha, not fade-to-black
-        for e in clip.effects
-            (e isa OpacityEffect || isneutral(e)) && continue
-            applyeffect!(frame, fx1, fx2, e)
+                       readers::Dict{String, Any}, engine::FxEngine;
+                       skipopacity::Bool = false)
+    dec = get!(() -> opendecoder(clip.source, engine.backend), readers, clip.source.path)
+    ec = effectiveclip(clip, srcframe)    # keyframed params baked at this frame
+    skipopacity && (ec = withoutopacity(ec))   # compositing: opacity = layer alpha
+    render(engine, dec, ec, Int(srcframe); exact = true) do layer
+        if ec.crop == (0.0, 0.0, 1.0, 1.0) && Base.size(layer) == Base.size(dest)
+            copyto!(dest, layer)
+        else
+            warp!(dest, layer, ec.crop)
+            KA.synchronize(KA.get_backend(dest))
         end
-        KA.synchronize(KA.get_backend(frame))
-    else
-        applyeffects!(frame, fx1, fx2, clip)
-    end
-    if clip.crop == (0.0, 0.0, 1.0, 1.0) && Base.size(frame) == Base.size(dest)
-        copyto!(dest, frame)
-    else
-        warp!(dest, frame, clip.crop)
-        KA.synchronize(KA.get_backend(dest))
     end
     return dest
 end

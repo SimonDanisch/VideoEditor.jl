@@ -176,6 +176,13 @@ end
 "Whether any registered parameter is keyframed on `clip`."
 isanimated(clip::Clip) = !isempty(clip.animations)
 
+"`clip` without its opacity effects — compositing reads opacity as the LAYER
+alpha, not a per-pixel fade to black."
+withoutopacity(clip::Clip) =
+    Clip(clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
+         filter(e -> !(uneffect(e) isa OpacityEffect), clip.effects),
+         clip.colortrack, clip.motiontrack, clip.animations, clip.track)
+
 """
     effectiveclip(clip, srcframe) -> Clip
 

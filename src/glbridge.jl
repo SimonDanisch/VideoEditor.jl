@@ -223,21 +223,18 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
             for clip in clips
                 srcframe = clip.src_in + (n - clip.start)
                 stream = player.gpucache[clip.source]
-                ec = effectiveclip(clip, srcframe)
                 # graph WITHOUT opacity — it becomes the layer alpha, not a fade to black
-                gclip = Clip(ec.source, ec.src_in, ec.src_out, ec.start, ec.crop,
-                             filter(e -> !(e isa OpacityEffect), ec.effects),
-                             ec.colortrack, ec.motiontrack, ec.animations, ec.track)
+                gclip = withoutopacity(effectiveclip(clip, srcframe))
                 layer = execute!(graphof(gclip; applytracks = player.applytracks[]), pool,
                                  FxContext(stream, gclip, srcframe, player.playing[]))
                 α = Float32(clamp(paramvalue(clip, :opacity, srcframe), 0.0, 1.0))
                 if first
-                    warp!(accum, layer, ec.crop)                  # bake crop into the canvas
+                    warp!(accum, layer, gclip.crop)                  # bake crop into the canvas
                     α < 0.999f0 && channellinear!(accum, Vec3f(α), Vec3f(0))
                     first = false
                 else
                     warpbuf = acquire!(pool, (W, H))
-                    warp!(warpbuf, layer, ec.crop)
+                    warp!(warpbuf, layer, gclip.crop)
                     blend!(accum, accum, warpbuf, α)              # (1-α)·below + α·layer
                     release!(pool, warpbuf)
                 end
