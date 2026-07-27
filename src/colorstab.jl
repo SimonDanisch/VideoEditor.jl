@@ -47,7 +47,13 @@ function analyzecolor!(clip::Clip; cutoff::Real = 0.5, backend = KA.CPU(), progr
         gains[i] = g
         offsets[i] = o
     end
-    clip.colortrack = ColorTrack(gains, offsets, clip.src_in)
+    # what the fix actually buys, in the same units the eye notices: mean
+    # frame-to-frame change of overall brightness, before vs after the correction
+    # (the corrected means are the smoothed targets by construction)
+    jump(m) = n < 2 ? 0.0 : mean(abs.(diff(vec(sum(m, dims = 2)))))
+    was, becomes = jump(means), jump(target_μ)
+    reduction = was > 0 ? clamp(1 - becomes / was, 0.0, 1.0) : 0.0
+    clip.colortrack = ColorTrack(gains, offsets, clip.src_in, 1.0f0, reduction)
     progress === nothing || progress(n, n)
     return clip.colortrack
 end

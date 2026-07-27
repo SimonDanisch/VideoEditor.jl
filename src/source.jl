@@ -1,10 +1,17 @@
 """
     VideoSource(path)
 
-Probed metadata for a video file: dimensions, framerate, duration, frame count
-and the keyframe index (scanned from packet flags, no decoding).
+Probed metadata for a video file: dimensions, framerate, duration, frame count,
+the keyframe index and the timestamp of EVERY frame (scanned from packet flags,
+no decoding).
 
-Frame indices are 0-based throughout: frame `n` is displayed at `n / framerate`.
+Frame indices are 0-based throughout. `n / framerate` is only the display time of
+frame `n` on constant-rate material — phone clips drop frames (measured on a
+"60 fps" clip: median period 0.0167 s, longest gap 0.2 s), and then the n-th
+DECODED frame and the frame at time `n/60` are different pictures. Analysis reads
+sequentially while the preview seeks by time, so every per-frame track (flicker,
+stabilization) landed on the wrong frame — 11 frames off at frame 100 on that
+clip. `frametimes` makes the mapping exact for both.
 """
 struct VideoSource
     path::String
@@ -14,6 +21,7 @@ struct VideoSource
     duration::Float64
     nframes::Int
     keyframe_times::Vector{Float64}
+    frametimes::Vector{Float64}   # display time of every frame, in display order
 end
 
 function VideoSource(path::AbstractString)
@@ -23,7 +31,8 @@ function VideoSource(path::AbstractString)
     fps = Float64(VideoIO.framerate(reader))
     close(reader)
     duration = VideoIO.get_duration(path)
-    keyframes, npackets = scan_packets(path)
+    keyframes, frametimes = scan_packets(path)
+    npackets = length(frametimes)
     counted = VideoIO.get_number_frames(path)
     nframes = something(counted, npackets > 0 ? npackets : round(Int, duration * fps))
     # containers may claim a track rate the stream doesn't deliver (YouTube mkv
@@ -41,35 +50,48 @@ function VideoSource(path::AbstractString)
         near = findfirst(r -> abs(eff - r) / r < 0.002, std)
         fps = near === nothing ? eff : std[near]
     end
-    return VideoSource(String(path), width, height, fps, duration, nframes, keyframes)
+    return VideoSource(String(path), width, height, fps, duration, nframes, keyframes,
+                       length(frametimes) == nframes ? frametimes : Float64[])
 end
 
 """
-    scan_packets(path) -> (keyframe_times::Vector{Float64}, npackets::Int)
+    scan_packets(path) -> (keyframe_times, frame_times)
 
-Keyframe timestamps in seconds plus the TRUE packet count, read from packet
-flags via ffprobe. Demux only — no decoding, fast even for long files. The
-count is authoritative where containers (mkv!) carry no `nb_frames`.
+Timestamps of every frame in DISPLAY order, plus the subset that are keyframes —
+read from packet flags via ffprobe. Demux only, no decoding, fast even for long
+files. The frame count implied here is authoritative where containers (mkv!)
+carry no `nb_frames`, and the per-frame times are what makes index↔time exact on
+variable-rate material.
 """
 function scan_packets(path::AbstractString)
     cmd = `$(FFMPEG_jll.ffprobe()) -v error -select_streams v:0 -show_entries packet=pts_time,flags -of csv=p=0 $path`
+    keys = Float64[]
     times = Float64[]
-    n = 0
     for line in eachline(cmd)
         parts = split(line, ',')
         length(parts) >= 2 || continue
-        n += 1
-        if occursin('K', parts[2])
-            t = tryparse(Float64, parts[1])
-            t === nothing || push!(times, t)
-        end
+        t = tryparse(Float64, parts[1])
+        t === nothing && continue
+        push!(times, t)
+        occursin('K', parts[2]) && push!(keys, t)
     end
+    # packets arrive in DECODE order (B-frames!); display order is by timestamp
     sort!(times)
-    return times, n
+    sort!(keys)
+    return keys, times
 end
 
-frametime(src::VideoSource, n::Integer) = n / src.framerate
-frameindex(src::VideoSource, t::Real) = clamp(round(Int, t * src.framerate), 0, src.nframes - 1)
+"Display time of frame `n` — the scanned timestamp when we have one, else the
+constant-rate assumption."
+frametime(src::VideoSource, n::Integer) =
+    1 <= n + 1 <= length(src.frametimes) ? src.frametimes[n + 1] : n / src.framerate
+
+"Frame displayed at time `t` — the inverse of [`frametime`](@ref)."
+function frameindex(src::VideoSource, t::Real)
+    isempty(src.frametimes) && return clamp(round(Int, t * src.framerate), 0, src.nframes - 1)
+    i = searchsortedlast(src.frametimes, Float64(t) + 1.0e-6)
+    return clamp(i - 1, 0, src.nframes - 1)
+end
 
 "Time of the last keyframe at or before `t` (falls back to 0.0)."
 function nearest_keyframe(src::VideoSource, t::Real)

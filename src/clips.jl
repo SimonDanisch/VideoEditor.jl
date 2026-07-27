@@ -9,9 +9,14 @@ mutable struct ColorTrack
     const offsets::Vector{Vec3f}
     const src_in::Int
     strength::Float32
+    # how much frame-to-frame brightness variation the correction takes out
+    # (0..1), measured while analyzing — the number the UI reports so applying
+    # the fix is not an act of faith
+    reduction::Float32
 end
-ColorTrack(gains::Vector{Vec3f}, offsets::Vector{Vec3f}, src_in::Integer) =
-    ColorTrack(gains, offsets, src_in, 1.0f0)
+ColorTrack(gains::Vector{Vec3f}, offsets::Vector{Vec3f}, src_in::Integer,
+           strength::Real = 1.0f0, reduction::Real = 0.0f0) =
+    ColorTrack(gains, offsets, src_in, Float32(strength), Float32(reduction))
 
 """
 Per-source-frame camera stabilization warps in source pixel coordinates

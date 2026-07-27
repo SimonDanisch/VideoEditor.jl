@@ -280,6 +280,8 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test menu.is_open[]
             press(mpos(-1.5)); release()         # option 2 (list opens downward)
             @test menu.selection[] == :objectlock
+            @test !menu.is_open[]                # picking closes it — an open dropdown
+                                                 # eats the next press anywhere
 
             stabbtn = p.fxwidgets[:analyze]
             stabcenter() = (sc = stabbtn.layoutobservables.computedbbox[]; Point2f(sc.origin .+ sc.widths ./ 2))
@@ -319,11 +321,16 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test waitfor(() -> occursin("object lock", p.stabinfo[]))
 
             stabopen()
-            # the analysis rebuilt the Stabilization section — re-fetch the live menu
+            # back to camera lock through the menu's own API — the click-driven path
+            # is covered by the object-lock beat above, and a MISSED option click
+            # leaves the dropdown open, which then swallows the next press anywhere
+            # in the window (that is how a stray click here broke the crop and the
+            # space bar three testsets later)
             menu = p.fxwidgets[:modemenu]
-            press(mpos(0.5)); release()
-            press(mpos(-0.5)); release()
+            menu.i_selected[] = 1
+            sleep(0.2)
             @test menu.selection[] == :similarity
+            @test !menu.is_open[]
         end
 
         @testset "remove stabilization restores the framing" begin
@@ -343,8 +350,13 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test waitfor(() -> !isempty(p.croprect[]))
             @test waitfor(() -> isempty(p.croprect[]))
             # the card stays put now (it is a tool, not a section that comes and
-            # goes) — pressing Remove on a clean clip says so instead of doing damage
-            press(Point2f(bb.origin .+ bb.widths ./ 2)); release()
+            # goes) — pressing Remove on a clean clip says so instead of doing damage.
+            # Re-fetch the button: the panel relaid out after the removal, so the
+            # bbox captured above points at whatever moved into that spot (a stray
+            # press there opened the mode Menu, which then ate the next keystrokes).
+            rmbtn2 = p.fxwidgets[:remove]
+            bb2 = rmbtn2.layoutobservables.computedbbox[]
+            press(Point2f(bb2.origin .+ bb2.widths ./ 2)); release()
             @test clip.motiontrack === nothing
             @test waitfor(() -> occursin("no stabilization", p.status[]))
             stabclose()

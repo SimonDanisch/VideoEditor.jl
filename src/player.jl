@@ -1419,7 +1419,9 @@ function tracksummary(track::ColorTrack)
     dev = maximum(zip(track.gains, track.offsets)) do (g, o)
         max(maximum(abs.(g .- 1.0f0)), maximum(abs.(o)))
     end
-    return "max adjustment $(round(Int, 100 * dev))%"
+    # lead with what it BOUGHT (measured while analyzing), not just how hard it pushes
+    got = track.reduction > 0 ? "flicker −$(round(Int, 100 * track.reduction))%, " : ""
+    return "$(got)max adjustment $(round(Int, 100 * dev))%"
 end
 
 "Re-present the playhead frame and repaint the timeline after an edit."
@@ -2363,7 +2365,6 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     # ONE searchable menu with EVERY addable thing: built-in kinds, live plugins,
     # Stabilization and the flicker fix (their sections appear once added, like
     # any other effect)
-    staged = Set{Tuple{UInt, Symbol}}()   # (clip id, :stab/:flicker) added pre-analysis
     menuopts() = vcat([(k.label, k.name) for k in effectkinds()],
                       [("Stabilization", :stabilization),
                        ("Color flicker fix", :flicker)])   # :stabilization → Tools
@@ -2382,9 +2383,8 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
             setstatus!(player, "Stabilize is in Tools — pick a mode there and press “Stabilize clip”")
             return
         elseif sel === :flicker
-            push!(staged, (clip.id, :flicker))
-            rebuildstack(force = true)
-            setstatus!(player, "Color flicker fix added — press “Analyze + fix” to run it")
+            opendock!(player, :tools)      # the flicker fix lives in the Tools dock now
+            setstatus!(player, "Fix flicker is in Tools — press “Analyze + fix flicker” there")
             return
         end
         k = kindbyname(sel); k === nothing && return
@@ -2431,8 +2431,6 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     # the section stack; rebuilt when the clip, its effects, its keyframed-param
     # set or its analyses change — and on collapse toggles (force)
     collapsed = Dict{Tuple{UInt, Any}, Bool}()   # (clip id, section key) → folded?
-    stabmode = Ref(:similarity)                  # survives rebuilds/clip switches
-    flickercutoff = Ref(0.5)                     # Hz — the analyze parameter, ditto
     listref = Ref{Any}(nothing); lastsig = Ref{Any}(:init)
     effsig(clip) = clip === nothing ? nothing :
         (clip.id,
@@ -2440,7 +2438,7 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
                                  nameof(typeof(s.effect))) for s in clip.effects),
          Tuple(sort!(collect(keys(clip.animations)))),
          clip.motiontrack !== nothing, clip.colortrack !== nothing,
-         (clip.id, :stab) in staged, (clip.id, :flicker) in staged)
+         clip.id)
     function rebuildstack(; force::Bool = false)
         force && (lastsig[] = :force)
         loc = editclip(player)
@@ -2602,57 +2600,9 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
             #  now — see `stabilizepanel!`. What it produces still renders like any
             #  other effect.)
 
-            # ---- Color flicker fix: its own effect-like section (a per-frame
-            # exposure/color track) — analyze in the body, × removes the track
-            showflicker = clip.colortrack !== nothing || (cid, :flicker) in staged
-            fgl = !showflicker ? nothing : section!(:flicker, "Color flicker fix";
-                onremove = () -> begin
-                    delete!(staged, (cid, :flicker))
-                    if clip.colortrack !== nothing
-                        snapshot!(player)
-                        clip.colortrack = nothing
-                        setstatus!(player, "flicker fix removed (Ctrl+Z restores)")
-                    end
-                    notify(player.playhead)
-                    rebuildstack(force = true)
-                end)
-            if fgl !== nothing
-                # cutoff = the ANALYSIS parameter: everything faster than this is
-                # treated as flicker, slower intentional changes survive
-                Label(fgl[1, 1], "Cutoff (Hz)"; halign = :left, fontsize = 12)
-                cutslider = Slider(fgl[1, 2]; range = 0.1:0.05:2.0,
-                                   startvalue = flickercutoff[])
-                Label(fgl[1, 3], map(v -> string(round(v, digits = 2)), cutslider.value);
-                      fontsize = 11, halign = :left, color = uicolors.text_muted, width = 32)
-                on(v -> flickercutoff[] = Float64(v), cutslider.value)
-                colorbtn = Button(fgl[2, 1:3]; tellwidth = false, width = Makie.Relative(1.0),
-                                  label = clip.colortrack === nothing ? "Analyze + fix flicker" :
-                                          "Re-analyze with this cutoff")
-                on(_ -> analyzeat!(player, (c; kw...) ->
-                                       analyzecolor!(c; cutoff = flickercutoff[],
-                                                     backend = player.analysisbackend, kw...),
-                                   "color stabilization"), colorbtn.clicks)
-                if clip.colortrack !== nothing
-                    # strength scales the correction at APPLY time — live, no re-analysis
-                    Label(fgl[3, 1], "Strength"; halign = :left, fontsize = 12)
-                    sslider = Slider(fgl[3, 2]; range = 0.0:0.01:1.0,
-                                     startvalue = clip.colortrack.strength)
-                    Label(fgl[3, 3], map(v -> string(round(v, digits = 2)), sslider.value);
-                          fontsize = 11, halign = :left, color = uicolors.text_muted, width = 32)
-                    on(sslider.value) do v
-                        ct = clip.colortrack
-                        ct === nothing && return
-                        ct.strength = Float32(v)
-                        player.playing[] || notify(player.playhead)
-                    end
-                    Label(fgl[4, 1:3], stabdescription(clip.colortrack); halign = :left,
-                          fontsize = 11, tellwidth = false, color = uicolors.text_muted)
-                else
-                    Label(fgl[3, 1:3], "not analyzed yet"; halign = :left, fontsize = 11,
-                          tellwidth = false, color = uicolors.text_muted)
-                end
-                player.fxwidgets[:color] = colorbtn
-            end
+            # (the flicker fix used to be a staged section here — it is an ANALYSIS
+            #  of the clip like stabilization, so it lives in the Tools dock now;
+            #  see `flickerpanel!`)
         end
         player.fxwidgets[:effectrows] = rows
         player.fxwidgets[:effectforms] = forms

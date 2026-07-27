@@ -1025,6 +1025,13 @@ function refreshblendlist!(ctx::ToolContext)
     fps = seq.framerate
     marked = markedpair(player)
     bs = blends(seq)
+    # rebuild ONLY when the list really changed: `toolrows!` deletes and recreates
+    # Blocks, which relayouts the dock — doing that on every playhead tick moved the
+    # panel (and with it the preview axis) mid-gesture, so a crop drag that started
+    # before the tick finished somewhere else
+    sig = (bs, marked)
+    get(ctx.state, :listsig, nothing) == sig && return nothing
+    ctx.state[:listsig] = sig
     # the length control shows what the SELECTED blend actually is, so the card
     # never claims a value the timeline doesn't have
     sel = marked === nothing ? nothing : findfirst(b -> (b[1], b[2]) == marked, bs)
@@ -1155,6 +1162,80 @@ registertool!(:stabilize, "Stabilize",
     "object lock keeps a subject still (click it in the preview afterwards).";
     panel = stabilizepanel!, activate = ctx -> (runstabilize!(ctx);
                                                 deactivatetool!(ctx.player)))
+
+# --------------------------------------------------------------- Flicker tool
+
+"""
+Fill the Flicker card: run the analysis, see WHAT IT BOUGHT, dial it back live,
+or take it off. The old flow only staged a section from the effect palette and
+then waited for a second button nobody found — so the honest answer to "did it do
+anything?" was silence (Simon, 2026-07-27).
+"""
+function flickerpanel!(ctx::ToolContext)
+    player = ctx.player
+    ctx.state = Dict{Symbol, Any}(:cutoff => 0.5)
+    toolslider!(ctx, "Cutoff", 0.1:0.05:2.0, v -> (ctx.state[:cutoff] = v);
+                startvalue = 0.5, format = v -> "$(round(v, digits = 2)) Hz")
+    analyze = toolaction!(ctx, "Analyze + fix flicker", () -> runflickerfix!(ctx))
+    # live strength: the one control that shows the fix working, frame by frame
+    toolslider!(ctx, "Strength", 0.0:0.05:1.0, v -> begin
+        loc = editclip(player)
+        loc === nothing && return
+        ct = loc[1].colortrack
+        ct === nothing && return
+        ct.strength = Float32(v)
+        player.playing[] || notify(player.playhead)
+    end; startvalue = 1.0, format = v -> string(round(v, digits = 2)))
+    # NB: plain Observable + `ontool!`, never a bare `lift` on a player observable:
+    # a lift is not registered for cleanup, so every panel rebuild leaves another
+    # one writing into a DELETED label — which throws inside the observable chain
+    # and takes every listener after it down with it (playback and the crop tool
+    # stopped reacting three testsets later).
+    status = Observable("not analyzed yet")
+    refresh!() = (loc = editclip(player);
+                  status[] = loc === nothing ? "no clip selected" :
+                             loc[1].colortrack === nothing ? "not analyzed yet" :
+                             stabdescription(loc[1].colortrack))
+    toollabel!(ctx, status)
+    ontool!(ctx, player.playhead; priority = 0) do _
+        refresh!()
+    end
+    refresh!()
+    remove = toolaction!(ctx, "Remove flicker fix", () -> begin
+        loc = editclip(player)
+        (loc === nothing || loc[1].colortrack === nothing) &&
+            return setstatus!(player, "no flicker fix on this clip")
+        snapshot!(player)
+        loc[1].colortrack = nothing
+        notify(player.playhead)
+        setstatus!(player, "flicker fix removed (Ctrl+Z restores)")
+    end)
+    merge!(player.fxwidgets, Dict{Symbol, Any}(:color => analyze, :flickerremove => remove))
+    return nothing
+end
+
+"""
+Clicking the Flicker card's header runs the analysis — the header IS the action,
+same as the other tool cards; nothing stays switched on afterwards.
+"""
+function runflickerfix!(ctx::ToolContext)
+    player = ctx.player
+    if player.stabinfo[] == "analyzing…"
+        setstatus!(player, "analysis already running — progress in the bottom right")
+    else
+        cut = ctx.state isa Dict ? get(ctx.state, :cutoff, 0.5) : 0.5
+        analyzeat!(player, (c; kw...) -> analyzecolor!(c; cutoff = cut,
+                                                       backend = player.analysisbackend, kw...),
+                   "color stabilization")
+    end
+    deactivatetool!(player)
+    return nothing
+end
+
+registertool!(:flicker, "Fix flicker",
+    "Evens out exposure/colour jitter on the SELECTED clip: everything faster " *
+    "than the cutoff is treated as flicker, slower changes survive.";
+    panel = flickerpanel!, activate = runflickerfix!)
 
 registertool!(:loopfinder, "Loop finder",
     "Each reference card holds one frame; ▼ hints on the thumb track mark the " *
