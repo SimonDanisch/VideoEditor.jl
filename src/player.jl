@@ -452,10 +452,37 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                        (outbtn, "Export"),
                        (splitbtn, "Blade  (S)"), (cropbtn, "Crop  (C)")],
                       [(onebtns[i], oneshots[i][2]) for i in eachindex(onebtns)])
+    # A tooltip is a SOLID little card, not glowing text: a stroked glyph over the
+    # timeline's thumbnails or a bright preview is unreadable (GLMakie's glow is
+    # weak), and it has to sit above modals too — the Modal block puts its overlay
+    # at z = 1000, so the tip goes higher. One registry for the whole UI: anything
+    # that wants a tip pushes (block, text) into `player.fxwidgets[:tips]`.
     tip_txt = Observable(" "); tip_pos = Observable(Point2f(0, 0)); tip_vis = Observable(false)
-    Makie.text!(fig.scene, tip_pos; text = tip_txt, visible = tip_vis, space = :pixel,
-                align = (:left, :center), fontsize = 15, font = :bold, color = :white,
-                strokecolor = (:black, 0.95), strokewidth = 2.5, overdraw = true)
+    tip_box = Observable(Rect2f(0, 0, 0, 0))
+    tipplot = poly!(fig.scene, tip_box; color = uicolors.surface, strokewidth = 1,
+                    strokecolor = uicolors.border, visible = tip_vis, space = :pixel,
+                    overdraw = true)
+    translate!(tipplot, 0, 0, 2000)
+    tiptext = Makie.text!(fig.scene, tip_pos; text = tip_txt, visible = tip_vis, space = :pixel,
+                          align = (:left, :center), fontsize = 13, color = uicolors.text,
+                          overdraw = true)
+    translate!(tiptext, 0, 0, 2001)
+    player.fxwidgets[:tips] = Dict{Any, String}()
+    """
+    Show `label` beside the block bounding box `bb`, flipping to its left when the
+    card would leave the window.
+    """
+    function showtip!(bb, label)
+        w = 6.6 * length(label) + 16   # tips are LABELS, not sentences — a few words
+        x = bb.origin[1] + bb.widths[1] + 10
+        x + w > widths(fig.scene.viewport[])[1] && (x = bb.origin[1] - w - 10)
+        y = bb.origin[2] + bb.widths[2] / 2
+        tip_box[] = Rect2f(x, y - 13, w, 26)
+        tip_pos[] = Point2f(x + 8, y)
+        tip_txt[] = label
+        tip_vis[] = true
+        return nothing
+    end
     # The tool cursor is scoped to where the tool can ACT: the blade scissor only
     # over a cuttable clip on the timeline, the crop crosshair only over the
     # preview — hovering buttons or panels always shows a normal arrow.
@@ -479,9 +506,12 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
         shape === lastcursor[] || (lastcursor[] = shape; setcursor!(player, shape))
         return
     end
+    for (btn, label) in tiptargets
+        player.fxwidgets[:tips][btn] = label
+    end
     on(events(fig).mouseposition) do mp
         p = Point2f(mp); hit = nothing
-        for (btn, label) in tiptargets
+        for (btn, label) in player.fxwidgets[:tips]
             bb = btn.layoutobservables.computedbbox[]
             if bb.origin[1] <= p[1] <= bb.origin[1] + bb.widths[1] &&
                bb.origin[2] <= p[2] <= bb.origin[2] + bb.widths[2]
@@ -491,9 +521,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
         if hit === nothing
             tip_vis[] && (tip_vis[] = false)
         else
-            bb, label = hit
-            tip_pos[] = Point2f(bb.origin[1] + bb.widths[1] + 10, bb.origin[2] + bb.widths[2] / 2)
-            tip_txt[] = label; tip_vis[] = true
+            showtip!(hit[1], hit[2])
         end
         refreshcursor!()
         return Consume(false)
@@ -529,8 +557,11 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     end
     opendock!(player, :effects)   # the working panel starts open
 
+    # picking another clip re-aims the inspector even when the playhead stays put
+    # (clicking the lane below it is exactly that case)
+    on(_ -> notify(playhead), timeline.selected)
     on(playhead) do n
-        loc = locate(sequence, n)
+        loc = editclip(player)          # the inspector follows the SELECTED clip
         clip = loc === nothing ? nothing : loc[1]
         if clip !== player.lastclip
             player.lastclip = clip
@@ -700,8 +731,48 @@ function gpuready(player::Player)
     return gp isa GPUPreview && player.gpubusy[] == 0
 end
 
-"Resolve and show timeline frame `n` if possible (gaps show black). Returns success."
-function showframe!(player::Player, n::Integer)
+"""
+Is the playhead PARKED — put there by a click, a seek or a step — rather than
+dragged or played? A parked playhead owes the user the EXACT frame; a moving one
+is happy with the decoder's nearest stand-in (see the `standin` policy of
+[`showframe!`](@ref)).
+"""
+atrest(player::Player) = !player.playing[] && !player.timeline.scrubbing[]
+
+"""
+    editclip(player) -> (clip, source_frame) | nothing
+
+The clip the INSPECTOR works on — sliders, effect stack, keyframes, stabilization:
+the SELECTED clip while it spans the playhead, else the topmost clip under the
+playhead (what [`locate`](@ref) renders). Selection wins because effects and
+keyframes are per CLIP, and stacked lanes must stay reachable: the preview can
+only ever show the upper clip, but the one below it still needs its parameters
+edited — that is exactly how an opacity fade between two stacked clips is built.
+"""
+function editclip(player::Player)
+    seq = player.sequence
+    n = player.playhead[]
+    i = player.timeline.selected[]
+    if 1 <= i <= length(seq.clips)
+        c = seq.clips[i]
+        c.start <= n < clipend(c) && return (c, c.src_in + (n - c.start))
+    end
+    return locate(seq, n)
+end
+
+"""
+Resolve and show timeline frame `n` if possible (gaps show black). Returns success.
+
+`standin` decides what a still-decoding GPU stream may put on screen. While the
+playhead MOVES — playback, a scrub drag — [`frameat!`](@ref)'s nearest already-
+decoded frame is exactly the feedback wanted: the picture follows the drag
+instead of freezing. While the playhead is PARKED it is not: every retry blits a
+closer stand-in, so one click into a cold GOP replays it into the preview (8
+stand-ins on a 300-frame GOP, measured) and whichever one came last stays on
+screen if the settle is cut short. A parked present therefore only advances the
+decode and reports failure; the retry loop lands the exact frame.
+"""
+function showframe!(player::Player, n::Integer; standin::Bool = !atrest(player))
     tr = transitionat(player.sequence, n)
     if tr !== nothing
         s = transitionsample(player.sequence, tr, n)
@@ -713,6 +784,8 @@ function showframe!(player::Player, n::Integer)
         clips = clipsat(player.sequence, n)
         if length(clips) > 1
             if gpuready(player) && all(haskey(player.gpucache, c.source) for c in clips)
+                # composites mix layers: one stand-in among them dates the whole frame
+                standin || primecomposite!(player, clips, n) || return false
                 presentgpucomposite!(player, clips, n) && return true
             end
             compositeframe!(player, n, clips) && return true
@@ -732,6 +805,11 @@ function showframe!(player::Player, n::Integer)
     if gpuready(player) && haskey(player.gpucache, clip.source)
         stream = player.gpucache[clip.source]
         if 0 <= srcframe < nframes(stream)
+            # parked on an undecoded frame: advance the feed but leave the last
+            # exact image up — the retry loop calls back until this frame lands
+            if !standin && !hasframe(stream, srcframe)
+                primeframe!(player, stream, srcframe) && return false
+            end
             ensureframesize!(player, clip.source)
             eclip = effectiveclip(clip, srcframe)
             if presentgpu!(player, eclip, srcframe; stream = stream)
@@ -816,12 +894,22 @@ function present!(player::Player)
     return false
 end
 
-"While paused, keep trying to present frame `n` until it lands or the playhead moves."
-function retrypresent(player::Player, n::Integer)
+"""
+While the playhead sits at `n`, keep refining until the EXACT frame is on screen
+(each attempt advances the stream's decode) — or until the playhead moves on.
+When the frame never arrives inside `budget` seconds the preview shows the
+decoder's best and SAYS so, rather than holding a stale image without a word.
+"""
+function retrypresent(player::Player, n::Integer; budget::Real = 20.0)
     @async begin
-        for _ in 1:400
-            (player.playhead[] == n && !player.playing[]) || break
+        deadline = time() + budget
+        while player.playhead[] == n && !player.playing[]
             showframe!(player, n) && (player.presented += 1; break)
+            if time() > deadline
+                showframe!(player, n; standin = true)
+                setstatus!(player, "frame $n never finished decoding — showing the nearest decoded frame")
+                break
+            end
             sleep(0.005)
         end
     end
@@ -960,6 +1048,18 @@ function playloop(player::Player)
     t0 = time_ns()
     lastset = base
     while player.playing[]
+        # HANDS ON THE RULER WIN: while the button is down on the timeline the user
+        # is placing the playhead, so playback holds its clock instead of dragging
+        # it away under the cursor (it used to run off between mouse moves, which
+        # read as "the playhead can't be moved while playing"). Release resumes
+        # from wherever it was put.
+        if player.timeline.presspick !== nothing
+            base = player.playhead[]
+            t0 = time_ns()
+            lastset = base
+            sleep(0.003)
+            continue
+        end
         # external scrub OR a shuttle-rate change (J/K/L) → rebase the clock
         if player.playhead[] != lastset || player.playrate[] != rate
             base = player.playhead[]
@@ -978,6 +1078,10 @@ function playloop(player::Player)
         lastset = player.playhead[]
         sleep(0.003)
     end
+    # Playback presents stand-ins to keep moving (frameat!'s latency budget), and
+    # nothing retries while playing. The moment it stops — Space, K, a GPU render
+    # error, the end of the sequence — the screen owes the frame the playhead is ON.
+    retrypresent(player, player.playhead[])
     return nothing
 end
 
@@ -1047,7 +1151,9 @@ function toggletransition!(player::Player)
         refreshedit!(player)
         return setstatus!(player, "removed transition at $(timecode(seq, at))")
     end
-    t = addtransition!(seq, at; duration = round(Int, 0.6fps))
+    lc, rc = transitionclips(seq, at)
+    t = (lc === nothing || rc === nothing) ? nothing :
+        addtransition!(seq, at; duration = defaultdissolve(seq, lc, rc))
     t === nothing && return setstatus!(player, "can't add a dissolve there — need a real cut between two clips")
     refreshedit!(player)
     setstatus!(player, "cross-dissolve at $(timecode(seq, at)) · $(round(t.duration / fps, digits = 2))s  (T to remove)")
@@ -1161,7 +1267,9 @@ end
 "Run a stabilization analysis for the clip at frame `at` (default: playhead), in the background."
 function analyzeat!(player::Player, analyze!::Function, what::String;
                     at::Integer = player.playhead[])
-    loc = locate(player.sequence, at)
+    # at the playhead this is the inspector acting → same clip the panel shows
+    # (the selected one on stacked lanes); an explicit `at` addresses the frame
+    loc = at == player.playhead[] ? editclip(player) : locate(player.sequence, at)
     if loc === nothing
         setstatus!(player, "$what: no clip under the playhead — move it onto a clip first")
         return nothing
@@ -2124,7 +2232,7 @@ function buildkeyframeoverlay!(player::Player)
                 key = nearestcurve(clip, sf, y)
                 if key === nothing                       # not aiming at any curve
                     setstatus!(player, isempty(clip.animations) ?
-                        "no animated parameter here — arm one with its ◆ in the Inspector first" :
+                        "no animated parameter here — turn one on with its ◆ in the Inspector first" :
                         "Alt-click ON a curve to add a keyframe to it")
                     return Consume(true)
                 end
@@ -2218,8 +2326,8 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
         kfb.buttoncolor[] = o ? uicolors.accent : uicolors.surface
         kfb.labelcolor[] = o ? uicolors.text_on_accent : uicolors.text
     end
-    target = map(player.playhead) do n
-        loc = locate(player.sequence, n)
+    target = map(player.playhead, player.timeline.selected) do n, _
+        loc = editclip(player)
         loc === nothing && return "▸ no clip at the playhead"
         c = loc[1]; i = something(findfirst(x -> x === c, player.sequence.clips), 0)
         fps = player.sequence.framerate
@@ -2242,23 +2350,23 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
         addmenu.options[] = menuopts()
     end
     function addbyname!(sel::Symbol)
-        loc = locate(player.sequence, player.playhead[])
+        loc = editclip(player)
         loc === nothing && return setstatus!(player, "no clip at the playhead — move it onto a clip first")
         clip = loc[1]
         if sel === :stabilization
-            push!(staged, (objectid(clip), :stab))
+            push!(staged, (clip.id, :stab))
             rebuildstack(force = true)
             setstatus!(player, "Stabilization added — pick a mode and press “Stabilize clip”")
             return
         elseif sel === :flicker
-            push!(staged, (objectid(clip), :flicker))
+            push!(staged, (clip.id, :flicker))
             rebuildstack(force = true)
             setstatus!(player, "Color flicker fix added — press “Analyze + fix” to run it")
             return
         end
         k = kindbyname(sel); k === nothing && return
         snapshot!(player)
-        push!(clip.effects, k.make(NamedTuple(pr.name => pr.default for pr in k.params)))
+        push!(clip.effects, FxSlot(k.make(NamedTuple(pr.name => pr.default for pr in k.params))))
         setstatus!(player, "added $(k.label) — tune it below (Ctrl+Z removes)")
         notify(player.playhead)      # rebuilds the stack + re-presents
         return
@@ -2284,7 +2392,7 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     # ◇ off-key, ◆ when the playhead sits ON a key, param color while animated
     kfaccstate = Dict{Symbol, NamedTuple}()
     function updatekfaccs()
-        loc = locate(player.sequence, player.playhead[])
+        loc = editclip(player)
         clip = loc === nothing ? nothing : loc[1]
         for (key, st) in kfaccstate
             anim = clip !== nothing && clipanimated(clip, key)
@@ -2307,15 +2415,15 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     analyzeref = Ref{Any}(nothing)               # the busy label needs the live widget
     listref = Ref{Any}(nothing); lastsig = Ref{Any}(:init)
     effsig(clip) = clip === nothing ? nothing :
-        (objectid(clip),
-         Tuple((e isa Bypassed, uneffect(e) isa PluginEffect ? uneffect(e).name :
-                                nameof(typeof(uneffect(e)))) for e in clip.effects),
+        (clip.id,
+         Tuple((s.id, s.enabled, s.effect isa PluginEffect ? s.effect.name :
+                                 nameof(typeof(s.effect))) for s in clip.effects),
          Tuple(sort!(collect(keys(clip.animations)))),
          clip.motiontrack !== nothing, clip.colortrack !== nothing,
-         (objectid(clip), :stab) in staged, (objectid(clip), :flicker) in staged)
+         (clip.id, :stab) in staged, (clip.id, :flicker) in staged)
     function rebuildstack(; force::Bool = false)
         force && (lastsig[] = :force)
-        loc = locate(player.sequence, player.playhead[])
+        loc = editclip(player)
         clip = loc === nothing ? nothing : loc[1]
         sig = effsig(clip)
         sig == lastsig[] && return
@@ -2324,7 +2432,7 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
         empty!(player.fxsliders)     # re-registered per form below (scrub keeps them synced)
         gl = GridLayout(stackgl[1, 1]); listref[] = gl
         forms = Any[]; rows = Any[]
-        cid = clip === nothing ? UInt(0) : objectid(clip)
+        cid = clip === nothing ? UInt64(0) : clip.id
         row = Ref(0)
         nextrow() = (row[] += 1)
 
@@ -2380,22 +2488,21 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
                 Label(gl[nextrow(), 1], "No effects yet — add one above.";
                       halign = :left, fontsize = 11, color = uicolors.text_muted,
                       tellwidth = false)
-            for (i, e0) in enumerate(clip.effects)
-                e = uneffect(e0)
+            for (i, slot) in enumerate(clip.effects)
+                e = slot.effect
                 k = effectkindfor(e)
-                body = section!((:fx, i), k === nothing ? string(nameof(typeof(e))) : k.label;
+                # sections are keyed by the SLOT id, so a rebuild after a move or an
+                # undo reopens the same entry instead of whatever sits at that index
+                body = section!((:fx, slot.id), k === nothing ? string(nameof(typeof(e))) : k.label;
                     hasbody = k !== nothing && !isempty(k.params),
-                    enabled = !(e0 isa Bypassed),
-                    onenable = a -> begin      # bypass keeps the params, all render paths skip it
-                        (1 <= i <= length(clip.effects)) || return
+                    enabled = slot.enabled,
+                    onenable = a -> begin      # off keeps the params, all render paths skip it
                         snapshot!(player)
-                        cur = uneffect(clip.effects[i])
-                        clip.effects[i] = a ? cur : Bypassed(cur)
+                        slot.enabled = a
                         notify(player.playhead)
                     end,
                     onremove = () -> begin
-                        (1 <= i <= length(clip.effects)) || return
-                        snapshot!(player); deleteat!(clip.effects, i); notify(player.playhead)
+                        snapshot!(player); removeslot!(clip, slot.id); notify(player.playhead)
                     end)
                 (body !== nothing && k !== nothing && !isempty(k.params)) || continue
                 cur0 = k.read(e)
@@ -2441,10 +2548,10 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
                 on(pf.graph[:values]) do vals
                     prevvals = lastvals[]; lastvals[] = vals
                     player.fxsyncing[] && return         # sync: just refresh the baseline
-                    (1 <= i <= length(clip.effects)) || return
-                    cur = clip.effects[i]
-                    k.matches(uneffect(cur)) || return
-                    prev = k.read(uneffect(cur))
+                    cur = findslot(clip, slot.id)
+                    cur === nothing && return
+                    k.matches(cur.effect) || return
+                    prev = k.read(cur.effect)
                     changedstatic = NamedTuple()
                     for (j, pr) in enumerate(k.params)
                         v = Float64(vals[fieldsym(pr)])
@@ -2464,10 +2571,8 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
                             changedstatic = merge(changedstatic, NamedTuple{(pr.name,)}((v,)))
                         end
                     end
-                    if !isempty(changedstatic)
-                        newe = k.make(merge(prev, changedstatic))
-                        clip.effects[i] = cur isa Bypassed ? Bypassed(newe) : newe
-                    end
+                    isempty(changedstatic) ||
+                        (cur.effect = k.make(merge(prev, changedstatic)))
                     player.playing[] || notify(player.playhead)
                 end
             end
@@ -2672,8 +2777,8 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
         :paletteopen => () -> (palquery[] = ""; palrefresh(); open!(pal)),
         :stabopen => () -> begin
             opendock!(player, :effects)
-            loc = locate(player.sequence, player.playhead[])
-            loc === nothing || push!(staged, (objectid(loc[1]), :stab))
+            loc = editclip(player)
+            loc === nothing || push!(staged, (loc[1].id, :stab))
             rebuildstack(force = true)
         end))
     rowgap!(panel, 10)
@@ -2739,7 +2844,7 @@ at the playhead (so animating is just scrub-and-adjust); otherwise sets the
 static value. Registry-driven, so every `PARAMS` entry with a slider works.
 """
 function applyslider!(player::Player, key::Symbol, value::Float32)
-    loc = locate(player.sequence, player.playhead[])
+    loc = editclip(player)
     loc === nothing && return nothing
     clip = loc[1]
     if time() - player.lastslidersnap > 1.5  # one undo entry per slider gesture
@@ -2786,7 +2891,7 @@ curve. Never destructive — clearing is the separate `clearkeyframes!` action, 
 a stray click can't wipe your work.
 """
 function armkeyframe!(player::Player, key::Symbol)
-    loc = locate(player.sequence, player.playhead[])
+    loc = editclip(player)
     loc === nothing && return nothing
     clip = loc[1]
     p = paramspec(key)
@@ -2810,7 +2915,7 @@ playhead — or REMOVE the one sitting there (removing the last key makes the
 parameter static again).
 """
 function togglekey!(player::Player, key::Symbol)
-    loc = locate(player.sequence, player.playhead[])
+    loc = editclip(player)
     loc === nothing && return nothing
     clip = loc[1]
     clipanimated(clip, key) || return armkeyframe!(player, key)
@@ -2839,7 +2944,7 @@ end
 "Jump the playhead to the previous (`dir < 0`) or next keyframe of `key` on the
 clip under it — the ◀ ▶ of the inspector trio."
 function gotokey!(player::Player, key::Symbol, dir::Integer)
-    loc = locate(player.sequence, player.playhead[])
+    loc = editclip(player)
     loc === nothing && return nothing
     clip = loc[1]
     p = paramspec(key)
@@ -2858,7 +2963,7 @@ end
 "Clear every keyframe of the focused parameter on the clip under the playhead
 (the slider returns to its static value; undoable)."
 function clearkeyframes!(player::Player)
-    loc = locate(player.sequence, player.playhead[])
+    loc = editclip(player)
     loc === nothing && return nothing
     clip = loc[1]
     key = player.kffocus[]

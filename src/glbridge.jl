@@ -270,6 +270,45 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
 end
 
 """
+Advance `stream`'s decode toward frame `n` WITHOUT rendering or presenting: the
+settle path (a parked playhead) refines a cold seek across a few of these calls
+while the last exact image stays on screen. Returns `false` when the decode
+errored — the caller then falls through to the CPU lane, which decodes it exactly.
+"""
+function primeframe!(player::Player, stream::GpuVideoStream, n::Integer)
+    gp = player.gpupreview
+    try
+        rungpuowned(player, gp) do
+            frameat!(stream, n)
+            nothing
+        end
+        return true
+    catch e
+        gpurendererror!(player, e)
+        return false
+    end
+end
+
+"""
+Advance every layer of a multi-track composite toward timeline frame `n`; `true`
+once they are ALL exactly decoded. A composite blends the layers into one image,
+so a single stand-in among them dates the whole frame.
+"""
+function primecomposite!(player::Player, clips::Vector{Clip}, n::Integer)
+    ready = true
+    for clip in clips
+        stream = player.gpucache[clip.source]
+        srcframe = clip.src_in + (n - clip.start)
+        hasframe(stream, srcframe) && continue
+        # a failed decode is loud and hands the frame to the CPU composite —
+        # waiting for exactness on a stream that just errored is pointless
+        primeframe!(player, stream, srcframe) || return true
+        ready = false
+    end
+    return ready
+end
+
+"""
 Point the preview plot back at its OWN texture before a CPU `frame`-notify present
 (scrub thumbnails, gap fills, the CPU fallback lane). GLMakie's notify-upload writes
 into the texture the render object currently holds — uploading linear CPU pixels

@@ -51,8 +51,8 @@ defaults(p::FxPlugin) = NamedTuple{Tuple(pr.name for pr in p.params)}(Tuple(pr.d
 plugineffect(name::Symbol; kw...) = (p = PLUGINBYNAME[name]; PluginEffect(name, merge(defaults(p), values(kw))))
 
 function findplugineffect(clip::Clip, name::Symbol)
-    for e in clip.effects
-        e isa PluginEffect && e.name == name && return e
+    for s in clip.effects
+        s.effect isa PluginEffect && s.effect.name == name && return s.effect
     end
     return nothing
 end

@@ -176,6 +176,19 @@ end
     t = seq2.transitions[1]
     @test (t.kind, t.at, t.duration) == (:dissolve, 40, 12)
     @test VE.transitionat(seq2, 40) !== nothing        # resolves at the cut after reload
+
+    # a one-click blend must not swallow the clips it blends (Simon, 2026-07-27:
+    # a dissolve drawn across BOTH clips end to end). The hard limit allows twice
+    # the shorter clip; the DEFAULT keeps three quarters of each side visible.
+    for len in (8, 15, 60, 300)
+        l = VE.Clip(src, 0, len, 0, (0.0, 0.0, 1.0, 1.0))
+        r = VE.Clip(src, len, 2len, len, (0.0, 0.0, 1.0, 1.0))
+        s = Sequence([l, r], 30.0)
+        d = VE.clamptransition(l, r, VE.defaultdissolve(s, l, r))
+        @test d <= VE.cliplength(l)                    # ≤ half of each side
+        @test d <= round(Int, 0.6 * 30.0)              # and never longer than 0.6 s
+        @test d >= 2
+    end
 end
 
 @testset "multi-track edits" begin
@@ -229,15 +242,81 @@ end
     r2.start += 5
     @test VE.joinclips!(seq2, 10) === nothing
 
-    # bypass: wrapped effect is neutral for every render path but keeps params
+    # a switched-off slot keeps its params and its id, and every render path skips it
     c = seq.clips[1]
-    push!(c.effects, ColorEffect(saturation = 1.8))
-    c.effects[1] = VE.Bypassed(c.effects[1])
-    @test VE.isneutral(c.effects[1])
-    @test VE.uneffect(c.effects[1]).adj.saturation == 1.8f0
-    d = VE.effectdict(c.effects[1])                   # project-file roundtrip
-    e2 = VE.effectfromdict(d)
-    @test e2 isa VE.Bypassed && VE.uneffect(e2).adj.saturation == 1.8f0
+    VE.seteffect!(c, ColorEffect(saturation = 1.8))
+    slot = c.effects[end]
+    id = slot.id
+    slot.enabled = false
+    @test isempty(collect(VE.liveeffects(c)))
+    @test VE.findeffect(c, ColorEffect).adj.saturation == 1.8f0   # params survive
+    @test VE.findslot(c, id) === slot                             # addressable by id
+    d = VE.slotdict(slot)                             # project-file roundtrip
+    s2 = VE.slotfromdict(d)
+    @test s2.id == id && !s2.enabled && s2.effect.adj.saturation == 1.8f0
+    # files written before ids existed still load — a wrapped effect becomes an off slot
+    old = Dict{String, Any}("type" => "bypassed",
+                            "inner" => VE.effectdict(ColorEffect(saturation = 1.2)))
+    s3 = VE.slotfromdict(old)
+    @test !s3.enabled && s3.effect.adj.saturation == 1.2f0 && s3.id != 0
+    slot.enabled = true
+end
+
+@testset "stable identities" begin
+    src = VideoSource(testvideo)
+    seq = Sequence(src)
+    c = seq.clips[1]
+    @test c.id != 0
+    @test VE.clipbyid(seq, c.id) === c
+    right = split!(seq, 40)
+    @test right.id != c.id                       # a new clip is a new identity …
+    @test VE.clipbyid(seq, right.id) === right
+    VE.seteffect!(c, BlurEffect(2.0f0))
+    slotid = c.effects[end].id
+    snap = VE.snapshot(seq)                      # … and undo preserves identities
+    sort!(seq.clips; by = x -> -x.start)         # sorting must not confuse anyone
+    VE.restore!(seq, snap)
+    @test VE.clipbyid(seq, c.id) !== nothing
+    @test VE.clipbyid(seq, c.id).effects[end].id == slotid
+end
+
+
+@testset "blend pairing survives everything" begin
+    # Simon, 2026-07-27: "was gibts denn zu suchen? wir markieren 2 clips, und dann
+    # merken wir uns die" — the pair is REMEMBERED by clip id, never re-derived from
+    # positions, so moves, sorting, undo and a reload all keep it.
+    src = VideoSource(testvideo)
+    seq = Sequence(src)
+    split!(seq, 40)
+    a, b = seq.clips[1], seq.clips[2]
+    b.blendfrom = a.id
+    VE.keyfade!(b, 12, :in)
+    @test VE.blends(seq) == [(1, 2, 12)]
+    @test VE.findslot(b, VE.OpacityEffect) !== nothing     # the blend IS an effect entry
+    slotid = VE.findslot(b, VE.OpacityEffect).id
+
+    b.start = a.start + 20                                  # move it over the other clip
+    b.track = 2
+    sort!(seq.clips; by = c -> (c.track, c.start))
+    @test VE.blends(seq) == [(1, 2, 12)]                    # still paired
+
+    path = joinpath(mktempdir(), "blend.videoedit.toml")
+    saveproject(path, seq)
+    seq2 = loadproject(path)
+    @test seq2.clips[2].blendfrom == seq2.clips[1].id       # ids survive the file
+    @test VE.blends(seq2) == [(1, 2, 12)]
+    @test VE.findslot(seq2.clips[2], VE.OpacityEffect).id == slotid
+
+    # switching the blend OFF keeps its keys and its id; removing it clears the pair
+    slot = VE.findslot(seq2.clips[2], VE.OpacityEffect)
+    slot.enabled = false
+    @test isempty(collect(VE.liveeffects(seq2.clips[2])))
+    @test VE.blends(seq2) == [(1, 2, 12)]                   # still listed, just off
+    VE.clearfade!(seq2.clips[2], :in)
+    seq2.clips[2].blendfrom = UInt64(0)          # the × action clears the pair too
+    @test isempty(VE.blends(seq2))
+    @test seq2.clips[2].blendfrom == 0
+    @test VE.findslot(seq2.clips[2], VE.OpacityEffect) === nothing
 end
 
 @testset "plugin registry + MCP authoring" begin

@@ -32,25 +32,24 @@ isneutral(e::SharpenEffect) = e.amount <= 0
 isneutral(e::OpacityEffect) = e.α >= 0.999f0
 
 """
-    Bypassed(effect)
+    liveeffects(clip)
 
-A disabled effect in the stack: it is `isneutral`, so every render path (the
-CPU stack, the GPU graph, the compositor, export) skips it — but it keeps its
-parameters, so the inspector's enable toggle switches it back on losslessly.
+The effects of `clip` that actually render: enabled slots whose effect isn't
+neutral, in stack order. Disabling a slot ([`FxSlot`](@ref)`.enabled`) keeps its
+parameters — the inspector's toggle is lossless — while every render path (CPU
+stack, GPU graph, compositor, export) simply skips it.
 """
-struct Bypassed <: Effect
-    e::Effect
+liveeffects(clip::Clip) = (s.effect for s in clip.effects if s.enabled && !isneutral(s.effect))
+
+"The slot with `id` on `clip`, or `nothing` — how anything points at ONE entry."
+function findslot(clip::Clip, id::Integer)
+    i = findfirst(s -> s.id == id, clip.effects)
+    return i === nothing ? nothing : clip.effects[i]
 end
-isneutral(::Bypassed) = true
-"The effect itself, seen through a [`Bypassed`](@ref) wrapper."
-uneffect(e::Effect) = e
-uneffect(b::Bypassed) = b.e
 
 "Apply `clip`'s effect stack to `buf` in place, using two same-size scratch buffers."
 function applyeffects!(buf::AnyRGBFrame, tmp1::AnyRGBFrame, tmp2::AnyRGBFrame, clip::Clip)
-    any(e -> !isneutral(e), clip.effects) || return buf
-    for e in clip.effects
-        isneutral(e) && continue
+    for e in liveeffects(clip)
         applyeffect!(buf, tmp1, tmp2, e)
     end
     KA.synchronize(KA.get_backend(buf))
@@ -75,11 +74,27 @@ effectdict(e::BlurEffect) = Dict{String, Any}("type" => "blur", "sigma" => e.σ)
 effectdict(e::SharpenEffect) =
     Dict{String, Any}("type" => "sharpen", "sigma" => e.σ, "amount" => e.amount)
 effectdict(e::OpacityEffect) = Dict{String, Any}("type" => "opacity", "alpha" => e.α)
-effectdict(b::Bypassed) = Dict{String, Any}("type" => "bypassed", "inner" => effectdict(b.e))
+
+"A stack entry as a project-file dict: the effect plus its id and enabled state."
+slotdict(s::FxSlot) = merge(effectdict(s.effect),
+                            Dict{String, Any}("id" => string(s.id), "enabled" => s.enabled))
+
+"""
+Read a stack entry back. Files written before effects had ids (and before
+`enabled` replaced the `bypassed` wrapper) still load: the entry gets a fresh id,
+and a wrapped effect becomes a disabled slot.
+"""
+function slotfromdict(d::AbstractDict)
+    if d["type"] == "bypassed"
+        return FxSlot(effectfromdict(d["inner"]); enabled = false)
+    end
+    id = haskey(d, "id") ? parse(UInt64, d["id"]) : freshid()
+    return FxSlot(id, effectfromdict(d), get(d, "enabled", true))
+end
 
 function effectfromdict(d::AbstractDict)
     t = d["type"]
-    t == "bypassed" && return Bypassed(effectfromdict(d["inner"]))
+    t == "bypassed" && return effectfromdict(d["inner"])
     t == "color" && return ColorEffect(; brightness = d["brightness"], contrast = d["contrast"],
                                        saturation = d["saturation"], temperature = d["temperature"])
     t == "blur" && return BlurEffect(Float32(d["sigma"]))
@@ -91,23 +106,47 @@ end
 
 # ------------------------------------------------------- fixed-stack helpers
 
-"The clip's effect of type `T`, or `nothing`."
+"The clip's effect of type `T`, or `nothing` — a DISABLED slot still answers, so
+the inspector shows a switched-off effect's real parameters."
 function findeffect(clip::Clip, ::Type{T}) where {T <: Effect}
-    i = findfirst(e -> e isa T, clip.effects)
-    return i === nothing ? nothing : clip.effects[i]::T
+    i = findfirst(s -> s.effect isa T, clip.effects)
+    return i === nothing ? nothing : clip.effects[i].effect::T
 end
 
-# Effects upsert by identity: one instance per type — except plugin effects, which
-# share a type, so they upsert per plugin name (see plugins.jl). A bypassed
-# effect keeps its inner key, so writing that kind replaces (and re-enables) it.
-effectkey(e::Effect) = typeof(e)
-effectkey(b::Bypassed) = effectkey(b.e)
+"The clip's slot holding an effect of type `T`, or `nothing`."
+function findslot(clip::Clip, ::Type{T}) where {T <: Effect}
+    i = findfirst(s -> s.effect isa T, clip.effects)
+    return i === nothing ? nothing : clip.effects[i]
+end
 
-"Replace the clip's effect with the same key, or append it."
+# Effects upsert by kind: one entry per type — except plugin effects, which share
+# a type, so they upsert per plugin name (see plugins.jl). Writing a kind that is
+# switched off replaces its effect AND switches it back on.
+effectkey(e::Effect) = typeof(e)
+
+"""
+    seteffect!(clip, e) -> clip
+
+Replace the effect in the slot of the same kind (keeping that slot's id, so
+anything pointing at it still points at it) or append a new slot.
+"""
 function seteffect!(clip::Clip, e::Effect)
-    i = findfirst(x -> effectkey(x) == effectkey(e), clip.effects)
-    i === nothing ? push!(clip.effects, e) : (clip.effects[i] = e)
+    i = findfirst(s -> effectkey(s.effect) == effectkey(e), clip.effects)
+    if i === nothing
+        push!(clip.effects, FxSlot(e))
+    else
+        clip.effects[i].effect = e
+        clip.effects[i].enabled = true
+    end
     return clip
+end
+
+"Drop the slot with `id` (returns whether one went)."
+function removeslot!(clip::Clip, id::Integer)
+    i = findfirst(s -> s.id == id, clip.effects)
+    i === nothing && return false
+    deleteat!(clip.effects, i)
+    return true
 end
 
 # ---------------------------------------------------- animatable parameters
@@ -179,9 +218,9 @@ isanimated(clip::Clip) = !isempty(clip.animations)
 "`clip` without its opacity effects — compositing reads opacity as the LAYER
 alpha, not a per-pixel fade to black."
 withoutopacity(clip::Clip) =
-    Clip(clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
-         filter(e -> !(uneffect(e) isa OpacityEffect), clip.effects),
-         clip.colortrack, clip.motiontrack, clip.animations, clip.track)
+    Clip(clip.id, clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
+         filter(s -> !(s.effect isa OpacityEffect), clip.effects),
+         clip.colortrack, clip.motiontrack, clip.animations, clip.track, clip.blendfrom)
 
 """
     effectiveclip(clip, srcframe) -> Clip
@@ -194,8 +233,11 @@ and a copied effect stack are mutated.
 """
 function effectiveclip(clip::Clip, srcframe::Integer)
     isempty(clip.animations) && return clip
-    ec = Clip(clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
-              copy(clip.effects), clip.colortrack, clip.motiontrack, clip.animations, clip.track)
+    # own slots (same ids, same on/off) so a sampled value never writes into the
+    # clip the user is editing
+    ec = Clip(clip.id, clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
+              [FxSlot(s.id, s.effect, s.enabled) for s in clip.effects],
+              clip.colortrack, clip.motiontrack, clip.animations, clip.track, clip.blendfrom)
     for (key, curve) in clip.animations
         haskey(PARAMBYKEY, key) || continue
         v = valueat(curve, srcframe)

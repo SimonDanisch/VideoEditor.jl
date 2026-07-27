@@ -47,9 +47,10 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             press(tlx(1.0))
             @test p.playhead[] == 30
             @test tl.selected[] == 1
-            @test tl.scrubbing[]
+            @test !tl.scrubbing[]     # a click is not a scrub yet — it settles EXACTLY
             moveto(tlx(2.5))
             @test p.playhead[] == 75
+            @test tl.scrubbing[]      # the press became a drag: stand-in frames welcome
             release()
             @test !tl.scrubbing[]
         end
@@ -499,7 +500,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test clip.track == 1
             sleep(0.5)
             press(tlx(3.0))
-            @test tl.scrubbing[]
+            @test tl.presspick !== nothing       # button down on the ruler (not a drag yet)
             vp = ax.scene.viewport[]
             moveto(Point2f(tlx(3.5)[1], vp.origin[2] + 0.93 * vp.widths[2]))
             @test !tl.scrubbing[]
@@ -562,7 +563,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             keypress(Keyboard.enter)                # ⏎ applies the top hit
             @test !p.fxwidgets[:palettemodal].open[]
             @test length(clip.effects) == nfx + 1
-            @test VE.uneffect(clip.effects[end]) isa VE.SharpenEffect
+            @test clip.effects[end].effect isa VE.SharpenEffect
             # Stabilization is addable the same way — its section lands in the inspector
             p.fxwidgets[:paletteopen]()
             p.fxwidgets[:palettequery][] = "stab"
@@ -575,7 +576,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             p.fxwidgets[:palettequery][] = "bright"
             keypress(Keyboard.enter)
             @test length(clip.effects) == nfx2 + 1
-            @test VE.uneffect(clip.effects[end]) isa VE.ColorEffect
+            @test clip.effects[end].effect isa VE.ColorEffect
         end
 
         @testset "keyframe overlay edits the param you click" begin
@@ -904,7 +905,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test VE.activetoolname(p)[] === :loopfinder
             # Find adds a SECOND reference card (signatures cached — instant)
             press(tlx(1.0)); release()               # another playhead frame
-            p.fxwidgets[:toolaction][3][]()          # the panel's Find action
+            VE.activetool(p)[2].callbacks[1]()       # the panel's Find action
             # the clip under t=1.0 may be an UNCACHED split half (the ▼ cut position
             # is content-driven) — the Find then runs a fresh async analysis; wait
             # for the card like the first Find did instead of a fixed sleep
@@ -927,9 +928,10 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             VE.deactivatetool!(p)
             @test isempty(p.fxwidgets[:toolcards][3])   # cards cleaned up
 
-            # blend: split, click both halves, expect a dissolve at their cut.
-            # undo keeps the loop-trim's zoomed-in view (zoom survives undo by
-            # design) — reset it so tlx() clicks can reach the whole sequence
+            # BLEND: opacity keys on the LATER clip, remembered as a pair by clip id.
+            # The card is project state (built whether or not the tool is on), the
+            # header IS the action, nothing captures timeline clicks, and the length
+            # control edits whatever blend is selected.
             Makie.limits!(ax, 0.0, VE.seqduration(p.sequence), 0.0, 1.0)
             sleep(0.2)
             nclips = length(p.sequence.clips)
@@ -937,17 +939,138 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             VE.seek!(p, VE.seqlength(p.sequence) ÷ 2)
             VE.split!(p); sleep(0.3)
             @test length(p.sequence.clips) == nclips + 1
-            VE.activatetool!(p, :blend)
             c1 = p.sequence.clips[1]; c2 = p.sequence.clips[2]
-            press(tlx((c1.start + VE.cliplength(c1) / 2) / fps)); release(); sleep(0.2)
-            @test occursin("adjacent", p.status[])   # first pick made, asks for second
-            press(tlx((c2.start + VE.cliplength(c2) / 2) / fps)); release(); sleep(0.2)
-            @test !isempty(p.sequence.transitions)
-            @test occursin("dissolve", p.status[])
-            VE.deactivatetool!(p)
-            # restore for the following beats: drop the dissolve, undo the split
-            VE.removetransition!(p.sequence, p.sequence.transitions[1].at)
-            VE.undo!(p); VE.undo!(p); sleep(0.2)     # blend snapshot, then the split
+            pctx = p.fxwidgets[:toolpanels][:blend]
+            @test VE.activetoolname(p)[] === :none      # nothing on …
+            @test !isempty(pctx.controls)               # … and the card is filled anyway
+            @test length(pctx.rows) == 1                # "no blends yet" placeholder
+            @test pctx.state[:fit]                      # "move clips to fit" is the default
+
+            tl.selection[] = [1, 2]; sleep(0.2)
+            VE.activatetool!(p, :blend); sleep(0.5)     # clicking the header blends
+            @test VE.activetoolname(p)[] === :none      # and hands the slot straight back
+            @test isempty(p.sequence.transitions)       # NOT a transition
+            @test VE.clipanimated(c2, :opacity)         # the later clip fades in
+            @test !VE.clipanimated(c1, :opacity)        # the earlier one is untouched
+            @test c2.blendfrom == c1.id                 # the pair is REMEMBERED, not guessed
+            @test VE.blends(p.sequence) == [(1, 2, VE.fadeinlength(c2))]
+            @test length(pctx.rows) == 1                # one row per blend
+            # with the option ticked the clips are already arranged: one step, done
+            @test c2.start < VE.clipend(c1)
+            @test VE.clipend(c1) - c2.start == VE.fadeinlength(c2)
+
+            # the length control works on a SINGLE selected clip, live, and the
+            # overlap follows it
+            tl.selection[] = Int[]; tl.selected[] = 2; sleep(0.3)
+            @test VE.selectedblend(p) !== nothing
+            VE.setblendlength!(pctx, 1.0); sleep(0.4)
+            @test VE.fadeinlength(c2) == round(Int, 1.0 * fps)
+            @test VE.clipend(c1) - c2.start == VE.fadeinlength(c2)
+            mid = c2.start + VE.fadeinlength(c2) ÷ 2
+            @test length(VE.clipsat(p.sequence, mid)) == 2
+            @test 0.2 < VE.paramvalue(c2, :opacity, c2.src_in + (mid - c2.start)) < 0.8
+
+            # the blend IS an effect entry: switch it off (keys stay), then remove it
+            slot = VE.findslot(c2, VE.OpacityEffect)
+            @test slot !== nothing
+            slot.enabled = false
+            @test isempty(collect(VE.liveeffects(c2)))
+            @test VE.clipanimated(c2, :opacity)          # the curve is untouched
+            slot.enabled = true
+
+            # the pair survives a move and an undo — nothing is re-derived
+            start0, track0 = c2.start, c2.track
+            VE.movetooverlap!(p, c1, c2, 12); sleep(0.3)
+            @test VE.blends(p.sequence) == [(1, 2, VE.fadeinlength(c2))]
+            VE.undo!(p); sleep(0.3)
+            @test length(VE.blends(p.sequence)) == 1
+
+            # dragging a clip ONTO another rides up a lane instead of being refused
+            c2 = p.sequence.clips[2]
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
+            press(tlx((c2.start + VE.cliplength(c2) / 2) / fps))
+            for t in range((c2.start + VE.cliplength(c2) / 2) / fps, c1.start / fps + 0.7; length = 6)
+                moveto(tlx(t)); sleep(0.05)
+            end
+            release()
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
+            sleep(0.4)
+            @test c2.start < VE.clipend(c1)
+            @test c2.track >= track0
+
+            # × clears keys, effect entry and the pair together
+            VE.clearfade!(c2, :in); c2.blendfrom = UInt64(0)   # what × does
+            VE.refreshedit!(p); sleep(0.2)
+            @test !VE.clipanimated(c2, :opacity)
+            @test VE.findslot(c2, VE.OpacityEffect) === nothing
+            @test c2.blendfrom == 0
+            @test isempty(VE.blends(p.sequence))
+            # restore for the following beats
+            c2.start, c2.track = start0, track0
+            VE.refreshedit!(p); sleep(0.2)
+            for _ in 1:6
+                VE.undo!(p)
+            end
+            tl.selection[] = Int[]
+            VE.refreshedit!(p); sleep(0.2)
+        end
+
+        @testset "the playhead can be placed while playing" begin
+            # Simon, 2026-07-27: "while playing, we cant move the playhead" — the
+            # loop kept advancing between mouse moves and dragged it away again.
+            VE.seek!(p, 5); sleep(0.2)
+            play!(p); sleep(0.4)
+            p.timeline.presspick = (0, 0.0, 0.0)     # button down on the ruler
+            p.playhead[] = 40; sleep(0.5)
+            @test p.playhead[] == 40                 # playback holds while you place it
+            p.timeline.presspick = nothing; sleep(0.4)
+            @test p.playhead[] > 40                  # and runs on from there after release
+            VE.pause!(p); sleep(0.2)
+        end
+
+        @testset "stacked clips: you edit the lane you click" begin
+            # Simon, 2026-07-27: "keyframes/effects are per clip — you only ever get
+            # the ones of the selected clip shown". They were per clip alright, but
+            # BOTH the click (clipat = topmost) and the whole inspector (locate =
+            # topmost) ignored the lane, so a clip stacked BELOW another could not be
+            # selected, inspected or keyed at all — which is exactly what an opacity
+            # fade between two stacked clips needs.
+            Makie.limits!(ax, 0.0, VE.seqduration(p.sequence), 0.0, 1.0); sleep(0.2)
+            fps = p.sequence.framerate
+            VE.seek!(p, VE.seqlength(p.sequence) ÷ 2)
+            VE.split!(p); sleep(0.3)
+            lower, upper = p.sequence.clips[1], p.sequence.clips[2]
+            track0, start0 = upper.track, upper.start
+            upper.track = 2
+            upper.start = lower.start + VE.cliplength(lower) ÷ 2   # overlap the lower one
+            empty!(upper.animations); empty!(lower.animations)
+            VE.refreshedit!(p); sleep(0.3)
+            over = upper.start + 5                                  # both clips cover this
+            VE.seek!(p, over); sleep(0.3)
+            laney(track) = (b = VE.trackband(track, VE.ntracks(p.sequence));
+                            vp = ax.scene.viewport[];
+                            vp.origin[2] + 0.5 * (b[1] + b[2]) * vp.widths[2])
+            lanepos(t, track) = Point2f(tlx(t)[1], laney(track))
+            @test VE.locate(p.sequence, over)[1] === upper          # the preview shows the top clip
+
+            press(lanepos(over / fps, 1)); release(); sleep(0.3)    # click the LOWER lane
+            @test tl.selected[] == 1
+            @test VE.editclip(p)[1] === lower                       # …and that is what you edit
+            VE.togglekey!(p, :opacity); sleep(0.2)
+            @test VE.clipanimated(lower, :opacity)
+            @test !VE.clipanimated(upper, :opacity)                 # the key went to the RIGHT clip
+
+            press(lanepos(over / fps, 2)); release(); sleep(0.3)    # click the upper lane
+            @test tl.selected[] == 2
+            @test VE.editclip(p)[1] === upper
+            VE.togglekey!(p, :opacity); sleep(0.2)
+            @test VE.clipanimated(upper, :opacity)
+
+            empty!(upper.animations); empty!(lower.animations)      # restore for later beats
+            upper.track, upper.start = track0, start0
+            VE.refreshedit!(p); sleep(0.2)
+            VE.undo!(p); VE.undo!(p); VE.undo!(p); sleep(0.2)       # two keyframe snapshots + the split
+            tl.selected[] = 0
         end
 
         @testset "shift-click marks multiple clips" begin

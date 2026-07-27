@@ -27,7 +27,9 @@ function clipdict(clip::Clip)
         "start" => clip.start,
         "track" => clip.track,
         "crop" => collect(clip.crop),
-        "effects" => [effectdict(e) for e in clip.effects],
+        "id" => string(clip.id),
+        "blendfrom" => string(clip.blendfrom),
+        "effects" => [slotdict(s) for s in clip.effects],
     )
     # stabilization tracks are part of the edit — losing an analysis on
     # save/reopen would be silently destructive
@@ -70,8 +72,13 @@ function loadproject(path::AbstractString)
         clip = Clip(source, cd["src_in"], cd["src_out"], cd["start"],
                     Tuple(Float64.(cd["crop"])))
         clip.track = Int(get(cd, "track", 1))
+        # ids are part of the edit: a blend points at its partner by id, and the
+        # inspector at a stack entry. Files written before ids existed simply keep
+        # the fresh ones the constructor handed out.
+        haskey(cd, "id") && (clip.id = parse(UInt64, cd["id"]))
+        clip.blendfrom = haskey(cd, "blendfrom") ? parse(UInt64, cd["blendfrom"]) : UInt64(0)
         for ed in get(cd, "effects", [])
-            push!(clip.effects, effectfromdict(ed))
+            push!(clip.effects, slotfromdict(ed))
         end
         if haskey(cd, "motiontrack")
             mt = cd["motiontrack"]

@@ -31,6 +31,28 @@ MotionTrack(transforms::Vector{Mat3f}, src_in::Integer, mode::Symbol = :unknown)
     MotionTrack(transforms, src_in, mode, nothing)
 
 """
+Source of stable identities for clips and effect slots. Position in a vector and
+`objectid` both die on the first sort, undo or project reload — anything that has
+to POINT at a clip or an effect (a blend at its partner, the inspector at a stack
+entry, MCP at either) needs an id that survives those.
+"""
+const NEXTID = Threads.Atomic{UInt64}(0)
+freshid() = UInt64(Threads.atomic_add!(NEXTID, UInt64(1)) + 1)
+
+"""
+One entry in a clip's effect stack: the effect, a STABLE `id` so anything can
+point at exactly this entry (the blend card, the inspector, MCP), and `enabled` —
+the honest form of what wrapping an effect in `Bypassed` used to express. Several
+entries of the same kind may coexist; they are told apart by their id.
+"""
+mutable struct FxSlot
+    const id::UInt64
+    effect::Any        # an Effect — effects.jl is included after this file
+    enabled::Bool
+end
+FxSlot(effect; enabled::Bool = true) = FxSlot(freshid(), effect, enabled)
+
+"""
     Clip(source; src_in=0, src_out=source.nframes, start=0)
 
 A non-destructive reference into a source video: frames
@@ -39,20 +61,24 @@ A non-destructive reference into a source video: frames
 y measured from the top).
 """
 mutable struct Clip
+    id::UInt64                  # stable across sorting, undo and save/load
+                                # (settable so a project file restores its own)
     const source::VideoSource
     src_in::Int
     src_out::Int
     start::Int
     crop::NTuple{4, Float64}
-    const effects::Vector{Any}  # ordered Effect stack (see effects.jl)
+    const effects::Vector{FxSlot}  # ordered effect stack (see effects.jl)
     colortrack::Union{Nothing, ColorTrack}
     motiontrack::Union{Nothing, MotionTrack}
     const animations::Dict{Symbol, AnimCurve}  # keyframed params (see keyframes.jl)
     track::Int                  # stacking layer; higher = on top (1 = base)
+    blendfrom::UInt64           # clip this one blends away FROM (0 = nothing)
 end
 
 Clip(source::VideoSource, src_in, src_out, start, crop) =
-    Clip(source, src_in, src_out, start, crop, [], nothing, nothing, Dict{Symbol, AnimCurve}(), 1)
+    Clip(freshid(), source, src_in, src_out, start, crop, FxSlot[], nothing, nothing,
+         Dict{Symbol, AnimCurve}(), 1, UInt64(0))
 
 function Clip(source::VideoSource; src_in::Integer = 0, src_out::Integer = source.nframes,
               start::Integer = 0)
@@ -98,6 +124,13 @@ end
 Sequence(clips::Vector{Clip}, framerate::Real) = Sequence(clips, framerate, Transition[])
 Sequence(source::VideoSource) = Sequence([Clip(source)], source.framerate)
 
+"The clip with `id`, or `nothing` — how anything refers to a clip across sorting,
+undo and reloads (indices shift, `objectid` dies on the first copy)."
+function clipbyid(seq::Sequence, id::Integer)
+    i = findfirst(c -> c.id == id, seq.clips)
+    return i === nothing ? nothing : seq.clips[i]
+end
+
 seqlength(seq::Sequence) = maximum(clipend, seq.clips; init = 0)
 seqduration(seq::Sequence) = seqlength(seq) / seq.framerate
 
@@ -117,6 +150,18 @@ function clipat(seq::Sequence, n::Integer)
         end
     end
     return best
+end
+
+"""
+Index of the clip covering frame `n` ON `track` — the lane-aware `clipat`. The
+topmost clip is what the preview renders, but a click (and the inspector behind
+it) must be able to reach the one stacked BELOW it.
+"""
+function clipat(seq::Sequence, n::Integer, track::Integer)
+    for (i, c) in enumerate(seq.clips)
+        c.track == track && c.start <= n < clipend(c) && return i
+    end
+    return nothing
 end
 
 "Resolve timeline frame `n` to `(clip, source_frame)`, or `nothing` in a gap."
@@ -161,6 +206,17 @@ end
 "Largest even duration a dissolve on this cut can take without overrunning either clip."
 clamptransition(left::Clip, right::Clip, duration::Integer) =
     2 * max(min(duration ÷ 2, cliplength(left), cliplength(right)), 0)
+
+"""
+The dissolve length a one-click blend should use on this cut: 0.6 s, but never
+more than HALF the shorter clip, so each side keeps three quarters of itself
+un-blended. The hard limit ([`clamptransition`](@ref)) allows a dissolve twice
+the shorter clip — on short clips (loop cuts!) that swallows both of them whole
+and the timeline is one big bowtie with no clip left to see.
+"""
+defaultdissolve(seq::Sequence, left::Clip, right::Clip) =
+    max(min(round(Int, 0.6 * seq.framerate),
+            cliplength(left) ÷ 2, cliplength(right) ÷ 2), 2)
 
 """
     addtransition!(seq, at; duration, kind=:dissolve) -> Union{Transition, Nothing}
@@ -216,7 +272,10 @@ function split!(seq::Sequence, n::Integer)
     offset = n - clip.start
     right = Clip(clip.source, clip.src_in + offset, clip.src_out, n, clip.crop)
     right.track = clip.track              # both halves stay on the same stacking layer
-    append!(right.effects, clip.effects)  # elements are immutable, sharing is safe
+    right.blendfrom = clip.blendfrom
+    # each half owns its stack: same effects, own slot ids, so the inspector and
+    # the blend card can address one half's entry without touching the other's
+    append!(right.effects, [FxSlot(s.effect; enabled = s.enabled) for s in clip.effects])
     right.colortrack = clip.colortrack    # keyed by absolute source frame, still valid
     right.motiontrack = clip.motiontrack
     for (key, curve) in clip.animations   # absolute-frame keyed, but each half gets
@@ -286,8 +345,10 @@ end
 
 "Copy of the edit state for undo/redo. Sources and analysis tracks are shared."
 snapshot(seq::Sequence) =
-    [Clip(c.source, c.src_in, c.src_out, c.start, c.crop, copy(c.effects),
-          c.colortrack, c.motiontrack, deepcopy(c.animations), c.track) for c in seq.clips]
+    [Clip(c.id, c.source, c.src_in, c.src_out, c.start, c.crop,
+          [FxSlot(s.id, s.effect, s.enabled) for s in c.effects],
+          c.colortrack, c.motiontrack, deepcopy(c.animations), c.track, c.blendfrom)
+     for c in seq.clips]
 
 "Restore a [`snapshot`](@ref) (the snapshot itself stays reusable)."
 function restore!(seq::Sequence, snap::Vector{Clip})

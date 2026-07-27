@@ -283,8 +283,7 @@ function graphof(clip::Clip; applytracks::Bool = true)
         push!(nodes, ColorTrackNode(cur)); cur = length(nodes)
     end
     if applytracks
-        for e in clip.effects
-            isneutral(e) && continue
+        for e in liveeffects(clip)          # enabled, non-neutral entries in stack order
             push!(nodes, nodefor(e, cur)); cur = length(nodes)
         end
     end

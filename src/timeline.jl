@@ -38,7 +38,10 @@ mutable struct Timeline
     const sequence::Sequence
     const caches::Dict{VideoSource, ThumbnailCache}
     const playhead::Observable{Int}
-    const scrubbing::Base.RefValue{Bool}
+    const scrubbing::Base.RefValue{Bool}  # a DRAG is under way (the press moved) — a
+                                          # click alone is not scrubbing: the preview
+                                          # then settles on the exact frame instead of
+                                          # showing decode stand-ins (see `atrest`)
     const colors::NamedTuple
     # shared recipe inputs
     const viewrange::Observable{Tuple{Float64, Float64}}
@@ -427,9 +430,13 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
         end
         event.button == Mouse.left || return Consume(false)
         if event.action == Mouse.press && is_mouseinside(axis.scene)
-            t = mouseposition(axis.scene)[1]
+            t, ypos = mouseposition(axis.scene)
             n = timelineframe(timeline, t)
-            i = clipat(seq, n)
+            # the clip you POINT AT: on stacked lanes that is the one in the band
+            # under the cursor, not the topmost — the preview shows the upper clip,
+            # but the lower one has to be selectable (and thus editable) too
+            lane = clipat(seq, n, trackat(ypos, ntracks(seq)))
+            i = lane === nothing ? clipat(seq, n) : lane
             # Shift+click MARKS clips (toggle in the multi-selection) without
             # scrubbing; a plain click collapses the marks to the one clip
             if ispressed(axis.scene, Keyboard.left_shift | Keyboard.right_shift) && i !== nothing
@@ -455,11 +462,12 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
                 timeline.onedit()
                 timeline.trimclip = (seq.clips[edge[1]], edge[2], edge[1])
             else
-                timeline.scrubbing[] = true
-                # remember what the press landed on: dragging OUT of that clip's
-                # lane converts the scrub into a clip move (no Ctrl needed)
-                y = mouseposition(axis.scene)[2]
-                timeline.presspick = (something(i, 0), Float64(t), Float64(y))
+                # a press alone is a CLICK, not yet a scrub — `presspick` says the
+                # button is down on the ruler (and what it landed on: dragging OUT
+                # of that clip's lane converts the scrub into a clip move, no Ctrl
+                # needed); `scrubbing` turns on at the first move, so a click gets
+                # the exact frame instead of the decoder's stand-ins
+                timeline.presspick = (something(i, 0), Float64(t), Float64(ypos))
                 n == playhead[] || (playhead[] = n)
             end
             return Consume(true)
@@ -491,7 +499,7 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
             mp = mouseposition(axis.scene); dragto!(timeline, mp[1], mp[2])
         elseif timeline.trimclip !== nothing
             trimto!(timeline, mouseposition(axis.scene)[1])
-        elseif timeline.scrubbing[]
+        elseif timeline.presspick !== nothing   # button down on the ruler → moving = scrubbing
             mp = mouseposition(axis.scene)
             pk = timeline.presspick
             if pk !== nothing && pk[1] != 0 && inside
@@ -516,6 +524,7 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
             end
             t = mp[1]
             n = timelineframe(timeline, t)
+            timeline.scrubbing[] = true    # the press became a drag
             n == playhead[] || (playhead[] = n)
         elseif inside
             hoverat!(timeline, mouseposition(axis.scene)[1])
@@ -621,6 +630,12 @@ function dragto!(timeline::Timeline, t::Real, y::Real = NaN)
     # above the top lane targets a NEW track
     ntr = ntracks(seq)
     track = isnan(y) ? clip.track : trackat(y, ntr)
+    # dropping ONTO another clip rides up a lane instead of being refused: one lane
+    # holds one clip at a time, but overlapping clips is how they blend — the ghost
+    # shows the lane it will land on, so the lift is visible before the release
+    while !canplace(seq, clip, snapped, track) && track <= ntr
+        track += 1
+    end
     timeline.dragstart = snapped
     timeline.dragtrack = track
     timeline.dragvalid = canplace(seq, clip, snapped, track)
