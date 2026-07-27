@@ -86,8 +86,8 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
         end
 
         @testset "hold-to-compare" begin
-            stabopen()
-            comparebtn = p.fxwidgets[:compare]   # in the stabilize modal
+            VE.opendock!(p, :effects); sleep(0.3)
+            comparebtn = p.fxwidgets[:compare]   # inspector: it bypasses the WHOLE stack
             center = comparebtn.layoutobservables.computedbbox[]
             pos = Point2f(center.origin .+ center.widths ./ 2)
             @test p.applytracks[]
@@ -330,7 +330,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             clip = VE.locate(p.sequence, p.playhead[])[1]
             @test clip.motiontrack !== nothing   # from the object-lock beat
             @test clip.crop != (0.0, 0.0, 1.0, 1.0)
-            # the Stabilization section header carries the × while a track exists
+            # the Stabilize card's "Remove stabilization" takes the track off again
             rmbtn = p.fxwidgets[:remove]
             bb = rmbtn.layoutobservables.computedbbox[]
             press(Point2f(bb.origin .+ bb.widths ./ 2)); release()
@@ -338,12 +338,15 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test clip.crop == (0.0, 0.0, 1.0, 1.0)          # basecrop restored
             @test occursin("no stabilization", p.stabinfo[])
             @test waitfor(() -> occursin("removed", p.status[]))   # async status queue
-            # with the track gone the × leaves the header — nothing left to misclick
-            @test waitfor(() -> !haskey(p.fxwidgets, :remove))
             # let the restore glide + outline flash FULLY finish before later beats:
             # croprect starts empty, so wait for the outline to appear, then clear
             @test waitfor(() -> !isempty(p.croprect[]))
             @test waitfor(() -> isempty(p.croprect[]))
+            # the card stays put now (it is a tool, not a section that comes and
+            # goes) — pressing Remove on a clean clip says so instead of doing damage
+            press(Point2f(bb.origin .+ bb.widths ./ 2)); release()
+            @test clip.motiontrack === nothing
+            @test waitfor(() -> occursin("no stabilization", p.status[]))
             stabclose()
         end
 
@@ -584,12 +587,15 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test !p.fxwidgets[:palettemodal].open[]
             @test length(clip.effects) == nfx + 1
             @test clip.effects[end].effect isa VE.SharpenEffect
-            # Stabilization is addable the same way — its section lands in the inspector
+            # Stabilization is findable the same way, but it is a TOOL now: the entry
+            # takes you to the Tools dock instead of stacking a section (Simon,
+            # 2026-07-27 — "stabilization should move to tools")
             p.fxwidgets[:paletteopen]()
             p.fxwidgets[:palettequery][] = "stab"
             keypress(Keyboard.enter)
-            @test waitfor(() -> any(l -> Makie.to_value(l.text) == "Stabilization",
-                                    p.fxwidgets[:effectrows]))
+            @test waitfor(() -> p.dockopen[] === :tools)
+            @test haskey(p.fxwidgets, :modemenu) && haskey(p.fxwidgets, :analyze)
+            VE.opendock!(p, :effects); sleep(0.3)
             # PARAMETER labels hit too: "bright" finds the Color kind (Premiere-style)
             nfx2 = length(clip.effects)
             p.fxwidgets[:paletteopen]()

@@ -2366,7 +2366,7 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     staged = Set{Tuple{UInt, Symbol}}()   # (clip id, :stab/:flicker) added pre-analysis
     menuopts() = vcat([(k.label, k.name) for k in effectkinds()],
                       [("Stabilization", :stabilization),
-                       ("Color flicker fix", :flicker)])
+                       ("Color flicker fix", :flicker)])   # :stabilization → Tools
     addmenu = Menu(panel[3, 1]; prompt = "+  Add effect…", default = nothing,
                    searchable = true, search_placeholder = "type to filter…",
                    options = menuopts(), tellwidth = false)
@@ -2378,9 +2378,8 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
         loc === nothing && return setstatus!(player, "no clip at the playhead — move it onto a clip first")
         clip = loc[1]
         if sel === :stabilization
-            push!(staged, (clip.id, :stab))
-            rebuildstack(force = true)
-            setstatus!(player, "Stabilization added — pick a mode and press “Stabilize clip”")
+            opendock!(player, :tools)      # stabilizing lives in the Tools dock now
+            setstatus!(player, "Stabilize is in Tools — pick a mode there and press “Stabilize clip”")
             return
         elseif sel === :flicker
             push!(staged, (clip.id, :flicker))
@@ -2406,10 +2405,8 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     comparebtn = Button(panel[4, 1]; label = "Hold to compare with the original",
                         tellwidth = false, width = Makie.Relative(1.0))
     stackgl = GridLayout(panel[5, 1])
-    Label(panel[6, 1], "Loop"; font = :bold, halign = :left, tellwidth = false)
-    loopbtn = Button(panel[7, 1]; label = "Make seamless loop", tellwidth = false,
-                     width = Makie.Relative(1.0))
-    on(_ -> findlooptrim!(player), loopbtn.clicks)
+    # (the old "Make seamless loop" button lived here — the loop finder tool does
+    #  the same job with references you can see and cut at, so it is gone)
 
     # ◀◆▶ accessory state: ONE persistent (label, color) pair per param, shared by
     # every rebuild of its button and driven by a single playhead listener —
@@ -2436,7 +2433,6 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     collapsed = Dict{Tuple{UInt, Any}, Bool}()   # (clip id, section key) → folded?
     stabmode = Ref(:similarity)                  # survives rebuilds/clip switches
     flickercutoff = Ref(0.5)                     # Hz — the analyze parameter, ditto
-    analyzeref = Ref{Any}(nothing)               # the busy label needs the live widget
     listref = Ref{Any}(nothing); lastsig = Ref{Any}(:init)
     effsig(clip) = clip === nothing ? nothing :
         (clip.id,
@@ -2601,54 +2597,10 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
                 end
             end
 
-            # ---- Stabilization: a section like any other effect — it appears when
-            # ADDED from the menu (or when an analysis exists), × removes it
-            haskey(player.fxwidgets, :remove) && clip.motiontrack === nothing &&
-                delete!(player.fxwidgets, :remove)
-            showstab = clip.motiontrack !== nothing || (cid, :stab) in staged
-            sgl = !showstab ? nothing : section!(:stab, "Stabilization";
-                register = clip.motiontrack === nothing ? nothing : :remove,
-                onremove = () -> begin
-                    delete!(staged, (cid, :stab))
-                    if clip.motiontrack !== nothing
-                        removestabilization!(player)   # notifies → rebuild
-                    else
-                        rebuildstack(force = true)     # just un-stage the section
-                    end
-                end)
-            if sgl !== nothing
-                opts = [("Camera lock — like a tripod", :similarity),
-                        ("Object lock — keep a subject still", :objectlock),
-                        ("Tripod (affine) — legacy", :tripod),
-                        ("Tripod + perspective — legacy", :perspective),
-                        ("Smooth — keep camera moves", :smooth)]
-                modemenu = Menu(sgl[1, 1]; options = opts, tellwidth = false,
-                                default = something(findfirst(o -> o[2] === stabmode[], opts), 1))
-                on(sel -> sel === nothing || (stabmode[] = sel), modemenu.selection)
-                analyzebtn = Button(sgl[2, 1]; tellwidth = false, width = Makie.Relative(1.0),
-                                    label = player.stabinfo[] == "analyzing…" ? "⏳ Analyzing…" :
-                                            "Stabilize clip")
-                Label(sgl[3, 1], player.stabinfo; halign = :left, fontsize = 11,
-                      tellwidth = false, color = uicolors.text_muted)
-                on(analyzebtn.clicks) do _
-                    player.stabinfo[] == "analyzing…" &&
-                        return setstatus!(player, "analysis already running — progress in the bottom right")
-                    mode = something(modemenu.selection[], stabmode[])
-                    if mode === :objectlock
-                        armpick!(player)   # the next preview click picks the subject to lock
-                    else
-                        analyzeat!(player, (c; kwargs...) ->
-                                       analyzemotion!(c; mode, backend = player.analysisbackend, kwargs...),
-                                   "motion stabilization")
-                    end
-                end
-                analyzeref[] = analyzebtn
-                merge!(player.fxwidgets, Dict{Symbol, Any}(
-                    :modemenu => modemenu, :analyze => analyzebtn))
-                rowgap!(sgl, 8)
-            else
-                analyzeref[] = nothing
-            end
+            # (Stabilization used to be a section here; it is an ANALYSIS of the
+            #  clip, not an entry in its effect stack, so it lives in the Tools dock
+            #  now — see `stabilizepanel!`. What it produces still renders like any
+            #  other effect.)
 
             # ---- Color flicker fix: its own effect-like section (a per-frame
             # exposure/color track) — analyze in the body, × removes the track
@@ -2714,7 +2666,7 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     rebuildstack()
 
     on(player.stabinfo) do s    # busy feedback at the button that started the job
-        b = analyzeref[]
+        b = get(player.fxwidgets, :analyze, nothing)
         b === nothing && return
         try
             b.label[] = s == "analyzing…" ? "⏳ Analyzing…" : "Stabilize clip"
@@ -2795,16 +2747,11 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     end
 
     merge!(player.fxwidgets, Dict{Symbol, Any}(
-        :addeffect => addmenu, :fxlistrefresh => rebuildstack, :loop => loopbtn,
+        :addeffect => addmenu, :fxlistrefresh => rebuildstack,
         :compare => comparebtn,
         :palettemodal => pal, :palettequery => palquery, :paletteapply => addbyname!,
         :paletteopen => () -> (palquery[] = ""; palrefresh(); open!(pal)),
-        :stabopen => () -> begin
-            opendock!(player, :effects)
-            loc = editclip(player)
-            loc === nothing || push!(staged, (loc[1].id, :stab))
-            rebuildstack(force = true)
-        end))
+        :stabopen => () -> opendock!(player, :tools)))   # the Stabilize card lives there
     rowgap!(panel, 10)
     colsize!(panel, 1, Makie.Relative(1.0))   # content fills the dock width, left-aligned
     return panel

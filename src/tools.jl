@@ -200,7 +200,11 @@ again puts it away); the body holds the tool's description, its OWN action slot
 and its OWN preview cards, so nothing of one tool renders under another's.
 Rebuilt live on [`registertool!`](@ref)."
 function buildtoolspanel!(player::Player, gridpos, uicolors)
-    panel = GridLayout(gridpos; tellheight = false, valign = :top)
+    # tellheight = TRUE on purpose: the dock is a scrollable Subfigure and derives
+    # its content size from the layout's determined height. With the height hidden
+    # the Subfigure thought the content was 0 tall, so nothing scrolled and long
+    # cards were simply cut off at the bottom.
+    panel = GridLayout(gridpos; valign = :top)
     Label(panel[1, 1], "Tools"; font = :bold, halign = :left, tellwidth = false)
     rows = GridLayout(panel[2, 1])
     colsize!(panel, 1, Makie.Relative(1.0))
@@ -255,9 +259,14 @@ function buildtoolspanel!(player::Player, gridpos, uicolors)
             body = GridLayout(card[2, 1]; alignmode = Makie.Outside(10, 10, 10, 6))
             Label(body[1, 1], wraptext(tool.description); fontsize = 11, halign = :left,
                   color = uicolors.text_muted, tellwidth = false)
-            actionslots[tool.name] = GridLayout(body[2, 1])
-            rowslots[tool.name] = GridLayout(body[3, 1])
-            cardslots[tool.name] = GridLayout(body[4, 1])
+            # A slot starts EMPTY, and an empty GridLayout has no determinable
+            # height — which makes the whole card, the panel and finally the dock's
+            # content size indeterminate, so the Subfigure never scrolls and long
+            # cards are simply cut off. A zero-size spacer in a side column keeps
+            # every slot measurable while claiming nothing.
+            actionslots[tool.name] = measurable!(GridLayout(body[2, 1]))
+            rowslots[tool.name] = measurable!(GridLayout(body[3, 1]))
+            cardslots[tool.name] = measurable!(GridLayout(body[4, 1]))
             # the card shows the PROJECT's state, not the tool's mode: its content
             # is built now and stays, armed or not
             ctx = ToolContext(player, tool.name)
@@ -282,8 +291,8 @@ function buildtoolspanel!(player::Player, gridpos, uicolors)
         (event.button == Mouse.left && event.action == Mouse.press &&
          player.dockopen[] === :tools && !isempty(cards)) || return Consume(false)
         mp = events(player.fig).mouseposition[]
-        for (id, box, _, _, onclick) in cards
-            bb = box.layoutobservables.computedbbox[]
+        for (id, frame, _, _, onclick, _, _) in cards
+            bb = frame.layoutobservables.computedbbox[]
             if bb.origin[1] <= mp[1] <= bb.origin[1] + bb.widths[1] &&
                bb.origin[2] <= mp[2] <= bb.origin[2] + bb.widths[2]
                 onclick === nothing || onclick(id)
@@ -293,6 +302,16 @@ function buildtoolspanel!(player::Player, gridpos, uicolors)
         return Consume(false)
     end
     return panel
+end
+
+"""
+Make an (initially empty) layout report a height: GridLayoutBase treats a layout
+with no measurable content as indeterminate, and one such slot is enough to hide
+the height of everything above it — including the dock's scrollable content size.
+"""
+function measurable!(gl)
+    Box(gl[1, 2]; width = 0, height = 0, color = :transparent, strokewidth = 0)
+    return gl
 end
 
 "The card slot (`:controls` or `:rows`) this context fills, or `nothing`."
@@ -317,7 +336,22 @@ function toolaction!(ctx::ToolContext, label::AbstractString, callback)
                width = Makie.Relative(1.0))
     on(_ -> (f = ctx.callbacks[i]; f === nothing || f()), b.clicks)
     push!(ctx.controls, b)
-    return nothing
+    return b
+end
+
+"""
+    toollabel!(ctx, text) -> Label
+
+Add a line of text to this tool's card — `text` may be an Observable, e.g. the
+result of an analysis.
+"""
+function toollabel!(ctx::ToolContext, text)
+    slot = toolslot(ctx, :controls)
+    slot === nothing && return nothing
+    l = Label(slot[length(ctx.controls) + 1, 1], text; halign = :left, fontsize = 11,
+              tellwidth = false, color = ctx.player.timeline.colors.text)
+    push!(ctx.controls, l)
+    return l
 end
 
 """
@@ -416,17 +450,26 @@ function tooladdcard!(ctx::ToolContext, img::AbstractMatrix{RGB{N0f8}};
     colors = ctx.player.timeline.colors
     id = length(cards) + 1
     k = 2id - 1
-    box = Box(cardrows[k, 1]; height = 96, tellwidth = false, width = Makie.Relative(1.0),
-              color = colors.surface, strokecolor = colors.border, strokewidth = 1,
-              cornerradius = 3)
-    lbl = Label(cardrows[k + 1, 1], String(caption); fontsize = 11, halign = :left,
-                color = (colors.text, 0.65), tellwidth = false)
+    # A CARD, visibly: one framed container holding a header row [caption … ×] and
+    # the picture under it — the same section look the tool cards themselves use, so
+    # a reference reads as one object instead of a loose label next to an image.
+    cardbg = Makie.lerp_oklab(RGBf(Makie.to_color(colors.background)), RGBf(1, 1, 1), 0.075)
+    frame = Box(cardrows[k:(k + 1), 1]; color = cardbg, strokecolor = colors.border,
+                strokewidth = 1, cornerradius = 6, tellwidth = false, tellheight = false)
+    Box(cardrows[k, 1]; color = colors.surface, strokewidth = 0, cornerradius = 5,
+        tellwidth = false, tellheight = false)
+    head = GridLayout(cardrows[k, 1]; alignmode = Makie.Outside(8, 6, 4, 4))
+    lbl = Label(head[1, 1], String(caption); fontsize = 11, halign = :left,
+                color = (colors.text, 0.75), tellwidth = false)
     rm = nothing
-    if onremove !== nothing   # × shares the caption row, clear of the image
-        rm = Button(cardrows[k + 1, 1]; label = "×", width = 22, halign = :right,
-                    tellwidth = false)
+    if onremove !== nothing
+        rm = Button(head[1, 2]; label = "×", width = 22, height = 20)
         on(_ -> onremove(id), rm.clicks)
     end
+    box = Box(cardrows[k + 1, 1]; height = 96, tellwidth = false,
+              width = Makie.Relative(1.0), color = colors.surface,
+              strokecolor = (:black, 0.0), strokewidth = 0, cornerradius = 3,
+              alignmode = Makie.Outside(6, 6, 2, 6))
     imgobs = Observable(reverse(collect(img), dims = 2))   # dock scene is y-up
     xy = lift(box.layoutobservables.computedbbox, scene.viewport) do bb, vp
         all(isfinite, bb.origin) && all(isfinite, bb.widths) || return (0.0, 1.0, 0.0, 1.0)
@@ -437,7 +480,7 @@ function tooladdcard!(ctx::ToolContext, img::AbstractMatrix{RGB{N0f8}};
                 space = :pixel, interpolate = true,
                 visible = lift(d -> d === :tools, ctx.player.dockopen))
     translate!(im, 0, 0, 20)
-    push!(cards, (id, box, im, lbl, onclick, rm))
+    push!(cards, (id, frame, im, lbl, onclick, rm, box))
     return id
 end
 
@@ -446,9 +489,9 @@ function toolhighlight!(ctx::ToolContext, id::Integer)
     tc = get(ctx.player.fxwidgets, :toolcards, nothing)
     tc === nothing && return nothing
     colors = ctx.player.timeline.colors
-    for (cid, box, _, _, _, _) in tc[3]
-        box.strokecolor[] = cid == id ? colors.accent : colors.border
-        box.strokewidth[] = cid == id ? 2 : 1
+    for (cid, frame, _, _, _, _, _) in tc[3]
+        frame.strokecolor[] = cid == id ? colors.accent : colors.border
+        frame.strokewidth[] = cid == id ? 2 : 1
     end
     return nothing
 end
@@ -459,9 +502,10 @@ function cleartoolcards!(player::Player)
     tc = get(player.fxwidgets, :toolcards, nothing)
     tc === nothing && return nothing
     _, scene, cards = tc
-    for (_, box, im, lbl, _, rm) in cards
+    for (_, frame, im, lbl, _, rm, box) in cards
         try
-            Makie.delete!(box); Makie.delete!(lbl); Makie.delete!(scene, im)
+            Makie.delete!(frame); Makie.delete!(box); Makie.delete!(lbl)
+            Makie.delete!(scene, im)
             rm === nothing || Makie.delete!(rm)
         catch
         end
@@ -1054,6 +1098,63 @@ function activateblend!(ctx::ToolContext)
     deactivatetool!(player)   # nothing stays armed — the card keeps showing the blends
     return nothing
 end
+
+# ------------------------------------------------------------- Stabilize tool
+
+"The stabilization modes the tool offers, as Makie Menu `(label, value)` options."
+const STABMODES = [("Camera lock — like a tripod", :similarity),
+                   ("Object lock — keep a subject still", :objectlock),
+                   ("Tripod (affine) — legacy", :tripod),
+                   ("Tripod + perspective — legacy", :perspective),
+                   ("Smooth — keep camera moves", :smooth)]
+
+"""
+Fill the Stabilize card: the mode, the action that runs the analysis, what the
+selected clip currently carries, and a way to take it off again. Stabilizing is
+an ANALYSIS of a clip — like the loop finder's search — so it lives with the
+tools, not in the effect stack (Simon, 2026-07-27); what it produces (the motion
+track) still renders as part of the clip like any other effect.
+"""
+function stabilizepanel!(ctx::ToolContext)
+    player = ctx.player
+    ctx.state = Dict{Symbol, Any}(:mode => :similarity)
+    menu = toolmenu!(ctx, "Mode", STABMODES, v -> (v === nothing || (ctx.state[:mode] = v));
+                     default = STABMODES[1][1])
+    analyze = toolaction!(ctx, "Stabilize clip", () -> runstabilize!(ctx))
+    toollabel!(ctx, player.stabinfo)
+    remove = toolaction!(ctx, "Remove stabilization", () -> begin
+        loc = editclip(player)
+        (loc === nothing || loc[1].motiontrack === nothing) &&
+            return setstatus!(player, "no stabilization on this clip")
+        removestabilization!(player)
+    end)
+    # the widget names the tests and MCP address stay the same, they just live here now
+    merge!(player.fxwidgets, Dict{Symbol, Any}(:modemenu => menu, :analyze => analyze,
+                                               :remove => remove))
+    return nothing
+end
+
+"Run (or arm) the analysis the Stabilize card is set to."
+function runstabilize!(ctx::ToolContext)
+    player = ctx.player
+    player.stabinfo[] == "analyzing…" &&
+        return setstatus!(player, "analysis already running — progress in the bottom right")
+    mode = get(ctx.state, :mode, :similarity)
+    if mode === :objectlock
+        armpick!(player)      # the next preview click picks the subject to lock on
+    else
+        analyzeat!(player, (c; kwargs...) ->
+                       analyzemotion!(c; mode, backend = player.analysisbackend, kwargs...),
+                   "motion stabilization")
+    end
+    return nothing
+end
+
+registertool!(:stabilize, "Stabilize",
+    "Locks the SELECTED clip: camera lock holds the framing like a tripod, " *
+    "object lock keeps a subject still (click it in the preview afterwards).";
+    panel = stabilizepanel!, activate = ctx -> (runstabilize!(ctx);
+                                                deactivatetool!(ctx.player)))
 
 registertool!(:loopfinder, "Loop finder",
     "Each reference card holds one frame; ▼ hints on the thumb track mark the " *
