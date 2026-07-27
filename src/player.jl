@@ -627,6 +627,13 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     end
 
     timeline.onedit = () -> snapshot!(player)
+    # trimming shows the frame the cut would land on — exact when it is decoded,
+    # the decoder's nearest otherwise so the picture still follows the drag
+    timeline.ontrimpreview = (clip, sf) -> begin
+        presentclipframe!(player, clip, sf; standin = false) ||
+            presentclipframe!(player, clip, sf; standin = true)
+        return nothing
+    end
     # trim-handle hover changes the cursor too (refreshcursor! reads edgeline)
     on(_ -> refreshcursor!(), timeline.edgeline)
     wirecroptool(player)
@@ -800,6 +807,24 @@ function showframe!(player::Player, n::Integer; standin::Bool = !atrest(player))
         return true
     end
     clip, srcframe = loc
+    target, protect = decodetarget(player, n, clip, srcframe)
+    return presentclipframe!(player, clip, srcframe; standin, target, protect)
+end
+
+"""
+    presentclipframe!(player, clip, srcframe; standin, target, protect) -> Bool
+
+Put `clip`'s source frame `srcframe` on screen — the whole present path (GPU
+stream, GPU effects over a CPU-decoded frame, or the CPU tier), addressed
+DIRECTLY instead of resolved from the playhead. [`showframe!`](@ref) uses it for
+the playhead's frame; the trim gesture uses it to show the frame at the edge it
+is dragging, which is the frame you are deciding about — without moving the
+playhead. `target`/`protect` steer the decode worker (see [`decodetarget`](@ref)).
+"""
+function presentclipframe!(player::Player, clip::Clip, srcframe::Integer;
+                           standin::Bool = !atrest(player),
+                           target::Integer = srcframe,
+                           protect::UnitRange{Int} = 1:0)
     # PURE-GPU path: a streaming GPU decoder feeds this source — Vulkan-Video decode
     # into a bounded VRAM ring + effects on device, no CPU decode, no upload.
     if gpuready(player) && haskey(player.gpucache, clip.source)
@@ -822,7 +847,6 @@ function showframe!(player::Player, n::Integer; standin::Bool = !atrest(player))
         end
     end
     sp = pool(player, clip.source)
-    target, protect = decodetarget(player, n, clip, srcframe)
     settarget!(sp.worker, target; protect)
     ensureframesize!(player, sp.source)  # proxy resolution when one is active
     buf = player.composebuf

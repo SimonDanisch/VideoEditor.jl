@@ -4,6 +4,7 @@
 
 import GLMakie
 import VideoEditor.Makie as Makie
+using Statistics: mean
 using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
 
 @testset "UI interactions" begin
@@ -152,8 +153,19 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test VE.cliplength(clip) == 45
             @test clip.src_out == 45
 
+            # trimming shows the frame AT THE EDGE, and leaves the playhead alone —
+            # you have to see the frame you are cutting on to know where to stop
+            # (Simon, 2026-07-27). Reference: what source frame 15 looks like.
+            VE.seek!(p, 30); sleep(0.5)
+            playheadframe = copy(p.frame[])
+            edgeref = VE.renderpreview(p, 15 / p.sequence.framerate, size(p.frame[], 1))
+            chan(x) = Float32.(VE.ColorTypes.red.(x))
             press(tlx(0.0))                       # left edge: shift start + src_in
             moveto(tlx(0.5))
+            sleep(0.6)
+            @test p.playhead[] == 30                          # playhead stays put …
+            @test mean(abs.(chan(p.frame[]) .- chan(edgeref))) < 0.01   # … preview is the EDGE
+            @test mean(abs.(chan(p.frame[]) .- chan(playheadframe))) > 0.02  # not the playhead's
             # …and the PICTURE follows the edge you are dragging (Simon, 2026-07-27:
             # "we should CLIP/Resize the clip WHERE WE DRAG"). The model was already
             # right — it was the strip that kept drawing the old head under a
@@ -161,9 +173,11 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test p.timeline.clipranges[1][][1] ≈ clip.start / p.sequence.framerate
             @test p.timeline.clipstarts[1][] ≈ clip.src_in / clip.source.framerate
             release()
+            sleep(0.8)
             @test clip.src_in == 15
             @test clip.start == 15
             @test VE.cliplength(clip) == 30
+            @test mean(abs.(chan(p.frame[]) .- chan(playheadframe))) < 0.01   # back to the playhead
 
             # regression (Simon): exactly ON the edge and just OUTSIDE the last
             # clip must both show the handle — the boundary frame belongs to

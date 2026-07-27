@@ -74,6 +74,8 @@ mutable struct Timeline
     trimclip::Union{Nothing, Tuple{Clip, Symbol, Int}}  # (clip, :left/:right, index)
     onrightclick::Function
     onedit::Function                            # called before a gesture mutates
+    ontrimpreview::Function                     # (clip, srcframe) while trimming:
+                                                # show the EDGE frame, playhead untouched
     refreshtask::Task
     transbox::Observable{Vector{Rect2f}}        # cross-dissolve span boxes
     transx::Observable{Vector{Point2f}}         # the bowtie X inside each box
@@ -114,7 +116,8 @@ mutable struct Timeline
                        Observable(Float64[]), Observable(Point2f[]),
                        Observable(""), Observable(Point2f(0, 0)),
                        Threads.Atomic{Bool}(true),
-                       nothing, nothing, nothing, 0, 1, false, nothing, identity, identity)
+                       nothing, nothing, nothing, 0, 1, false, nothing, identity, identity,
+                       (_, _) -> nothing)
         timeline.gpurun = nothing
         timeline.rightpress = nothing
 
@@ -478,6 +481,7 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
             if timeline.trimclip !== nothing
                 timeline.trimclip = nothing
                 relayout!(timeline)
+                notify(timeline.playhead)   # the preview returns to the playhead frame
             end
             return Consume(false)
         end
@@ -694,7 +698,10 @@ function trimto!(timeline::Timeline, t::Real)
     timeline.clipstarts[i][] = clip.src_in / clip.source.framerate
     e = (side === :right ? clipend(clip) : clip.start) / fps
     timeline.edgeline[] = Point2f[Point2f(e, 0.02), Point2f(e, 0.86)]  # handle follows
-    notify(timeline.playhead)  # live preview while trimming
+    # show the frame AT THE EDGE, not the one under the playhead: while dragging `[`
+    # or `]` the question is which frame the cut lands on, and the playhead has no
+    # business moving for that
+    timeline.ontrimpreview(clip, side === :right ? clip.src_out - 1 : clip.src_in)
     return nothing
 end
 
