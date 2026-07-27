@@ -154,6 +154,12 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
 
             press(tlx(0.0))                       # left edge: shift start + src_in
             moveto(tlx(0.5))
+            # …and the PICTURE follows the edge you are dragging (Simon, 2026-07-27:
+            # "we should CLIP/Resize the clip WHERE WE DRAG"). The model was already
+            # right — it was the strip that kept drawing the old head under a
+            # shrinking band, which reads as the FAR end being cut instead.
+            @test p.timeline.clipranges[1][][1] ≈ clip.start / p.sequence.framerate
+            @test p.timeline.clipstarts[1][] ≈ clip.src_in / clip.source.framerate
             release()
             @test clip.src_in == 15
             @test clip.start == 15

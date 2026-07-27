@@ -687,6 +687,11 @@ function trimto!(timeline::Timeline, t::Real)
         clip.start += delta
     end
     timeline.clipranges[i][] = (clip.start / fps, clipend(clip) / fps)
+    # the STRIP has to follow too: trimming the left edge walks `src_in`, so the
+    # thumbnails must start at the new in-point. Updating only the time range drew
+    # the old head under a shrinking band — it looked as if the far end were being
+    # cut instead of the one under the cursor.
+    timeline.clipstarts[i][] = clip.src_in / clip.source.framerate
     e = (side === :right ? clipend(clip) : clip.start) / fps
     timeline.edgeline[] = Point2f[Point2f(e, 0.02), Point2f(e, 0.86)]  # handle follows
     notify(timeline.playhead)  # live preview while trimming
