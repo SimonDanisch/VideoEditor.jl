@@ -364,6 +364,9 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
 
         @testset "proxy swap keeps the preview consistent" begin
             press(tlx(0.3)); release()               # onto clip 1
+            # a press on the ruler must REACH the timeline: scrolled-out dock content
+            # used to sit over it and eat the click (see the Subfigure clip fix)
+            @test p.playhead[] == 9
             clip = p.sequence.clips[1]
             VE.startproxy!(p, clip.source; height = 90)
             t0 = time()
