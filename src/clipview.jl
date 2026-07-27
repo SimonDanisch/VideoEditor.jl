@@ -86,24 +86,43 @@ function composetiles(trange, vrange, pps, bandheight, s0, thumbs, (tw, th), fal
     # aspect-correct lane-height tile covers on screen — zooming in repeats
     # frames, zooming out skips them, tiles always butt against each other
     pitch = max(bandheight, 8.0) * (tw / th) / pps
-    firsttile = max(floor(Int, (lo - t0) / pitch), 0)
-    lasttile = floor(Int, (hi - t0 - 1.0e-9) / pitch)
+    # …and the grid is anchored to the MEDIA, not to the clip: `origin` is where
+    # this source's time 0 would sit on the timeline. Trimming the head moves the
+    # clip start and `s0` by the SAME amount, so the grid does not move and the
+    # picture stays exactly where it was — you just see less of it. Anchored at the
+    # clip start instead, every head trim re-sliced the whole strip, which is what
+    # made trimming the left edge look like the far end was being cut.
+    origin = t0 - s0
+    firsttile = floor(Int, (lo - origin) / pitch)
+    lasttile = floor(Int, (hi - origin - 1.0e-9) / pitch)
     lasttile = min(lasttile, firsttile + 600)   # runaway guard at absurd zoom
     parts = Matrix{RGB{N0f8}}[]
+    xstart = origin + firsttile * pitch         # exact edges of what we KEEP, so the
+    xend = origin + (lasttile + 1) * pitch      # image maps back onto the same pixels
     for k in firsttile:lasttile
-        second = floor(Int, s0 + k * pitch)
+        second = floor(Int, k * pitch)          # source second under this tile
         img = something(thumbs === nothing ? nothing : thumbs(second), placeholder())
-        tilend = t0 + (k + 1) * pitch
-        if tilend > t1  # partial tail tile at a cut: slice, don't squeeze
-            frac = (t1 - (t0 + k * pitch)) / pitch
-            img = img[1:max(round(Int, size(img, 1) * frac), 1), :]
+        tilestart = origin + k * pitch
+        tileend = tilestart + pitch
+        if tilestart < t0 || tileend > t1       # partial tile at either cut: slice
+            w = size(img, 1)
+            a = clamp((max(tilestart, t0) - tilestart) / pitch, 0.0, 1.0)
+            b = clamp((min(tileend, t1) - tilestart) / pitch, 0.0, 1.0)
+            # round the cuts INWARD so the strip never bleeds past the band's edge
+            i0 = clamp(ceil(Int, w * a) + 1, 1, w)
+            i1 = clamp(floor(Int, w * b), 1, w)
+            i0 > i1 && (i0 = i1)
+            img = img[i0:i1, :]
+            # the strip's outer edges follow the ROUNDED cut, not the ideal one —
+            # otherwise the image is stretched by a fraction of a tile and the whole
+            # filmstrip creeps sideways as a trim rounds differently
+            k == firsttile && (xstart = tilestart + (i0 - 1) / w * pitch)
+            k == lasttile && (xend = tilestart + i1 / w * pitch)
         end
         push!(parts, collect(img))
     end
     isempty(parts) && return (placeholder(), (t0, t0 + 1.0e-6), false)
     strip = vcat(parts...)  # (w, h) layout: horizontal concat is along dim 1
-    xstart = t0 + firsttile * pitch
-    xend = min(t0 + (lasttile + 1) * pitch, t1)
     return (strip, (xstart, xend), true)
 end
 

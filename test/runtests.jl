@@ -163,6 +163,38 @@ end
     @test c.keys[2].ease === :smooth
 end
 
+@testset "filmstrip stays put when the head is trimmed" begin
+    # Simon, 2026-07-27 (fifth time asking): trimming the left edge must CUT the
+    # head — "the thumbnails should NOT move whatsoever". The model always did the
+    # right thing; the STRIP was anchored at the clip start, so every head trim
+    # re-sliced the whole filmstrip and the picture crept sideways (measured as a
+    # 0.31 mean pixel difference over the untouched part of the clip).
+    # A thumbnail whose red channel encodes the source second it came from, so the
+    # composed strip can be read back and compared time-for-time.
+    tint(sec) = fill(VideoEditor.RGB{VideoEditor.N0f8}(clamp(sec / 255, 0, 1), 0, 0), 49, 88)
+    fallback = VideoEditor.RGBAf(0, 0, 0, 1)
+    compose(t0, s0) = VE.composetiles((t0, 4.0), (0.0, 4.0), 100.0, 72.0, s0,
+                                      tint, (49, 88), fallback)
+    secat(res, t) = begin
+        strip, (x0, x1), _ = res
+        i = clamp(round(Int, (t - x0) / (x1 - x0) * size(strip, 1)), 1, size(strip, 1))
+        round(Float64(VideoEditor.ColorTypes.red(strip[i, 1])) * 255)
+    end
+    full = compose(0.0, 0.0)          # clip at 0 s showing the source from 0 s
+    trimmed = compose(0.5, 0.5)       # head trimmed by 0.5 s: start AND src_in move
+    for t in 1.0:0.2:3.8
+        @test secat(full, t) == secat(trimmed, t)     # same frame at the same place
+    end
+    # …and the strip really starts at the new edge, not before it
+    @test trimmed[2][1] >= 0.5 - 1.0e-9
+    # trimming the TAIL leaves the head alone just as much
+    tailtrimmed = VE.composetiles((0.0, 3.0), (0.0, 4.0), 100.0, 72.0, 0.0,
+                                  tint, (49, 88), fallback)
+    for t in 0.2:0.2:2.8
+        @test secat(full, t) == secat(tailtrimmed, t)
+    end
+end
+
 @testset "transition roundtrip" begin
     src = VideoSource(testvideo)
     seq = Sequence(src)
