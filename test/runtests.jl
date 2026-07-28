@@ -896,7 +896,10 @@ catch e
     @warn "skipping UI interaction tests (no GL context)" exception = e
     false
 end
+include("agentview.jl")   # what an AGENT sees (headless: no window needed)
+
 canui && include("interactions.jl")
+canui && include("fuzz.jl")   # random edit programs vs the picture (needs a Player)
 
 @testset "Thumbnails" begin
     src = VideoSource(testvideo)
@@ -924,4 +927,191 @@ canui && include("interactions.jl")
     # upscale path stays nearest (no zero-count cells → no black pixels)
     big = VE.downscale(checker, 128, 128)
     @test all(c -> Float32(c.g) in (0.0f0, 1.0f0), big)
+end
+
+@testset "matte track, effect and keyframes" begin
+    src = VideoSource(testvideo2)              # smptebars 480x270, strong colour blocks
+    clip = Clip(src; src_in = 0, src_out = 12)
+
+    # --- propagation from a marked frame
+    rect = (0.1, 0.1, 0.3, 0.3)
+    mask = VideoEditor.seedmask(clip, rect)
+    @test size(mask) == (src.width, src.height)
+    @test any(!=(0x00), mask)
+
+    reader = let sr = VideoEditor.SequentialReader(src),
+                 buf = VideoEditor.RGBFrame(undef, src.width, src.height)
+        sf -> (VideoEditor.readframe!(buf, sr, Int(sf)); copy(buf))
+    end
+    track = VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); mattewidth = 96)
+    @test clip.mattetrack === track
+    @test size(track.alpha, 3) == 12
+    @test track.seeds == [0]
+    @test track.src_in == 0
+    # the marked region must come out more opaque than the far corner
+    mw, mh = VideoEditor.mattesize(track)
+    inside = Int(track.alpha[max(1, mw ÷ 5), max(1, mh ÷ 5), 1])
+    outside = Int(track.alpha[mw - 1, mh - 1, 1])
+    @test inside > outside
+
+    # --- applying: same function the GPU node calls
+    frame = reader(0)
+    keyed = VideoEditor.applymatte!(copy(frame), clip, 0; strength = 1.0)
+    @test size(keyed) == size(frame)
+    # strength 0 is an exact no-op, so a keyframe can fade the matte in from nothing
+    @test VideoEditor.applymatte!(copy(frame), clip, 0; strength = 0.0) == frame
+    # a frame outside the analyzed range is untouched, not blacked out
+    @test VideoEditor.applymatte!(copy(frame), clip, 999; strength = 1.0) == frame
+    # somewhere the matte actually darkened the background
+    @test any(keyed[i] != frame[i] for i in eachindex(frame))
+
+    # --- effect: registries, neutrality, serialization
+    @test VideoEditor.isneutral(MatteEffect(0.0, 0.0))
+    @test !VideoEditor.isneutral(MatteEffect(1.0, 0.0))
+    @test VideoEditor.effectfromdict(VideoEditor.effectdict(MatteEffect(0.7, 0.2))) ==
+          MatteEffect(0.7f0, 0.2f0)
+    k = only(filter(x -> x.name === :matte, VideoEditor.BUILTIN_KINDS))
+    @test k.kfkeys == [:matte_strength, :matte_feather]
+    @test k.matches(MatteEffect(1.0, 0.0))
+    @test k.read(MatteEffect(0.5, 0.25)) == (strength = 0.5, feather = 0.25)
+    @test k.make((strength = 0.5, feather = 0.25)) == MatteEffect(0.5f0, 0.25f0)
+
+    # --- keyframes drive it through the normal param path
+    push!(clip.effects, VideoEditor.FxSlot(MatteEffect()))
+    curve(k) = get!(() -> VideoEditor.AnimCurve(VideoEditor.Keyframe[], :linear),
+                    clip.animations, k)
+    VideoEditor.setkey!(curve(:matte_strength), 0, 0.0)
+    VideoEditor.setkey!(curve(:matte_strength), 11, 1.0)
+    @test VideoEditor.valueat(clip.animations[:matte_strength], 0) ≈ 0.0
+    e0 = VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 0), MatteEffect)
+    e1 = VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 11), MatteEffect)
+    @test e0.strength ≈ 0.0f0
+    @test e1.strength ≈ 1.0f0
+    # feather keyframes must not clobber strength (shared-effect rebuild)
+    VideoEditor.setkey!(curve(:matte_feather), 11, 0.5)
+    e1b = VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 11), MatteEffect)
+    @test e1b.strength ≈ 1.0f0 && e1b.feather ≈ 0.5f0
+
+    # --- the graph builds a MatteNode for it
+    g = VideoEditor.graphof(VideoEditor.effectiveclip(clip, 11))
+    @test any(n -> n isa VideoEditor.MatteNode, g.nodes)
+
+    # --- project round-trip: seeds in the file, alpha in the sidecar
+    path = joinpath(mktempdir(), "matte.toml")
+    seq = Sequence([clip], 30.0)
+    saveproject(path, seq)
+    @test isfile(VideoEditor.mattefile(path, clip.id))
+    seq2 = loadproject(path)
+    t2 = seq2.clips[1].mattetrack
+    @test t2 !== nothing
+    @test t2.seeds == [0]
+    @test t2.alpha == track.alpha
+    # a missing sidecar must not lose the edit: seeds survive, alpha comes back zeroed
+    rm(VideoEditor.mattefile(path, clip.id))
+    seq3 = loadproject(path)
+    @test seq3.clips[1].mattetrack.seeds == [0]
+    @test all(==(0x00), seq3.clips[1].mattetrack.alpha)
+
+    # --- a registered propagator takes over
+    called = Ref(0)
+    VideoEditor.registermatte!((frames, seeds; progress = nothing) -> begin
+        called[] += 1
+        fill(0xff, size(frames[1])..., length(frames))
+    end)
+    try
+        @test VideoEditor.hasmattemodel()
+        t4 = VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); mattewidth = 96)
+        @test called[] == 1
+        @test all(==(0xff), t4.alpha)
+    finally
+        VideoEditor.MATTEPROPAGATOR[] = nothing
+    end
+    @test !VideoEditor.hasmattemodel()
+end
+
+@testset "restore effect and cache" begin
+    src = VideoSource(testvideo2)
+    clip = Clip(src; src_in = 0, src_out = 6)
+
+    # a stand-in restorer: 2x nearest upscale, so the test needs no model
+    called = Ref(0)
+    # a `do` block cannot declare keyword arguments, and the contract has one
+    function fakerestore(frames; progress = nothing)
+        called[] += 1
+        map(frames) do f
+            w, h = size(f)
+            out = Matrix{VideoEditor.RGB{VideoEditor.N0f8}}(undef, 2w, 2h)
+            for j in 1:2h, i in 1:2w
+                # inverted, so applying it is observable — a plain nearest
+                # upscale samples back down to the original pixel exactly and
+                # would make the apply test vacuous
+                c = f[cld(i, 2), cld(j, 2)]
+                out[i, j] = VideoEditor.RGB{VideoEditor.N0f8}(
+                    1 - VideoEditor.red(c), 1 - VideoEditor.green(c), 1 - VideoEditor.blue(c))
+            end
+            out
+        end
+    end
+    VideoEditor.registerrestore!(fakerestore; scale = 2)
+    try
+        @test VideoEditor.hasrestoremodel()
+        @test VideoEditor.restorescale() == 2
+
+        sr = VideoEditor.SequentialReader(src)
+        buf = VideoEditor.RGBFrame(undef, src.width, src.height)
+        rd = sf -> (VideoEditor.readframe!(buf, sr, Int(sf)); buf)
+
+        n = restorewindow!(clip, rd, 0, 4)
+        @test n == 4
+        @test called[] == 1
+        @test VideoEditor.hasrestored(clip, 0)
+        @test !VideoEditor.hasrestored(clip, 5)          # outside the window
+        img = VideoEditor.restorecache(clip).frames[0]
+        @test size(img) == (2 * src.width, 2 * src.height)
+
+        # applying: same function the graph node calls
+        frame = copy(rd(0))
+        orig = copy(frame)
+        applyrestore!(frame, clip, 0; strength = 1.0)
+        @test any(frame[i] != orig[i] for i in eachindex(frame))
+        # strength 0 and an un-restored frame are both exact no-ops
+        f2 = copy(orig); applyrestore!(f2, clip, 0; strength = 0.0)
+        @test f2 == orig
+        f3 = copy(orig); applyrestore!(f3, clip, 5; strength = 1.0)
+        @test f3 == orig
+
+        # the cache is bounded and evicts oldest-first
+        c = VideoEditor.RestoreCache(2)
+        for k in 1:4
+            VideoEditor.putrestored!(c, k, fill(VideoEditor.RGB{VideoEditor.N0f8}(0, 0, 0), 2, 2))
+        end
+        @test length(c.frames) == 2
+        @test haskey(c.frames, 4) && !haskey(c.frames, 1)
+
+        # effect + registries
+        @test VideoEditor.isneutral(RestoreEffect(0.0))
+        @test !VideoEditor.isneutral(RestoreEffect(1.0))
+        @test VideoEditor.effectfromdict(VideoEditor.effectdict(RestoreEffect(0.6))) ==
+              RestoreEffect(0.6f0)
+        k = only(filter(x -> x.name === :restore, VideoEditor.BUILTIN_KINDS))
+        @test k.kfkeys == [:restore_strength]
+        @test k.read(RestoreEffect(0.5)) == (strength = 0.5,)
+
+        # keyframable through the normal param path
+        push!(clip.effects, VideoEditor.FxSlot(RestoreEffect()))
+        cur = get!(() -> VideoEditor.AnimCurve(VideoEditor.Keyframe[], :linear),
+                   clip.animations, :restore_strength)
+        VideoEditor.setkey!(cur, 0, 0.0)
+        VideoEditor.setkey!(cur, 5, 1.0)
+        @test VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 0), RestoreEffect).strength ≈ 0.0f0
+        @test VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 5), RestoreEffect).strength ≈ 1.0f0
+
+        # the graph builds a RestoreNode
+        g = VideoEditor.graphof(VideoEditor.effectiveclip(clip, 5))
+        @test any(n -> n isa VideoEditor.RestoreNode, g.nodes)
+    finally
+        VideoEditor.RESTOREMODEL[] = nothing
+        VideoEditor.clearrestore!()
+    end
+    @test !VideoEditor.hasrestoremodel()
 end

@@ -236,10 +236,27 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test target2 == src2 && isempty(protect2)
         end
 
-        @testset "drop a second source" begin
-            # state: two clips (0.7s split of a 45-frame clip), 45 frames total
+        @testset "dropping files fills the media bin" begin
+            # state: two clips (0.7s split of a 45-frame clip), 45 frames total.
+            # A drop from the file manager IMPORTS (it does not edit the
+            # timeline): the bin opens itself so the new rows are visible, every
+            # file in the drop is accounted for, and the probing happens off the
+            # UI thread — which is why these are waitfor and not plain reads.
             nclips = length(p.sequence.clips)
-            ev.dropped_files[] = [testvideo2]      # what GLFW delivers on file drop
+            nbin = length(p.mediasources[])
+            VE.opendock!(p, :effects); sleep(0.2)          # bin CLOSED before the drop
+            ev.dropped_files[] = [testvideo2, testvideo, "/nonexistent/nope.mp4"]
+            @test p.dockopen[] === :media                  # …opens itself on the drop
+            @test waitfor(() -> length(p.mediasources[]) == nbin + 1)
+            @test last(p.mediasources[]).width == 480
+            @test length(p.sequence.clips) == nclips       # nothing placed on the timeline
+            @test waitfor(() -> occursin("imported", p.status[]))
+            @test occursin("already in the bin", p.status[])   # testvideo was there
+            @test occursin("couldn't open nope.mp4", p.status[])
+            @test waitfor(() -> isempty(p.fxwidgets[:dropstatus][]))  # zone back to idle
+            @test isnan(p.jobprogress[])                   # …and the footer job is done
+
+            VE.addsource!(p, testvideo2)                   # place it: the multi-source beats
             @test length(p.sequence.clips) == nclips + 1
             @test length(tl.clipplots) == nclips + 1
             added = p.sequence.clips[end]
@@ -618,6 +635,59 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             keypress(Keyboard.enter)
             @test length(clip.effects) == nfx2 + 1
             @test clip.effects[end].effect isa VE.ColorEffect
+        end
+
+        @testset "the Add effect menu survives a search that matches nothing" begin
+            # Simon, 2026-07-27: picking the first entry ("Color") or the first
+            # search hit in the fx menu did nothing. A query with NO hits emptied
+            # the menu's per-option color vectors; the next hit then resolved the
+            # option text plot against them and threw inside the compute graph —
+            # which kills the GLMakie render loop, so the whole window went numb.
+            VE.opendock!(p, :effects); sleep(0.3)
+            press(tlx(2.0)); release()
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            nfx = length(clip.effects)
+            menu = p.fxwidgets[:addeffect]
+            optiontexts = menu.blockscene.children[1].plots[2]
+            menu.is_open[] = true; sleep(0.1)
+            foreach(c -> ev.unicode_input[] = c, "colq")   # "colq" matches nothing
+            @test isempty(optiontexts.text[])
+            keypress(Keyboard.backspace)                   # back to "col" → Color first
+            @test first(optiontexts.text[]) == "Color"
+            @test length(optiontexts.color[]) == length(optiontexts.text[])
+            keypress(Keyboard.enter)                       # ⏎ takes the first hit
+            @test !menu.is_open[]
+            @test length(clip.effects) == nfx + 1
+            @test clip.effects[end].effect isa VE.ColorEffect
+        end
+
+        @testset "the FIRST row of a dropdown is clickable" begin
+            # Simon, 2026-07-27: "ich kann immer noch nicht color auswählen als
+            # erstes". The A/B compare button sits directly under the "+ Add
+            # effect…" menu, and its priority-100 bbox hit test swallowed the
+            # press on the dropdown's first row: a raw bbox test cannot see what
+            # is DRAWN over it. Rows 2+ hang below the button and always worked,
+            # which is exactly why this never showed up in a test before.
+            VE.opendock!(p, :effects); sleep(0.3)
+            press(tlx(2.0)); release()
+            clip = VE.locate(p.sequence, p.playhead[])[1]
+            nfx = length(clip.effects)
+            menu = p.fxwidgets[:addeffect]
+            menuscene = menu.blockscene.children[end]
+            bb = menu.layoutobservables.computedbbox[]
+            sleep(0.5)                                    # clear the dblclick window
+            press(Point2f(bb.origin .+ bb.widths ./ 2)); release()
+            @test menu.is_open[]
+            rects = menuscene.plots[1][1][]
+            tr = Makie.translation(menuscene)[]
+            row1 = Point2f(sum(extrema(rects[1])) ./ 2 .+ Point2f(tr[1], tr[2]))
+            # the overlap is REAL — this is the whole point of the regression
+            @test row1 in p.fxwidgets[:compare].layoutobservables.computedbbox[]
+            press(row1); release(); sleep(0.3)
+            @test !menu.is_open[]
+            @test length(clip.effects) == nfx + 1
+            @test clip.effects[end].effect isa VE.ColorEffect
+            @test p.applytracks[]        # …and the compare bypass never fired
         end
 
         @testset "keyframe overlay edits the param you click" begin
@@ -1149,6 +1219,8 @@ end
     p = Player(testvideo; gpupreview = false)
     sleep(1.5)
     ev = Makie.events(p.fig)
+    p.fxwidgets[:browse] = () -> nothing   # the storm clicks everywhere, and the bin's
+                                           # drop zone would open a BLOCKING native dialog
     # dock-panel widgets live outside fig.content — include them in the storm
     buttons = vcat([b for b in p.fig.content if b isa Makie.Button],
                    [w for w in values(p.fxwidgets) if w isa Makie.Button])

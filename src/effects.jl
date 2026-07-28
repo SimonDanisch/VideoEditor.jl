@@ -20,6 +20,34 @@ struct SharpenEffect <: Effect
     amount::Float32
 end
 
+"""
+Keys the frame against the clip's subject matte (see `analyzematte!`).
+
+Holds no matte itself — the pixels live on the clip's `MatteTrack`, so this stays
+a couple of scalars that the keyframe registry can animate like any other. That
+is the point of the split: `strength` fading 0→1 is a keyframed reveal, and
+`feather` softening an edge over time is a keyframed edge, both with no
+re-analysis.
+"""
+struct MatteEffect <: Effect
+    strength::Float32
+    feather::Float32
+end
+MatteEffect(; strength = 1.0, feather = 0.0) = MatteEffect(Float32(strength), Float32(feather))
+
+"""
+Replaces the frame with a restoration model's output (see `restore.jl`).
+
+Holds only `strength`, for the same reason `MatteEffect` does: the pixels live in
+the clip's restore cache, so this stays a scalar the keyframe registry can
+animate. Cross-fading it in is a legitimate edit — a restoration is a judgement
+call, and half of one is often what you want.
+"""
+struct RestoreEffect <: Effect
+    strength::Float32
+end
+RestoreEffect(; strength = 1.0) = RestoreEffect(Float32(strength))
+
 "Composite opacity: scales the frame toward black by `α` (1 = opaque). The main
 use is a keyframed fade in/out; on a single track α<1 fades to black."
 struct OpacityEffect <: Effect
@@ -30,6 +58,8 @@ isneutral(e::ColorEffect) = GPUFiltering.isneutral(e.adj)
 isneutral(e::BlurEffect) = e.σ <= 0
 isneutral(e::SharpenEffect) = e.amount <= 0
 isneutral(e::OpacityEffect) = e.α >= 0.999f0
+isneutral(e::MatteEffect) = e.strength <= 0.001f0
+isneutral(e::RestoreEffect) = e.strength <= 0.001f0
 
 """
     liveeffects(clip)
@@ -74,6 +104,10 @@ effectdict(e::BlurEffect) = Dict{String, Any}("type" => "blur", "sigma" => e.σ)
 effectdict(e::SharpenEffect) =
     Dict{String, Any}("type" => "sharpen", "sigma" => e.σ, "amount" => e.amount)
 effectdict(e::OpacityEffect) = Dict{String, Any}("type" => "opacity", "alpha" => e.α)
+effectdict(e::RestoreEffect) =
+    Dict{String, Any}("type" => "restore", "strength" => e.strength)
+effectdict(e::MatteEffect) =
+    Dict{String, Any}("type" => "matte", "strength" => e.strength, "feather" => e.feather)
 
 "A stack entry as a project-file dict: the effect plus its id and enabled state."
 slotdict(s::FxSlot) = merge(effectdict(s.effect),
@@ -100,6 +134,8 @@ function effectfromdict(d::AbstractDict)
     t == "blur" && return BlurEffect(Float32(d["sigma"]))
     t == "sharpen" && return SharpenEffect(Float32(d["sigma"]), Float32(d["amount"]))
     t == "opacity" && return OpacityEffect(Float32(d["alpha"]))
+    t == "restore" && return RestoreEffect(Float32(d["strength"]))
+    t == "matte" && return MatteEffect(Float32(d["strength"]), Float32(get(d, "feather", 0.0)))
     t == "plugin" && return plugineffectfromdict(d)   # requires the plugin registered
     error("unknown effect type: $t")
 end
@@ -185,6 +221,17 @@ const PARAMS = ParamSpec[
     ParamSpec(:sharpen, "Sharpen", :sharpen, 0.0, 2.0, 0.0,
         c -> (e = findeffect(c, SharpenEffect); e === nothing ? 0.0 : Float64(e.amount)),
         (c, v) -> seteffect!(c, SharpenEffect(2.0f0, Float32(v)))),
+    ParamSpec(:restore_strength, "Restore", :restore, 0.0, 1.0, 1.0,
+        c -> (e = findeffect(c, RestoreEffect); e === nothing ? 1.0 : Float64(e.strength)),
+        (c, v) -> seteffect!(c, RestoreEffect(Float32(v)))),
+    ParamSpec(:matte_strength, "Matte", :matte, 0.0, 1.0, 1.0,
+        c -> (e = findeffect(c, MatteEffect); e === nothing ? 1.0 : Float64(e.strength)),
+        (c, v) -> (e = findeffect(c, MatteEffect);
+                   seteffect!(c, MatteEffect(Float32(v), e === nothing ? 0.0f0 : e.feather)))),
+    ParamSpec(:matte_feather, "Feather", :matte, 0.0, 1.0, 0.0,
+        c -> (e = findeffect(c, MatteEffect); e === nothing ? 0.0 : Float64(e.feather)),
+        (c, v) -> (e = findeffect(c, MatteEffect);
+                   seteffect!(c, MatteEffect(e === nothing ? 1.0f0 : e.strength, Float32(v))))),
     ParamSpec(:crop_x, "Pan X", :geometry, 0.0, 1.0, 0.0,
         c -> c.crop[1], (c, v) -> (c.crop = (clampunit(v), c.crop[2], c.crop[3], c.crop[4]))),
     ParamSpec(:crop_y, "Pan Y", :geometry, 0.0, 1.0, 0.0,
@@ -220,7 +267,8 @@ alpha, not a per-pixel fade to black."
 withoutopacity(clip::Clip) =
     Clip(clip.id, clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
          filter(s -> !(s.effect isa OpacityEffect), clip.effects),
-         clip.colortrack, clip.motiontrack, clip.animations, clip.track, clip.blendfrom)
+         clip.colortrack, clip.motiontrack, clip.mattetrack, clip.animations, clip.track,
+              clip.blendfrom)
 
 """
     effectiveclip(clip, srcframe) -> Clip
@@ -237,7 +285,8 @@ function effectiveclip(clip::Clip, srcframe::Integer)
     # clip the user is editing
     ec = Clip(clip.id, clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
               [FxSlot(s.id, s.effect, s.enabled) for s in clip.effects],
-              clip.colortrack, clip.motiontrack, clip.animations, clip.track, clip.blendfrom)
+              clip.colortrack, clip.motiontrack, clip.mattetrack, clip.animations, clip.track,
+              clip.blendfrom)
     for (key, curve) in clip.animations
         haskey(PARAMBYKEY, key) || continue
         v = valueat(curve, srcframe)

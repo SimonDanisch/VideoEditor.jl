@@ -45,6 +45,8 @@ include("player.jl")
 include("glbridge.jl")
 include("audiopreview.jl")
 include("audio.jl")
+include("matte.jl")
+include("restore.jl")
 include("colorstab.jl")
 include("motionstab.jl")
 include("bundlestab.jl")
@@ -52,17 +54,21 @@ include("export.jl")   # sourceinto! dispatches on GpuVideoStream — needs the 
 include("campath.jl")  # GrayReader wraps export's SequentialReader; grayinto! needs GpuVideoStream
 include("plugins.jl")
 include("tools.jl")    # GUI tools: timeline-overlay hints + premade operations
+include("agentview.jl")  # what an AGENT sees: contact sheets, zoom, change search
 include("mcp.jl")
 
 export VideoSource, Player, Clip, Sequence
 export play!, pause!, step!
 export split!, deleteclip!, moveclip!, addsource!, saveproject, loadproject
-export ColorEffect, BlurEffect, SharpenEffect, seteffect!
+export ColorEffect, BlurEffect, SharpenEffect, MatteEffect, seteffect!
+export MatteTrack, analyzematte!, applymatte!, registermatte!, seedmask
+export RestoreEffect, registerrestore!, restorewindow!, applyrestore!
 export registerplugin!, FxParam, FxPlugin, Pointwise, Stencil
 export registertool!, EditorTool, ToolContext, toolplot!, ontool!, tooltime, toolband
 export activatetool!, deactivatetool!
 export exportvideo, exportgif, analyzecolor!, analyzemotion!, analyzeobject!, findloop
 export loopsignatures, similarframes
+export contactsheet, filmstrip, framegrab, regiongrab, findchange, viewsummary
 export generateproxy, startproxy!
 export mcpserve!
 

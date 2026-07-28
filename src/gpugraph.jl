@@ -147,6 +147,15 @@ pointwiseop(::FxNode) = false
 struct SourceNode <: FxNode end                                      # the decoded frame
 struct MotionNode <: FxNode; input::Int; end                         # stabilization warp
 struct ColorTrackNode <: FxNode; input::Int; end                     # per-frame color stabilization
+struct RestoreNode <: FxNode                                         # model-restored frame
+    input::Int
+    strength::Float32
+end
+struct MatteNode <: FxNode                                           # per-frame subject matte
+    input::Int
+    strength::Float32
+    feather::Float32
+end
 struct ColorNode <: FxNode; input::Int; adj::ColorAdjustments; end
 struct BlurNode <: FxNode; input::Int; σ::Float32; end
 struct SharpenNode <: FxNode; input::Int; σ::Float32; amount::Float32; end
@@ -155,6 +164,8 @@ struct PixelNode{K <: FxKind} <: FxNode; input::Int; kind::K; end    # a callbac
 
 inputs(n::MotionNode) = (n.input,)
 inputs(n::ColorTrackNode) = (n.input,)
+inputs(n::MatteNode) = (n.input,)
+inputs(n::RestoreNode) = (n.input,)
 inputs(n::ColorNode) = (n.input,)
 inputs(n::BlurNode) = (n.input,)
 inputs(n::SharpenNode) = (n.input,)
@@ -184,6 +195,18 @@ end
 function eval_node!(n::ColorTrackNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
     out = canmutate ? ins[1] : copyacquire!(pool, ins[1])
     applycolortrack!(out, ctx.clip, ctx.served[])
+    return out
+end
+# like the matte, restored frames are keyed by the frame actually served
+function eval_node!(n::RestoreNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
+    out = canmutate ? ins[1] : copyacquire!(pool, ins[1])
+    applyrestore!(out, ctx.clip, ctx.served[]; strength = n.strength)
+    return out
+end
+# the matte is per-frame data like the tracks above, so it samples `served` too
+function eval_node!(n::MatteNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
+    out = canmutate ? ins[1] : copyacquire!(pool, ins[1])
+    applymatte!(out, ctx.clip, ctx.served[]; strength = n.strength, feather = n.feather)
     return out
 end
 function eval_node!(n::ColorNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
@@ -260,6 +283,8 @@ end
 
 # ---------------------------------------------------------------- build from a clip
 
+nodefor(e::RestoreEffect, input) = RestoreNode(input, e.strength)
+nodefor(e::MatteEffect, input) = MatteNode(input, e.strength, e.feather)
 nodefor(e::ColorEffect, input) = ColorNode(input, e.adj)             # specialized kernels
 nodefor(e::BlurEffect, input) = BlurNode(input, e.σ)
 nodefor(e::SharpenEffect, input) = SharpenNode(input, e.σ, e.amount)
@@ -320,5 +345,57 @@ function render(f, engine::FxEngine, source, clip::Clip, frame::Integer;
         return f(out)
     finally
         release!(engine.pool, out)
+    end
+end
+
+"""
+    composite(f, engine, clips, n, sourcefor; applytracks, playing, exact) -> Bool
+
+The stack of `clips` (bottom track → top) at timeline frame `n` as ONE image,
+handed to `f(canvas)`; returns whether it was rendered. Per layer: [`render`]'s
+effect graph, then its crop BAKED into the canvas with `warp!`, then an alpha
+blend by the layer's opacity — opacity is the layer alpha here, not a fade to
+black inside the graph.
+
+`sourcefor(clip, srcframe)` is the ONE thing that differs between the tiers: a
+`GpuVideoStream` for the GPU preview, a decoded `RGBFrame` from the ring for the
+CPU preview, an export decoder for the render. Returning `nothing` means "that
+layer isn't there yet" and aborts the composite (`false`) — the caller falls
+back. Everything the PICTURE depends on lives here, once: preview and export,
+CPU and GPU, cannot drift apart (they did: the GPU preview forgot that a baked
+canvas must be shown whole, so a stabilized clip's crop was applied twice for
+the length of a blend).
+"""
+function composite(f, engine::FxEngine, clips, n::Integer, sourcefor;
+                   applytracks::Bool = true, playing::Bool = false, exact::Bool = false)
+    pool = engine.pool
+    W, H = clips[end].source.width, clips[end].source.height
+    accum = acquire!(pool, (W, H))
+    warpbuf = nothing
+    try
+        for (k, clip) in enumerate(clips)
+            srcframe = clip.src_in + (n - clip.start)
+            source = sourcefor(clip, srcframe)
+            source === nothing && return false
+            lclip = withoutopacity(effectiveclip(clip, srcframe))
+            layer = execute!(graphof(lclip; applytracks = applytracks), pool,
+                             FxContext(source, lclip, srcframe, playing; exact))
+            α = Float32(clamp(paramvalue(clip, :opacity, srcframe), 0.0, 1.0))
+            if k == 1                                   # the bottom layer sits on black:
+                warp!(accum, layer, lclip.crop)         # (1-α)·0 + α·layer = α·layer
+                α < 0.999f0 && channellinear!(accum, Vec3f(α), Vec3f(0))
+            else
+                warpbuf === nothing && (warpbuf = acquire!(pool, (W, H)))
+                warp!(warpbuf, layer, lclip.crop)
+                blend!(accum, accum, warpbuf, α)
+            end
+            release!(pool, layer)
+        end
+        KA.synchronize(pool.backend)
+        f(accum)
+        return true
+    finally
+        warpbuf === nothing || release!(pool, warpbuf)
+        release!(pool, accum)
     end
 end

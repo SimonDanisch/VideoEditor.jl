@@ -72,10 +72,13 @@ the playhead), crop drags a rectangle on the preview; ✕/↶/↷ (delete/undo/r
 act at the playhead. The timeline spans the full window width. The preview
 fills the whole available width when a crop/zoom makes it wider than the source.
 
-- **Bin** — imported sources, each with a first-frame thumbnail. *Import clip…*
-  opens a native file dialog; press a row and drag it onto the timeline (a
-  translucent drop-region preview shows where it lands) to place a clip.
-  Dropping video files on the window imports them too.
+- **Bin** — imported sources, each with a first-frame thumbnail. Drop video
+  files anywhere on the window (any number at once) and they land here — the
+  Bin opens itself, the drop zone counts the files through, and the status
+  line accounts for every one of them (imported / already in the bin / would
+  not open). The zone is also a button: clicking it opens a native file
+  dialog. From there, press a row and drag it onto the timeline (a translucent
+  drop-region preview shows where it lands) to place a clip.
 - **Out** — output path (native save dialog), format (mp4/mkv/mov or animated
   **gif**), codec, quality (crf), preset, audio toggle, and GIF fps/loop; then
   *Export video* / *Export GIF* renders in the background.
@@ -112,6 +115,35 @@ claude mcp add --transport http videoedit http://localhost:8765
 The agent can then inspect state, look at rendered frames, cut, move, crop,
 grade, stabilize and export — e.g. "look through this video, cut out the
 boring parts and make it warmer" works against the live editor window.
+
+### Seeing the edit without filling the context
+
+A frame per second of footage buries a model in tokens, so the viewing API
+(`src/agentview.jl`, MCP tools `view_sheet` / `view_strip` / `view_region` /
+`find_change`) is a **zoom**, not a dump. Every image is rendered by
+`renderframe!` — the function the encoder writes — so what the agent sees IS
+what the export produces: effects, keyframes, stabilization, crop, transitions,
+track composites.
+
+| call | what you get | cost |
+| --- | --- | --- |
+| `contactsheet(seq)` | the whole timeline as one numbered grid | 64 frames ≈ 350 vision tokens (512 px) |
+| `contactsheet(seq, t0, t1)` | the same for the interval a cell pointed at | one image per zoom level |
+| `filmstrip(seq, t0, t1)` | a short span in one row, bigger | ~8 frames |
+| `regiongrab(seq, t, rect)` | one rectangle of one frame at real pixel detail | one image |
+| `findchange(seq, t0, t1)` | the moment the picture changes, by bisection | O(log n) renders |
+
+Each sheet returns a manifest (`index → time, frame, clip`), so "cell 27" is a
+time you can zoom into: every level divides the span by the cell count, and
+three levels take ten minutes down to single frames. Cuts of the *edit* need no
+search at all — they are clip boundaries in `get_state` / `viewsummary(seq)`.
+
+```julia
+sheet, manifest = contactsheet(player)            # where is anything interesting?
+t = manifest[27].time                             # cell 27 → 6.5 s
+sheet2, _ = contactsheet(player, t - 0.5, t + 0.5)   # …and zoom in
+detail = regiongrab(player, t, (0.4, 0.3, 0.2, 0.2)) # …or zoom spatially
+```
 
 ## Demo
 

@@ -228,37 +228,17 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
             setupgpupreview!(player, gp, W, H)
         end
         nxt = gp.doublebuffer ? 3 - gp.cur : gp.cur   # same switch as presentgpu!
-        rungpuowned(player, gp) do
+        # the GPU tier of ONE composite (see `composite`): its only job is to
+        # name each layer's stream and to blit the finished canvas
+        ok = rungpuowned(player, gp) do
             gp.engine === nothing && (gp.engine = FxEngine(player.analysisbackend))
-            pool = gp.engine.pool
-            accum = acquire!(pool, (W, H))
-            first = true
-            for clip in clips
-                srcframe = clip.src_in + (n - clip.start)
-                stream = player.gpucache[clip.source]
-                # graph WITHOUT opacity — it becomes the layer alpha, not a fade to black
-                gclip = withoutopacity(effectiveclip(clip, srcframe))
-                layer = execute!(graphof(gclip; applytracks = player.applytracks[]), pool,
-                                 FxContext(stream, gclip, srcframe, player.playing[]))
-                α = Float32(clamp(paramvalue(clip, :opacity, srcframe), 0.0, 1.0))
-                if first
-                    warp!(accum, layer, gclip.crop)                  # bake crop into the canvas
-                    α < 0.999f0 && channellinear!(accum, Vec3f(α), Vec3f(0))
-                    first = false
-                else
-                    warpbuf = acquire!(pool, (W, H))
-                    warp!(warpbuf, layer, gclip.crop)
-                    blend!(accum, accum, warpbuf, α)              # (1-α)·below + α·layer
-                    release!(pool, warpbuf)
-                end
-                release!(pool, layer)
+            composite(gp.engine, clips, n, (clip, _) -> player.gpucache[clip.source];
+                      applytracks = player.applytracks[], playing = player.playing[]) do canvas
+                gp.packed .= packrgba.(reshape(canvas, W * H))
+                copyto!(gp.eimages[nxt], gp.packed)
             end
-            KA.synchronize(pool.backend)
-            gp.packed .= packrgba.(reshape(accum, W * H))
-            copyto!(gp.eimages[nxt], gp.packed)
-            release!(pool, accum)
-            nothing
         end
+        ok === true || return false
         player.screen.cache[objectid(player.previewplot)].uniforms[:image] = gp.gltex[nxt]
         gp.cur = nxt
         player.screen.requires_update = true
@@ -339,9 +319,13 @@ function preloadgpu!(player::Player, source::VideoSource)
     gp isa GPUPreview || return nothing
     haskey(player.gpucache, source) && return nothing
     stream = nothing
+    # a mezzanine transcoded earlier for this source IS the streamable version —
+    # a later run opens on it directly instead of failing the probe again
+    mezz = mezzaninepath(source)
+    path = isfile(mezz) ? mezz : source.path
     Threads.atomic_add!(player.gpubusy, 1)   # presents stay on the CPU tier during warmup
     try
-        stream = openstream(player.analysisbackend, source.path, source.width, source.height;
+        stream = openstream(player.analysisbackend, path, source.width, source.height;
                             capacity = GPU_STREAM_CAPACITY)
         # probe: decode GOP 0, confirm it's supported at the display size
         # (cold this also compiles the decode session + kernels)
@@ -380,6 +364,8 @@ Transcode `source` into the editing mezzanine in the background (footer
 progress) and, when done, open the GPU stream ON the mezzanine file — keyed by
 the ORIGINAL source, so playback flips from the CPU tier to pure-GPU streaming
 transparently. Export keeps reading the original (no generation loss).
+[`preloadgpu!`](@ref) picks the finished mezzanine up from the cache path by
+itself, so the open lives in ONE place.
 """
 function startmezzanine!(player::Player, source::VideoSource)
     jobs = get!(() -> Set{String}(), player.fxwidgets, :mezzjobs)
@@ -388,34 +374,14 @@ function startmezzanine!(player::Player, source::VideoSource)
     Threads.@spawn try
         setstatus!(player, "$(basename(source.path)): preparing editing mezzanine…")
         player.jobprogress[] = 0.0
-        mezz = generatemezzanine(source;
+        generatemezzanine(source;
             progress = (d, t) -> (player.jobprogress[] = d / max(t, 1)))
         player.jobprogress[] = NaN
         gp = player.gpupreview
         gp isa GPUPreview || return nothing
-        Threads.atomic_add!(player.gpubusy, 1)
-        stream = nothing
-        try
-            stream = openstream(player.analysisbackend, mezz, source.width, source.height;
-                                capacity = GPU_STREAM_CAPACITY)
-            ok = rungpusync(player) do
-                f = frameat!(stream, 0)
-                size(f.y) == (source.width, source.height)
-            end
-            if ok
-                player.gpucache[source] = stream
-                setstatus!(player, "$(basename(source.path)) — GPU streaming via mezzanine")
-                player.playing[] || put!(player.uiqueue, () -> notify(player.playhead))
-            else
-                close(stream)
-            end
-        catch e
-            stream === nothing || (try; close(stream); catch; end)
-            setstatus!(player, "$(basename(source.path)): mezzanine stream failed — CPU decode " *
-                               "($(sprint(showerror, e)))")
-        finally
-            Threads.atomic_sub!(player.gpubusy, 1)
-        end
+        delete!(jobs, source.path)          # the file is there now; retries may re-run
+        preloadgpu!(player, source)         # opens ON the mezzanine (cache path)
+        player.playing[] || put!(player.uiqueue, () -> notify(player.playhead))
     catch e
         player.jobprogress[] = NaN
         setstatus!(player, "mezzanine transcode failed: $(sprint(showerror, e))")

@@ -53,25 +53,7 @@ function exportvideo(path::AbstractString, seq::Sequence;
                                     encoder_options = encoder_options)
     try
         for n in 0:(total - 1)
-            tr = transitionat(seq, n)
-            sample = tr === nothing ? nothing : transitionsample(seq, tr, n)
-            if sample !== nothing
-                left, srcA, right, srcB, p = sample
-                rendercanvas!(outbuf, left, srcA, readers, engine)
-                rendercanvas!(transbuf, right, srcB, readers, engine)
-                blend!(outbuf, outbuf, transbuf, p)
-            elseif ntracks(seq) > 1 && length(clipsat(seq, n)) > 1
-                fillblack!(outbuf, blackhost)                   # composite the track stack
-                for clip in clipsat(seq, n)                     # bottom → top
-                    sf = clip.src_in + (n - clip.start)
-                    rendercanvas!(layerbuf, clip, sf, readers, engine; skipopacity = true)
-                    blend!(outbuf, outbuf, layerbuf, Float32(clamp(paramvalue(clip, :opacity, sf), 0.0, 1.0)))
-                end
-            else
-                loc = locate(seq, n)
-                loc === nothing ? fillblack!(outbuf, blackhost) :
-                                  rendercanvas!(outbuf, loc[1], loc[2], readers, engine)
-            end
+            renderframe!(outbuf, seq, n, readers, engine; scratch = transbuf, black = blackhost)
             writeframe!(writer, outbuf, hostout, backend)
             progress === nothing || n % 30 == 0 && progress(n + 1, total)
         end
@@ -196,6 +178,50 @@ opendecoder(source::VideoSource, ::KA.CPU) = SequentialReader(source)
 function opendecoder(source::VideoSource, backend)
     videocodec(source.path) in (:h264, :hevc) || return SequentialReader(source)
     return openstream(backend, source.path, source.width, source.height)
+end
+
+"""
+    renderframe!(dest, seq, n, readers, engine; scratch, black) -> dest
+
+Timeline frame `n` of `seq`, finished: transition, track composite or single
+clip, every layer through the effect graph under the export policy (`exact`).
+
+This is the ONE definition of "what frame `n` looks like" — the encoder writes
+it, and the agent views ([`contactsheet`](@ref), [`framegrab`](@ref)) show it,
+so what an agent sees is by construction what the export produces. `readers`
+caches one decoder per source path; pass `scratch`/`black` canvas-sized buffers
+to avoid per-frame allocation in a loop.
+"""
+function renderframe!(dest::AnyRGBFrame, seq::Sequence, n::Integer,
+                      readers::Dict{String, Any}, engine::FxEngine;
+                      scratch::Union{Nothing, AnyRGBFrame} = nothing,
+                      black::Union{Nothing, AbstractMatrix} = nothing)
+    tr = transitionat(seq, n)
+    sample = tr === nothing ? nothing : transitionsample(seq, tr, n)
+    if sample !== nothing
+        left, srcA, right, srcB, p = sample
+        incoming = scratch === nothing ? similar(dest) : scratch
+        rendercanvas!(dest, left, srcA, readers, engine)
+        rendercanvas!(incoming, right, srcB, readers, engine)
+        blend!(dest, dest, incoming, p)
+    elseif ntracks(seq) > 1 && length(clipsat(seq, n)) > 1
+        # the export tier of ONE composite (see `composite`): same layer loop the
+        # preview runs, only under the exact-decode policy
+        composite(engine, clipsat(seq, n), n,
+                  (clip, _) -> get!(() -> opendecoder(clip.source, engine.backend),
+                                    readers, clip.source.path);
+                  exact = true) do canvas
+            copyto!(dest, canvas)
+        end || error("composite at frame $n could not be rendered")
+    else
+        loc = locate(seq, n)
+        if loc === nothing
+            black === nothing ? fill!(dest, RGB{N0f8}(0, 0, 0)) : fillblack!(dest, black)
+        else
+            rendercanvas!(dest, loc[1], loc[2], readers, engine)
+        end
+    end
+    return dest
 end
 
 """

@@ -85,6 +85,21 @@ end
 
 textcontent(x) = Dict("content" => [Dict("type" => "text", "text" => x isa String ? x : JSON.json(x))])
 
+"""
+An MCP image reply: the PNG, plus the manifest that says what is IN it (cell
+numbers → times). A picture without that mapping is a picture an agent can look
+at but not point at.
+"""
+function imagecontent(img::AbstractMatrix, manifest = nothing)
+    io = IOBuffer()
+    PNGFiles.save(io, PermutedDimsArray(img, (2, 1)))
+    content = Any[Dict("type" => "image", "data" => Base64.base64encode(take!(io)),
+                       "mimeType" => "image/png")]
+    manifest === nothing ||
+        push!(content, Dict("type" => "text", "text" => JSON.json(manifest)))
+    return Dict("content" => content)
+end
+
 tool(name, description, props = Dict(), required = String[]) =
     Dict("name" => name, "description" => description,
          "inputSchema" => Dict("type" => "object", "properties" => props, "required" => required))
@@ -98,6 +113,42 @@ function tooldefinitions()
         tool("get_state", "Project state: clips (source ranges, timeline placement, crop, effects, stabilization flags), playhead, duration."),
         tool("get_frame", "Rendered preview PNG at a timeline time — includes stabilization, color correction, effects and crop (what export will produce).",
              Dict("time" => t, "width" => Dict("type" => "integer", "description" => "preview width px (default 480)")), ["time"]),
+        # ---- seeing the edit without filling the context: one image per call,
+        # each answer says what to call next (see src/agentview.jl)
+        tool("view_sheet",
+             "SEE a whole time range in ONE image: `cells` rendered frames (effects, crop, " *
+             "stabilization — what export produces) tiled in a numbered grid, plus a manifest " *
+             "mapping every cell number to its time. START HERE, then call view_sheet again on " *
+             "the interval around an interesting cell — each level divides the span by `cells`, " *
+             "so three calls take 10 minutes down to single frames. Default 64 cells in a " *
+             "512 px image costs ~350 vision tokens.",
+             Dict("time_start" => num("range start in seconds (default 0)"),
+                  "time_end" => num("range end in seconds (default: end of sequence)"),
+                  "cells" => Dict("type" => "integer", "description" => "frames in the grid (default 64)"),
+                  "size" => Dict("type" => "integer", "description" => "image size in px (default 512)"))),
+        tool("view_strip",
+             "SEE a SHORT span in order: `count` rendered frames side by side in one row, bigger " *
+             "than sheet cells — for reading a gesture, a cut or a transition frame by frame.",
+             Dict("time_start" => t, "time_end" => t,
+                  "count" => Dict("type" => "integer", "description" => "frames (default 8)"),
+                  "height" => Dict("type" => "integer", "description" => "row height px (default 120)")),
+             ["time_start", "time_end"]),
+        tool("view_region",
+             "ZOOM IN SPATIALLY: one normalized rectangle (x, y from top-left, w, h in 0..1) of the " *
+             "rendered frame at `time`, at real pixel detail — use it when a sheet cell shows " *
+             "something too small to judge.",
+             Dict("time" => t, "x" => num("left 0..1"), "y" => num("top 0..1"),
+                  "w" => num("width 0..1"), "h" => num("height 0..1"),
+                  "width" => Dict("type" => "integer", "description" => "output width px (default 480)")),
+             ["time", "x", "y", "w", "h"]),
+        tool("find_change",
+             "Bisect a time range for the moment the picture stops resembling the frame at " *
+             "`time_start` by more than `threshold` (0..1, default 0.08) — a cut, a flash, a " *
+             "subject leaving. O(log n) renders instead of a scan. Returns the time and how big " *
+             "the difference is, or nothing when the range never changes that much. The cuts of " *
+             "the EDIT itself need no search — they are clip boundaries in get_state.",
+             Dict("time_start" => num("range start (default 0)"), "time_end" => num("range end (default: end)"),
+                  "threshold" => num("mean abs gray difference 0..1, default 0.08"))),
         tool("seek", "Move the playhead.", Dict("time" => t), ["time"]),
         tool("play", "Start playback."),
         tool("pause", "Pause playback."),
@@ -165,10 +216,35 @@ function calltool(srv::MCPServer, name::String, args)
 
     if name == "get_frame"
         img = renderpreview(player, Float64(args["time"]), Int(get(args, "width", 480)))
-        io = IOBuffer()
-        PNGFiles.save(io, PermutedDimsArray(img, (2, 1)))
-        return Dict("content" => [Dict("type" => "image", "data" => Base64.base64encode(take!(io)),
-                                       "mimeType" => "image/png")])
+        return imagecontent(img)
+    elseif name == "view_sheet"
+        # decode-heavy and read-only: runs on the HTTP task, never on the editor's
+        # executor (a 64-frame render would stall the render loop for a second)
+        t1 = Float64(get(args, "time_end", seqduration(seq)))
+        img, manifest = contactsheet(seq, Float64(get(args, "time_start", 0.0)), t1;
+                                     cells = Int(get(args, "cells", 64)),
+                                     size = Int(get(args, "size", 512)))
+        return imagecontent(img, Dict("cells" => manifest,
+                                      "hint" => "call view_sheet again with time_start/time_end " *
+                                                "around an interesting cell to zoom in"))
+    elseif name == "view_strip"
+        img, manifest = filmstrip(seq, Float64(args["time_start"]), Float64(args["time_end"]);
+                                  count = Int(get(args, "count", 8)),
+                                  height = Int(get(args, "height", 120)))
+        return imagecontent(img, Dict("frames" => manifest))
+    elseif name == "view_region"
+        img = regiongrab(seq, Float64(args["time"]),
+                         (Float64(args["x"]), Float64(args["y"]),
+                          Float64(args["w"]), Float64(args["h"]));
+                         width = Int(get(args, "width", 480)))
+        return imagecontent(img)
+    elseif name == "find_change"
+        found = findchange(seq, Float64(get(args, "time_start", 0.0)),
+                           Float64(get(args, "time_end", seqduration(seq)));
+                           threshold = Float64(get(args, "threshold", 0.08)))
+        return textcontent(found === nothing ?
+                           Dict("changed" => false) :
+                           Dict("changed" => true, "time" => found[1], "difference" => found[2]))
     elseif name == "export"
         # runs on the HTTP task: only reads edit metadata, and must not
         # starve the editor's executor (and with it the render loop) for its
@@ -329,10 +405,14 @@ function statedict(player::Player)
     return Dict(
         "duration_seconds" => seqduration(seq),
         "framerate" => fps,
+        "frames" => seqlength(seq),
+        "canvas" => collect(canvassize(seq)),
+        "tracks" => ntracks(seq),        # stacked layers; clips of the same frame composite
         "playhead_seconds" => player.playhead[] / fps,
         "playing" => player.playing[],
         "clips" => [Dict(
             "index" => i,
+            "track" => clip.track,
             "timeline_start" => clip.start / fps,
             "timeline_end" => clipend(clip) / fps,
             "source" => clip.source.path,
@@ -340,6 +420,9 @@ function statedict(player::Player)
             "crop" => collect(clip.crop),
             "id" => string(clip.id),
             "effects" => [slotdict(s) for s in clip.effects],
+            # keyframed parameters — their values vary ACROSS the clip, so a single
+            # frame does not describe it; view_sheet the clip's range to see them
+            "animated" => sort!(string.(collect(keys(clip.animations)))),
             "has_colortrack" => clip.colortrack !== nothing,
             "has_motiontrack" => clip.motiontrack !== nothing,
         ) for (i, clip) in enumerate(seq.clips)],
@@ -360,7 +443,7 @@ function renderpreview(player::Player, t::Float64, width::Int)
     loc === nothing && return fill!(preview, RGB{N0f8}(0, 0, 0))
     clip, srcframe = loc
 
-    sp = pool(player, clip.source)
+    sp = pool(player, clip)
     scratch = RGBFrame(undef, sp.source.width, sp.source.height)
     settarget!(sp.worker, srcframe)
     deadline = time() + 3.0

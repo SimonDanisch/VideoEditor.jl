@@ -36,6 +36,29 @@ MotionTrack(transforms::Vector{Mat3f}, src_in::Integer, mode::Symbol = :unknown)
     MotionTrack(transforms, src_in, mode, nothing)
 
 """
+Per-source-frame subject matte (see `analyzematte!`), same absolute-frame keying
+as the other tracks.
+
+`alpha` is `(w, h, nframes)` at *matte* resolution — usually smaller than the
+source — and is sampled bilinearly when applied, so the matte does not have to
+carry full-resolution pixels for every frame of a clip.
+
+`seeds` are the frames the user marked: the matte keyframes. They are the edit,
+`alpha` is only a cache of what propagating from them produced, which is why
+`seeds` is what the project file stores and `alpha` goes to a sidecar that can be
+regenerated. Sorted, absolute source frames.
+"""
+mutable struct MatteTrack
+    const alpha::Array{UInt8, 3}
+    const src_in::Int
+    const seeds::Vector{Int}
+end
+MatteTrack(alpha::Array{UInt8, 3}, src_in::Integer, seeds::AbstractVector{<:Integer} = Int[]) =
+    MatteTrack(alpha, Int(src_in), sort!(Int.(collect(seeds))))
+
+mattesize(t::MatteTrack) = (size(t.alpha, 1), size(t.alpha, 2))
+
+"""
 Source of stable identities for clips and effect slots. Position in a vector and
 `objectid` both die on the first sort, undo or project reload — anything that has
 to POINT at a clip or an effect (a blend at its partner, the inspector at a stack
@@ -76,6 +99,7 @@ mutable struct Clip
     const effects::Vector{FxSlot}  # ordered effect stack (see effects.jl)
     colortrack::Union{Nothing, ColorTrack}
     motiontrack::Union{Nothing, MotionTrack}
+    mattetrack::Union{Nothing, MatteTrack}
     const animations::Dict{Symbol, AnimCurve}  # keyframed params (see keyframes.jl)
     track::Int                  # stacking layer; higher = on top (1 = base)
     blendfrom::UInt64           # clip this one blends away FROM (0 = nothing)
@@ -83,7 +107,7 @@ end
 
 Clip(source::VideoSource, src_in, src_out, start, crop) =
     Clip(freshid(), source, src_in, src_out, start, crop, FxSlot[], nothing, nothing,
-         Dict{Symbol, AnimCurve}(), 1, UInt64(0))
+         nothing, Dict{Symbol, AnimCurve}(), 1, UInt64(0))
 
 function Clip(source::VideoSource; src_in::Integer = 0, src_out::Integer = source.nframes,
               start::Integer = 0)
@@ -352,7 +376,8 @@ end
 snapshot(seq::Sequence) =
     [Clip(c.id, c.source, c.src_in, c.src_out, c.start, c.crop,
           [FxSlot(s.id, s.effect, s.enabled) for s in c.effects],
-          c.colortrack, c.motiontrack, deepcopy(c.animations), c.track, c.blendfrom)
+          c.colortrack, c.motiontrack, c.mattetrack, deepcopy(c.animations), c.track,
+          c.blendfrom)
      for c in seq.clips]
 
 "Restore a [`snapshot`](@ref) (the snapshot itself stays reusable)."

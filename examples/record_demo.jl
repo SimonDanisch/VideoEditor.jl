@@ -230,10 +230,18 @@ events = [
     Wait(0.4), LeftUp(),
     KeyUp(Makie.Keyboard.left_control), Wait(1.0),
 
-    # [6b] Multi-source: DROP a second video file onto the window — it lands
-    # as a new clip at the end (own thumbnails, own decoder, different
-    # aspect), the status line confirms; click it and play a moment
-    DropFiles(demosource2), Wait(1.6),
+    # [6b] Multi-source: DROP a second video file onto the window — the Bin
+    # opens itself and the file lands there as a row (thumbnail, duration);
+    # zoom out for room past the last clip, then drag that row onto the
+    # timeline, where it becomes a clip with its own decoder and aspect
+    DropFiles(demosource2), Wait(2.5),   # opening a source probes it off-thread
+    Lazy(_ -> MouseTo(timeline_pos(VE.seqduration(player.sequence) * 0.6))),
+    Scroll((0, -3); duration = 0.8), Wait(0.8),
+    Lazy(_ -> MouseTo(block_center(player.binrows[end][2]))),   # the row's thumbnail
+    LeftDown(), Wait(0.6),
+    Lazy(_ -> MouseTo(timeline_pos(VE.seqduration(player.sequence) * 0.75))), Wait(0.4),
+    Lazy(_ -> MouseTo(timeline_pos(VE.seqduration(player.sequence)))), Wait(0.5),
+    LeftUp(), Wait(1.4),
     Lazy(_ -> MouseTo(timeline_pos(VE.seqduration(player.sequence) - 4.0))),
     LeftClick(), Wait(1.2),
     KeyPress(Makie.Keyboard.space), Wait(2.2),

@@ -16,6 +16,7 @@ function saveproject(path::AbstractString, seq::Sequence)
         [Dict{String, Any}("kind" => String(t.kind), "at" => t.at, "duration" => t.duration)
          for t in seq.transitions])
     open(io -> TOML.print(io, dict), path, "w")
+    savemattes(path, seq)
     return path
 end
 
@@ -47,6 +48,16 @@ function clipdict(clip::Clip)
             "strength" => Float64(clip.colortrack.strength),
             "gains" => [Float64.(collect(g)) for g in clip.colortrack.gains],
             "offsets" => [Float64.(collect(o)) for o in clip.colortrack.offsets])
+    end
+    # The matte's SEEDS are the edit and go in the project file; the propagated
+    # alpha is a cache and goes to a sidecar, because a clip's worth of per-frame
+    # mattes has no business inside a TOML and losing it costs a recompute rather
+    # than an edit.
+    if clip.mattetrack !== nothing
+        t = clip.mattetrack
+        cd["matte"] = Dict{String, Any}(
+            "src_in" => t.src_in, "seeds" => t.seeds,
+            "size" => collect(Int.(size(t.alpha))))
     end
     # keyframed parameters — losing them on reopen would silently drop an animation
     anims = Dict{String, Any}(
@@ -94,6 +105,12 @@ function loadproject(path::AbstractString)
                 [Vec3f(Float32.(v)...) for v in ct["offsets"]], Int(ct["src_in"]),
                 Float32(get(ct, "strength", 1.0)))   # absent in older project files
         end
+        if haskey(cd, "matte")
+            mt = cd["matte"]
+            sz = NTuple{3, Int}(Int.(mt["size"]))
+            clip.mattetrack = MatteTrack(loadmatte(path, clip.id, sz), Int(mt["src_in"]),
+                                         Int.(mt["seeds"]))
+        end
         for (key, ad) in get(cd, "animations", Dict{String, Any}())
             eases = get(ad, "eases", fill("linear", length(ad["frames"])))  # older files
             clip.animations[Symbol(key)] = AnimCurve(
@@ -108,4 +125,37 @@ function loadproject(path::AbstractString)
         push!(seq.transitions, Transition(Symbol(td["kind"]), Int(td["at"]), Int(td["duration"])))
     end
     return seq
+end
+
+
+"Directory holding a project's matte sidecars (created on demand)."
+mattedir(path::AbstractString) = string(path, ".mattes")
+mattefile(path::AbstractString, id::Integer) = joinpath(mattedir(path), string(id, ".bin"))
+
+"Write every clip's propagated alpha next to the project file."
+function savemattes(path::AbstractString, seq::Sequence)
+    any(c -> c.mattetrack !== nothing, seq.clips) || return
+    dir = mattedir(path)
+    isdir(dir) || mkpath(dir)
+    for clip in seq.clips
+        clip.mattetrack === nothing && continue
+        open(io -> write(io, clip.mattetrack.alpha), mattefile(path, clip.id), "w")
+    end
+    return
+end
+
+"""
+Read a clip's matte sidecar, or zeros of the recorded size when it is missing or
+the wrong length. A missing cache must not be an error: the seeds are still in
+the project, so the matte is one re-run away, and `applymatte!` treats an
+all-zero track as "not analyzed here" rather than blacking the frame out.
+"""
+function loadmatte(path::AbstractString, id::Integer, sz::NTuple{3, Int})
+    f = mattefile(path, id)
+    n = prod(sz)
+    if isfile(f) && filesize(f) == n
+        return reshape(read(f), sz)
+    end
+    isfile(f) && @warn "matte sidecar for clip $id is $(filesize(f)) bytes, expected $n — ignoring"
+    return zeros(UInt8, sz)
 end

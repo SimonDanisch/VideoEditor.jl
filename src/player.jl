@@ -47,6 +47,9 @@ mutable struct Player
     const uiqueue::Channel{Function}   # thread → main-thread actions
     const applytracks::Observable{Bool}
     const stabinfo::Observable{String}
+    const matteinfo::Observable{String}          # matte tool status line
+    const restoreinfo::Observable{String}        # restore tool status line
+    const mattemarks::Dict{UInt64, Dict{Int, Matrix{UInt8}}}  # clip id -> marked frames
     analysisbackend::Any  # KA backend for analysis/GPU playback; set by auto-detect
     const fig::Figure
     const previewaxis::Axis
@@ -260,9 +263,14 @@ function Player(path::AbstractString; capacity::Integer = 64,
     return player
 end
 
-"The decode pool for `source`, created on first use."
+"The decode pool for `source`, created on first use. One reader per source is
+enough even when two clips of it overlap in a blend: the ring and the GPU
+stream index by GOP, and serving two positions from one reader measured 0
+stand-ins and 5.4 ms/frame vs 8.2 ms for a reader per layer (2026-07-28)."
 pool(player::Player, source::VideoSource) =
     get!(() -> SourcePool(source; capacity = player.capacity), player.pools, source)
+
+pool(player::Player, clip::Clip) = pool(player, clip.source)
 
 """
     startproxy!(player, source; height=player.proxyheight)
@@ -354,7 +362,10 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     player = Player(sequence, pools, capacity, proxyheight, proxythreshold,
                     timeline, frame, playhead,
                     playing, status, Channel{String}(32), Channel{Function}(32),
-                    Observable(true), Observable("no analysis yet"), analysisbackend,
+                    Observable(true), Observable("no analysis yet"),
+                    Observable("no matte"), Observable("no restoration"),
+                    Dict{UInt64, Dict{Int, Matrix{UInt8}}}(),
+                    analysisbackend,
                     fig, ax, Ref(false),
                     Observable(Point2f[]),
                     similar(frame[]), Dict{Symbol, Slider}(),
@@ -540,9 +551,10 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     on(events(fig).mousebutton; priority = 95) do event
         (event.button == Mouse.left && event.action == Mouse.press) || return Consume(false)
         player.tool[] === :split || return Consume(false)
-        mp = Point2f(events(fig).mouseposition[])
         tlscene = timeline.axis.scene
-        mp in tlscene.viewport[] || return Consume(false)
+        # is_mouseinside, not `in viewport`: an armed blade must not cut THROUGH
+        # a dropdown or a modal that happens to hang over the timeline
+        Makie.is_mouseinside(tlscene) || return Consume(false)
         t = Makie.mouseposition(tlscene)[1]
         # NB: must NOT be named `frame` — that would rebind the shared preview
         # Observable this scope captures (used by image! + the scrub fallback)
@@ -590,7 +602,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                                                  floor(Int, srcframe / clip.source.framerate)) :
                             nothing
                     if thumb !== nothing
-                        ensureframesize!(player, pool(player, clip.source).source)
+                        ensureframesize!(player, pool(player, clip).source)
                         blitthumb!(frame[], thumb)
                         showcpuframe!(player)
                         notify(frame)
@@ -615,17 +627,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
         end
     end
 
-    # drop video files onto the window to append them to the timeline
-    on(events(fig).dropped_files) do files
-        for f in files
-            try
-                addsource!(player, f)
-            catch e
-                setstatus!(player, "could not add $(basename(f)): $(sprint(showerror, e))")
-            end
-        end
-    end
-
+    # (files dropped on the window go to the media bin — see buildmediabin!)
     timeline.onedit = () -> snapshot!(player)
     # trimming shows the frame the cut would land on — exact when it is decoded,
     # the decoder's nearest otherwise so the picture still follows the drag
@@ -659,8 +661,8 @@ dissolves preview as the outgoing clip; export still blends them via warp).
 """
 function showtransition!(player::Player, sample)
     left, srcA, right, srcB, p = sample
-    spA = pool(player, left.source)
-    spB = pool(player, right.source)
+    spA = pool(player, left)
+    spB = pool(player, right)
     (spA.source.width, spA.source.height) == (spB.source.width, spB.source.height) || return false
     settarget!(spA.worker, srcA)
     settarget!(spB.worker, srcB)
@@ -696,35 +698,27 @@ yet. CPU preview path — the GPU/export paths still show the top clip for now.
 """
 function compositeframe!(player::Player, n::Integer, clips::Vector{Clip})
     ensureframesize!(player, clips[end].source)      # canvas at the top clip's resolution
-    canvas = player.composebuf; W, H = size(canvas)
-    warpbuf = similar(canvas)
-    fill!(canvas, RGB{N0f8}(0, 0, 0))
-    for clip in clips
-        srcframe = clip.src_in + (n - clip.start)
-        sp = pool(player, clip.source)
+    # the CPU tier of ONE composite (see `composite`): its only job is to hand
+    # each layer a decoded frame from that source's ring — everything the
+    # picture depends on is shared with the GPU tier and the export
+    decoded = function (clip, srcframe)
+        sp = pool(player, clip)
         settarget!(sp.worker, srcframe)
-        clipbuf = RGBFrame(undef, clip.source.width, clip.source.height)
+        buf = RGBFrame(undef, clip.source.width, clip.source.height)
         deadline = time() + 1.0
-        while !fetchframe!(clipbuf, sp.ring, srcframe)
-            time() > deadline && return false            # not buffered yet → single-clip fallback
+        while !fetchframe!(buf, sp.ring, srcframe)
+            time() > deadline && return nothing          # not buffered yet → single-clip fallback
             sleep(0.004)
         end
-        ec = withoutopacity(effectiveclip(clip, srcframe))   # opacity = the layer alpha
-        if player.applytracks[]                          # false = hold-to-compare bypass
-            render(player.cpuengine, clipbuf, ec, Int(srcframe)) do out
-                copyto!(clipbuf, out)
-            end
-        end
-        warp!(warpbuf, clipbuf, ec.crop)                 # bake this layer's crop into canvas space
-        KA.synchronize(KA.get_backend(warpbuf))
-        α = Float32(clamp(paramvalue(clip, :opacity, srcframe), 0.0, 1.0))
-        blend!(canvas, canvas, warpbuf, α)               # (1-α)·below + α·layer
+        return buf
     end
-    copyto!(player.frame[], canvas)                      # publish the finished composite
+    ok = composite(player.cpuengine, clips, n, decoded;
+                   applytracks = player.applytracks[], playing = player.playing[]) do canvas
+        copyto!(player.frame[], canvas)                  # publish the finished composite
+    end
+    ok || return false
     showcpuframe!(player)
     notify(player.frame)
-    player.lastcrop = (0.0, 0.0, 1.0, 1.0)
-    coverlimits!(player, 0, W, H, 0)                     # show the full baked canvas
     return true
 end
 
@@ -790,12 +784,24 @@ function showframe!(player::Player, n::Integer; standin::Bool = !atrest(player))
     if ntracks(player.sequence) > 1
         clips = clipsat(player.sequence, n)
         if length(clips) > 1
+            shown = false
             if gpuready(player) && all(haskey(player.gpucache, c.source) for c in clips)
                 # composites mix layers: one stand-in among them dates the whole frame
                 standin || primecomposite!(player, clips, n) || return false
-                presentgpucomposite!(player, clips, n) && return true
+                shown = presentgpucomposite!(player, clips, n)
             end
-            compositeframe!(player, n, clips) && return true
+            shown || (shown = compositeframe!(player, n, clips))
+            if shown
+                # every layer's crop is BAKED INTO the composited canvas, so the
+                # view shows the canvas WHOLE — one rule, above the tier split
+                # (the GPU tier used to leave the single-clip present's crop on
+                # the axis, applying a stabilized clip's framing twice for the
+                # length of a blend)
+                src = clips[end].source
+                player.lastcrop = (0.0, 0.0, 1.0, 1.0)
+                coverlimits!(player, 0, src.width, src.height, 0)
+                return true
+            end
         end
     end
     loc = locate(player.sequence, n)
@@ -846,7 +852,7 @@ function presentclipframe!(player::Player, clip::Clip, srcframe::Integer;
             end
         end
     end
-    sp = pool(player, clip.source)
+    sp = pool(player, clip)
     settarget!(sp.worker, target; protect)
     ensureframesize!(player, sp.source)  # proxy resolution when one is active
     buf = player.composebuf
@@ -890,10 +896,10 @@ function decodetarget(player::Player, n::Integer, clip::Clip, srcframe::Integer)
     nxt = seq.clips[i + 1]
     nxt.start == clipend(clip) || return (srcframe, 1:0)  # gap: nothing to prefetch
     if nxt.source !== clip.source
-        settarget!(pool(player, nxt.source).worker, nxt.src_in)
+        settarget!(pool(player, nxt).worker, nxt.src_in)
         return (srcframe, 1:0)
     end
-    ring = pool(player, clip.source).ring
+    ring = pool(player, clip).ring
     for k in 0:(tail - 1)                                 # tail fully buffered?
         hasframe(ring, srcframe + k) || return (srcframe, 1:0)
     end
@@ -1427,8 +1433,23 @@ end
 "Re-present the playhead frame and repaint the timeline after an edit."
 function refreshedit!(player::Player)
     relayout!(player.timeline)
+    ensurestreams!(player)
     notify(player.playhead)
     player.playing[] || retrypresent(player, player.playhead[])
+    return nothing
+end
+
+"""
+Open a GPU stream for every source the sequence shows and that has none yet —
+an edit can bring in a source that was not there when the player started (a
+clip dragged in from the bin), and its layers would otherwise fall back to CPU
+decode forever. Cheap: one `haskey` per source, the open runs off the UI thread.
+"""
+function ensurestreams!(player::Player)
+    player.gpupreview isa GPUPreview || return nothing
+    for source in unique(c.source for c in player.sequence.clips)
+        haskey(player.gpucache, source) || Threads.@spawn preloadgpu!(player, source)
+    end
     return nothing
 end
 
@@ -1709,25 +1730,46 @@ end
 Media-bin dock panel: each imported source is a card — an ASPECT-CORRECT
 first-frame thumbnail beside its left-aligned name and duration. Drag a card
 onto a timeline lane (a chip follows the cursor, the target lane ghosts) or
-onto the "+ new track" strip. "Import clip…" opens a native file dialog.
+onto the "+ new track" strip. The head of the panel is the drop zone: files
+dropped anywhere on the window import here (see [`importsources!`](@ref)), and
+clicking it opens the native file dialog.
 """
 function buildmediabin!(player::Player, gridpos, uicolors)
     panel = GridLayout(gridpos; tellheight = false, valign = :top)
     Label(panel[1, 1], "Media"; font = :bold, halign = :left, tellwidth = false)
-    importbtn = Button(panel[2, 1]; label = "Import clip…", tellwidth = false,
-                       width = Makie.Relative(1.0))
+    # ONE import target instead of a button: files dropped from the file manager
+    # land here (any number at once), and a click opens the browse dialog. A
+    # drop zone you can see beats a button that hides where dropping is allowed.
+    dropstatus = Observable("")     # "" = idle, else the running import's line
+    dropaccent = lift(s -> isempty(s) ? uicolors.border : uicolors.accent, dropstatus)
+    droparea = Box(panel[2, 1]; height = 60, cornerradius = 6, linestyle = :dash,
+                   strokewidth = 1.5, color = uicolors.surface_subtle,
+                   strokecolor = dropaccent)
+    Label(panel[2, 1], lift(s -> isempty(s) ? "Drop clips here\nor click to browse" : s,
+                            dropstatus);
+          fontsize = 12, justification = :center, color = dropaccent,
+          tellwidth = false, tellheight = false)
     Label(panel[3, 1], "drag a clip onto a lane · top strip = new track";
           fontsize = 11, halign = :left, color = uicolors.text_muted, tellwidth = false)
     rows = GridLayout(panel[4, 1])
     colsize!(panel, 1, Makie.Relative(1.0))
-    on(importbtn.clicks) do _
-        Threads.@spawn try   # the dialog blocks — keep the UI thread rendering
-            path = Makie.choose_file_dialogue()
-            path === nothing ||
-                put!(player.uiqueue, () -> importsource!(player, String(path)))
-        catch e
-            setstatus!(player, "import failed: $(sprint(showerror, e))")
-        end
+    player.fxwidgets[:dropstatus] = dropstatus
+    player.fxwidgets[:droparea] = droparea
+    # the browse dialog behind a hook: it is a BLOCKING native window, so tests
+    # (the random event storm clicks everywhere) replace it with a no-op
+    player.fxwidgets[:browse] = () -> Threads.@spawn try
+        path = Makie.choose_file_dialogue()
+        path === nothing || importsources!(player, [String(path)])
+    catch e
+        setstatus!(player, "import failed: $(sprint(showerror, e))")
+    end
+    # files dropped onto the WINDOW go to the bin, wherever they land — the dock
+    # opens itself so the new rows are where the user is looking
+    on(events(player.fig).dropped_files) do paths
+        isempty(paths) && return
+        player.dockopen[] === :media || opendock!(player, :media)
+        importsources!(player, paths)
+        return
     end
     boxh = 58
     boxfill = RGB{N0f8}(uicolors.surface_subtle)
@@ -1846,7 +1888,15 @@ function buildmediabin!(player::Player, gridpos, uicolors)
     on(events(player.fig).mousebutton; priority = 90) do event
         event.button == Mouse.left || return Consume(false)
         mp = Point2f(events(player.fig).mouseposition[])
-        if event.action == Mouse.press && player.dockopen[] === :media
+        # …but only when nothing is drawn over the bin (a modal, a dropdown);
+        # the RELEASE is checked against the timeline instead, so it stays out
+        # of this guard — the pointer is over the timeline by then
+        if event.action == Mouse.press && player.dockopen[] === :media &&
+           Makie.receives_events(player.dockpanels[:media].sf.scene)
+            if mp in droparea.layoutobservables.computedbbox[]
+                player.fxwidgets[:browse]()
+                return Consume(true)
+            end
             for ((btn, box, _), src) in zip(player.binrows, player.mediasources[])
                 if mp in btn.layoutobservables.computedbbox[] ||
                    mp in box.layoutobservables.computedbbox[]
@@ -1890,18 +1940,71 @@ function registermedia!(player::Player, source::VideoSource)
     return nothing
 end
 
-"Open `path` and add it to the media bin (the import dialog's action)."
-function importsource!(player::Player, path::AbstractString)
-    source = try
-        VideoSource(path)
+"Text on the bin's drop zone: empty is the idle invitation, anything else the running import."
+function dropstate!(player::Player, text::AbstractString)
+    o = get(player.fxwidgets, :dropstatus, nothing)
+    o === nothing || put!(player.uiqueue, () -> (o[] = String(text)))
+    return nothing
+end
+
+"What the status line says after an import — every file is accounted for."
+function importsummary(added::Vector{VideoSource}, duplicates::Int, failed::Vector{String})
+    parts = String[]
+    isempty(added) || push!(parts, length(added) == 1 ?
+        "imported $(basename(added[1].path))" : "imported $(length(added)) clips")
+    duplicates == 0 || push!(parts, "$duplicates already in the bin")
+    isempty(failed) || push!(parts, "couldn't open $(join(failed, ", "))")
+    isempty(parts) && return "nothing to import"
+    return join(parts, " · ") * (isempty(added) ? "" : " — drag one onto a lane")
+end
+
+"""
+    importsources!(player, paths)
+
+Add every file in `paths` to the media bin — this is what a drop from the file
+manager (any number of files at once) and the browse dialog both run. Opening a
+source probes the whole container, so the work happens off the UI thread: rows
+appear one by one, the drop zone and the footer show the progress, and a file
+that won't open names itself in the status line without stopping the others.
+"""
+function importsources!(player::Player, paths)
+    files = unique(String[String(p) for p in paths])
+    isempty(files) && return nothing
+    n = length(files)
+    dropstate!(player, "importing 1/$n…")
+    Threads.@spawn try
+        added = VideoSource[]
+        failed = String[]
+        duplicates = 0
+        for (i, path) in enumerate(files)
+            dropstate!(player, "importing $i/$n…")
+            player.jobprogress[] = (i - 1) / n
+            if isdir(path)
+                push!(failed, basename(path) * " (a folder)")
+                continue
+            end
+            source = try
+                VideoSource(path)
+            catch
+                push!(failed, basename(path))
+                continue
+            end
+            if any(s -> s.path == source.path, player.mediasources[])
+                duplicates += 1
+            else
+                push!(added, source)
+                put!(player.uiqueue, () -> registermedia!(player, source))
+            end
+        end
+        player.jobprogress[] = NaN
+        dropstate!(player, "")
+        setstatus!(player, importsummary(added, duplicates, failed))
     catch e
-        setstatus!(player, "couldn't open $(basename(path)): $(sprint(showerror, e))")
-        return nothing
+        player.jobprogress[] = NaN
+        dropstate!(player, "")
+        setstatus!(player, "import failed: $(sprint(showerror, e))")
     end
-    registermedia!(player, source)
-    opendock!(player, :media)
-    setstatus!(player, "imported $(basename(path)) — drag it onto the timeline")
-    return source
+    return nothing
 end
 
 """
@@ -2628,7 +2731,12 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     on(events(player.fig).mousebutton; priority = 100) do event
         (player.dockopen[] === :effects && event.button == Mouse.left) ||
             return Consume(false)
+        # a bare bbox test doesn't know what is DRAWN over the button: the "+ Add
+        # effect…" dropdown opens right across it, and its first row used to be
+        # swallowed here (Simon, 2026-07-27: "kann color nicht als erstes
+        # auswählen"). Makie's event routing knows — ask it.
         if event.action == Mouse.press &&
+           Makie.receives_events(comparebtn.blockscene) &&
            Point2f(events(player.fig).mouseposition[]) in comparebtn.layoutobservables.computedbbox[]
             player.applytracks[] = false; notify(player.playhead); return Consume(true)
         elseif event.action == Mouse.release && !player.applytracks[]

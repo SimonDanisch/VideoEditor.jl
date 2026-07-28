@@ -290,6 +290,9 @@ function buildtoolspanel!(player::Player, gridpos, uicolors)
     on(events(player.fig).mousebutton; priority = 30) do event
         (event.button == Mouse.left && event.action == Mouse.press &&
          player.dockopen[] === :tools && !isempty(cards)) || return Consume(false)
+        # cards are hit-tested by bbox, which cannot see an overlay (modal,
+        # dropdown) drawn on top of them — Makie's event routing can
+        Makie.receives_events(player.dockpanels[:tools].sf.scene) || return Consume(false)
         mp = events(player.fig).mouseposition[]
         for (id, frame, _, _, onclick, _, _) in cards
             bb = frame.layoutobservables.computedbbox[]
@@ -1246,3 +1249,281 @@ registertool!(:loopfinder, "Loop finder",
 registertool!(:blend, "Blend clips",
     "Mark two clips (Shift+click), then click this header — the later clip fades in.";
     panel = blendpanel!, activate = activateblend!)
+
+# ----------------------------------------------------------------- Matte tool
+
+"""
+Mark a subject on one frame, propagate it across the clip.
+
+The marked frames are *matte keyframes*: each one is a place the user says "the
+subject is here", and propagation fills the frames between them. Adding a second
+mark where the propagation drifts is the whole correction workflow, which is why
+the card list is the seed list — one row per marked frame, removable, click to
+jump there ([[feedback-ui-shape-lists-not-buttons]] applies: the managed things
+are the marks, not the buttons).
+
+Marking is a click in the preview: it seeds a box around the click, at source
+resolution. `MatteEffect` is added to the clip on the first successful run, so
+the result is visible immediately rather than requiring a separate "add effect"
+step, and its `Matte`/`Feather` sliders are keyframable like any other param.
+"""
+function mattepanel!(ctx::ToolContext)
+    player = ctx.player
+    toollabel!(ctx, player.matteinfo)
+    toolaction!(ctx, "Mark subject (click preview)", () -> armmattepick!(ctx))
+    toolaction!(ctx, "Re-propagate", () -> runmatte!(ctx))
+    toolaction!(ctx, "Remove matte", () -> removematte!(player))
+    refreshmattecards!(ctx)
+    # Opening the panel is the earliest honest signal that a matte is coming, and
+    # the user is still deciding where to click — much better than paying the
+    # model's one-time specialization cost on their first mark.
+    if hasmattemodel() && !MATTEWARMED[]
+        # at the resolution `analyzematte!` will actually use for this clip
+        # Must match `analyzematte!`'s own sizing exactly, `min` clamp included:
+        # warming the wrong tile shapes buys nothing, because the GEMM
+        # specializes per tile and the real clip then pays the stall anyway.
+        loc0 = editclip(player)
+        mw, mh = if loc0 === nothing
+            480, 270
+        else
+            sw, sh = loc0[1].source.width, loc0[1].source.height
+            w = min(480, sw)
+            w, max(1, round(Int, sh * w / sw))
+        end
+        player.matteinfo[] = "warming up the model…"
+        runanalysis(player) do
+            try
+                warmmatte!(mw, mh)
+                put!(player.uiqueue, () -> (player.matteinfo[] = "ready — mark the subject"))
+            catch e
+                put!(player.uiqueue, () -> (player.matteinfo[] = "model warm-up failed"))
+            end
+        end
+    end
+    return nothing
+end
+
+"Seed size as a fraction of frame width — a box the user can hit by clicking."
+const MATTESEED = Ref{Float64}(0.25)
+
+function armmattepick!(ctx::ToolContext)
+    player = ctx.player
+    loc = editclip(player)
+    loc === nothing && return setstatus!(player, "matte: move the playhead onto a clip first")
+    player.onpick = p -> begin
+        clip, srcframe = loc
+        scale = clip.source.width / size(player.frame[], 1)
+        sw, sh = clip.source.width, clip.source.height
+        w = MATTESEED[]
+        cx = clamp(p[1] * scale / sw, 0.0, 1.0)
+        cy = clamp(p[2] * scale / sh, 0.0, 1.0)
+        rect = (clamp(cx - w / 2, 0.0, 1.0), clamp(cy - w / 2, 0.0, 1.0), w, w)
+        addmatteseed!(ctx, clip, srcframe, seedmask(clip, rect))
+    end
+    setstatus!(player, "matte: click the subject in the preview (Esc cancels)")
+    return nothing
+end
+
+"Record a mark at `srcframe` and re-propagate the clip."
+function addmatteseed!(ctx::ToolContext, clip::Clip, srcframe::Integer, mask)
+    player = ctx.player
+    seeds = mattemarks(player, clip)
+    seeds[Int(srcframe)] = mask
+    runmatte!(ctx; clip = clip, seeds = seeds)
+    return nothing
+end
+
+"""
+The marks for `clip`, live.
+
+Held next to the player rather than on the track because a mark is an input to
+propagation and the track is its output: re-running must see every mark, not the
+seed frames the last run happened to record. Keyed by clip id so it survives
+sorting and undo.
+"""
+mattemarks(player::Player, clip::Clip) =
+    get!(() -> Dict{Int, Matrix{UInt8}}(), player.mattemarks, clip.id)
+
+function runmatte!(ctx::ToolContext; clip = nothing, seeds = nothing)
+    player = ctx.player
+    if clip === nothing
+        loc = editclip(player)
+        loc === nothing && return setstatus!(player, "matte: no clip under the playhead")
+        clip = loc[1]
+    end
+    marks = seeds === nothing ? mattemarks(player, clip) : seeds
+    isempty(marks) &&
+        return setstatus!(player, "matte: mark the subject on a frame first")
+    player.matteinfo[] == "matting…" &&
+        return setstatus!(player, "matte: already running — progress in the bottom right")
+    player.matteinfo[] = "matting…"
+    setstatus!(player, "matte: propagating from $(length(marks)) marked frame(s) " *
+                       "($(mattebackendname()))")
+    runanalysis(player) do
+        try
+            reader = framereader(player, clip)
+            track = analyzematte!(clip, reader, marks; progress = (d, t) -> begin
+                player.jobprogress[] = d / max(t, 1)
+            end)
+            put!(player.uiqueue, () -> begin
+                freematteplanes!(track)
+                findeffect(clip, MatteEffect) === nothing &&
+                    push!(clip.effects, FxSlot(MatteEffect()))
+                player.matteinfo[] = "matte: $(length(track.seeds)) marked frame(s), " *
+                                     "$(size(track.alpha, 3)) frames"
+                player.jobprogress[] = NaN
+                refreshmattepanel!(player)
+                notify(player.playhead)
+                setstatus!(player, "matte ready — Matte/Feather are keyframable in the inspector")
+            end)
+        catch e
+            put!(player.uiqueue, () -> begin
+                player.matteinfo[] = "matte failed"
+                player.jobprogress[] = NaN
+                setstatus!(player, "matte failed: $(sprint(showerror, e))")
+            end)
+        end
+    end
+    return nothing
+end
+
+function removematte!(player::Player)
+    loc = editclip(player)
+    loc === nothing && return setstatus!(player, "matte: no clip under the playhead")
+    clip = loc[1]
+    clip.mattetrack === nothing && return setstatus!(player, "no matte on this clip")
+    freematteplanes!(clip.mattetrack)
+    clip.mattetrack = nothing
+    delete!(player.mattemarks, clip.id)
+    i = findfirst(s -> s.effect isa MatteEffect, clip.effects)
+    i === nothing || deleteat!(clip.effects, i)
+    player.matteinfo[] = "no matte"
+    refreshmattepanel!(player)
+    notify(player.playhead)
+    setstatus!(player, "matte removed")
+    return nothing
+end
+
+"One card per marked frame: jump to it, or drop the mark and re-propagate."
+function refreshmattecards!(ctx::ToolContext)
+    player = ctx.player
+    loc = editclip(player)
+    loc === nothing && return nothing
+    clip = loc[1]
+    marks = mattemarks(player, clip)
+    for f in sort!(collect(keys(marks)))
+        thumb = mattecardimage(marks[f])
+        tl = clip.start + (f - clip.src_in)
+        tooladdcard!(ctx, thumb; caption = "frame $tl",
+                     onclick = () -> (player.playhead[] = tl),
+                     onremove = () -> begin
+                         delete!(marks, f)
+                         isempty(marks) ? removematte!(player) : runmatte!(ctx; clip = clip)
+                     end)
+    end
+    return nothing
+end
+
+"A small preview of one mark, so a card shows WHICH region was marked."
+function mattecardimage(mask::AbstractMatrix{UInt8})
+    w, h = 48, 27
+    img = Matrix{RGB{N0f8}}(undef, w, h)
+    sw, sh = size(mask)
+    @inbounds for j in 1:h, i in 1:w
+        v = mask[clamp(round(Int, (i - 0.5) * sw / w + 0.5), 1, sw),
+                 clamp(round(Int, (j - 0.5) * sh / h + 0.5), 1, sh)]
+        img[i, j] = v > 0 ? RGB{N0f8}(1, 1, 1) : RGB{N0f8}(0.15, 0.15, 0.18)
+    end
+    return img
+end
+
+"Rebuild the Tools dock and the inspector after the matte changed either."
+function refreshmattepanel!(player::Player)
+    TOOLSVERSION[] += 1                       # tool cards
+    r = get(player.fxwidgets, :fxlistrefresh, nothing)
+    r === nothing || r()                      # inspector: the MatteEffect card
+    return nothing
+end
+
+registertool!(:matte, "Matte",
+    "Isolates a subject on the SELECTED clip. Mark it on one frame and the " *
+    "matte propagates across the clip; mark another frame wherever it drifts.";
+    panel = mattepanel!, activate = ctx -> armmattepick!(ctx))
+
+
+# --------------------------------------------------------------- Restore tool
+
+"""
+Run a restoration model over frames around the playhead.
+
+Temporal models want a window, not a frame, and the exported graph pins how long
+that window is — so the tool restores `restorewindowlength()` frames centred on
+the playhead rather than letting the user pick. Frames outside the cache render
+as decoded, so this is additive: restore the stretch you are working on, leave
+the rest.
+
+`RestoreEffect` goes on the clip at the first successful run, the same way the
+matte tool adds its effect, so the result is visible without a second step.
+"""
+function restorepanel!(ctx::ToolContext)
+    player = ctx.player
+    toollabel!(ctx, player.restoreinfo)
+    toolaction!(ctx, "Restore around playhead", () -> runrestore!(ctx))
+    toolaction!(ctx, "Clear restored frames", () -> begin
+        loc = editclip(player)
+        loc === nothing && return setstatus!(player, "restore: no clip under the playhead")
+        clearrestore!(loc[1])
+        i = findfirst(s -> s.effect isa RestoreEffect, loc[1].effects)
+        i === nothing || deleteat!(loc[1].effects, i)
+        player.restoreinfo[] = "no restoration"
+        refreshmattepanel!(player)
+        notify(player.playhead)
+        setstatus!(player, "restored frames cleared")
+    end)
+    hasrestoremodel() ||
+        toollabel!(ctx, "no model installed — see examples/basicvsrpp.jl")
+    return nothing
+end
+
+function runrestore!(ctx::ToolContext)
+    player = ctx.player
+    hasrestoremodel() ||
+        return setstatus!(player, "restore: no model installed (examples/basicvsrpp.jl)")
+    loc = editclip(player)
+    loc === nothing && return setstatus!(player, "restore: move the playhead onto a clip")
+    clip, srcframe = loc
+    player.restoreinfo[] == "restoring…" &&
+        return setstatus!(player, "restore: already running")
+    n = restorewindowlength()
+    first = clamp(srcframe - n ÷ 2, clip.src_in, max(clip.src_in, clip.src_out - n))
+    player.restoreinfo[] = "restoring…"
+    setstatus!(player, "restore: $n frames from $(first)")
+    runanalysis(player) do
+        try
+            reader = framereader(player, clip)
+            got = restorewindow!(clip, reader, first, n;
+                                 progress = (d, t) -> (player.jobprogress[] = d / max(t, 1)))
+            put!(player.uiqueue, () -> begin
+                findeffect(clip, RestoreEffect) === nothing &&
+                    push!(clip.effects, FxSlot(RestoreEffect()))
+                player.restoreinfo[] = "$got frames restored from $(first) (x$(restorescale()))"
+                player.jobprogress[] = NaN
+                refreshmattepanel!(player)
+                notify(player.playhead)
+                setstatus!(player, "restored $got frames — Restore is keyframable in the inspector")
+            end)
+        catch e
+            put!(player.uiqueue, () -> begin
+                player.restoreinfo[] = "restore failed"
+                player.jobprogress[] = NaN
+                setstatus!(player, "restore failed: $(sprint(showerror, e))")
+            end)
+        end
+    end
+    return nothing
+end
+
+registertool!(:restore, "Restore",
+    "Runs an upscaling/restoration model over frames around the playhead on the " *
+    "SELECTED clip. Needs a model installed (examples/basicvsrpp.jl).";
+    panel = restorepanel!, activate = ctx -> runrestore!(ctx))
