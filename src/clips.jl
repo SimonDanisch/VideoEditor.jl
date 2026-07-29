@@ -87,6 +87,18 @@ A non-destructive reference into a source video: frames
 `src_in:(src_out-1)` of `source`, placed at timeline frame `start`.
 `crop` is a normalized `(x, y, w, h)` rect ((0,0,1,1) = full frame,
 y measured from the top).
+
+`rate` is how many SOURCE frames one TIMELINE frame advances — the conform
+factor for a source that doesn't run at the sequence rate (a 30 fps clip in a
+60 fps timeline has `rate = 0.5` and shows each of its frames twice). It is
+`source.framerate / seq.framerate`, set once when the clip is placed, and it is
+the ONLY place the two frame worlds differ: `src_in`/`src_out` count source
+frames, `start`/[`cliplength`](@ref) count timeline frames, and
+[`sourceframe`](@ref) is the one conversion between them.
+
+Conforming preserves WALL-CLOCK duration (`srclength/source.framerate` seconds
+either way), which is why everything that works in time — audio, the filmstrip,
+thumbnails — needs no rate at all.
 """
 mutable struct Clip
     id::UInt64                  # stable across sorting, undo and save/load
@@ -103,20 +115,76 @@ mutable struct Clip
     const animations::Dict{Symbol, AnimCurve}  # keyframed params (see keyframes.jl)
     track::Int                  # stacking layer; higher = on top (1 = base)
     blendfrom::UInt64           # clip this one blends away FROM (0 = nothing)
+    rate::Float64               # source frames per timeline frame (1 = native)
+    reframe::NTuple{3, Float64} # (scale, x, y) on top of the automatic fit
 end
 
-Clip(source::VideoSource, src_in, src_out, start, crop) =
+Clip(source::VideoSource, src_in, src_out, start, crop, rate::Real = 1.0,
+     reframe::NTuple{3, <:Real} = (1.0, 0.0, 0.0)) =
     Clip(freshid(), source, src_in, src_out, start, crop, FxSlot[], nothing, nothing,
-         nothing, Dict{Symbol, AnimCurve}(), 1, UInt64(0))
+         nothing, Dict{Symbol, AnimCurve}(), 1, UInt64(0), Float64(rate),
+         Float64.(reframe))
 
 function Clip(source::VideoSource; src_in::Integer = 0, src_out::Integer = source.nframes,
-              start::Integer = 0)
-    return Clip(source, src_in, src_out, start, (0.0, 0.0, 1.0, 1.0))
+              start::Integer = 0, rate::Real = 1.0)
+    return Clip(source, src_in, src_out, start, (0.0, 0.0, 1.0, 1.0), rate)
 end
 
-cliplength(clip::Clip) = clip.src_out - clip.src_in
+"The identity reframe: fitted whole, centred, untouched by the user."
+const NEUTRALFRAME = (1.0, 0.0, 0.0)
+
+"Whether this clip is placed by the plain fit, with no manual zoom or shift."
+neutralframe(clip::Clip) = clip.reframe == NEUTRALFRAME
+
+"""
+    conformrate(source, framerate) -> Float64
+
+The [`Clip`](@ref) `rate` that puts `source` into a timeline running at
+`framerate`. Exactly 1.0 when the rates agree (to a hundredth of a frame), so a
+matching source never picks up conform arithmetic — or its rounding.
+"""
+conformrate(source::VideoSource, framerate::Real) =
+    isapprox(source.framerate, framerate; atol = 0.01) ? 1.0 :
+    Float64(source.framerate) / Float64(framerate)
+
+"Frames of SOURCE this clip spans — what every per-source-frame analysis iterates."
+srclength(clip::Clip) = clip.src_out - clip.src_in
+
+"""
+Frames of TIMELINE this clip occupies — its extent in the edit. Equal to
+[`srclength`](@ref) on a native clip; `floor` (not `round`) so the last timeline
+frame always maps inside the source range.
+"""
+cliplength(clip::Clip) = max(floor(Int, srclength(clip) / clip.rate), 0)
 clipend(clip::Clip) = clip.start + cliplength(clip)
 hascrop(clip::Clip) = clip.crop != (0.0, 0.0, 1.0, 1.0)
+
+"Whether this clip is retimed to the sequence rate rather than running natively."
+conformed(clip::Clip) = clip.rate != 1.0
+
+"""
+    sourceframe(clip, n) -> Int
+
+The source frame showing at timeline frame `n` — the ONE conversion between the
+edit's frame world and the media's. Not clamped: transition handles deliberately
+ask past a clip's own range.
+"""
+sourceframe(clip::Clip, n::Integer) =
+    clip.rate == 1.0 ? clip.src_in + (Int(n) - clip.start) :
+    clip.src_in + floor(Int, (Int(n) - clip.start) * clip.rate)
+
+"Timeline frames that `nsrc` source frames of this clip's media occupy."
+timelineframes(clip::Clip, nsrc::Integer) = floor(Int, Int(nsrc) / clip.rate)
+
+"""
+    timelineframe(clip, sf) -> Int
+
+Where source frame `sf` of `clip` shows on the timeline — the inverse of
+[`sourceframe`](@ref). Every keyframe marker, readout and ◆ jump needs it: keys
+are stored on source frames but drawn against the timeline.
+"""
+timelineframe(clip::Clip, sf::Integer) =
+    clip.start + timelineframes(clip, Int(sf) - clip.src_in)
 
 """
 A transition centered on the cut at timeline frame `at` (== `clipend(left)` ==
@@ -148,9 +216,16 @@ mutable struct Sequence
     const clips::Vector{Clip}
     framerate::Float64
     const transitions::Vector{Transition}
+    # Plots drawn over the finished canvas (see overlays.jl). They belong to the
+    # SEQUENCE, not to a clip: an overlay sits above the composite, so a cut
+    # underneath it changes nothing about where or when it is drawn.
+    const overlays::Vector{Overlay}
 end
 
-Sequence(clips::Vector{Clip}, framerate::Real) = Sequence(clips, framerate, Transition[])
+Sequence(clips::Vector{Clip}, framerate::Real) =
+    Sequence(clips, framerate, Transition[], Overlay[])
+Sequence(clips::Vector{Clip}, framerate::Real, transitions::Vector{Transition}) =
+    Sequence(clips, framerate, transitions, Overlay[])
 Sequence(source::VideoSource) = Sequence([Clip(source)], source.framerate)
 
 "The clip with `id`, or `nothing` — how anything refers to a clip across sorting,
@@ -198,7 +273,7 @@ function locate(seq::Sequence, n::Integer)
     i = clipat(seq, n)
     i === nothing && return nothing
     clip = seq.clips[i]
-    return (clip, clip.src_in + (n - clip.start))
+    return (clip, sourceframe(clip, n))
 end
 
 "The transition whose region contains timeline frame `n`, or `nothing`."
@@ -227,8 +302,8 @@ function transitionsample(seq::Sequence, t::Transition, n::Integer)
     left, right = transitionclips(seq, t.at)
     (left === nothing || right === nothing) && return nothing
     p = clamp((n - transstart(t) + 0.5) / t.duration, 0.0, 1.0)
-    srcA = clamp(left.src_in + (n - left.start), 0, left.source.nframes - 1)
-    srcB = clamp(right.src_in + (n - right.start), 0, right.source.nframes - 1)
+    srcA = clamp(sourceframe(left, n), 0, left.source.nframes - 1)
+    srcB = clamp(sourceframe(right, n), 0, right.source.nframes - 1)
     return (left, srcA, right, srcB, p)
 end
 
@@ -298,8 +373,14 @@ function split!(seq::Sequence, n::Integer)
     i === nothing && return nothing
     clip = seq.clips[i]
     n == clip.start && return nothing
-    offset = n - clip.start
-    right = Clip(clip.source, clip.src_in + offset, clip.src_out, n, clip.crop)
+    cut = sourceframe(clip, n)            # the cut in SOURCE frames — both halves share it
+    cut > clip.src_in || return nothing
+    # …and the halves must MEET: on a conformed clip several timeline frames show
+    # the same source frame, so the cut is snapped back to where that frame starts.
+    # Cutting at the raw `n` left the left half one frame short of the right one —
+    # a hole in the timeline that only appears on retimed material.
+    at = clip.start + timelineframes(clip, cut - clip.src_in)
+    right = Clip(clip.source, cut, clip.src_out, at, clip.crop, clip.rate)
     right.track = clip.track              # both halves stay on the same stacking layer
     right.blendfrom = clip.blendfrom
     # each half owns its stack: same effects, own slot ids, so the inspector and
@@ -310,9 +391,38 @@ function split!(seq::Sequence, n::Integer)
     for (key, curve) in clip.animations   # absolute-frame keyed, but each half gets
         right.animations[key] = AnimCurve(copy(curve.keys), curve.interp)
     end                                   # its OWN copy — halves must edit independently
-    clip.src_out = clip.src_in + offset
+    clip.src_out = cut
     insert!(seq.clips, i + 1, right)
     return right
+end
+
+"""
+    trimclip!(seq, clip, i, side, n) -> clip
+
+Move one edge of `clip` (`i` = its index in `seq.clips`) to timeline frame `n`.
+The left edge shifts `start` and `src_in` together so the content stays anchored;
+the right edge moves `src_out`. Clamped to the available source and to the
+neighbours on the same lane.
+
+The edge walks TIMELINE frames while the in/out points count SOURCE frames — on a
+conformed clip those are not the same step, which is why this is one function
+and not arithmetic inlined in the drag handler.
+"""
+function trimclip!(seq::Sequence, clip::Clip, i::Integer, side::Symbol, n::Integer)
+    if side === :right
+        maxend = clip.start + timelineframes(clip, clip.source.nframes - clip.src_in)
+        i < length(seq.clips) && (maxend = min(maxend, seq.clips[i + 1].start))
+        newend = clamp(Int(n), clip.start + 1, maxend)
+        clip.src_out = sourceframe(clip, newend)
+    else
+        minstart = max(i > 1 ? clipend(seq.clips[i - 1]) : 0,
+                       clip.start - timelineframes(clip, clip.src_in))  # src_in stays ≥ 0
+        newstart = clamp(Int(n), minstart, clipend(clip) - 1)
+        delta = newstart - clip.start
+        clip.src_in += round(Int, delta * clip.rate)
+        clip.start += delta
+    end
+    return clip
 end
 
 """
@@ -329,6 +439,7 @@ function joinclips!(seq::Sequence, n::Integer)
     i === nothing && return nothing
     c = seq.clips[i]
     j = findfirst(o -> o !== c && o.track == c.track && o.source === c.source &&
+                       o.rate == c.rate &&
                        o.start == clipend(c) && o.src_in == c.src_out, seq.clips)
     j === nothing && return nothing
     nxt = seq.clips[j]
@@ -377,7 +488,7 @@ snapshot(seq::Sequence) =
     [Clip(c.id, c.source, c.src_in, c.src_out, c.start, c.crop,
           [FxSlot(s.id, s.effect, s.enabled) for s in c.effects],
           c.colortrack, c.motiontrack, c.mattetrack, deepcopy(c.animations), c.track,
-          c.blendfrom)
+          c.blendfrom, c.rate, c.reframe)
      for c in seq.clips]
 
 "Restore a [`snapshot`](@ref) (the snapshot itself stays reusable)."

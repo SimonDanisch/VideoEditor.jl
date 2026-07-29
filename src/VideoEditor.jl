@@ -32,6 +32,7 @@ include("proxy.jl")
 include("buffer.jl")
 include("decoder.jl")
 include("keyframes.jl")
+include("overlays.jl")   # Overlay: the Sequence carries a list of them
 include("clips.jl")
 include("effects.jl")
 include("project.jl")
@@ -64,6 +65,7 @@ export ColorEffect, BlurEffect, SharpenEffect, MatteEffect, seteffect!
 export MatteTrack, analyzematte!, applymatte!, registermatte!, seedmask
 export RestoreEffect, registerrestore!, restorewindow!, applyrestore!
 export registerplugin!, FxParam, FxPlugin, Pointwise, Stencil
+export Overlay, registeroverlay!, addoverlay!, removeoverlay!, setoverlaykey!
 export registertool!, EditorTool, ToolContext, toolplot!, ontool!, tooltime, toolband
 export activatetool!, deactivatetool!
 export exportvideo, exportgif, analyzecolor!, analyzemotion!, analyzeobject!, findloop

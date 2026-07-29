@@ -66,6 +66,7 @@ mutable struct Player
     const fxsyncing::Base.RefValue{Bool}
     cropanchor::Union{Nothing, Point2f}
     lastcrop::NTuple{4, Float64}
+    lastframe::NTuple{3, Float64}   # the reframe half of the framing cache key
     lastclip::Union{Nothing, Clip}
     clipmodal::Any
     rctime::Float64
@@ -317,8 +318,11 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     # DataAspect keeps pixels square and letterboxes the crop inside the cell,
     # so we never show outside the crop (which would re-reveal the warp border
     # a stabilization crop hides). The wide dock-less cell gives the extra width.
+    # …and BLACK behind it, not the UI grey: everything the picture doesn't cover
+    # is a letterbox bar, and the encoder writes black there. A programme monitor
+    # that surrounds the frame in grey is off by exactly that lie.
     ax = Axis(fig[1, 3], aspect = DataAspect(), yreversed = true,
-              backgroundcolor = background)
+              backgroundcolor = RGBf(0, 0, 0))
     hidedecorations!(ax)
     hidespines!(ax)
     deregister_interaction!(ax, :rectanglezoom)  # left-drag is the crop tool
@@ -370,7 +374,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     Observable(Point2f[]),
                     similar(frame[]), Dict{Symbol, Slider}(),
                     Dict{Symbol, Any}(),
-                    Ref(false), nothing, (0.0, 0.0, 1.0, 1.0), nothing, nothing, 0.0,
+                    Ref(false), nothing, (0.0, 0.0, 1.0, 1.0), NEUTRALFRAME, nothing, nothing, 0.0,
                     nothing, nothing, nothing, nothing, nothing,
                     Vector{Clip}[], Vector{Clip}[], 0.0, nothing, 0, 0,
                     Dict{Symbol, Any}(), Observable(:none),
@@ -697,7 +701,8 @@ Returns `false` (caller falls back to the single-clip path) if any layer isn't b
 yet. CPU preview path — the GPU/export paths still show the top clip for now.
 """
 function compositeframe!(player::Player, n::Integer, clips::Vector{Clip})
-    ensureframesize!(player, clips[end].source)      # canvas at the top clip's resolution
+    canvas = canvassize(player.sequence)   # the SEQUENCE's format, not the top layer's
+    ensureframesize!(player, canvas)
     # the CPU tier of ONE composite (see `composite`): its only job is to hand
     # each layer a decoded frame from that source's ring — everything the
     # picture depends on is shared with the GPU tier and the export
@@ -712,9 +717,9 @@ function compositeframe!(player::Player, n::Integer, clips::Vector{Clip})
         end
         return buf
     end
-    ok = composite(player.cpuengine, clips, n, decoded;
-                   applytracks = player.applytracks[], playing = player.playing[]) do canvas
-        copyto!(player.frame[], canvas)                  # publish the finished composite
+    ok = composite(player.cpuengine, clips, n, decoded; canvas = canvas,
+                   applytracks = player.applytracks[], playing = player.playing[]) do composed
+        copyto!(player.frame[], composed)                # publish the finished composite
     end
     ok || return false
     showcpuframe!(player)
@@ -756,7 +761,7 @@ function editclip(player::Player)
     i = player.timeline.selected[]
     if 1 <= i <= length(seq.clips)
         c = seq.clips[i]
-        c.start <= n < clipend(c) && return (c, c.src_in + (n - c.start))
+        c.start <= n < clipend(c) && return (c, sourceframe(c, n))
     end
     return locate(seq, n)
 end
@@ -796,10 +801,13 @@ function showframe!(player::Player, n::Integer; standin::Bool = !atrest(player))
                 # view shows the canvas WHOLE — one rule, above the tier split
                 # (the GPU tier used to leave the single-clip present's crop on
                 # the axis, applying a stabilized clip's framing twice for the
-                # length of a blend)
-                src = clips[end].source
+                # length of a blend). The canvas is the SEQUENCE's: measuring it
+                # by the top layer left the limits describing one format while
+                # the buffer held another as soon as the layers differed in size.
+                cw, ch = canvassize(player.sequence)
                 player.lastcrop = (0.0, 0.0, 1.0, 1.0)
-                coverlimits!(player, 0, src.width, src.height, 0)
+                player.lastframe = NEUTRALFRAME
+                coverlimits!(player, 0, cw, ch, 0)
                 return true
             end
         end
@@ -907,9 +915,12 @@ function decodetarget(player::Player, n::Integer, clip::Clip, srcframe::Integer)
 end
 
 "Match the preview and effect buffers to the active clip's source resolution."
-function ensureframesize!(player::Player, source::VideoSource)
-    size(player.frame[]) == (source.width, source.height) && return nothing
-    player.frame.val = RGBFrame(undef, source.width, source.height)  # notified once filled
+ensureframesize!(player::Player, source::VideoSource) =
+    ensureframesize!(player, (source.width, source.height))
+
+function ensureframesize!(player::Player, wh::Tuple{Integer, Integer})
+    size(player.frame[]) == (Int(wh[1]), Int(wh[2])) && return nothing
+    player.frame.val = RGBFrame(undef, Int(wh[1]), Int(wh[2]))  # notified once filled
     player.composebuf = similar(player.frame[])
     player.lastcrop = (-1.0, 0.0, 0.0, 0.0)  # force applycrop! (limits are per-source)
     return nothing
@@ -959,14 +970,23 @@ function coverlimits!(player::Player, xlo::Real, xhi::Real, yfirst::Real, ysecon
     return nothing
 end
 
-"Apply a clip's crop to the preview via axis limits (zero-copy, GPU-side).
-The crop is normalized, so limits come from the DISPLAYED buffer — which is
-the proxy's resolution when one is active."
+"""
+Frame a single-clip present via axis limits — zero-copy, no resample, and the
+proxy's resolution when one is active (limits come from the DISPLAYED buffer).
+
+The limits are the canvas rectangle mapped back through [`layermatrix`](@ref),
+so this shows EXACTLY what the composite bakes: the crop, fitted whole, plus the
+clip's reframe. When the clip already has the canvas' shape that is precisely
+its crop rect (the old behaviour, bit for bit); when it doesn't, the limits reach
+past the picture and the axis background fills the difference — the letterbox
+bars, matching the black the encoder writes there.
+"""
 function applycrop!(player::Player, clip::Clip)
-    clip.crop == player.lastcrop && return nothing
+    (clip.crop == player.lastcrop && clip.reframe == player.lastframe) && return nothing
     player.lastcrop = clip.crop
-    x, y, w, h = clip.crop
+    player.lastframe = clip.reframe
     W, H = size(player.frame[])
+    x, y, w, h = canvasrect(clip, (W, H), canvassize(player.sequence))
     coverlimits!(player, x * W, (x + w) * W, (y + h) * H, y * H)
     return nothing
 end
@@ -1205,23 +1225,24 @@ end
     addsource!(player, path) -> Clip
 
 Append the video at `path` as a new clip at the end of the timeline
-(undoable). The source must match the sequence framerate (the edit model is
-frame-exact, no resampling); resolution may differ. Also triggered by
+(undoable). Resolution and framerate may differ from the sequence — a source at
+another rate is conformed (see [`placesource!`](@ref)). Also triggered by
 dropping video files onto the editor window.
 """
 function addsource!(player::Player, path::AbstractString)
     source = VideoSource(path)
     seq = player.sequence
-    isapprox(source.framerate, seq.framerate; atol = 0.01) ||
-        error("framerate $(source.framerate) doesn't match the sequence ($(seq.framerate))")
+    rate = conformrate(source, seq.framerate)
     snapshot!(player)
-    clip = Clip(source, 0, source.nframes, seqlength(seq), (0.0, 0.0, 1.0, 1.0))
+    clip = Clip(source, 0, source.nframes, seqlength(seq), (0.0, 0.0, 1.0, 1.0), rate)
     push!(seq.clips, clip)
     registermedia!(player, source)
     limits!(player.timeline.axis, 0.0, seqduration(seq), 0.0, 1.0)  # reveal the new clip
     refreshedit!(player)
+    note = conformnote(source, seq.framerate)
     setstatus!(player, "added $(basename(path)) — $(source.width)×$(source.height), " *
-                       "$(round(source.nframes / source.framerate, digits = 1))s")
+                       "$(round(source.nframes / source.framerate, digits = 1))s" *
+                       (isempty(note) ? "" : " · " * note))
     needsproxy(source; maxpixels = player.proxythreshold) && startproxy!(player, source)
     return clip
 end
@@ -1285,6 +1306,7 @@ function removestabilization!(player::Player; at::Integer = player.playhead[])
     shown = locate(player.sequence, player.playhead[])
     if shown !== nothing && shown[1] === clip
         player.lastcrop = clip.crop
+        player.lastframe = clip.reframe
         notify(player.playhead)
         showcrop!(player, oldcrop, clip.crop)
     else
@@ -1305,7 +1327,7 @@ function analyzeat!(player::Player, analyze!::Function, what::String;
         return nothing
     end
     clip = loc[1]
-    setstatus!(player, "$what: analyzing $(cliplength(clip)) frames…")
+    setstatus!(player, "$what: analyzing $(srclength(clip)) frames…")
     player.stabinfo[] = "analyzing…"
     player.jobprogress[] = 0.0   # footer spinner + bar animate while the job runs
     # replacing a track must not stack auto-crops: the new analysis composes
@@ -1341,6 +1363,7 @@ function analyzeat!(player::Player, analyze!::Function, what::String;
                 shown = locate(player.sequence, player.playhead[])
                 if shown !== nothing && shown[1] === clip
                     player.lastcrop = clip.crop      # presents keep hands off
+                    player.lastframe = clip.reframe
                     notify(player.playhead)
                     showcrop!(player, oldcrop, clip.crop)
                 else
@@ -1384,8 +1407,8 @@ function findlooptrim!(player::Player; at::Integer = player.playhead[],
     fps = clip.source.framerate
     # cap below the full length so it can't return the whole clip; a small
     # length bias makes a full behavioural cycle win over a short sub-loop
-    maxs = maxseconds > 0 ? Float64(maxseconds) : 0.9 * cliplength(clip) / fps
-    setstatus!(player, "make loop: matching frames across $(cliplength(clip)) frames…")
+    maxs = maxseconds > 0 ? Float64(maxseconds) : 0.9 * srclength(clip) / fps
+    setstatus!(player, "make loop: matching frames across $(srclength(clip)) frames…")
     player.jobprogress[] = 0.0
     job = () -> try
         a, b, score = findloop(clip; minseconds = 3.0, maxseconds = maxs, lengthbias = 0.0002,
@@ -1453,13 +1476,74 @@ function ensurestreams!(player::Player)
     return nothing
 end
 
+"""
+    previewtosource(player, clip, srcframe, p) -> (x, y)
+
+Where a click in the preview lands, in the clip's SOURCE pixels.
+
+Two hops, and both are *sampling* matrices, so this is a forward multiply rather
+than an inversion. `layermatrix` maps a canvas pixel to the layer pixel that was
+drawn there — the clip's crop, fitted whole, plus its reframe, letterbox bars
+included. The stabilization transform maps a displayed pixel to the source pixel
+it was sampled from, which is the same direction. Composing them is the mapping.
+
+What this replaces was `scale = clip.source.width / size(player.frame[], 1)`,
+i.e. "the canvas is the source, scaled". That holds only for an uncropped,
+unreframed, unstabilized clip on a full-width canvas. Anywhere else the click
+landed somewhere other than where the user pointed, and on a stabilized clip it
+was wrong by a different amount on every frame — the transform is per frame.
+"""
+function previewtosource(player::Player, clip::Clip, srcframe::Integer, p)
+    canvas = size(player.frame[])
+    # Source pixels, not the layer's: `fitmatrix` depends on the input size only
+    # through the crop rect's aspect ratio, and a proxy scales both extents
+    # together. Feeding the original size therefore lands directly in source
+    # pixels and makes the whole mapping proxy-independent — which matters,
+    # because a proxy swap replaces the decode pool, not `clip.source`.
+    layer = (clip.source.width, clip.source.height)
+    lclip = effectiveclip(clip, srcframe)   # crop/reframe can be keyframed
+    q = layermatrix(lclip, layer, canvas) * Vec3f(p[1], p[2], 1)   # canvas -> source
+    track = clip.motiontrack
+    if track !== nothing
+        i = srcframe - track.src_in + 1
+        if 1 <= i <= length(track.transforms)
+            # stored in source pixels, which is what `q` now is
+            q = track.transforms[i] * Vec3f(q[1], q[2], 1)         # shown -> pre-stab
+        end
+    end
+    return (q[1], q[2])
+end
+
+"""
+    sourcetopreview(player, clip, srcframe, s) -> (x, y)
+
+Where a source pixel shows up on the canvas — [`previewtosource`](@ref) the other
+way round, so an overlay drawn from source coordinates lands on the pixel it
+describes even after a reframe, a crop or a stabilization warp.
+
+Inverting here rather than keeping a second forward mapping: two mappings would
+be two things to keep in step, and the one that drifts is always the one the user
+sees.
+"""
+function sourcetopreview(player::Player, clip::Clip, srcframe::Integer, s)
+    canvas = size(player.frame[])
+    layer = (clip.source.width, clip.source.height)
+    q = Vec3f(s[1], s[2], 1)
+    track = clip.motiontrack
+    if track !== nothing
+        i = srcframe - track.src_in + 1
+        1 <= i <= length(track.transforms) && (q = inv(track.transforms[i]) * q)
+    end
+    r = inv(layermatrix(effectiveclip(clip, srcframe), layer, canvas)) * q
+    return (r[1], r[2])
+end
+
 "Arm a one-shot preview click that picks the subject to lock onto."
 function armpick!(player::Player)
     player.onpick = p -> analyzeat!(player,
         (clip; kwargs...) -> begin
-            # preview data coords may be proxy pixels; analysis reads the original
-            scale = clip.source.width / size(player.frame[], 1)
-            analyzeobject!(clip, (p[1] * scale, p[2] * scale);
+            srcframe = sourceframe(clip, player.playhead[])
+            analyzeobject!(clip, previewtosource(player, clip, srcframe, p);
                            backend = player.analysisbackend, kwargs...)
         end,
         "object lock")
@@ -1469,7 +1553,13 @@ end
 
 function wirecroptool(player::Player)
     ax = player.previewaxis
+    # Every handler over the preview asks first whether the pointer is still its
+    # to take. An overlay scene that claims it (`captures_mouse`, e.g. the matte
+    # marking) turns this false, so a click lands in exactly one place instead of
+    # arming a pick AND dropping a crop anchor AND scrubbing.
+    mine() = Makie.receives_events(ax.scene)
     on(events(ax.scene).mousebutton) do event
+        mine() || return Consume(false)
         pick = player.onpick
         if pick !== nothing && event.button == Mouse.left &&
            event.action == Mouse.press && is_mouseinside(ax.scene)
@@ -1480,6 +1570,7 @@ function wirecroptool(player::Player)
         return Consume(false)
     end
     on(events(ax.scene).mousebutton) do event
+        mine() || return Consume(false)
         event.button == Mouse.left || return Consume(false)
         player.cropmode[] || return Consume(false)
         if event.action == Mouse.press && is_mouseinside(ax.scene)
@@ -1492,6 +1583,7 @@ function wirecroptool(player::Player)
         return Consume(false)
     end
     on(events(ax.scene).mouseposition) do _
+        mine() || return Consume(false)
         anchor = player.cropanchor
         if anchor !== nothing && player.cropmode[]
             pos = Point2f(mouseposition(ax.scene))
@@ -1573,8 +1665,29 @@ function wirekeys(player::Player)
             analyzeat!(player, (c; kw...) -> analyzemotion!(c; backend = player.analysisbackend, kw...), "motion stabilization")
         elseif event.key == Keyboard.z && ispress &&
                ispressed(player.fig, Keyboard.left_control | Keyboard.right_control)
-            shift ? redo!(player) : undo!(player)
+            # While a selection is being marked, Ctrl+Z means "take that point
+            # back" — the thing the user just did. Letting it fall through to the
+            # project undo edits the TIMELINE instead, which is both surprising
+            # and hard to notice: the clip moves behind a preview you are staring
+            # at for a matte.
+            col = mattecollect(player)
+            if col !== nothing && !shift
+                dropmattepoint!(col)
+            else
+                shift ? redo!(player) : undo!(player)
+            end
+        elseif event.key == Keyboard.enter && ispress && mattecollect(player) !== nothing
+            # Enter is the "I am done marking" gesture; it must beat every other
+            # Enter binding while a selection is open, hence the guard up here.
+            finishmattecollect!(mattecollect(player))
+        elseif event.key == Keyboard.backspace && ispress && mattecollect(player) !== nothing
+            dropmattepoint!(mattecollect(player))
         elseif event.key == Keyboard.escape && ispress
+            col = mattecollect(player)
+            if col !== nothing
+                cancelmattecollect!(col)
+                return Consume(true)
+            end
             player.cropmode[] = false
             player.cropanchor = nothing
             player.croprect[] = Point2f[]
@@ -1855,7 +1968,11 @@ function buildmediabin!(player::Player, gridpos, uicolors)
             t = pos[1]
             seq = player.sequence
             ntr = ntracks(seq)
-            nfr = player.dragsource.nframes
+            src = player.dragsource
+            # the ghost must show what will LAND: a conformed clip keeps its
+            # wall-clock duration but occupies a different number of timeline
+            # frames. Measuring it in sequence frames drew a 9.3 s clip as 4.7 s.
+            nfr = floor(Int, src.nframes / conformrate(src, seq.framerate))
             # target the hovered lane; if that spot is taken, the ghost snaps to
             # the first free lane above (stacking), never silently to the end
             track = freetrack(seq, round(Int, t * seq.framerate), nfr, trackat(pos[2], ntr))
@@ -1903,10 +2020,16 @@ function buildmediabin!(player::Player, gridpos, uicolors)
                     player.dragsource = src
                     player.timeline.dragactive[] = true
                     setcursor!(player, :hand)
-                    draglabel[] = basename(src.path)
+                    # the chip carries the retime, so the conform is visible BEFORE
+                    # the drop rather than after it (or, as it used to be, never)
+                    note = conformnote(src, player.sequence.framerate)
+                    draglabel[] = isempty(note) ? basename(src.path) :
+                                  basename(src.path) * "  ·  " *
+                                  "$(round(src.framerate; digits = 2)) → $(round(player.sequence.framerate; digits = 2)) fps"
                     dragvis[] = true
                     moveghost(mp)
-                    setstatus!(player, "drop $(basename(src.path)) on a timeline lane — or on “+ new track” above them")
+                    setstatus!(player, "drop $(basename(src.path)) on a timeline lane — or on “+ new track” above them" *
+                                       (isempty(note) ? "" : " · will be " * note))
                     return Consume(true)
                 end
             end
@@ -2008,29 +2131,52 @@ function importsources!(player::Player, paths)
 end
 
 """
+    conformnote(source, framerate) -> String
+
+What conforming this source will do, for the drag chip and the status line — or
+`""` when it runs at the sequence rate and nothing happens to it. A retime that
+is never mentioned is a retime the user later finds by wondering why the picture
+stutters.
+"""
+function conformnote(source::VideoSource, framerate::Real)
+    r = conformrate(source, framerate)
+    r == 1.0 && return ""
+    fps(x) = string(round(x; digits = x == round(x) ? 0 : 2))
+    how = r < 1 ? "each frame held $(round(1 / r; digits = 1))×" :
+                  "every $(round(r; digits = 1))ᵗʰ frame kept"
+    return "conformed $(fps(source.framerate)) → $(fps(framerate)) fps ($how)"
+end
+
+"""
 Place `source` as a new clip starting at frame `at` on `track` (undoable) —
 dropping above the top lane creates a new track, whose clips composite over the
-ones below (multi-track). A drop that would overlap a clip ON THE SAME track
-lands at the end of the timeline instead — the status line says which happened.
+ones below (multi-track). A drop onto an occupied spot stacks on the first free
+lane above; the status line says which happened.
+
+A source at a different framerate is CONFORMED to the sequence rather than
+refused (see [`Clip`](@ref)'s `rate`): its duration is preserved and frames are
+held or dropped to fit. Refusing it was a dead end that only announced itself in
+the status line — the bin had accepted the file, the drag ghost had shown a
+valid lane, and then nothing landed.
 """
 function placesource!(player::Player, source::VideoSource, at::Integer; track::Integer = 1)
     seq = player.sequence
-    if !isapprox(source.framerate, seq.framerate; atol = 0.01)
-        setstatus!(player, "framerate $(source.framerate) doesn't match the sequence ($(seq.framerate))")
-        return nothing
-    end
+    rate = conformrate(source, seq.framerate)
     start = max(Int(at), 0)
+    len = floor(Int, source.nframes / rate)   # TIMELINE frames this clip will occupy
     # if the wanted lane is occupied there, stack on the first free lane above —
     # the drop always lands where the drag ghost showed it
-    track = freetrack(seq, start, Int(source.nframes), clamp(Int(track), 1, ntracks(seq) + 1))
-    if track > ntracks(seq) && ntracks(seq) > 0 && !isempty(seq.clips)
-        setstatus!(player, "placed $(basename(source.path)) on NEW track V$track — it composites over the tracks below")
+    track = freetrack(seq, start, len, clamp(Int(track), 1, ntracks(seq) + 1))
+    note = conformnote(source, seq.framerate)
+    where = if track > ntracks(seq) && ntracks(seq) > 0 && !isempty(seq.clips)
+        "placed $(basename(source.path)) on NEW track V$track — it composites over the tracks below"
     else
-        setstatus!(player, "placed $(basename(source.path)) at $(timestring(start / seq.framerate))" *
-                           (track > 1 ? " on track V$track" : ""))
+        "placed $(basename(source.path)) at $(timestring(start / seq.framerate))" *
+        (track > 1 ? " on track V$track" : "")
     end
+    setstatus!(player, isempty(note) ? where : where * " · " * note)
     snapshot!(player)
-    clip = Clip(source, 0, source.nframes, start, (0.0, 0.0, 1.0, 1.0))
+    clip = Clip(source, 0, source.nframes, start, (0.0, 0.0, 1.0, 1.0), rate)
     clip.track = track
     push!(seq.clips, clip)
     sort!(seq.clips, by = c -> (c.track, c.start))
@@ -2201,7 +2347,7 @@ function buildkeyframeoverlay!(player::Player)
                 x0 = clip.start / fps; x1 = clipend(clip) / fps
                 for i in 0:60
                     s = x0 + (x1 - x0) * i / 60
-                    sf = clip.src_in + (round(Int, s * fps) - clip.start)
+                    sf = sourceframe(clip, round(Int, s * fps))
                     v = something(valueat(c, sf), p.get(clip))
                     push!(segs, Point2f(s, yat(clip, p, v)))
                 end
@@ -2227,7 +2373,7 @@ function buildkeyframeoverlay!(player::Player)
                 col = RGBAf(Makie.to_color(paramcolor(key)))
                 for (i, k) in enumerate(c.keys)
                     clip.src_in <= k.frame <= clip.src_out || continue
-                    pt = Point2f((clip.start + (k.frame - clip.src_in)) / fps,
+                    pt = Point2f(timelineframe(clip, k.frame) / fps,
                                  yat(clip, p, k.value))
                     push!(pts, pt)
                     push!(markmeta, (key, i, clip))
@@ -2357,7 +2503,7 @@ function buildkeyframeoverlay!(player::Player)
                 ci = findfirst(c -> c.track == tr && c.start <= n < clipend(c), seq.clips)
                 ci === nothing && return Consume(false)
                 clip = seq.clips[ci]
-                sf = clip.src_in + (n - clip.start)
+                sf = sourceframe(clip, n)
                 key = nearestcurve(clip, sf, y)
                 if key === nothing                       # not aiming at any curve
                     setstatus!(player, isempty(clip.animations) ?
@@ -2392,7 +2538,7 @@ function buildkeyframeoverlay!(player::Player)
             kfmenuctx[] = (clip, key, kidx)
             c = clip.animations[key]
             k = c.keys[kidx]
-            kfmenu.title = "◆ $(paramspec(key).label) · $(timestring((clip.start + (k.frame - clip.src_in)) / fps))"
+            kfmenu.title = "◆ $(paramspec(key).label) · $(timestring(timelineframe(clip, k.frame) / fps))"
             easelabel[] = keyease(c, k) === :smooth ? "Make linear (corner)" : "Ease in & out"
             holdlabel[] = k.ease === :hold ? "Interpolate again" : "Hold until the next key"
             mp = events(player.fig).mouseposition[]      # pop up AT the cursor
@@ -2408,19 +2554,19 @@ function buildkeyframeoverlay!(player::Player)
         dragref[] === nothing && return Consume(false)
         c, i, clip, p = dragref[]
         t, y = mouseposition(ax.scene)
-        f = clamp(clip.src_in + (timelineframe(tl, t) - clip.start), clip.src_in, clip.src_out)
+        f = clamp(sourceframe(clip, timelineframe(tl, t)), clip.src_in, clip.src_out)
         # snap to the playhead when close (Premiere-style) — RAW pixel distance, not
         # the frame-quantized one (a frame can already be wider than the threshold)
         vp = ax.scene.viewport[]; (x0, x1) = tl.viewrange[]
         pxpersec = max(vp.widths[1], 1) / max(x1 - x0, 1.0e-9)
         phf = clamp(playheadframe(player, clip), clip.src_in, clip.src_out)
-        pht = (clip.start + (phf - clip.src_in)) / fps
+        pht = timelineframe(clip, phf) / fps
         abs(t - pht) * pxpersec < 12 && (f = phf)
         v = yval(clip, p, y)
         movekey!(c, i, f, v)
         j = findfirst(k -> k.frame == f, c.keys); j === nothing || (dragref[] = (c, j, clip, p))
-        dragtippos[] = Point2f((clip.start + (f - clip.src_in)) / fps, yat(clip, p, v))
-        dragtiptext[] = "$(p.label)  $(round(v; digits = 2)) · $(timestring((clip.start + (f - clip.src_in)) / fps))"
+        dragtippos[] = Point2f(timelineframe(clip, f) / fps, yat(clip, p, v))
+        dragtiptext[] = "$(p.label)  $(round(v; digits = 2)) · $(timestring(timelineframe(clip, f) / fps))"
         dragtip.visible = true
         notify(player.playhead); return Consume(true)
     end
@@ -2859,7 +3005,7 @@ end
 clipanimated(clip::Clip, key::Symbol) = haskey(clip.animations, key) && !isempty(clip.animations[key])
 
 "Absolute source frame the playhead currently maps to within `clip`."
-playheadframe(player::Player, clip::Clip) = clip.src_in + (player.playhead[] - clip.start)
+playheadframe(player::Player, clip::Clip) = sourceframe(clip, player.playhead[])
 
 "Effective value of `key` on `clip` at source frame `sf` — the animated curve if
 keyframed, otherwise the static value."
@@ -2985,7 +3131,7 @@ function gotokey!(player::Player, key::Symbol, dir::Integer)
         "$(p.label): no keyframe $(dir < 0 ? "before" : "after") the playhead")
     k = dir < 0 ? last(cand) : first(cand)
     player.kffocus[] = key
-    seek!(player, clamp(clip.start + (k.frame - clip.src_in), 0, seqlength(player.sequence) - 1))
+    seek!(player, clamp(timelineframe(clip, k.frame), 0, seqlength(player.sequence) - 1))
     return nothing
 end
 

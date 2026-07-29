@@ -53,7 +53,7 @@ function extracttracks(backend, clip::Clip, gw::Int, gh::Int;
                        mintracks::Integer = 120, minlen::Integer = 6,
                        progress = nothing)
     source = clip.source
-    n = cliplength(clip)
+    n = srclength(clip)
     w = Int(window); iseven(w) || (w -= 1)
     half = w ÷ 2
     R = Int(searchradius)
@@ -208,7 +208,7 @@ DaVinci's *Similarity + Camera Lock*.
 function bundlelock!(clip::Clip; analysis_width::Integer = 480, window::Integer = 32,
                      searchradius::Integer = 8, huber::Real = 1.5, iters::Integer = 25,
                      backend = KA.CPU(), progress = nothing, kwargs...)
-    n = cliplength(clip)
+    n = srclength(clip)
     n >= 2 || return nothing
     source = clip.source
     aw = clamp(Int(analysis_width), 120, source.width)

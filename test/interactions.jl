@@ -1209,6 +1209,74 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             VE.undo!(p); sleep(0.2)                  # and the split
             @test VE.seqlength(p.sequence) == nbefore
         end
+
+        # The marking interaction, end to end, with the built-in propagator — the
+        # matte testset covers tracks and keyframes but never drives a click, so
+        # `showlivematte!` shipped with a `findeffect(...).effect` on its first
+        # line and the suite stayed green.
+        @testset "matte marking: points, live preview, removal" begin
+            press(tlx(1.0)); release(); sleep(0.3)   # select a clip: marking needs one
+            clip = p.sequence.clips[1]
+            clip.mattetrack = nothing
+            filter!(s -> !(s.effect isa VE.MatteEffect), clip.effects)
+            VE.opendock!(p, :tools)
+            VE.activatetool!(p, :matte); sleep(0.5)
+            col = VE.mattecollect(p)
+            @test col !== nothing                       # marking is armed…
+            @test col.scene.visible[]                   # …and the overlay is up
+            @test col.scene.captures_mouse              # so nothing else gets the click
+            moveto(pv(0.5, 0.5))                        # routing is asked about a POSITION
+            @test !Makie.receives_events(p.previewaxis.scene)   # crop/pick stand down
+
+            press(pv(0.5, 0.5)); release(); sleep(0.2)  # one foreground point
+            @test length(col.points) == 1
+            @test length(col.fg[]) == 1
+            @test waitfor(() -> clip.mattetrack !== nothing)
+            @test size(clip.mattetrack.alpha, 3) == 1   # THIS frame only
+            fx = VE.findeffect(clip, VE.MatteEffect)
+            @test fx !== nothing && fx.strength < 1.0f0 # background dimmed, not black
+
+            press(pv(0.5, 0.5)); release(); sleep(0.3)  # clicking a dot removes it
+            @test isempty(col.points)
+            @test isempty(col.fg[])
+
+            press(pv(0.5, 0.5)); release(); sleep(0.2)
+            press(pv(0.6, 0.55)); release(); sleep(0.2)
+            @test length(col.points) == 2
+            keypress(Keyboard.backspace); sleep(0.2)    # Backspace undoes the last
+            @test length(col.points) == 1
+            press(pv(0.62, 0.5)); release(); sleep(0.2)
+            @test length(col.points) == 2
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
+            keypress(Keyboard.z); sleep(0.3)            # Ctrl+Z takes the point back…
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
+            @test length(col.points) == 1
+            @test length(p.sequence.clips) == 1         # …and does NOT undo the edit
+
+            keypress(Keyboard.escape); sleep(0.5)       # Esc puts everything back
+            @test VE.mattecollect(p) === nothing
+            @test !col.scene.visible[] && !col.scene.captures_mouse
+            @test isempty(col.fg[]) && isempty(col.bg[])
+            @test VE.findeffect(clip, VE.MatteEffect) === nothing
+            moveto(pv(0.5, 0.5))
+            @test Makie.receives_events(p.previewaxis.scene)    # pointer handed back
+            # A mark's card: propagate, then call the stored callbacks exactly as
+            # the card system does — with the card id. Zero-arg closures threw
+            # inside the render loop, which is why clicking a card spammed errors
+            # and its × did nothing.
+            press(pv(0.35, 0.62)); release(); sleep(0.2)  # a spot with no dot on it
+            @test length(col.points) == 2                # …so this ADDS, not removes
+            keypress(Keyboard.enter)                     # propagate (built-in propagator)
+            @test waitfor(() -> clip.mattetrack !== nothing && size(clip.mattetrack.alpha, 3) > 1;
+                          s = 30)
+            VE.activatetool!(p, :matte); sleep(0.5)      # rebuilds the cards
+            cards = get(p.fxwidgets, :toolcards, nothing)
+            @test cards !== nothing && !isempty(cards[3])
+            for c in cards[3]
+                c[5] === nothing || c[5](c[1])           # onclick(id)
+            end
+            @test true                                    # got here without throwing
+        end
     finally
         close(p)
     end

@@ -108,6 +108,22 @@ function materializeease!(c::AnimCurve)
 end
 
 """
+One tunable parameter — a scalar with a slider range and a default. Effect
+plugins ([`registerplugin!`](@ref)) and overlays ([`registeroverlay!`](@ref))
+both declare their parameters with this, and both get keyframing for free
+because a declared scalar is all the curve engine needs.
+"""
+struct FxParam
+    name::Symbol
+    label::String
+    min::Float64
+    max::Float64
+    default::Float64
+end
+FxParam(name, label; min = 0.0, max = 1.0, default = min) =
+    FxParam(Symbol(name), String(label), Float64(min), Float64(max), Float64(default))
+
+"""
 Descriptor for one animatable clip parameter — the ONLY place that knows how a
 named parameter maps to clip state. `get(clip)` reads its current static value;
 `set(clip, v)` writes `v` onto the clip. Everything else (keyframe storage, the

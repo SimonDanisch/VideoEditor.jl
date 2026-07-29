@@ -6,16 +6,9 @@
 # Registration is live — no restart. An effect is a pure callback ([`fxkind`]); the
 # registry just adds discoverability and generic param wiring on top.
 
-"One tunable parameter of a plugin effect (a scalar with a slider range)."
-struct FxParam
-    name::Symbol
-    label::String
-    min::Float64
-    max::Float64
-    default::Float64
-end
-FxParam(name, label; min = 0.0, max = 1.0, default = min) =
-    FxParam(Symbol(name), String(label), Float64(min), Float64(max), Float64(default))
+# (`FxParam`, the tunable-scalar descriptor, lives in keyframes.jl next to
+# `ParamSpec` — overlays declare their parameters with it too, and they are
+# defined before the edit model.)
 
 """
 A registered effect: a name, display label, tunable params, and `kind(p::NamedTuple)`
@@ -46,7 +39,7 @@ effectdict(e::PluginEffect) = Dict{String, Any}("type" => "plugin", "name" => St
 plugineffectfromdict(d::AbstractDict) = PluginEffect(Symbol(d["name"]),
     NamedTuple(Symbol(k) => Float64(v) for (k, v) in d["params"]))
 
-defaults(p::FxPlugin) = NamedTuple{Tuple(pr.name for pr in p.params)}(Tuple(pr.default for pr in p.params))
+defaults(p::FxPlugin) = defaults(p.params)
 "Construct plugin `name`'s effect, overriding params by keyword (`plugineffect(:vignette; strength=0.8)`)."
 plugineffect(name::Symbol; kw...) = (p = PLUGINBYNAME[name]; PluginEffect(name, merge(defaults(p), values(kw))))
 

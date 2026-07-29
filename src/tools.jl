@@ -226,6 +226,11 @@ function buildtoolspanel!(player::Player, gridpos, uicolors)
         for ctx in values(panelctxs)     # drop the previous cards' content + listeners
             cleartoolcontext!(ctx)
         end
+        # …and the cards themselves. Their image plots live in the DOCK SCENE, not
+        # in the panel layout, so rebuilding the panels leaves them drawn: after
+        # "Remove matte" a mark's thumbnail kept floating between two other tools'
+        # cards, belonging to nothing.
+        cleartoolcards!(player)
         empty!(panelctxs)
         foreach(Makie.delete!, built)
         empty!(built)
@@ -257,8 +262,12 @@ function buildtoolspanel!(player::Player, gridpos, uicolors)
             colsize!(card, 1, Makie.Relative(1.0))
             open || continue
             body = GridLayout(card[2, 1]; alignmode = Makie.Outside(10, 10, 10, 6))
+            # `halign` places the BLOCK; `justification` sets the lines inside it,
+            # and its default centres them — which is why a wrapped description
+            # read as ragged centred text floating in the card instead of a
+            # left-aligned paragraph under the header.
             Label(body[1, 1], wraptext(tool.description); fontsize = 11, halign = :left,
-                  color = uicolors.text_muted, tellwidth = false)
+                  justification = :left, color = uicolors.text_muted, tellwidth = false)
             # A slot starts EMPTY, and an empty GridLayout has no determinable
             # height — which makes the whole card, the panel and finally the dock's
             # content size indeterminate, so the Subfigure never scrolls and long
@@ -351,7 +360,14 @@ result of an analysis.
 function toollabel!(ctx::ToolContext, text)
     slot = toolslot(ctx, :controls)
     slot === nothing && return nothing
-    l = Label(slot[length(ctx.controls) + 1, 1], text; halign = :left, fontsize = 11,
+    # WRAPPED, like every other line in a card. An analysis result is a sentence
+    # ("marking — left: subject, right: not subject, Enter: propagate"), it does
+    # not fit a 300 px dock on one line, and a Label neither wraps nor truncates
+    # on its own — it just draws past the card and the panel clips it mid-word.
+    wrapped = text isa Observables.AbstractObservable ?
+              lift(t -> wraptext(string(t)), text) : wraptext(string(text))
+    l = Label(slot[length(ctx.controls) + 1, 1], wrapped; halign = :left,
+              justification = :left, fontsize = 11,
               tellwidth = false, color = ctx.player.timeline.colors.text)
     push!(ctx.controls, l)
     return l
@@ -657,13 +673,13 @@ function loopfind!(ctx::ToolContext)
         return nothing
     end
     clip, srcframe = loc
-    ref = clamp(srcframe - clip.src_in + 1, 1, cliplength(clip))
+    ref = clamp(srcframe - clip.src_in + 1, 1, srclength(clip))
     sigs = st[:sigs]
     if haskey(sigs, clip)
         addloopref!(ctx, clip, ref, sigs[clip])
         return nothing
     end
-    setstatus!(player, "Loop finder: analyzing $(cliplength(clip)) frames…")
+    setstatus!(player, "Loop finder: analyzing $(srclength(clip)) frames…")
     player.jobprogress[] = 0.0
     job = () -> try
         sig = loopsignatures(clip; backend = player.analysisbackend,
@@ -702,7 +718,7 @@ function activateloopfinder!(ctx::ToolContext)
     foreach(p -> translate!(p, 0, 0, 6), (hp, rp))   # above thumbs, below playhead
     toolplot!(ctx, hp)
     toolplot!(ctx, rp)
-    toolaction!(ctx, "Find similar to the playhead frame", () -> loopfind!(ctx))
+    toolaction!(ctx, "Find similar frames", () -> loopfind!(ctx))
     ontool!(ctx, events(ax.scene).mousebutton) do event
         (event.button == Mouse.left && event.action == Mouse.press) || return Consume(false)
         Makie.is_mouseinside(ax.scene) || return Consume(false)
@@ -731,12 +747,16 @@ function keyfade!(clip::Clip, frames::Integer, dir::Symbol)
     clearfade!(clip, dir)
     findslot(clip, OpacityEffect) === nothing && seteffect!(clip, OpacityEffect(1.0f0))
     curve = get!(AnimCurve, clip.animations, :opacity)
+    # callers count the fade in TIMELINE frames (a length in seconds off the
+    # sequence rate); keys live on SOURCE frames. On a conformed clip those are
+    # different counts, and a 0.6 s blend would otherwise last 0.3 s or 1.2 s.
+    sf = max(round(Int, Int(frames) * clip.rate), 1)
     if dir === :out
-        setkey!(curve, clip.src_out - frames, 1.0)
+        setkey!(curve, clip.src_out - sf, 1.0)
         setkey!(curve, clip.src_out - 1, 0.0)
     else
         setkey!(curve, clip.src_in, 0.0)
-        setkey!(curve, clip.src_in + frames - 1, 1.0)
+        setkey!(curve, clip.src_in + sf - 1, 1.0)
     end
     return clip
 end
@@ -751,7 +771,7 @@ are left the curve and its (now pointless) `OpacityEffect` go too.
 function clearfade!(clip::Clip, dir::Symbol)
     c = get(clip.animations, :opacity, nothing)
     c === nothing && return clip
-    half = max(cliplength(clip) ÷ 2, 1)
+    half = max(srclength(clip) ÷ 2, 1)   # the fade zone is keyed in SOURCE frames
     zone = dir === :out ? ((clip.src_out - half):clip.src_out) :
            (clip.src_in:(clip.src_in + half))
     filter!(k -> !(k.frame in zone), c.keys)
@@ -781,7 +801,9 @@ function fadeinlength(clip::Clip)
     length(ks) >= 2 && ks[1].frame == clip.src_in && ks[1].value < 0.02 || return 0
     j = findfirst(k -> k.value > 0.98, ks)
     j === nothing && return 0
-    return ks[j].frame - clip.src_in + 1
+    # in TIMELINE frames — the same unit [`keyfade!`](@ref) took, so a blend
+    # reads back the length it was given
+    return timelineframes(clip, ks[j].frame - clip.src_in + 1)
 end
 
 """
@@ -1112,11 +1134,15 @@ end
 # ------------------------------------------------------------- Stabilize tool
 
 "The stabilization modes the tool offers, as Makie Menu `(label, value)` options."
-const STABMODES = [("Camera lock — like a tripod", :similarity),
-                   ("Object lock — keep a subject still", :objectlock),
-                   ("Tripod (affine) — legacy", :tripod),
-                   ("Tripod + perspective — legacy", :perspective),
-                   ("Smooth — keep camera moves", :smooth)]
+# Short on purpose: a Menu shares its row with the "Mode" label inside a 300 px
+# dock and, unlike a Label, neither wraps nor shrinks — it just draws past its box
+# and gets clipped mid-word. What each mode DOES belongs in the card's
+# description, which wraps.
+const STABMODES = [("Camera lock", :similarity),
+                   ("Object lock", :objectlock),
+                   ("Tripod (legacy)", :tripod),
+                   ("Perspective (legacy)", :perspective),
+                   ("Smooth", :smooth)]
 
 """
 Fill the Stabilize card: the mode, the action that runs the analysis, what the
@@ -1161,8 +1187,9 @@ function runstabilize!(ctx::ToolContext)
 end
 
 registertool!(:stabilize, "Stabilize",
-    "Locks the SELECTED clip: camera lock holds the framing like a tripod, " *
-    "object lock keeps a subject still (click it in the preview afterwards).";
+    "Locks the SELECTED clip. Camera lock holds the framing like a tripod. " *
+    "Object lock keeps one subject still — click it in the preview afterwards. " *
+    "Smooth keeps the camera moves and only takes the shake out.";
     panel = stabilizepanel!, activate = ctx -> (runstabilize!(ctx);
                                                 deactivatetool!(ctx.player)))
 
@@ -1270,7 +1297,9 @@ step, and its `Matte`/`Feather` sliders are keyframable like any other param.
 function mattepanel!(ctx::ToolContext)
     player = ctx.player
     toollabel!(ctx, player.matteinfo)
-    toolaction!(ctx, "Mark subject (click preview)", () -> armmattepick!(ctx))
+    # the button says what it DOES; how to work it belongs in the description,
+    # which has room to wrap — a Button label has none and simply overflows
+    toolaction!(ctx, "Mark subject", () -> armmattepick!(ctx))
     toolaction!(ctx, "Re-propagate", () -> runmatte!(ctx))
     toolaction!(ctx, "Remove matte", () -> removematte!(player))
     refreshmattecards!(ctx)
@@ -1306,21 +1335,397 @@ end
 "Seed size as a fraction of frame width — a box the user can hit by clicking."
 const MATTESEED = Ref{Float64}(0.25)
 
+"""
+A selection being marked.
+
+The interaction is a **scene laid over the preview**, not a mode the rest of the
+editor has to know about. `scene` is a child of the preview axis with
+`captures_mouse = true`: while it is visible it claims the pointer, so
+`Makie.receives_events` is false for every other handler over that viewport, and
+false for its OWN handlers the moment it is hidden. "Am I marking?" is therefore
+not a flag anyone can consult and get wrong — it is whether the scene is up.
+
+Everything the interaction owns hangs off it: the two dot plots live in that
+scene, the listeners are registered on it, and ending the marking hides the scene
+and empties it in one step. Nothing to forget to delete, and no second feature
+can be handed the same click.
+"""
+mutable struct MatteCollect
+    ctx::ToolContext
+    clip::Clip
+    srcframe::Int
+    scene::Makie.Scene                              # the overlay; owns plots + events
+    points::Vector{Tuple{Float64, Float64, Bool}}   # normalized source coords, foreground?
+    fg::Observable{Vector{Point2f}}                 # canvas coords, for the dots
+    bg::Observable{Vector{Point2f}}
+    listeners::Vector{Any}
+    prevtrack::Any                                  # restored on Esc
+    prevmatte::Any                                  # the user's MatteEffect, dimmed while marking
+    painting::Any                                   # true/false = a stroke of fg/bg, nothing = idle
+    lastpaint::Any                                  # where the stroke last laid a point
+    hadeffect::Bool
+    busy::Bool                                      # a preview run is in flight
+    pending::Bool                                   # …and the points changed while it ran
+    # The seed the last preview was computed from, and the points it came from.
+    # Kept so that pressing Enter propagates *the mask the user was just looking
+    # at* rather than recomputing one — with a segmenter installed that is not a
+    # cheap repeat, and worse, a recomputation is a chance for what propagates to
+    # differ from what was previewed.
+    lastseed::Any
+    lastseedpoints::Vector{Tuple{Float64, Float64, Bool}}
+end
+
+"""
+    mattecollect(player) -> MatteCollect | nothing
+
+The selection being marked on `player`, if any.
+
+Kept in `player.fxwidgets` — the slot this editor already uses for transient UI
+state (`:activetool`, `:kfmenu`) — rather than a module-level `Ref`. State that
+belongs to one player must not be reachable without one: a global would make two
+players share a selection, and it would outlive the window that owns the dots.
+"""
+mattecollect(player::Player) = get(player.fxwidgets, :mattecollect, nothing)
+
+"""
+    matteoverlay(player) -> (scene, fg, bg)
+
+The marking overlay: a child scene of the preview axis, plus the two point
+vectors drawn in it. Built on first use and then **reused** — one per player, for
+the player's life.
+
+Not rebuilt per marking: a `Scene` adds itself to its parent's `children` and
+there is no unregistering it by hiding it, so a scene per interaction is a leak
+that grows with every click of "Mark subject". Idle it is invisible, which
+`receives_events` reads as "not listening", and empty vectors draw nothing.
+
+It shares the axis' camera so a dot sits in the same data coordinates the frame
+is drawn in; a positive z plus `captures_mouse` put it on top for drawing *and*
+for pointer routing.
+"""
+function matteoverlay(player::Player)
+    return get!(player.fxwidgets, :matteoverlay) do
+        ax = player.previewaxis
+        # A SIBLING of the axis, not a child of it. `receives_events` lets a
+        # covering scene through to anything on its own root-to-leaf path, so a
+        # child would claim the pointer and still leave the axis' own handlers
+        # (crop, pick, scrub) firing — the exact conflict this is here to end.
+        # Same viewport and camera, so a dot still lands in frame coordinates.
+        sc = Makie.Scene(player.fig.scene; viewport = ax.scene.viewport,
+                         camera = ax.scene.camera, clear = false, visible = false)
+        Makie.translate!(sc, 0, 0, 10)
+        fg, bg = Observable(Point2f[]), Observable(Point2f[])
+        scatter!(sc, fg; color = (:limegreen, 0.75), marker = :circle,
+                 markersize = 9, strokewidth = 1, strokecolor = (:black, 0.6))
+        scatter!(sc, bg; color = (:orangered, 0.75), marker = :xcross,
+                 markersize = 9, strokewidth = 1, strokecolor = (:black, 0.6))
+        (scene = sc, fg = fg, bg = bg)
+    end
+end
+
+"""
+Start marking. Clicks land in the preview until the user is done:
+
+  * left click marks the subject, right click marks what is *not* the subject
+  * dragging paints a run of points
+  * every point re-mattes THIS frame only, so the picture updates while marking
+  * Enter propagates across the clip, Esc restores what was there before
+
+The live matte goes through the ordinary render path — a one-frame `MatteTrack`
+on the clip — rather than a bespoke overlay, so what is shown while marking is
+literally what the finished key looks like, at the strength and feather the
+inspector is set to.
+"""
 function armmattepick!(ctx::ToolContext)
     player = ctx.player
     loc = editclip(player)
     loc === nothing && return setstatus!(player, "matte: move the playhead onto a clip first")
-    player.onpick = p -> begin
-        clip, srcframe = loc
-        scale = clip.source.width / size(player.frame[], 1)
-        sw, sh = clip.source.width, clip.source.height
-        w = MATTESEED[]
-        cx = clamp(p[1] * scale / sw, 0.0, 1.0)
-        cy = clamp(p[2] * scale / sh, 0.0, 1.0)
-        rect = (clamp(cx - w / 2, 0.0, 1.0), clamp(cy - w / 2, 0.0, 1.0), w, w)
-        addmatteseed!(ctx, clip, srcframe, seedmask(clip, rect))
+    mattecollect(player) === nothing || return finishmattecollect!(mattecollect(player))
+    clip, srcframe = loc
+    ax = player.previewaxis
+    ov = matteoverlay(player)
+    sc = ov.scene
+    paintstep = 12   # canvas units between the points a drag lays down: dense
+                     # enough that the discs overlap into a stroke, sparse enough
+                     # that a long drag stays a few dozen points
+    sc.visible[] = true
+    sc.captures_mouse = true
+    col = MatteCollect(ctx, clip, Int(srcframe), sc, Tuple{Float64, Float64, Bool}[],
+                       ov.fg, ov.bg, Any[],
+                       clip.mattetrack, nothing, nothing, nothing,
+                       findeffect(clip, MatteEffect) !== nothing, false, false,
+                       nothing, Tuple{Float64, Float64, Bool}[])
+    push!(col.listeners, on(events(sc).mousebutton) do event
+        Makie.receives_events(sc) || return Consume(false)
+        event.button in (Mouse.left, Mouse.right) || return Consume(false)
+        if event.action == Mouse.press && is_mouseinside(sc)
+            col.painting = (event.button == Mouse.left)
+            col.lastpaint = Point2f(mouseposition(ax.scene))
+            addmattepoint!(col, col.lastpaint, col.painting; live = false)
+            return Consume(true)
+        elseif event.action == Mouse.release && col.painting !== nothing
+            col.painting = nothing
+            livematte!(col)          # ONE model run per stroke, not per point
+            return Consume(true)
+        end
+        return Consume(false)
+    end)
+    # Dragging paints. The seed MatAnyone wants is a rough mask of the subject,
+    # not a hint: measured on this clip, one disc gives a matte covering 0.3% of
+    # the frame and the 25% box gives 4.9% — the model propagates what it is
+    # given and grows nothing. So the gesture that produces a usable seed has to
+    # be able to cover the subject, and that is a stroke.
+    push!(col.listeners, on(events(sc).mouseposition) do _
+        col.painting === nothing && return Consume(false)
+        Makie.receives_events(sc) || return Consume(false)
+        p = Point2f(mouseposition(ax.scene))
+        last = col.lastpaint
+        (last !== nothing && sum(abs2, p .- last) < paintstep^2) && return Consume(false)
+        col.lastpaint = p
+        addmattepoint!(col, p, col.painting; live = false, remove = false)
+        return Consume(true)
+    end)
+    player.fxwidgets[:mattecollect] = col
+    player.matteinfo[] = "painting: drag over the subject, right-drag to exclude"
+    setstatus!(player, "matte: DRAG over the subject (right-drag excludes) · " *
+                       "Ctrl+Z or Backspace undoes · Enter propagates · Esc cancels")
+    return nothing
+end
+
+
+"""
+Add one marked point and re-matte this frame — or take one away.
+
+Clicking a point you already placed **removes** it, whichever button you use:
+the gesture that put a point down takes it back, with no mode to enter and no
+modifier to remember. Backspace drops the most recent one, for the "no, not
+there" immediately after clicking.
+
+The target is the **dot you can see**, `hit` canvas units wide — deliberately not
+the much larger disc that dot paints into the seed. Matching the paint radius
+made two neighbouring points impossible to place: on a cropped, stabilized clip
+the preview is scaled up, so a second click aimed at a subject right next to the
+first landed inside the first one's disc and deleted it instead of adding.
+"""
+function addmattepoint!(col::MatteCollect, p, foreground::Bool;
+                       hit::Real = 14, remove::Bool = true, live::Bool = true)
+    player = col.ctx.player
+    sx, sy = previewtosource(player, col.clip, col.srcframe, p)
+    sw, sh = col.clip.source.width, col.clip.source.height
+    nx, ny = clamp(sx / sw, 0.0, 1.0), clamp(sy / sh, 0.0, 1.0)
+    # compared where the user is pointing — on the canvas — not in source pixels,
+    # so the hit area is the dot's size however far the preview is zoomed.
+    # `remove = false` while a stroke is being painted: a drag lays points close
+    # together on purpose and would otherwise erase the ones it just made.
+    ondot = remove ? findlast(eachindex(col.points)) do i
+            q = sourcetopreview(player, col.clip, col.srcframe,
+                                (col.points[i][1] * sw, col.points[i][2] * sh))
+            (q[1] - p[1])^2 + (q[2] - p[2])^2 <= hit^2
+        end : nothing
+    if ondot === nothing
+        push!(col.points, (nx, ny, foreground))
+    else
+        deleteat!(col.points, ondot)
     end
-    setstatus!(player, "matte: click the subject in the preview (Esc cancels)")
+    refreshmattedots!(col)
+    # `live = false` while painting: the model runs once when the stroke ends,
+    # not once per point laid down.
+    live && (isempty(col.points) ? clearlivematte!(col) : livematte!(col))
+    return nothing
+end
+
+"Drop the most recently marked point."
+function dropmattepoint!(col::MatteCollect)
+    isempty(col.points) && return nothing
+    pop!(col.points)
+    refreshmattedots!(col)
+    isempty(col.points) ? clearlivematte!(col) : livematte!(col)
+    return nothing
+end
+
+"""
+Redraw the dots from `col.points`.
+
+Rebuilt from the source of truth rather than pushed/popped alongside it: the two
+lists disagreeing is the classic way a removed point keeps its dot. Canvas
+positions come back out of the same mapping that put them in, so a dot sits where
+its point is even after the playhead moved or the clip was reframed.
+"""
+function refreshmattedots!(col::MatteCollect)
+    player = col.ctx.player
+    sw, sh = col.clip.source.width, col.clip.source.height
+    fg, bg = Point2f[], Point2f[]
+    for (nx, ny, isfg) in col.points
+        q = sourcetopreview(player, col.clip, col.srcframe, (nx * sw, ny * sh))
+        push!(isfg ? fg : bg, Point2f(q))
+    end
+    col.fg[] = fg
+    col.bg[] = bg
+    return nothing
+end
+
+"Back to the picture the clip had before this marking, with no points left."
+function clearlivematte!(col::MatteCollect)
+    col.clip.mattetrack === nothing || freematteplanes!(col.clip.mattetrack)
+    col.clip.mattetrack = col.prevtrack
+    restorematteeffect!(col)
+    col.ctx.player.matteinfo[] = "marking — no points"
+    notify(col.ctx.player.playhead)
+    return nothing
+end
+
+"""
+Re-matte the marked frame with the points so far.
+
+Coalescing rather than queueing: while a run is in flight further clicks only set
+`pending`, and one more run happens when it lands. Marking is faster than the
+model, and a queue would spend the whole interaction showing states the user has
+already clicked past.
+"""
+function livematte!(col::MatteCollect)
+    player = col.ctx.player
+    if col.busy
+        col.pending = true
+        return nothing
+    end
+    isempty(col.points) && return nothing
+    col.busy = true
+    # The points are copied, and the seed is built on the analysis executor
+    # rather than here: a segmenter needs the frame, and the frame is decoded
+    # there. Copying is what makes the cached seed trustworthy — `col.points` is
+    # mutated by every click, so keeping a reference would let `lastseedpoints`
+    # silently agree with points the seed was never computed from.
+    points = copy(col.points)
+    runanalysis(player) do
+        try
+            frame = framereader(player, col.clip)(col.srcframe)
+            mask = seedmask(col.clip, frame, points; key = (col.clip.id, col.srcframe))
+            alpha = previewmatte(col.clip, frame, mask)
+            put!(player.uiqueue, () -> begin
+                if mattecollect(player) === col         # not cancelled meanwhile
+                    col.lastseed = mask
+                    col.lastseedpoints = points
+                    showlivematte!(col, alpha)
+                end
+                col.busy = false
+                if col.pending
+                    col.pending = false
+                    livematte!(col)
+                end
+            end)
+        catch e
+            put!(player.uiqueue, () -> begin
+                col.busy = false
+                setstatus!(player, "matte preview failed: $(sprint(showerror, e))")
+            end)
+        end
+    end
+    return nothing
+end
+
+"""
+    showlivematte!(col, alpha; strength = 0.85f0)
+
+Install a one-frame matte track so the ordinary render path shows the selection.
+
+`strength` is how much of the background is keyed away *while marking*: keying it
+to black says what is IN the selection and nothing about what is next to it, and
+what you judge while marking is exactly the edge — i.e. what got left out. At
+0.85 the background stays readable at ~15%. The user's own strength is put back
+the moment marking ends, and this value reaches the matte kernel as a plain
+argument, so it must not come from anywhere mutable.
+"""
+function showlivematte!(col::MatteCollect, alpha::Matrix{UInt8}; strength = 0.85f0)
+    player = col.ctx.player
+    track = MatteTrack(reshape(alpha, size(alpha, 1), size(alpha, 2), 1),
+                       col.srcframe, [col.srcframe])
+    col.clip.mattetrack === nothing || freematteplanes!(col.clip.mattetrack)
+    col.clip.mattetrack = track
+    if col.prevmatte === nothing                       # first preview of this marking
+        # `findeffect` hands back the EFFECT (`findslot` is the one that returns
+        # the slot) — reaching for `.effect` here asked a `MatteEffect` for a
+        # field it has never had, on the very first marked point.
+        col.prevmatte = something(findeffect(col.clip, MatteEffect), MatteEffect())
+        seteffect!(col.clip, MatteEffect(; strength, feather = col.prevmatte.feather))
+    end
+    player.matteinfo[] = "marking — $(length(col.points)) point(s), this frame only"
+    notify(player.playhead)
+    return nothing
+end
+
+"Put the user's own matte strength back after the dimmed marking preview."
+function restorematteeffect!(col::MatteCollect)
+    col.prevmatte === nothing && return nothing
+    seteffect!(col.clip, col.prevmatte)
+    col.prevmatte = nothing
+    return nothing
+end
+
+"Propagate the marked points across the clip."
+function finishmattecollect!(col::MatteCollect)
+    endmattecollect!(col)
+    restorematteeffect!(col)
+    isempty(col.points) &&
+        return setstatus!(col.ctx.player, "matte: nothing marked")
+    # the live one-frame track was never the clip's matte; propagation replaces it
+    col.clip.mattetrack = col.prevtrack
+    if col.lastseed !== nothing && col.lastseedpoints == col.points
+        # exactly the mask the preview was showing a moment ago
+        addmatteseed!(col.ctx, col.clip, col.srcframe, col.lastseed)
+        return nothing
+    end
+    # Enter before a preview landed for these points. Build the seed on the
+    # analysis executor, never here: this runs on the UI thread, and with a
+    # segmenter installed the seed is a model call — half a second of a frozen
+    # window, on the frame the user is looking at.
+    ctx, clip, srcframe = col.ctx, col.clip, col.srcframe
+    points = copy(col.points)
+    player = ctx.player
+    setstatus!(player, "matte: reading the marked frame…")
+    runanalysis(player) do
+        try
+            frame = framereader(player, clip)(srcframe)
+            mask = seedmask(clip, frame, points; key = (clip.id, Int(srcframe)))
+            put!(player.uiqueue, () -> addmatteseed!(ctx, clip, srcframe, mask))
+        catch e
+            put!(player.uiqueue,
+                 () -> setstatus!(player, "matte: seeding failed: $(sprint(showerror, e))"))
+        end
+    end
+    return nothing
+end
+
+"Discard the marking and put back what the preview showed before it."
+function cancelmattecollect!(col::MatteCollect)
+    endmattecollect!(col)
+    restorematteeffect!(col)
+    col.clip.mattetrack === nothing || freematteplanes!(col.clip.mattetrack)
+    col.clip.mattetrack = col.prevtrack
+    if !col.hadeffect                      # we added it; take it back off again
+        i = findfirst(s -> s.effect isa MatteEffect, col.clip.effects)
+        i === nothing || deleteat!(col.clip.effects, i)
+    end
+    col.ctx.player.matteinfo[] = "marking cancelled"
+    notify(col.ctx.player.playhead)
+    setstatus!(col.ctx.player, "matte: marking cancelled")
+    return nothing
+end
+
+"""
+Leave marking mode.
+
+Taking the scene down takes the dots, the listeners and the pointer claim with
+it — which is the reason they live there rather than side by side in the player,
+each needing its own line here and its own way to be forgotten.
+"""
+function endmattecollect!(col::MatteCollect)
+    foreach(Observables.off, col.listeners)
+    empty!(col.listeners)
+    col.scene.captures_mouse = false      # stops claiming the pointer…
+    col.scene.visible[] = false           # …and `receives_events` goes false with it
+    col.fg[] = Point2f[]                  # the plots stay, their contents do not
+    col.bg[] = Point2f[]
+    delete!(col.ctx.player.fxwidgets, :mattecollect)
     return nothing
 end
 
@@ -1369,12 +1774,26 @@ function runmatte!(ctx::ToolContext; clip = nothing, seeds = nothing)
                 freematteplanes!(track)
                 findeffect(clip, MatteEffect) === nothing &&
                     push!(clip.effects, FxSlot(MatteEffect()))
+                cov = mattecoverage(track)
                 player.matteinfo[] = "matte: $(length(track.seeds)) marked frame(s), " *
-                                     "$(size(track.alpha, 3)) frames"
+                                     "$(size(track.alpha, 3)) frames, " *
+                                     "$(round(Int, 100cov))% kept ($(mattebackendname()))"
                 player.jobprogress[] = NaN
                 refreshmattepanel!(player)
                 notify(player.playhead)
-                setstatus!(player, "matte ready — Matte/Feather are keyframable in the inspector")
+                # A matte that keeps everything (or nothing) renders as no visible
+                # change at all, and the user reads that as "the tool is broken".
+                # The built-in propagator does exactly that on most footage — it is
+                # a stand-in, not a matting model — so say which one ran and what
+                # it produced instead of reporting "ready" either way.
+                setstatus!(player, if cov > 0.97 || cov < 0.02
+                        "matte covers $(round(Int, 100cov))% of the frame — " *
+                        (hasmattemodel() ? "mark more of the subject, or a background point where it spills" :
+                                           "no matting model is installed, so this is the built-in stand-in " *
+                                           "(run `usematanyone!()` for the real one)")
+                    else
+                        "matte ready ($(mattebackendname())) — Matte/Feather are keyframable in the inspector"
+                    end)
             end)
         catch e
             put!(player.uiqueue, () -> begin
@@ -1414,9 +1833,12 @@ function refreshmattecards!(ctx::ToolContext)
     for f in sort!(collect(keys(marks)))
         thumb = mattecardimage(marks[f])
         tl = clip.start + (f - clip.src_in)
+        # `onclick`/`onremove` are handed the CARD id (see `tooladdcard!`); taking
+        # no argument made every click on a mark — and every × — a MethodError in
+        # the render loop, which is why the button looked dead.
         tooladdcard!(ctx, thumb; caption = "frame $tl",
-                     onclick = () -> (player.playhead[] = tl),
-                     onremove = () -> begin
+                     onclick = _ -> (player.playhead[] = tl),
+                     onremove = _ -> begin
                          delete!(marks, f)
                          isempty(marks) ? removematte!(player) : runmatte!(ctx; clip = clip)
                      end)
@@ -1446,8 +1868,10 @@ function refreshmattepanel!(player::Player)
 end
 
 registertool!(:matte, "Matte",
-    "Isolates a subject on the SELECTED clip. Mark it on one frame and the " *
-    "matte propagates across the clip; mark another frame wherever it drifts.";
+    "Isolates a subject on the SELECTED clip. DRAG over the subject to paint it " *
+    "roughly (right-drag paints what is NOT it), then Enter. The model propagates " *
+    "the painted mask across the clip — it does not grow a dot, so cover the " *
+    "subject. Mark another frame wherever it drifts.";
     panel = mattepanel!, activate = ctx -> armmattepick!(ctx))
 
 

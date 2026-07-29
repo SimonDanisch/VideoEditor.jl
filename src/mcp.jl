@@ -180,7 +180,7 @@ function tooldefinitions()
                   "fps" => Dict("type" => "integer", "description" => "gif frame rate, default 15"),
                   "loop" => Dict("type" => "integer", "description" => "gif looping: 0 = forever (default), -1 = play once")), ["path"]),
         tool("save_project", "Save edit metadata as TOML.", Dict("path" => str("output path")), ["path"]),
-        tool("add_source", "Append a video file as a new clip at the end of the timeline (framerate must match the sequence).",
+        tool("add_source", "Append a video file as a new clip at the end of the timeline (a differing framerate is conformed to the sequence).",
              Dict("path" => str("video file path")), ["path"]),
     ]
     # registered effect plugins → one tool each (reflects new plugins on every list)

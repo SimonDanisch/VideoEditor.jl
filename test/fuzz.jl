@@ -51,10 +51,11 @@ end
 function exportframe(seq, n, engine, readers)
     cs = clipsat(seq, n)
     isempty(cs) && return nothing
-    out = RGBFrame(undef, cs[end].source.width, cs[end].source.height)
+    out = RGBFrame(undef, VE.canvassize(seq)...)   # the SEQUENCE's format, as the encoder writes it
     ok = VE.composite(engine, cs, n,
                       (clip, _) -> get!(() -> VE.opendecoder(clip.source, engine.backend),
-                                        readers, clip.source.path); exact = true) do canvas
+                                        readers, clip.source.path);
+                      canvas = VE.canvassize(seq), exact = true) do canvas
         copyto!(out, canvas)
     end
     return ok ? out : nothing
@@ -63,11 +64,11 @@ end
 "The single-clip reference: the clip's graph at `n`, crop NOT baked (the preview
 leaves that to the axis limits — see the framing check)."
 function uncropped(clip::Clip, n::Integer, engine, readers)
-    sf = clip.src_in + (n - clip.start)
+    sf = VE.sourceframe(clip, n)
     ec = effectiveclip(clip, sf)
     flat = Clip(ec.id, ec.source, ec.src_in, ec.src_out, ec.start, (0.0, 0.0, 1.0, 1.0),
                 ec.effects, ec.colortrack, ec.motiontrack, ec.mattetrack, ec.animations,
-                ec.track, ec.blendfrom)
+                ec.track, ec.blendfrom, ec.rate, ec.reframe)
     dec = get!(() -> VE.opendecoder(clip.source, engine.backend), readers, clip.source.path)
     out = RGBFrame(undef, clip.source.width, clip.source.height)
     VE.render(engine, dec, flat, sf; exact = true) do layer
@@ -113,6 +114,18 @@ function fuzzactions(player, rng)
             c.track = prev.track + 1                       # stack it…
             c.start = max(prev.start, clipend(prev) - max(cliplength(c) ÷ 2, 3))
             "overlap clip $i → V$(c.track) at $(c.start)"  # …ONTO the one before it
+        end),
+        ("conform", () -> begin
+            # a source at HALF the rate and a portrait frame: the mixed-format
+            # case. It has to survive every other action below — split, trim,
+            # blend and keyframe all mean different things once one timeline
+            # frame is not one source frame
+            length(seq.clips) > 4 && return "conform (enough clips)"
+            src = VE.VideoSource(testvideo15)
+            at = rand(rng, 0:max(seqlength(seq) - 1, 0))
+            c = VE.placesource!(player, src, at; track = rand(rng, 1:3))
+            c === nothing ? "conform (refused)" :
+                "conform $(basename(src.path)) @$(c.start) V$(c.track) rate=$(c.rate)"
         end),
         ("blend", () -> begin
             length(seq.clips) < 2 && return "blend (needs 2 clips)"
@@ -206,8 +219,13 @@ end
                 else
                     push!(mismatches, "frame $n: preview $(size(player.frame[])) vs export $(size(ref))")
                 end
-                # …and FRAMING: the visible region is the framing the export bakes
-                want = length(cs) > 1 ? (0.0, 0.0, 1.0, 1.0) : cs[1].crop
+                # …and FRAMING: the visible region is the framing the export bakes.
+                # `canvasrect` is the source's OWN definition of it (shared with
+                # `applycrop!`), so this asserts the wiring — that the present put
+                # that framing on the axis, once — rather than re-deriving the
+                # geometry and agreeing with itself about the formula.
+                want = length(cs) > 1 ? (0.0, 0.0, 1.0, 1.0) :
+                       VE.canvasrect(cs[1], size(player.frame[]), VE.canvassize(seq))
                 vis = visiblerect(player)
                 all(abs.(vis .- want) .< 5.0e-3) ||
                     push!(mismatches, "frame $n: shows $(round.(vis; digits = 3)), " *

@@ -7,9 +7,14 @@ import FFMPEG_jll
 testvideo = joinpath(mktempdir(), "test.mp4")
 run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -f lavfi -i testsrc2=size=320x180:rate=30 -t 4 -c:v libx264 -g 30 -pix_fmt yuv420p $testvideo`,
              stdout = devnull, stderr = devnull))
-# second source: same framerate (required), different resolution and content
+# second source: same framerate, different resolution and content
 testvideo2 = joinpath(mktempdir(), "test2.mp4")
 run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -f lavfi -i smptebars=size=480x270:rate=30 -t 3 -c:v libx264 -g 30 -pix_fmt yuv420p $testvideo2`,
+             stdout = devnull, stderr = devnull))
+# third source: HALF the rate and a PORTRAIT frame — the mixed-format case (a
+# 30 fps phone clip meeting a 60 fps one), which used to be refused at the drop
+testvideo15 = joinpath(mktempdir(), "test15.mp4")
+run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -f lavfi -i testsrc2=size=180x320:rate=15 -t 4 -c:v libx264 -g 15 -pix_fmt yuv420p $testvideo15`,
              stdout = devnull, stderr = devnull))
 
 @testset "VideoSource" begin
@@ -410,6 +415,12 @@ end
     probe = VideoSource(out)
     @test probe.nframes == 210
     @test (probe.width, probe.height) == (320, 180)
+    # 4:2:0, not the 4:4:4 ffmpeg picks for RGB input: 4:4:4 lands the file in
+    # H.264 High 4:4:4 Predictive, which no phone or TV hardware decoder plays
+    # (found the only way these things are found — a file that wouldn't open)
+    fmt = readchomp(`$(FFMPEG_jll.ffprobe()) -v error -select_streams v:0
+                     -show_entries stream=pix_fmt -of csv=p=0 $out`)
+    @test fmt == "yuv420p"
     reader = VideoIO.openvideo(out)
     early = read(reader)                    # clip 1 content (testsrc2)
     seek(reader, 5.0)
@@ -1115,3 +1126,208 @@ end
     end
     @test !VideoEditor.hasrestoremodel()
 end
+
+@testset "conform: a source at another framerate" begin
+    fast = VideoSource(testvideo)     # 30 fps, 320×180, 120 frames
+    slow = VideoSource(testvideo15)   # 15 fps, 180×320,  60 frames
+    @test (fast.framerate, slow.framerate) == (30.0, 15.0)
+
+    # the rate is EXACTLY 1 when the source matches — a native clip must never
+    # pick up conform arithmetic (nor its rounding)
+    @test VE.conformrate(fast, 30.0) === 1.0
+    @test VE.conformrate(slow, 30.0) == 0.5
+    @test VE.conformrate(fast, 15.0) == 2.0
+    @test VE.conformrate(fast, 30.004) === 1.0    # inside the tolerance
+
+    c = VE.Clip(slow, 0, slow.nframes, 0, (0.0, 0.0, 1.0, 1.0), 0.5)
+    @test VE.srclength(c) == 60                    # source frames: unchanged
+    @test VE.cliplength(c) == 120                  # timeline frames: twice as many
+    # …and the point of it all: the clip lasts as long as its media does
+    @test VE.cliplength(c) / 30.0 ≈ slow.nframes / slow.framerate
+
+    # every source frame held twice, and the LAST timeline frame stays in range
+    @test [VE.sourceframe(c, n) for n in 0:5] == [0, 0, 1, 1, 2, 2]
+    @test VE.sourceframe(c, VE.cliplength(c) - 1) == slow.nframes - 1
+    @test VE.timelineframe(c, VE.sourceframe(c, 17)) <= 17   # inverse, no overshoot
+    @test VE.conformed(c) && !VE.conformed(VE.Clip(fast, 0, 10, 0, (0.0,0.0,1.0,1.0)))
+
+    seq = VE.Sequence([VE.Clip(fast, 0, 60, 0, (0.0, 0.0, 1.0, 1.0)), c], 30.0)
+    c.start = 60
+    @test VE.seqlength(seq) == 60 + 120
+    @test VE.clipend(seq.clips[1]) == c.start      # gapless
+
+    @testset "split lands on a source frame, and the halves meet" begin
+        s = VE.Sequence([VE.Clip(slow, 0, slow.nframes, 0, (0.0,0.0,1.0,1.0), 0.5)], 30.0)
+        left = s.clips[1]
+        right = VE.split!(s, 41)                   # ODD frame: no source frame starts there
+        @test right !== nothing
+        @test VE.clipend(left) == right.start      # no one-frame hole
+        @test left.src_out == right.src_in         # and no source frame lost
+        @test right.rate == 0.5
+        @test VE.cliplength(left) + VE.cliplength(right) == 120
+        # walking across the seam never lands in a gap
+        @test all(VE.locate(s, n) !== nothing for n in 36:46)
+
+        @test VE.joinclips!(s, 20) !== nothing     # …and it joins back up
+        @test length(s.clips) == 1 && VE.cliplength(s.clips[1]) == 120
+    end
+
+    @testset "trim walks timeline frames, in/out points source frames" begin
+        s = VE.Sequence([VE.Clip(slow, 0, slow.nframes, 0, (0.0,0.0,1.0,1.0), 0.5)], 30.0)
+        cl = s.clips[1]
+        VE.trimclip!(s, cl, 1, :right, 60)
+        @test (VE.cliplength(cl), cl.src_out) == (60, 30)
+        VE.trimclip!(s, cl, 1, :left, 20)
+        @test (cl.start, cl.src_in) == (20, 10)
+        @test VE.clipend(cl) == 60                 # the far edge did not move
+        # trimming can't run past the media
+        VE.trimclip!(s, cl, 1, :right, 10_000)
+        @test cl.src_out <= slow.nframes
+    end
+
+    @testset "a fade keeps its LENGTH IN SECONDS on a conformed clip" begin
+        cl = VE.Clip(slow, 0, slow.nframes, 0, (0.0,0.0,1.0,1.0), 0.5)
+        VE.keyfade!(cl, 30, :in)                   # 30 timeline frames = 1 s at 30 fps
+        @test VE.fadeinlength(cl) == 30            # reads back in the same unit
+        ks = cl.animations[:opacity].keys
+        @test (ks[end].frame - ks[1].frame + 1) == 15   # …which is 15 SOURCE frames
+    end
+
+    @testset "the rate survives undo and the project file" begin
+        s = VE.Sequence([VE.Clip(slow, 4, 50, 7, (0.1, 0.1, 0.8, 0.8), 0.5)], 30.0)
+        snap = VE.snapshot(s)
+        @test [c.rate for c in snap] == [0.5]
+        s2 = VE.Sequence(VE.Clip[], 30.0); VE.restore!(s2, snap)
+        @test [(c.rate, c.src_in, c.src_out, c.start) for c in s2.clips] ==
+              [(0.5, 4, 50, 7)]
+
+        path = joinpath(mktempdir(), "conform.videoedit.toml")
+        VE.saveproject(path, s)
+        back = VE.loadproject(path)
+        @test [(c.rate, c.src_in, c.src_out, c.start) for c in back.clips] ==
+              [(0.5, 4, 50, 7)]
+        @test VE.cliplength(back.clips[1]) == VE.cliplength(s.clips[1])
+        # a project written before conforming existed holds native clips only
+        write(path, replace(read(path, String), r"\nrate = [0-9.]+" => ""))
+        @test VE.loadproject(path).clips[1].rate == 1.0
+    end
+end
+
+@testset "one canvas: mixed resolution composites to the SEQUENCE format" begin
+    # portrait 15 fps over landscape 30 fps — different rate AND different shape,
+    # on two tracks so the composite path runs
+    base = VideoSource(testvideo)      # 320×180
+    over = VideoSource(testvideo15)    # 180×320, half rate
+    c1 = VE.Clip(base, 0, 90, 0, (0.0, 0.0, 1.0, 1.0)); c1.track = 1
+    c2 = VE.Clip(over, 0, 30, 20, (0.0, 0.0, 1.0, 1.0), 0.5); c2.track = 2
+    seq = VE.Sequence([c1, c2], 30.0)
+
+    canvas = VE.canvassize(seq)
+    @test canvas == (320, 180)                       # the sequence's format
+    stack = VE.clipsat(seq, 30)
+    @test length(stack) == 2 && stack[end].source.width == 180   # top layer differs
+
+    engine = VE.FxEngine(VE.KA.CPU())
+    readers = Dict{String, Any}()
+    dest = VE.RGBFrame(undef, canvas...)
+    VE.renderframe!(dest, seq, 30, readers, engine)
+    @test size(dest) == canvas
+
+    # …and that is the buffer the layer loop actually works on. Sizing it from
+    # the top layer was a SECOND definition of the output format: with a
+    # different pixel count it could not be copied into the export buffer at
+    # all, and with the same count (320×180 vs 180×320 — exactly this pair) it
+    # copied linearly and silently scrambled the picture.
+    got = Ref((0, 0))
+    VE.composite(engine, stack, 30,
+                 (clip, _) -> get!(() -> VE.opendecoder(clip.source, engine.backend),
+                                   readers, clip.source.path);
+                 canvas = canvas, exact = true) do buf
+        got[] = size(buf)
+    end
+    @test got[] == canvas
+    @test got[] != (stack[end].source.width, stack[end].source.height)
+    @test length(VE.RGBFrame(undef, canvas...)) == length(VE.RGBFrame(undef, 180, 320))
+end
+
+@testset "letterbox: material of another shape is fitted, not stretched" begin
+    land = VideoSource(testvideo)      # 320×180
+    port = VideoSource(testvideo15)    # 180×320, and half the rate
+    engine = VE.FxEngine(VE.KA.CPU())
+    readers = Dict{String, Any}()
+    black = VE.RGB{VE.N0f8}(0, 0, 0)
+
+    # fitting must be a NO-OP on material that already fits: same matrix, bit for
+    # bit, so a single-format edit is not silently resampled by this feature
+    @test VE.GPUFiltering.fitmatrix((0.0, 0.0, 1.0, 1.0), (320, 180), (320, 180)) ==
+          VE.GPUFiltering.cropmatrix((0.0, 0.0, 1.0, 1.0), (320, 180), (320, 180))
+    @test VE.GPUFiltering.fitmatrix((0.2, 0.1, 0.5, 0.5), (320, 180), (160, 90)) ==
+          VE.GPUFiltering.cropmatrix((0.2, 0.1, 0.5, 0.5), (320, 180), (160, 90))
+    # a crop with the canvas' aspect fills it → the visible region IS the crop
+    @test VE.canvasrect(VE.Clip(land, 0, 30, 0, (0.25, 0.25, 0.5, 0.5)), (320, 180), (320, 180)) ==
+          (0.25, 0.25, 0.5, 0.5)
+    # one WITHOUT it is fitted: 160×45 is wider than 16:9, so the width fills and
+    # the view opens up vertically around the crop's centre (bars top and bottom)
+    r = VE.canvasrect(VE.Clip(land, 0, 30, 0, (0.25, 0.5, 0.5, 0.25)), (320, 180), (320, 180))
+    @test (r[1], r[3]) == (0.25, 0.5)                    # width untouched
+    @test r[4] ≈ 0.5 && r[2] + r[4] / 2 ≈ 0.5 + 0.25 / 2  # taller, same centre
+
+    # a portrait clip ALONE on a landscape canvas: black bars, picture undistorted
+    c1 = VE.Clip(land, 0, 30, 0, (0.0, 0.0, 1.0, 1.0))
+    c2 = VE.Clip(port, 0, 30, 30, (0.0, 0.0, 1.0, 1.0), 0.5)   # clip 1 sets the canvas
+    seq = VE.Sequence([c1, c2], 30.0)
+    canvas = VE.canvassize(seq)
+    @test canvas == (320, 180)
+    dest = VE.RGBFrame(undef, canvas...)
+    VE.renderframe!(dest, seq, 40, readers, engine)   # only the portrait clip is here
+    mid = canvas[2] ÷ 2
+    @test dest[3, mid] == black && dest[canvas[1] - 2, mid] == black
+    @test dest[canvas[1] ÷ 2, mid] != black           # …and the picture in between
+    # 180 px fitted into 320×180 is 101 px wide → 109 px of bar each side
+    bars = count(x -> dest[x, mid] == black, 1:canvas[1])
+    @test bars == 2 * ((canvas[1] - round(Int, 180 * (180 / 320))) ÷ 2)
+
+    # the manual reframe scales about the centre: more picture, fewer bars
+    c2.reframe = (1.9, 0.0, 0.0)
+    zoomed = VE.RGBFrame(undef, canvas...)
+    VE.renderframe!(zoomed, seq, 40, readers, engine)
+    @test count(x -> zoomed[x, mid] == black, 1:canvas[1]) < bars
+    @test !VE.neutralframe(c2)
+    # …and shifting moves it: pushed right, the LEFT bar grows
+    c2.reframe = (1.9, 0.15, 0.0)
+    shifted = VE.RGBFrame(undef, canvas...)
+    VE.renderframe!(shifted, seq, 40, readers, engine)
+    leftbar(f) = something(findfirst(x -> f[x, mid] != black, 1:canvas[1]), canvas[1])
+    @test leftbar(shifted) > leftbar(zoomed)
+    c2.reframe = VE.NEUTRALFRAME
+
+    # a letterboxed layer STACKED over another shows the track below through its
+    # bars — painting them black would black out the picture underneath
+    c2.start = 0; c2.track = 2
+    over = VE.RGBFrame(undef, canvas...)
+    VE.renderframe!(over, seq, 5, readers, engine)
+    base = VE.RGBFrame(undef, canvas...)
+    VE.renderframe!(base, VE.Sequence([c1], 30.0), 5, readers, engine)
+    @test over[3, mid] == base[3, mid] && over[3, mid] != black
+    @test over[canvas[1] - 2, mid] == base[canvas[1] - 2, mid]
+    @test over[canvas[1] ÷ 2, mid] != base[canvas[1] ÷ 2, mid]   # …and the layer itself on top
+
+    # scale/position are ordinary animatable params: keyframes, project, undo
+    @test VE.paramspec(:scale).group === :geometry
+    VE.paramspec(:scale).set(c2, 1.4)
+    @test c2.reframe[1] == 1.4 && VE.paramspec(:scale).get(c2) == 1.4
+    VE.paramspec(:pos_x).set(c2, -0.2)
+    @test c2.reframe[2] == -0.2
+    cur = VE.AnimCurve(); VE.setkey!(cur, 0, 1.0); VE.setkey!(cur, 20, 2.0)
+    c2.animations[:scale] = cur
+    @test VE.effectiveclip(c2, 10).reframe[1] ≈ 1.5      # baked at the frame
+    path = joinpath(mktempdir(), "reframe.videoedit.toml")
+    VE.saveproject(path, seq)
+    back = VE.loadproject(path)
+    @test back.clips[end].reframe == c2.reframe
+    @test VE.snapshot(seq)[end].reframe == c2.reframe
+    write(path, replace(read(path, String), r"\nreframe = \[[^\]]*\]" => ""))
+    @test VE.loadproject(path).clips[end].reframe == VE.NEUTRALFRAME   # older projects
+end
+
+include("overlays.jl")

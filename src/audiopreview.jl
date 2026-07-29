@@ -93,9 +93,13 @@ function fillaudio!(out::AbstractMatrix{Int16}, seq::Sequence,
         if track === nothing
             fill!(view(out, :, (pos + 1):(pos + span)), Int16(0))
         else
-            # timeline sample → source sample via the clip's source offset
-            srcsample = round(Int, (clip.src_in + (tsample / AUDIORATE * fps - clip.start)) /
-                                   fps * AUDIORATE)
+            # timeline sample → source sample: through the clip's source frame, and
+            # from there at the SOURCE's rate. Dividing by the sequence rate was the
+            # same number only while every source ran at it; conformed clips would
+            # otherwise drift their audio against their picture.
+            tframe = tsample / AUDIORATE * fps - clip.start
+            srcframe = clip.src_in + tframe * clip.rate
+            srcsample = round(Int, srcframe / clip.source.framerate * AUDIORATE)
             avail = clamp(track.nsamples - srcsample, 0, span)
             if avail > 0
                 copyto!(view(out, :, (pos + 1):(pos + avail)),

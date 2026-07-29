@@ -221,8 +221,7 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
     gp = player.gpupreview
     all(haskey(player.gpucache, c.source) for c in clips) || return false
     try
-        top = clips[end]
-        W, H = top.source.width, top.source.height
+        W, H = canvassize(player.sequence)   # the SEQUENCE's format, not the top layer's
         if (gp.width, gp.height) != (W, H)
             notify(player.frame)
             setupgpupreview!(player, gp, W, H)
@@ -233,7 +232,8 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
         ok = rungpuowned(player, gp) do
             gp.engine === nothing && (gp.engine = FxEngine(player.analysisbackend))
             composite(gp.engine, clips, n, (clip, _) -> player.gpucache[clip.source];
-                      applytracks = player.applytracks[], playing = player.playing[]) do canvas
+                      canvas = (W, H), applytracks = player.applytracks[],
+                      playing = player.playing[]) do canvas
                 gp.packed .= packrgba.(reshape(canvas, W * H))
                 copyto!(gp.eimages[nxt], gp.packed)
             end
@@ -278,7 +278,7 @@ function primecomposite!(player::Player, clips::Vector{Clip}, n::Integer)
     ready = true
     for clip in clips
         stream = player.gpucache[clip.source]
-        srcframe = clip.src_in + (n - clip.start)
+        srcframe = sourceframe(clip, n)
         hasframe(stream, srcframe) && continue
         # a failed decode is loud and hands the frame to the CPU composite —
         # waiting for exactness on a stream that just errored is pointless
@@ -318,6 +318,16 @@ function preloadgpu!(player::Player, source::VideoSource)
     gp = player.gpupreview
     gp isa GPUPreview || return nothing
     haskey(player.gpucache, source) && return nothing
+    # One probe per source, not one per present. `ensurestreams!` runs on every
+    # frame that is shown, so a source that is not directly streamable used to be
+    # re-probed forever: each attempt raised `gpubusy` (presents dropped to the
+    # CPU tier and the progress indicator flickered), failed, logged, and
+    # overwrote the mezzanine's own status line. The retry that matters is the
+    # one `startmezzanine!` makes itself once the transcode has landed.
+    probed = get!(() -> Set{String}(), player.fxwidgets, :gpuprobed)
+    mezzready = isfile(mezzaninepath(source))
+    (source.path in probed && !mezzready) && return nothing
+    push!(probed, source.path)
     stream = nothing
     # a mezzanine transcoded earlier for this source IS the streamable version —
     # a later run opens on it directly instead of failing the probe again
@@ -335,6 +345,7 @@ function preloadgpu!(player::Player, source::VideoSource)
         end
         if ok
             player.gpucache[source] = stream
+            delete!(probed, source.path)
             setstatus!(player, "$(basename(source.path)) — streaming decode on the GPU")
         else
             close(stream)
@@ -349,7 +360,7 @@ function preloadgpu!(player::Player, source::VideoSource)
         if occursin("VRAM budget", msg)
             setstatus!(player, "$(basename(source.path)): CPU decode — $msg")
         else
-            setstatus!(player, "$(basename(source.path)): not GPU-streamable ($msg)")
+            setstatus!(player, "$(basename(source.path)): not GPU-streamable, transcoding once")
             startmezzanine!(player, source)
         end
         @warn "GPU stream unavailable; staying on CPU decode" exception = e
@@ -380,6 +391,7 @@ function startmezzanine!(player::Player, source::VideoSource)
         gp = player.gpupreview
         gp isa GPUPreview || return nothing
         delete!(jobs, source.path)          # the file is there now; retries may re-run
+        delete!(get!(() -> Set{String}(), player.fxwidgets, :gpuprobed), source.path)
         preloadgpu!(player, source)         # opens ON the mezzanine (cache path)
         player.playing[] || put!(player.uiqueue, () -> notify(player.playhead))
     catch e

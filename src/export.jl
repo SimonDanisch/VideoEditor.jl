@@ -12,6 +12,13 @@ Keywords:
 - `framerate`: defaults to the sequence framerate.
 - `codec_name` / `encoder_options`: passed through to `VideoIO.open_video_out`
   (default H.264, `crf=20, preset="medium"`).
+- `pixel_format`: the encoded chroma layout, `yuv420p` by default. Left to
+  ffmpeg it would be `yuv444p` — RGB in, so 4:4:4 is the "best match" and no
+  chroma is thrown away — but that lands the file in H.264 *High 4:4:4
+  Predictive*, which no phone, TV or browser hardware decoder will touch. An
+  export that won't play on the device it was shot on is not an export. Pass
+  `VideoIO.AV_PIX_FMT_YUV444P` if you want the extra chroma and control the
+  player.
 - `audio`: mux the sources' audio along the cut list (see [`muxaudio`](@ref));
   on by default, skipped automatically when no source has an audio stream.
 - `backend`: KA backend for the render chain. A GPU backend (e.g. `LavaBackend()`)
@@ -27,6 +34,7 @@ function exportvideo(path::AbstractString, seq::Sequence;
                      framerate::Real = seq.framerate,
                      codec_name::Union{Nothing, String} = nothing,
                      encoder_options::NamedTuple = (crf = 20, preset = "medium"),
+                     pixel_format = VideoIO.AV_PIX_FMT_YUV420P,
                      audio::Bool = true,
                      backend = KA.CPU(),
                      progress = nothing)
@@ -50,7 +58,8 @@ function exportvideo(path::AbstractString, seq::Sequence;
     fr = rationalize(Float64(framerate); tol = 1e-6)
     writer = VideoIO.open_video_out(videopath, RGB{N0f8}, (canvas[2], canvas[1]);
                                     framerate = fr, codec_name = codec_name,
-                                    encoder_options = encoder_options)
+                                    encoder_options = encoder_options,
+                                    target_pix_fmt = pixel_format)
     try
         for n in 0:(total - 1)
             renderframe!(outbuf, seq, n, readers, engine; scratch = transbuf, black = blackhost)
@@ -210,7 +219,7 @@ function renderframe!(dest::AnyRGBFrame, seq::Sequence, n::Integer,
         composite(engine, clipsat(seq, n), n,
                   (clip, _) -> get!(() -> opendecoder(clip.source, engine.backend),
                                     readers, clip.source.path);
-                  exact = true) do canvas
+                  canvas = Base.size(dest), exact = true) do canvas
             copyto!(dest, canvas)
         end || error("composite at frame $n could not be rendered")
     else
@@ -221,6 +230,10 @@ function renderframe!(dest::AnyRGBFrame, seq::Sequence, n::Integer,
             rendercanvas!(dest, loc[1], loc[2], readers, engine)
         end
     end
+    # Plots go on LAST, over the finished canvas — including over a gap, so a
+    # title can carry a black hold. Unconditional: on a sequence without
+    # overlays it returns without touching a pixel.
+    drawoverlays!(dest, seq.overlays, n; framerate = seq.framerate)
     return dest
 end
 
@@ -237,10 +250,12 @@ function rendercanvas!(dest::AnyRGBFrame, clip::Clip, srcframe::Integer,
     ec = effectiveclip(clip, srcframe)    # keyframed params baked at this frame
     skipopacity && (ec = withoutopacity(ec))   # compositing: opacity = layer alpha
     render(engine, dec, ec, Int(srcframe); exact = true) do layer
-        if ec.crop == (0.0, 0.0, 1.0, 1.0) && Base.size(layer) == Base.size(dest)
-            copyto!(dest, layer)
+        if ec.crop == (0.0, 0.0, 1.0, 1.0) && neutralframe(ec) &&
+           Base.size(layer) == Base.size(dest)
+            copyto!(dest, layer)          # already exactly the canvas — no resample
         else
-            warp!(dest, layer, ec.crop)
+            fill!(dest, RGB{N0f8}(0, 0, 0))   # whatever the fit doesn't cover is a bar
+            placelayer!(dest, layer, ec)
             KA.synchronize(KA.get_backend(dest))
         end
     end

@@ -15,6 +15,8 @@ function saveproject(path::AbstractString, seq::Sequence)
     isempty(seq.transitions) || (dict["transitions"] =
         [Dict{String, Any}("kind" => String(t.kind), "at" => t.at, "duration" => t.duration)
          for t in seq.transitions])
+    # overlays are edits like any other — a lost title is a lost edit
+    isempty(seq.overlays) || (dict["overlays"] = [overlaydict(ov) for ov in seq.overlays])
     open(io -> TOML.print(io, dict), path, "w")
     savemattes(path, seq)
     return path
@@ -28,6 +30,8 @@ function clipdict(clip::Clip)
         "start" => clip.start,
         "track" => clip.track,
         "crop" => collect(clip.crop),
+        "rate" => clip.rate,        # conform factor; 1.0 on native-rate clips
+        "reframe" => collect(clip.reframe),   # manual (scale, x, y) over the fit
         "id" => string(clip.id),
         "blendfrom" => string(clip.blendfrom),
         "effects" => [slotdict(s) for s in clip.effects],
@@ -80,8 +84,10 @@ function loadproject(path::AbstractString)
     sources = Dict{String, VideoSource}()
     clips = map(dict["clips"]) do cd
         source = get!(() -> VideoSource(cd["source"]), sources, cd["source"])
+        # files written before conforming existed hold only native-rate clips
         clip = Clip(source, cd["src_in"], cd["src_out"], cd["start"],
-                    Tuple(Float64.(cd["crop"])))
+                    Tuple(Float64.(cd["crop"])), Float64(get(cd, "rate", 1.0)),
+                    Tuple(Float64.(get(cd, "reframe", collect(NEUTRALFRAME)))))
         clip.track = Int(get(cd, "track", 1))
         # ids are part of the edit: a blend points at its partner by id, and the
         # inspector at a stack entry. Files written before ids existed simply keep
@@ -123,6 +129,9 @@ function loadproject(path::AbstractString)
     seq = Sequence(collect(Clip, clips), Float64(dict["framerate"]))
     for td in get(dict, "transitions", [])
         push!(seq.transitions, Transition(Symbol(td["kind"]), Int(td["at"]), Int(td["duration"])))
+    end
+    for od in get(dict, "overlays", [])
+        push!(seq.overlays, overlayfromdict(od))
     end
     return seq
 end

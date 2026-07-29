@@ -11,7 +11,7 @@ later splits/moves of the clip. Applied automatically (before user
 effects) in preview and export. Saved with the project.
 """
 function analyzecolor!(clip::Clip; cutoff::Real = 0.5, backend = KA.CPU(), progress = nothing)
-    n = cliplength(clip)
+    n = srclength(clip)
     n >= 24 || return nothing  # too short to separate flicker from content
     means = Matrix{Float32}(undef, n, 3)
     stds = Matrix{Float32}(undef, n, 3)

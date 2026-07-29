@@ -33,7 +33,7 @@ function analyzemotion!(clip::Clip; mode::Symbol = :similarity, analysis_width::
         error("mode must be :similarity, :tripod, :perspective or :smooth")
     mode === :similarity && return similaritypath!(clip; backend, progress)
     mode === :bundle && return bundlelock!(clip; analysis_width, backend, progress)
-    n = cliplength(clip)
+    n = srclength(clip)
     n >= 24 || return nothing
     source = clip.source
     aw = Int(analysis_width)
@@ -210,7 +210,7 @@ function cameralock!(clip::Clip; point = nothing, window::Integer = 96,
                      maxfeatures::Integer = 120, replenishfrac::Real = 0.5,
                      redetectevery::Integer = 6,
                      backend = KA.CPU(), progress = nothing, debug = nothing)
-    n = cliplength(clip)
+    n = srclength(clip)
     n >= 2 || return nothing
     source = clip.source
     # small sources get proportionally smaller patches and searches
@@ -443,7 +443,7 @@ std, so lighting drift doesn't dominate the comparison.
 function loopsignatures(clip::Clip; matchwidth::Integer = 64,
                         backend = KA.CPU(), progress = nothing)
     src = clip.source
-    n = cliplength(clip)
+    n = srclength(clip)
     W, H = src.width, src.height
     # warp at a small working resolution (≈90× less work than full res) —
     # applymotiontrack! rescales the transform to the buffer size for us
@@ -530,7 +530,7 @@ function findloop(clip::Clip; minseconds::Real = 1.5, maxseconds::Real = 6.0,
                   matchwidth::Integer = 64, step::Integer = 2, lengthbias::Real = 0.0,
                   backend = KA.CPU(), progress = nothing)
     fps = clip.source.framerate
-    n = cliplength(clip)
+    n = srclength(clip)
     n >= 4 || throw(ArgumentError("clip too short to loop"))
     frames = loopsignatures(clip; matchwidth, backend, progress)
     gw, gh = size(frames, 1), size(frames, 2)

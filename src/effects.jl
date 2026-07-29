@@ -240,6 +240,19 @@ const PARAMS = ParamSpec[
         c -> c.crop[3], (c, v) -> (c.crop = (c.crop[1], c.crop[2], clamp(Float64(v), 0.05, 1.0), c.crop[4]))),
     ParamSpec(:crop_h, "Zoom H", :geometry, 0.05, 1.0, 1.0,
         c -> c.crop[4], (c, v) -> (c.crop = (c.crop[1], c.crop[2], c.crop[3], clamp(Float64(v), 0.05, 1.0)))),
+    # …and where the cropped picture SITS in the canvas. The fit is automatic
+    # (whole, centred, black bars); these three are the manual override for
+    # material that doesn't share the sequence's shape — 1.0 fits, >1 fills past
+    # the edges, and the shift moves it inside the frame.
+    ParamSpec(:scale, "Scale", :geometry, 0.1, 4.0, 1.0,
+        c -> c.reframe[1],
+        (c, v) -> (c.reframe = (clamp(Float64(v), 0.1, 4.0), c.reframe[2], c.reframe[3]))),
+    ParamSpec(:pos_x, "Position X", :geometry, -1.0, 1.0, 0.0,
+        c -> c.reframe[2],
+        (c, v) -> (c.reframe = (c.reframe[1], clamp(Float64(v), -1.0, 1.0), c.reframe[3]))),
+    ParamSpec(:pos_y, "Position Y", :geometry, -1.0, 1.0, 0.0,
+        c -> c.reframe[3],
+        (c, v) -> (c.reframe = (c.reframe[1], c.reframe[2], clamp(Float64(v), -1.0, 1.0)))),
 ]
 const PARAMBYKEY = Dict(p.key => p for p in PARAMS)
 
@@ -268,7 +281,7 @@ withoutopacity(clip::Clip) =
     Clip(clip.id, clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
          filter(s -> !(s.effect isa OpacityEffect), clip.effects),
          clip.colortrack, clip.motiontrack, clip.mattetrack, clip.animations, clip.track,
-              clip.blendfrom)
+              clip.blendfrom, clip.rate, clip.reframe)
 
 """
     effectiveclip(clip, srcframe) -> Clip
@@ -286,7 +299,7 @@ function effectiveclip(clip::Clip, srcframe::Integer)
     ec = Clip(clip.id, clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
               [FxSlot(s.id, s.effect, s.enabled) for s in clip.effects],
               clip.colortrack, clip.motiontrack, clip.mattetrack, clip.animations, clip.track,
-              clip.blendfrom)
+              clip.blendfrom, clip.rate, clip.reframe)
     for (key, curve) in clip.animations
         haskey(PARAMBYKEY, key) || continue
         v = valueat(curve, srcframe)

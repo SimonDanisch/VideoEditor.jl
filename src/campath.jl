@@ -310,7 +310,7 @@ function similaritypath!(clip::Clip; window::Integer = 11, iters::Integer = 15,
                          outlierwindow::Integer = 3, outliertrans::Real = 20.0,
                          outlierscale::Real = 0.1, outlierrot::Real = 5.0,
                          backend = KA.CPU(), progress = nothing)
-    n = cliplength(clip)
+    n = srclength(clip)
     n >= 2 || return nothing
     # Feed both passes from the backend's frame source: on the GPU the chunked
     # stream decodes on-device with bounded VRAM. Replaces the old whole-source

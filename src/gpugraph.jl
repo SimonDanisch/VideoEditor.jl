@@ -349,13 +349,65 @@ function render(f, engine::FxEngine, source, clip::Clip, frame::Integer;
 end
 
 """
-    composite(f, engine, clips, n, sourcefor; applytracks, playing, exact) -> Bool
+    layermatrix(clip, layersize, canvas) -> Mat3f
+
+How this clip's rendered layer lands on the canvas: its crop rect, FITTED WHOLE
+(aspect preserved, so material of another shape gets letterbox bars rather than
+being stretched), then the clip's manual `reframe` on top. The one definition —
+the preview's axis limits and the composited pixels both come from it, so a
+reframe cannot mean two things.
+"""
+layermatrix(clip::Clip, layersize::Tuple{Int, Int}, canvas::Tuple{Int, Int}) =
+    fitmatrix(clip.crop, layersize, canvas;
+              scale = clip.reframe[1], position = (clip.reframe[2], clip.reframe[3]))
+
+"""
+    placelayer!(dest, layer, clip) -> dest
+
+Draw one rendered layer into the canvas through [`layermatrix`](@ref). Pixels the
+layer does not cover are LEFT AS THEY ARE — so the bars show whatever the caller
+put in `dest` first: black underneath the base layer, the canvas so far under a
+layer stacked above one (whose bars must stay clear, not paint black over the
+track below).
+"""
+function placelayer!(dest, layer, clip::Clip)
+    warp!(dest, layer, layermatrix(clip, size(layer), size(dest)); skipoutside = true)
+    return dest
+end
+
+"""
+    canvasrect(clip, layersize, canvas) -> (x, y, w, h)
+
+Which part of a `layersize` buffer the canvas shows, normalized — the inverse of
+[`layermatrix`](@ref), and what the preview puts on its axis so a single-clip
+present frames itself exactly as the composite would bake it. Equal to the
+clip's crop when it fills the canvas; reaching past 0..1 is precisely where the
+letterbox bars are.
+"""
+function canvasrect(clip::Clip, layersize::Tuple{Int, Int}, canvas::Tuple{Int, Int})
+    M = layermatrix(clip, layersize, canvas)
+    lo = M * Vec3f(0.5f0, 0.5f0, 1.0f0)
+    hi = M * Vec3f(Float32(canvas[1]) + 0.5f0, Float32(canvas[2]) + 0.5f0, 1.0f0)
+    x0 = (lo[1] - 0.5) / layersize[1]
+    y0 = (lo[2] - 0.5) / layersize[2]
+    return (x0, y0, (hi[1] - 0.5) / layersize[1] - x0, (hi[2] - 0.5) / layersize[2] - y0)
+end
+
+"""
+    composite(f, engine, clips, n, sourcefor; canvas, applytracks, playing, exact) -> Bool
 
 The stack of `clips` (bottom track → top) at timeline frame `n` as ONE image,
 handed to `f(canvas)`; returns whether it was rendered. Per layer: [`render`]'s
 effect graph, then its crop BAKED into the canvas with `warp!`, then an alpha
 blend by the layer's opacity — opacity is the layer alpha here, not a fade to
 black inside the graph.
+
+`canvas` is `(width, height)` — the SEQUENCE's canvas ([`canvassize`](@ref)),
+which every caller passes. Taking it from the top layer instead was a second
+definition of the output format: on mixed-resolution material the preview
+composited at the top clip's size while the export wrote the first clip's, so
+the two disagreed about the picture (and `copyto!` into the export buffer had
+no matching size to copy into).
 
 `sourcefor(clip, srcframe)` is the ONE thing that differs between the tiers: a
 `GpuVideoStream` for the GPU preview, a decoded `RGBFrame` from the ring for the
@@ -367,14 +419,15 @@ canvas must be shown whole, so a stabilized clip's crop was applied twice for
 the length of a blend).
 """
 function composite(f, engine::FxEngine, clips, n::Integer, sourcefor;
+                   canvas::Tuple{Integer, Integer},
                    applytracks::Bool = true, playing::Bool = false, exact::Bool = false)
     pool = engine.pool
-    W, H = clips[end].source.width, clips[end].source.height
+    W, H = Int(canvas[1]), Int(canvas[2])
     accum = acquire!(pool, (W, H))
     warpbuf = nothing
     try
         for (k, clip) in enumerate(clips)
-            srcframe = clip.src_in + (n - clip.start)
+            srcframe = sourceframe(clip, n)
             source = sourcefor(clip, srcframe)
             source === nothing && return false
             lclip = withoutopacity(effectiveclip(clip, srcframe))
@@ -382,11 +435,17 @@ function composite(f, engine::FxEngine, clips, n::Integer, sourcefor;
                              FxContext(source, lclip, srcframe, playing; exact))
             α = Float32(clamp(paramvalue(clip, :opacity, srcframe), 0.0, 1.0))
             if k == 1                                   # the bottom layer sits on black:
-                warp!(accum, layer, lclip.crop)         # (1-α)·0 + α·layer = α·layer
+                fill!(accum, RGB{N0f8}(0, 0, 0))        # (1-α)·0 + α·layer = α·layer,
+                placelayer!(accum, layer, lclip)        # and the bars stay that black
                 α < 0.999f0 && channellinear!(accum, Vec3f(α), Vec3f(0))
             else
                 warpbuf === nothing && (warpbuf = acquire!(pool, (W, H)))
-                warp!(warpbuf, layer, lclip.crop)
+                # start from the canvas so far: where THIS layer doesn't reach,
+                # `warpbuf` still holds what is below and the blend leaves it be
+                # (blend(a, a, α) = a). A letterboxed upper layer therefore shows
+                # the track underneath through its bars instead of blacking it out.
+                copyto!(warpbuf, accum)
+                placelayer!(warpbuf, layer, lclip)
                 blend!(accum, accum, warpbuf, α)
             end
             release!(pool, layer)

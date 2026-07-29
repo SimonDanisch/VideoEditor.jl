@@ -676,20 +676,7 @@ function trimto!(timeline::Timeline, t::Real)
     clip, side, i = trim
     seq = timeline.sequence
     fps = seq.framerate
-    n = round(Int, t * fps)
-    if side === :right
-        maxend = clip.start + (clip.source.nframes - clip.src_in)
-        i < length(seq.clips) && (maxend = min(maxend, seq.clips[i + 1].start))
-        newend = clamp(n, clip.start + 1, maxend)
-        clip.src_out = clip.src_in + (newend - clip.start)
-    else
-        minstart = max(i > 1 ? clipend(seq.clips[i - 1]) : 0,
-                       clip.start - clip.src_in)  # src_in must stay ≥ 0
-        newstart = clamp(n, minstart, clipend(clip) - 1)
-        delta = newstart - clip.start
-        clip.src_in += delta
-        clip.start += delta
-    end
+    trimclip!(seq, clip, i, side, round(Int, t * fps))
     timeline.clipranges[i][] = (clip.start / fps, clipend(clip) / fps)
     # the STRIP has to follow too: trimming the left edge walks `src_in`, so the
     # thumbnails must start at the new in-point. Updating only the time range drew
