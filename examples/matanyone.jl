@@ -3,7 +3,7 @@ Drive the editor's matte tool with MatAnyone running on Lava.
 
 Opt-in glue, deliberately not a dependency in either direction: VideoEditor owns
 the track, the UI and the render path and asks a propagator to fill in the
-frames; LavaDNN knows nothing about editors. Including this file is what joins
+frames; DNNKernels knows nothing about editors. Including this file is what joins
 them.
 
     include("examples/matanyone.jl")
@@ -35,21 +35,23 @@ using Lava: LavaBackend
 
 Install the MatAnyone propagator into the editor's matte tool.
 
-# Load `VideoEditorRunner` first, or the first propagation costs 94 seconds
+# Why the propagator is not defined in this file
 
-The propagator lives in `MatAnyoneRunner`, not in this file, and this file is a
-dozen lines because of a measurement rather than a preference. Through the
-editor's seam, with every kernel already frozen:
+It lives in `MatAnyoneRunner`, and this file is a dozen lines, because of a
+measurement rather than a preference. Through the editor's seam, with every
+kernel already frozen:
 
     first propagation (6 frames)   94.30 s   (74.44 s compiling)
     second propagation              9.20 s   ( 0.00 s compiling)
 
 Code in a script cannot be in a package image, so a propagator defined here is
 one that always pays the 74 s. And moving it into a package is only half: loading
-`VideoEditor` invalidates the inference a model package cached, so what actually
-has to run the workload is `VideoEditorRunner`, which depends on both and caches
-on the far side of that. Same story as `sam2.jl`, same fix, and its docstring has
-the numbers for the segmenter half.
+`VideoEditor` invalidates the inference a model package cached, so the workload
+that traces it has to run on the far side of that load. `VideoEditor` depends on
+`MatAnyoneRunner` directly, which makes the editor itself that far side, and it
+carries the workload (`VideoEditor/src/precompile.jl`) — so there is nothing
+extra to load here. Same story as `sam2.jl`, same fix, and its docstring has the
+numbers for the segmenter half.
 """
 function usematanyone!(; backend = LavaBackend(), kwargs...)
     propref = Ref{Any}(nothing)
@@ -63,8 +65,6 @@ function usematanyone!(; backend = LavaBackend(), kwargs...)
             (propref[] = MatAnyoneRunner.matanyonepropagator(; backend, kwargs...))
         return propref[](frames, seeds; progress)
     end)
-    isdefined(Main, :VideoEditorRunner) ||
-        @warn "load VideoEditorRunner for a fast first matte — without it it costs ~74 s of Julia compilation"
     @info "matte: MatAnyone propagator installed"
     return nothing
 end

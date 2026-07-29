@@ -1297,6 +1297,13 @@ step, and its `Matte`/`Feather` sliders are keyframable like any other param.
 function mattepanel!(ctx::ToolContext)
     player = ctx.player
     toollabel!(ctx, player.matteinfo)
+    # WHICH seed the clicks will produce. The difference between an object
+    # boundary and a painted disc decides the quality of the whole matte, so it
+    # is not a detail to leave the user guessing at — and when the weights are
+    # missing, saying so is the only way anyone would know why it got worse.
+    toollabel!(ctx, player.segmenter === nothing ?
+                    "seed: discs (no SAM 2 weights) — DRAG to cover the subject" :
+                    "seed: $(seedbackendname(player.segmenter)) — click the subject")
     # the button says what it DOES; how to work it belongs in the description,
     # which has room to wrap — a Button label has none and simply overflows
     toolaction!(ctx, "Mark subject", () -> armmattepick!(ctx))
@@ -1320,7 +1327,7 @@ function mattepanel!(ctx::ToolContext)
             w, max(1, round(Int, sh * w / sw))
         end
         player.matteinfo[] = "warming up the model…"
-        runanalysis(player) do
+        runanalysis(player; gpu = hasmattemodel()) do
             try
                 warmmatte!(mw, mh)
                 put!(player.uiqueue, () -> (player.matteinfo[] = "ready — mark the subject"))
@@ -1486,8 +1493,15 @@ function armmattepick!(ctx::ToolContext)
         return Consume(true)
     end)
     player.fxwidgets[:mattecollect] = col
-    player.matteinfo[] = "painting: drag over the subject, right-drag to exclude"
-    setstatus!(player, "matte: DRAG over the subject (right-drag excludes) · " *
+    # The gesture depends on what makes the seed. A segmenter turns ONE click
+    # into the object's boundary, so telling the user to drag would have them
+    # painting a stroke the model does not need; without one the seed IS the
+    # painted shape and a stroke is the only way to cover a subject.
+    clicks = player.segmenter !== nothing
+    player.matteinfo[] = clicks ? "marking: click the subject, right-click to exclude" :
+                                  "painting: drag over the subject, right-drag to exclude"
+    setstatus!(player, (clicks ? "matte: CLICK the subject (right-click excludes) · " :
+                                 "matte: DRAG over the subject (right-drag excludes) · ") *
                        "Ctrl+Z or Backspace undoes · Enter propagates · Esc cancels")
     return nothing
 end
@@ -1596,17 +1610,31 @@ function livematte!(col::MatteCollect)
     # mutated by every click, so keeping a reference would let `lastseedpoints`
     # silently agree with points the seed was never computed from.
     points = copy(col.points)
-    runanalysis(player) do
+    # SAY something before the model runs. Discs were instant, so a silent path
+    # was honest; a segmenter takes ~0.6 s warm, and the first click of a session
+    # also builds and compiles the model — measured at 58 s. A dot appearing and
+    # then nothing at all for a minute reads as a tool that does not work.
+    setstatus!(player, segmenterready(player.segmenter) ?
+                       "matte: segmenting…" :
+                       "matte: building the $(seedbackendname(player.segmenter)) model — " *
+                       "first click of the session, this one takes a while")
+    player.jobprogress[] = 0.0   # footer spinner, so the wait is visible too
+    runanalysis(player; gpu = player.segmenter !== nothing) do
         try
             frame = framereader(player, col.clip)(col.srcframe)
-            mask = seedmask(col.clip, frame, points; key = (col.clip.id, col.srcframe))
+            mask = seedmask(col.clip, frame, points; segmenter = player.segmenter,
+                            key = (col.clip.id, col.srcframe))
             alpha = previewmatte(col.clip, frame, mask)
             put!(player.uiqueue, () -> begin
                 if mattecollect(player) === col         # not cancelled meanwhile
                     col.lastseed = mask
                     col.lastseedpoints = points
                     showlivematte!(col, alpha)
+                    setstatus!(player, "matte: $(length(points)) point$(length(points) == 1 ? "" : "s") — " *
+                               "selection covers $(round(100 * count(!=(0x00), mask) / length(mask); digits = 1))%" *
+                               " · Enter to propagate")
                 end
+                player.jobprogress[] = NaN
                 col.busy = false
                 if col.pending
                     col.pending = false
@@ -1614,9 +1642,12 @@ function livematte!(col::MatteCollect)
                 end
             end)
         catch e
+            bt = catch_backtrace()
             put!(player.uiqueue, () -> begin
+                player.jobprogress[] = NaN
                 col.busy = false
-                setstatus!(player, "matte preview failed: $(sprint(showerror, e))")
+                setstatus!(player, "matte: $(briefly(e))")
+                @error "matte preview failed" exception = (e, bt)
             end)
         end
     end
@@ -1682,10 +1713,11 @@ function finishmattecollect!(col::MatteCollect)
     points = copy(col.points)
     player = ctx.player
     setstatus!(player, "matte: reading the marked frame…")
-    runanalysis(player) do
+    runanalysis(player; gpu = player.segmenter !== nothing) do
         try
             frame = framereader(player, clip)(srcframe)
-            mask = seedmask(clip, frame, points; key = (clip.id, Int(srcframe)))
+            mask = seedmask(clip, frame, points; segmenter = player.segmenter,
+                            key = (clip.id, Int(srcframe)))
             put!(player.uiqueue, () -> addmatteseed!(ctx, clip, srcframe, mask))
         catch e
             put!(player.uiqueue,
@@ -1764,7 +1796,7 @@ function runmatte!(ctx::ToolContext; clip = nothing, seeds = nothing)
     player.matteinfo[] = "matting…"
     setstatus!(player, "matte: propagating from $(length(marks)) marked frame(s) " *
                        "($(mattebackendname()))")
-    runanalysis(player) do
+    runanalysis(player; gpu = hasmattemodel()) do
         try
             reader = framereader(player, clip)
             track = analyzematte!(clip, reader, marks; progress = (d, t) -> begin
@@ -1868,10 +1900,11 @@ function refreshmattepanel!(player::Player)
 end
 
 registertool!(:matte, "Matte",
-    "Isolates a subject on the SELECTED clip. DRAG over the subject to paint it " *
-    "roughly (right-drag paints what is NOT it), then Enter. The model propagates " *
-    "the painted mask across the clip — it does not grow a dot, so cover the " *
-    "subject. Mark another frame wherever it drifts.";
+    "Isolates a subject on the SELECTED clip. CLICK the subject (right-click " *
+    "marks what is NOT it), then Enter: SAM 2 turns each click into an object " *
+    "boundary, and that seed is propagated across the clip. Mark another frame " *
+    "wherever it drifts. Without SAM 2's weights the seed is a painted disc " *
+    "instead — then drag to cover the subject, and the panel says so.";
     panel = mattepanel!, activate = ctx -> armmattepick!(ctx))
 
 
@@ -1922,7 +1955,7 @@ function runrestore!(ctx::ToolContext)
     first = clamp(srcframe - n ÷ 2, clip.src_in, max(clip.src_in, clip.src_out - n))
     player.restoreinfo[] = "restoring…"
     setstatus!(player, "restore: $n frames from $(first)")
-    runanalysis(player) do
+    runanalysis(player; gpu = RESTOREMODEL[] !== nothing) do
         try
             reader = framereader(player, clip)
             got = restorewindow!(clip, reader, first, n;

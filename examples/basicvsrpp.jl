@@ -1,5 +1,5 @@
 """
-Drive the editor's restore effect with BasicVSR++ running on LavaDNN.
+Drive the editor's restore effect with BasicVSR++ running on DNNKernels.
 
 Same opt-in shape as `matanyone.jl`: no dependency in either direction, the
 editor owns the effect and the cache, and including this file installs the model.
@@ -18,7 +18,7 @@ match what was exported. Passing a different count silently produces a graph
 whose `select` indices run off the end, which is why this checks up front.
 """
 
-using VideoEditor, LavaDNN, KernelAbstractions
+using VideoEditor, DNNKernels, KernelAbstractions
 using VideoEditor: RGB, N0f8, red, green, blue
 const KA = KernelAbstractions
 
@@ -33,9 +33,9 @@ window length the exported graph expects and the model's upscale factor.
 function basicvsrpprestorer(; graphdir = GRAPHDIR, backend = KA.CPU())
     isdir(graphdir) || error("no exported BasicVSR++ graph at $graphdir — " *
                              "run tools/export_basicvsrpp.py first")
-    g = LavaDNN.loadgraph(joinpath(graphdir, "basicvsrpp.json"))
-    w0 = LavaDNN.readsafetensors(joinpath(graphdir, "weights.safetensors"))
-    weights = Dict{String, Any}(k => LavaDNN.toback(backend, v) for (k, v) in w0)
+    g = DNNKernels.loadgraph(joinpath(graphdir, "basicvsrpp.json"))
+    w0 = DNNKernels.readsafetensors(joinpath(graphdir, "weights.safetensors"))
+    weights = Dict{String, Any}(k => DNNKernels.toback(backend, v) for (k, v) in w0)
     # The exported input pins (W, H, C, T, N); read the window length and size
     # back off it so the caller cannot silently disagree with the graph.
     inb = g.buffers[g.inputs[1]]
@@ -54,10 +54,10 @@ function basicvsrpprestorer(; graphdir = GRAPHDIR, backend = KA.CPU())
             host[i, j, 2, t, 1] = Float32(green(c))
             host[i, j, 3, t, 1] = Float32(blue(c))
         end
-        lqs = LavaDNN.toback(backend, host)
-        vals = LavaDNN.execute!(g, Dict{String, Any}(g.inputs[1] => lqs), weights;
+        lqs = DNNKernels.toback(backend, host)
+        vals = DNNKernels.execute!(g, Dict{String, Any}(g.inputs[1] => lqs), weights;
                                 dims = (;), backend = backend)
-        out = LavaDNN.value(LavaDNN.Ctx(vals, g, (;), backend), g.outputs[1])
+        out = DNNKernels.value(DNNKernels.Ctx(vals, g, (;), backend), g.outputs[1])
         KA.synchronize(backend)
         a = Array(out)                              # (4W, 4H, 3, T, 1)
         OW, OH = size(a, 1), size(a, 2)

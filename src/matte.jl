@@ -14,7 +14,7 @@ selection at each. Propagation fills the frames between them. `MatteTrack.alpha`
 is therefore a cache: deleting it costs a recompute, not an edit.
 
 The propagation itself is pluggable — see [`registermatte!`](@ref). A model
-runner (LavaDNN's MatAnyone) registers the good one; the built-in fallback keeps
+runner (DNNKernels' MatAnyone) registers the good one; the built-in fallback keeps
 the feature, its UI and its tests working with no model installed.
 """
 
@@ -186,28 +186,97 @@ hasmattemodel() = MATTEPROPAGATOR[] !== nothing
 mattebackendname() = hasmattemodel() ? "model" : "built-in"
 
 """
-    registersegmenter!(f)
+# Segmenters
 
-Install the segmenter. `f(frame, points; key) -> Matrix{UInt8}` receives one
-source-resolution frame, the marked `(x, y, foreground)` points in normalized
-coordinates, and a value identifying the frame, and returns a 0/255 mask the size
-of the frame. `key` is what lets an implementation cache per-frame work across
-the clicks of one marking; it is `nothing` when the caller cannot identify the
-frame.
+`f(frame, points; key) -> Matrix{UInt8}` receives one source-resolution frame,
+the marked `(x, y, foreground)` points in normalized coordinates, and a value
+identifying the frame, and returns a 0/255 mask the size of the frame. `key` is
+what lets an implementation cache per-frame work across the clicks of one
+marking; it is `nothing` when the caller cannot identify the frame.
 
-A second seam next to [`registermatte!`](@ref), because they answer different
-questions and only one of them is a matter of taste. A propagator carries a mask
-through a clip; it does **not** find one — measured on both this implementation
-and PyTorch's, MatAnyone's matte tracks its seed (IoU against the seed 0.95
-falling to 0.82 across a clip) rather than segmenting the subject. So the quality
-of the whole matte is decided by the seed, and a seed painted as discs around
-clicks is a rough one. A segmenter turns those same clicks into an actual object
-boundary; SAM 2.1 is what `examples/sam2.jl` installs here.
+A segmenter is a plain function passed to [`seedmask`](@ref), and the editor's is
+[`Player`](@ref)`.segmenter` — not a registry, and not a global switch. Pass a
+different one to use a different model.
+
+A separate seam from [`registermatte!`](@ref), because they answer different
+questions. A propagator carries a mask through a clip; it does **not** find one —
+measured on both this implementation and PyTorch's, MatAnyone's matte tracks its
+seed (IoU against the seed 0.95 falling to 0.82 across a clip) rather than
+segmenting the subject. So the quality of the whole matte is decided by the seed,
+and a seed painted as discs around clicks is a rough one.
 """
-const MATTESEGMENTER = Ref{Any}(nothing)
-registersegmenter!(f) = (MATTESEGMENTER[] = f; nothing)
-hassegmenter() = MATTESEGMENTER[] !== nothing
-seedbackendname() = hassegmenter() ? "model" : "discs"
+
+"Whether SAM 2's exported graphs and weights are on disk."
+sam2ready() = isfile(joinpath(SAM2Runner.assetdir(), "weights.safetensors"))
+
+# The ONE piece of genuinely global state here: the built-in model itself. It is
+# ~5 GB of VRAM and a Vulkan context — one per process, whatever else is going
+# on — so it is a singleton because the GPU is, not for convenience.
+#
+# Built on FIRST USE and never at load: a `BatchQueue` is single-writer and
+# belongs to whichever thread first touches the context, and the editor calls a
+# segmenter from `runanalysis` — its pinned GPU worker. Constructing it at load
+# would bind the queue to whoever loaded the package, and every later click would
+# die on "BatchQueue is single-writer".
+const SAM2MODEL = Ref{Any}(nothing)
+
+"""
+    sam2seed(frame, points; key) -> Matrix{UInt8}
+
+The built-in segmenter: SAM 2.1 on Lava, turning clicks into an object boundary.
+
+`pick = :confident` takes the highest predicted IoU but breaks a near-tie by
+logit magnitude, which on measured clicks cuts the seed's boundary fragmentation
+from 13.6× a compact blob to 3.6×; SAM's own argmax (`:best`) is what PyTorch
+does. A click is genuinely ambiguous — a windowpane, the window, the wall — and
+the model says so by returning three proposals.
+"""
+function sam2seed(frame, points; key = nothing)
+    if SAM2MODEL[] === nothing
+        model = SAM2Runner.sam2model(; backend = Lava.LavaBackend())
+        SAM2MODEL[] = SAM2Runner.sam2segmenter(model; pick = :confident)
+    end
+    return SAM2MODEL[](frame, points; key)
+end
+
+"""
+    defaultsegmenter() -> Function or nothing
+
+What a new [`Player`](@ref) segments with: SAM 2.1 when its weights are on disk,
+and `nothing` when they are not — `nothing` being what makes [`seedmask`](@ref)
+fall back to painting discs around the clicks.
+"""
+defaultsegmenter() = sam2ready() ? sam2seed : nothing
+
+"Name of the seed a segmenter produces, for the tool panel to show."
+seedbackendname(seg) = seg === nothing ? "discs" :
+                       seg === sam2seed ? "SAM 2" : "custom model"
+
+"""
+Whether `seg` can answer a click straight away, or the caller is about to wait
+for a model to be built. Only the built-in one is knowable — anything else is
+assumed ready, since a custom segmenter's laziness is its own business.
+"""
+segmenterready(seg) = seg !== sam2seed || SAM2MODEL[] !== nothing
+
+"""
+    briefly(e) -> String
+
+One line of an exception, for a status bar.
+
+A Vulkan out-of-memory report is twenty lines of per-heap budgets. That belongs
+in the log; in a footer it buries the one sentence the user can act on, and a
+status nobody reads is the same as no status at all — which is how "it failed"
+became "nothing happens".
+"""
+function briefly(e)
+    s = sprint(showerror, e)
+    occursin("Out of GPU memory", s) &&
+        return "out of GPU memory — another process is likely holding the card"
+    occursin("BatchQueue is single-writer", s) &&
+        return "the GPU model was built on the wrong thread (restart the editor)"
+    return first(split(s, '\n'))
+end
 
 """
 Fallback propagator: per-frame colour-distance segmentation seeded by the marked
@@ -380,10 +449,11 @@ function seedmask(clip::Clip, rect::NTuple{4, <:Real})
 end
 
 """
-    seedmask(clip, frame, points; radius = 0.06, key = nothing) -> Matrix{UInt8}
+    seedmask(clip, frame, points; segmenter = defaultsegmenter(), radius = 0.06, key = nothing)
 
-The selection for one marked frame: the segmenter's answer when one is
-installed, and discs around the points when none is.
+The selection for one marked frame: `segmenter`'s answer — SAM 2.1 unless the
+caller passes another — and discs around the points only when there is no
+segmenter at all.
 
 Taking the frame is what makes the segmenter possible at all — the disc form
 needs only coordinates, which is why it never asked for a picture. Callers read
@@ -398,10 +468,9 @@ embedding again and the live preview stops being live.
 """
 function seedmask(clip::Clip, frame::AbstractMatrix{<:RGB},
                   points::AbstractVector{<:Tuple{<:Real, <:Real, Bool}};
-                  radius::Real = 0.06, key = nothing)
-    seg = MATTESEGMENTER[]
-    seg === nothing && return seedmask(clip, points; radius)
-    m = seg(frame, points; key)
+                  segmenter = defaultsegmenter(), radius::Real = 0.06, key = nothing)
+    segmenter === nothing && return seedmask(clip, points; radius)
+    m = segmenter(frame, points; key)
     size(m) == size(frame) ||
         error("segmenter returned $(size(m)), expected $(size(frame))")
     return m

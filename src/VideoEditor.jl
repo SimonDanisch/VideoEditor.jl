@@ -8,6 +8,7 @@ using GPUFiltering
 using Lava
 using Makie
 using Observables
+using SAM2Runner
 using Printf
 using TOML
 using VideoIO
@@ -57,12 +58,15 @@ include("plugins.jl")
 include("tools.jl")    # GUI tools: timeline-overlay hints + premade operations
 include("agentview.jl")  # what an AGENT sees: contact sheets, zoom, change search
 include("mcp.jl")
+include("precompile.jl")  # LAST: the workload runs the render + matte paths, so
+                          # everything it calls has to be defined already
 
 export VideoSource, Player, Clip, Sequence
 export play!, pause!, step!
 export split!, deleteclip!, moveclip!, addsource!, saveproject, loadproject
 export ColorEffect, BlurEffect, SharpenEffect, MatteEffect, seteffect!
 export MatteTrack, analyzematte!, applymatte!, registermatte!, seedmask
+export sam2seed, sam2ready, defaultsegmenter
 export RestoreEffect, registerrestore!, restorewindow!, applyrestore!
 export registerplugin!, FxParam, FxPlugin, Pointwise, Stencil
 export Overlay, registeroverlay!, addoverlay!, removeoverlay!, setoverlaykey!

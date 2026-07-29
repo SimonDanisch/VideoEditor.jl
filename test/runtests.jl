@@ -940,6 +940,35 @@ canui && include("fuzz.jl")   # random edit programs vs the picture (needs a Pla
     @test all(c -> Float32(c.g) in (0.0f0, 1.0f0), big)
 end
 
+@testset "matte: SAM 2 is the seed by default" begin
+    # The editor segments out of the box — no include, no opt-in call. Before
+    # this, `seedmask` painted discs around clicks unless somebody had run
+    # `usesam2!()` by hand, and nothing in the UI said which one you were
+    # getting, so a matte seeded from a 130 px blob looked like a broken model.
+    @test VE.sam2ready() == isfile(joinpath(VE.SAM2Runner.assetdir(), "weights.safetensors"))
+    if VE.sam2ready()
+        @test VE.defaultsegmenter() === VE.sam2seed
+        @test VE.seedbackendname(VE.defaultsegmenter()) == "SAM 2"
+    else
+        @test VE.defaultsegmenter() === nothing   # discs, and the panel says so
+    end
+
+    # …and it is a PARAMETER, not a global switch: pass another and it is used,
+    # with nothing left installed anywhere afterwards
+    called = Ref(false)
+    mine = (frame, points; key = nothing) -> (called[] = true; fill(0xff, size(frame)))
+    @test VE.seedbackendname(mine) == "custom model"
+    @test VE.seedbackendname(nothing) == "discs"
+    src = VideoSource(testvideo)
+    clip = Clip(src)
+    frame = fill(VE.RGB{VE.N0f8}(0.5, 0.5, 0.5), src.width, src.height)
+    m = VideoEditor.seedmask(clip, frame, [(0.5, 0.5, true)]; segmenter = mine)
+    @test called[] && size(m) == size(frame) && all(==(0xff), m)
+    # explicit `nothing` is the disc fallback, reachable without unsetting anything
+    d = VideoEditor.seedmask(clip, frame, [(0.5, 0.5, true)]; segmenter = nothing)
+    @test size(d) == size(frame) && any(!=(0x00), d) && !all(==(0xff), d)
+end
+
 @testset "matte track, effect and keyframes" begin
     src = VideoSource(testvideo2)              # smptebars 480x270, strong colour blocks
     clip = Clip(src; src_in = 0, src_out = 12)

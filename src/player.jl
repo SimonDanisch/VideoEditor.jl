@@ -75,6 +75,11 @@ mutable struct Player
     previewplot::Any  # the preview image plot (texture swap target, glbridge.jl)
     gpupreview::Any   # GPUPreview when Player(gpupreview = true), else nothing
     audio::Any        # AudioPreview when Player(audiopreview = true), else nothing
+    # What turns matte clicks into a mask (see `seedmask`): SAM 2.1 by default,
+    # `nothing` when its weights aren't on disk — then the seed is painted discs.
+    # A field rather than a registry: which model an editor segments with is that
+    # editor's business, and two open on one desktop can differ.
+    segmenter::Any
     const undostack::Vector{Vector{Clip}}
     const redostack::Vector{Vector{Clip}}
     lastslidersnap::Float64
@@ -166,9 +171,18 @@ GPU backend → the pinned GPU worker. On the GPU the sources' stream rings are
 closed for the duration — their VRAM starves the analysis pool otherwise (flaky
 pool-block OOM in `goodfeatures`) — and re-opened afterwards; playback falls
 back to CPU decode in between and returns to the stream when it's ready.
+
+`gpu = true` says the JOB is a GPU job whatever the analysis tier is, and pins it
+to the worker regardless. The matte's models are exactly that: a segmenter is a
+Vulkan model even when analysis runs on the CPU, and a `BatchQueue` belongs to
+the thread that first touched it — so building one from `Threads.@spawn` dies on
+"BatchQueue is single-writer". That is not hypothetical: the analysis backend
+starts as `KA.CPU()` and is upgraded asynchronously by `autodetectgpu!`, so
+every matte click before that lands — or any session where the probe failed
+because another process held the card — took the thread path into that assertion.
 """
-function runanalysis(job::Function, player::Player)
-    if player.analysisbackend isa KA.CPU
+function runanalysis(job::Function, player::Player; gpu::Bool = false)
+    if player.analysisbackend isa KA.CPU && !gpu
         Threads.@spawn job()
         return nothing
     end
@@ -375,7 +389,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     similar(frame[]), Dict{Symbol, Slider}(),
                     Dict{Symbol, Any}(),
                     Ref(false), nothing, (0.0, 0.0, 1.0, 1.0), NEUTRALFRAME, nothing, nothing, 0.0,
-                    nothing, nothing, nothing, nothing, nothing,
+                    nothing, nothing, nothing, nothing, nothing, defaultsegmenter(),
                     Vector{Clip}[], Vector{Clip}[], 0.0, nothing, 0, 0,
                     Dict{Symbol, Any}(), Observable(:none),
                     Observable(VideoSource[]), Any[], nothing, Observable(:none),
