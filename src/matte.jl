@@ -22,6 +22,20 @@ the feature, its UI and its tests working with no model installed.
 
 using KernelAbstractions: @kernel, @index, @Const
 
+"""
+    unitn0f8(x) -> N0f8
+
+A 0…1 float as `N0f8`, clamped, without the range check.
+
+`N0f8(x)` (and therefore `RGB{N0f8}(::Float32, …)`) validates and calls
+`throw_colorerror`, which builds its message with `repr`/`string`. That drags
+string allocation and dynamic dispatch into the kernel's IR, and Lava rejects the
+whole kernel for it — a compile error on the *error path*, reached by no input.
+The clamp here is the check.
+"""
+@inline unitn0f8(x::Real) =
+    reinterpret(N0f8, unsafe_trunc(UInt8, clamp(Float32(x), 0.0f0, 1.0f0) * 255.0f0 + 0.5f0))
+
 @kernel function matte_kernel!(buf, @Const(alpha), mw::Int32, mh::Int32,
                                strength::Float32, feather::Float32, bg::Vec3f)
     i, j = @index(Global, NTuple)
@@ -48,9 +62,7 @@ using KernelAbstractions: @kernel, @index, @Const
         c = buf[i, j]
         src = Vec3f(red(c), green(c), blue(c))
         out = src .* a .+ bg .* (1.0f0 - a)
-        buf[i, j] = RGB{N0f8}(clamp(out[1], 0.0f0, 1.0f0),
-                              clamp(out[2], 0.0f0, 1.0f0),
-                              clamp(out[3], 0.0f0, 1.0f0))
+        buf[i, j] = RGB{N0f8}(unitn0f8(out[1]), unitn0f8(out[2]), unitn0f8(out[3]))
     end
 end
 
@@ -174,6 +186,30 @@ hasmattemodel() = MATTEPROPAGATOR[] !== nothing
 mattebackendname() = hasmattemodel() ? "model" : "built-in"
 
 """
+    registersegmenter!(f)
+
+Install the segmenter. `f(frame, points; key) -> Matrix{UInt8}` receives one
+source-resolution frame, the marked `(x, y, foreground)` points in normalized
+coordinates, and a value identifying the frame, and returns a 0/255 mask the size
+of the frame. `key` is what lets an implementation cache per-frame work across
+the clicks of one marking; it is `nothing` when the caller cannot identify the
+frame.
+
+A second seam next to [`registermatte!`](@ref), because they answer different
+questions and only one of them is a matter of taste. A propagator carries a mask
+through a clip; it does **not** find one — measured on both this implementation
+and PyTorch's, MatAnyone's matte tracks its seed (IoU against the seed 0.95
+falling to 0.82 across a clip) rather than segmenting the subject. So the quality
+of the whole matte is decided by the seed, and a seed painted as discs around
+clicks is a rough one. A segmenter turns those same clicks into an actual object
+boundary; SAM 2.1 is what `examples/sam2.jl` installs here.
+"""
+const MATTESEGMENTER = Ref{Any}(nothing)
+registersegmenter!(f) = (MATTESEGMENTER[] = f; nothing)
+hassegmenter() = MATTESEGMENTER[] !== nothing
+seedbackendname() = hassegmenter() ? "model" : "discs"
+
+"""
 Fallback propagator: per-frame colour-distance segmentation seeded by the marked
 frames, propagated by carrying the seed's colour statistics forward.
 
@@ -236,7 +272,7 @@ per-pixel source detail and a full-resolution one costs a clip's worth of memory
 """
 function analyzematte!(clip::Clip, readframe, seeds::Dict{Int, <:AbstractMatrix};
                        mattewidth::Integer = 480, progress = nothing)
-    n = cliplength(clip)
+    n = srclength(clip)
     n > 0 || error("cannot matte an empty clip")
     isempty(seeds) && error("matting needs at least one marked frame")
     first = readframe(clip.src_in)
@@ -267,6 +303,53 @@ function analyzematte!(clip::Clip, readframe, seeds::Dict{Int, <:AbstractMatrix}
     return track
 end
 
+"""
+    mattecoverage(track) -> Float64
+
+Fraction of the clip's pixels the matte keeps, sampled across its frames.
+
+Reported to the user because both ends of the range look identical on screen —
+"keeps everything" and "keeps nothing" are equally a picture with no visible
+change — and the difference between a working model and a stand-in is exactly
+this number.
+"""
+function mattecoverage(track::MatteTrack; samples::Integer = 12)
+    a = track.alpha
+    n = size(a, 3)
+    n == 0 && return 0.0
+    ks = unique(round.(Int, range(1, n; length = min(samples, n))))
+    return sum(count(>(0x7f), view(a, :, :, k)) for k in ks) /
+           (length(ks) * size(a, 1) * size(a, 2))
+end
+
+"""
+    previewmatte(clip, frame, mask; mattewidth = 480) -> Matrix{UInt8}
+
+The matte for ONE frame, at matte resolution — what the current selection would
+produce right here, without touching the rest of the clip.
+
+The same propagator as [`analyzematte!`](@ref), called with a one-element clip:
+a live preview must not be a second, differently-behaving implementation of what
+propagation does, or the picture that talks the user into stopping is not the
+picture they get. It is also why the seeded frame had to start returning a
+segmented matte instead of the seed — a single-frame call was otherwise a
+very expensive way to hand the box back.
+
+Cost is one seeded frame's worth of model work (~0.2 s on the GPU tier), which is
+what makes it usable between clicks.
+"""
+function previewmatte(clip::Clip, frame::AbstractMatrix{<:RGB}, mask::AbstractMatrix;
+                      mattewidth::Integer = 480)
+    sw, sh = size(frame)
+    mw = min(Int(mattewidth), sw)
+    mh = max(1, round(Int, sh * mw / sw))
+    prop = something(MATTEPROPAGATOR[], fallbackpropagate)
+    alpha = prop([downscale(frame, mw, mh)], Dict(1 => mattemaskscale(mask, mw, mh)))
+    size(alpha) == (mw, mh, 1) ||
+        error("matte propagator returned $(size(alpha)), expected $((mw, mh, 1))")
+    return alpha[:, :, 1]
+end
+
 function mattemaskscale(src::AbstractMatrix, w::Int, h::Int)
     sw, sh = size(src)
     out = Matrix{UInt8}(undef, w, h)
@@ -295,6 +378,67 @@ function seedmask(clip::Clip, rect::NTuple{4, <:Real})
     m[x0:max(x0, x1), y0:max(y0, y1)] .= 0xff
     return m
 end
+
+"""
+    seedmask(clip, frame, points; radius = 0.06, key = nothing) -> Matrix{UInt8}
+
+The selection for one marked frame: the segmenter's answer when one is
+installed, and discs around the points when none is.
+
+Taking the frame is what makes the segmenter possible at all — the disc form
+needs only coordinates, which is why it never asked for a picture. Callers read
+the frame on the analysis executor anyway (it is the same frame the preview
+mattes), so this costs nothing extra.
+
+`key` identifies the frame so a segmenter can cache whatever it derives from it.
+That is not an optimisation detail for SAM 2: embedding a frame costs 0.6 s and
+answering a click against a cached embedding costs 0.02 s, and marking a subject
+means a dozen clicks on the *same* frame. Without the key every click pays the
+embedding again and the live preview stops being live.
+"""
+function seedmask(clip::Clip, frame::AbstractMatrix{<:RGB},
+                  points::AbstractVector{<:Tuple{<:Real, <:Real, Bool}};
+                  radius::Real = 0.06, key = nothing)
+    seg = MATTESEGMENTER[]
+    seg === nothing && return seedmask(clip, points; radius)
+    m = seg(frame, points; key)
+    size(m) == size(frame) ||
+        error("segmenter returned $(size(m)), expected $(size(frame))")
+    return m
+end
+
+"""
+    seedmask(clip, points; radius = 0.06) -> Matrix{UInt8}
+
+A selection built from marked points: `(x, y, foreground)` in normalized source
+coordinates, painted as discs of `radius` (a fraction of frame width) in the
+order given.
+
+Order is the whole point of taking a list rather than a set. A background point
+placed after a foreground one erases where they overlap, so "not that bit" is a
+click rather than a restart — which is the correction users actually reach for
+when one disc swallows an arm or the floor next to it.
+"""
+function seedmask(clip::Clip, points::AbstractVector{<:Tuple{<:Real, <:Real, Bool}};
+                  radius::Real = 0.06)   # of frame width: points are placed several at a
+                                       # time, so a disc large enough to hit the
+                                       # subject from ONE click would swallow the
+                                       # background between them
+    sw, sh = clip.source.width, clip.source.height
+    m = zeros(UInt8, sw, sh)
+    r = max(1, round(Int, radius * sw))
+    r2 = r * r
+    for (nx, ny, fg) in points
+        cx = round(Int, clamp(nx, 0.0, 1.0) * sw)
+        cy = round(Int, clamp(ny, 0.0, 1.0) * sh)
+        v = fg ? 0xff : 0x00
+        @inbounds for j in max(1, cy - r):min(sh, cy + r), i in max(1, cx - r):min(sw, cx + r)
+            (i - cx)^2 + (j - cy)^2 <= r2 && (m[i, j] = v)
+        end
+    end
+    return m
+end
+
 
 
 """
