@@ -116,7 +116,13 @@ end
 function videocodec(path::AbstractString)
     out = read(`$(FFMPEG_jll.ffprobe()) -v error -select_streams v:0
                 -show_entries stream=codec_name -of csv=p=0 $path`, String)
-    return Symbol(strip(out))
+    # FIRST FIELD, not the whole line. ffprobe's csv writer pads the row with an
+    # empty trailing field when the file carries extra streams — an iPhone MOV has
+    # seven — so this comes back as "hevc," and `Symbol("hevc,")` matches no
+    # supported codec. A perfectly streamable file was then declared
+    # un-streamable, sent to the mezzanine transcoder it did not need, and the
+    # retry parsed the result the same way and failed again.
+    return Symbol(first(split(strip(out), ',')))
 end
 
 """

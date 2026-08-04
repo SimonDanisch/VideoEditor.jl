@@ -335,7 +335,7 @@ function similaritypath!(clip::Clip; window::Integer = 11, iters::Integer = 15,
                       s = Float32(sc[k]); co = Float32(cosd(th[k])); si = Float32(sind(th[k]))
                       Mat3f(s * co, s * si, 0, -s * si, s * co, 0, Float32(tx[k]), Float32(ty[k]), 1)
                   end for k in 1:n]
-    clip.motiontrack = MotionTrack(transforms, clip.src_in, :similarity)
+    setmotiontrack!(clip, MotionTrack(transforms, clip.src_in, :similarity))
     progress === nothing || progress(2n, 2n)
     return clip.motiontrack
 end

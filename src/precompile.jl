@@ -45,13 +45,25 @@ frozen is the code path, not the content.
 function editorassets()
     p = get(ENV, "JULIA_VIDEOEDITOR_ASSET", "")
     isempty(p) || return p
-    # Walked up from here rather than a fixed `../../..`, for the reason
-    # `DNNKernels.findasset` gives: the depth of the media directory above this
-    # package is a property of the checkout, not of the package, and encoding it
-    # here is what broke the model runners when they moved into a monorepo.
+    # Walked up from here rather than a fixed `../../..`: the depth of the media
+    # directory above this package is a property of the checkout, not of the
+    # package, and encoding it here is what broke the model runners when they
+    # moved into a monorepo.
+    #
+    # This is the editor's *own* walk because `DNNKernels.findasset` was deleted
+    # — a model's assets come from its artifact and from nowhere else, and a
+    # filesystem search was the fallback that kept a broken download invisible.
+    # A demo clip is not a model asset: it is optional, the workload skips when
+    # it is absent, and there is nothing to download.
     for c in ("media/demo_source.mp4", "media/birds_export.mp4", "media/demo_loop.mp4")
-        f = SAM2Runner.DNNKernels.findasset(c; from = @__DIR__)
-        isfile(f) && return f
+        dir = @__DIR__
+        for _ in 1:6
+            f = joinpath(dir, c)
+            isfile(f) && return f
+            parent = dirname(dir)
+            parent == dir && break
+            dir = parent
+        end
     end
     return ""
 end
@@ -71,6 +83,30 @@ end
 # frozen cache the workload below fills, before anything asks for a kernel.
 function __init__()
     Lava.use_frozen_kernels(KERNELS_VERSION)
+    # Install the matte propagator HERE, and never from the workload below. The
+    # workload's closure has already run, so its `modelref` holds a built model —
+    # and a built model holds `LavaArray`s whose `VkContext` belongs to the
+    # *precompilation* process. `registermatte!` writes a module global, so that
+    # gets serialised into the package image and every matte call at runtime then
+    # drives a dead device: `sync_access!` sees a `BatchQueue` from another
+    # context and refuses, and before that guard existed it was a segfault inside
+    # vkQueueSubmit2 during `warmmatte!`. `matanyonepropagator` builds its model
+    # on first use, so registering a fresh one costs nothing at load.
+    MATTEPROPAGATOR[] = nothing     # drop anything an older image baked in
+    # `assetdir()` can reach `ensure_artifact_installed`, so this could in
+    # principle download at load. It does not in practice: the workload below
+    # resolves the same asset during precompilation, and `sam2ready()` does the
+    # equivalent at every `Player` construction — by the time this runs the
+    # artifact is on disk and the call is a TOML read. The `catch` is what makes
+    # the remaining case (no assets, no network) a no-op rather than a package
+    # that will not load.
+    try
+        if isdir(MatAnyoneRunner.assetdir()) && isfile(MatAnyoneRunner.weightpath())
+            registermatte!(MatAnyoneRunner.matanyonepropagator())
+        end
+    catch err
+        @debug "VideoEditor: no matte propagator registered" exception = err
+    end
     return nothing
 end
 
@@ -92,7 +128,7 @@ end
             # 97% of it Julia inferring `seedmask` and the segmenter it calls.
             samready = isfile(joinpath(SAM2Runner.assetdir(), "weights.safetensors"))
             matready = isdir(MatAnyoneRunner.assetdir()) && isfile(MatAnyoneRunner.weightpath())
-            markframe = framereader(nothing, clip)(1)
+            markframe = framereader(clip, engine)(1)
             marks = [(0.5, 0.5, true), (0.2, 0.2, false)]
 
             @compile_workload KERNELS_VERSION begin
@@ -119,9 +155,8 @@ end
                     seedmask(clip, markframe, marks; segmenter = seg, key = (clip.id, 1))
                     seedmask(clip, markframe, marks; segmenter = seg, key = (clip.id, 1))  # cached
                 end
-                # …and the disc fallback, which is what a Player without SAM 2
-                # weights runs (`segmenter = nothing`, not a global left unset)
-                seedmask(clip, markframe, marks; segmenter = nothing, key = (clip.id, 1))
+                # …and the disc seed, which is the rect/box path, not a fallback
+                seedmask(clip, [(0.5, 0.5, true), (0.2, 0.2, false)])
 
                 # …and the OTHER half of the matte: propagation. Measured at
                 # 94.3 s on the first run, 74.4 s of it Julia, and it has to be
@@ -137,7 +172,10 @@ end
                     seed[(size(markframe,1)÷3):(2size(markframe,1)÷3),
                          (size(markframe,2)÷3):(2size(markframe,2)÷3)] .= 0xff
                     prop([markframe, markframe], Dict(1 => seed))
-                    registermatte!(prop)
+                    # Deliberately NOT `registermatte!(prop)`: running `prop`
+                    # built its model, and installing it would serialise those
+                    # device buffers — and the context they belong to — into the
+                    # package image. `__init__` registers a fresh lazy one.
                 end
                 KA.synchronize(backend)
             end

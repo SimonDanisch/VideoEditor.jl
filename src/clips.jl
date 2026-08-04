@@ -68,17 +68,31 @@ const NEXTID = Threads.Atomic{UInt64}(0)
 freshid() = UInt64(Threads.atomic_add!(NEXTID, UInt64(1)) + 1)
 
 """
+A reference from one effect slot to another, possibly on another clip — see
+links.jl for what they mean and how they are followed. The type lives here
+because `FxSlot` has a field of it.
+"""
+struct FxLink
+    clip::UInt64      # target clip id; 0 = the same clip
+    slot::UInt64      # target slot id
+    role::Symbol      # what the target IS to the parent ("fades into", …)
+end
+
+"""
 One entry in a clip's effect stack: the effect, a STABLE `id` so anything can
-point at exactly this entry (the blend card, the inspector, MCP), and `enabled` —
-the honest form of what wrapping an effect in `Bypassed` used to express. Several
-entries of the same kind may coexist; they are told apart by their id.
+point at exactly this entry (a linked card, the panel, MCP), `enabled` — the
+honest form of what wrapping an effect in `Bypassed` used to express — and any
+`links` to other slots. Several entries of the same kind may coexist; they are
+told apart by their id.
 """
 mutable struct FxSlot
     const id::UInt64
     effect::Any        # an Effect — effects.jl is included after this file
     enabled::Bool
+    const links::Vector{FxLink}
 end
-FxSlot(effect; enabled::Bool = true) = FxSlot(freshid(), effect, enabled)
+FxSlot(effect; enabled::Bool = true) = FxSlot(freshid(), effect, enabled, FxLink[])
+FxSlot(id::Integer, effect, enabled::Bool) = FxSlot(UInt64(id), effect, enabled, FxLink[])
 
 """
     Clip(source; src_in=0, src_out=source.nframes, start=0)
@@ -116,25 +130,44 @@ mutable struct Clip
     track::Int                  # stacking layer; higher = on top (1 = base)
     blendfrom::UInt64           # clip this one blends away FROM (0 = nothing)
     rate::Float64               # source frames per timeline frame (1 = native)
-    reframe::NTuple{3, Float64} # (scale, x, y) on top of the automatic fit
 end
 
 Clip(source::VideoSource, src_in, src_out, start, crop, rate::Real = 1.0,
-     reframe::NTuple{3, <:Real} = (1.0, 0.0, 0.0)) =
-    Clip(freshid(), source, src_in, src_out, start, crop, FxSlot[], nothing, nothing,
-         nothing, Dict{Symbol, AnimCurve}(), 1, UInt64(0), Float64(rate),
-         Float64.(reframe))
+     reframe::Union{Nothing, NTuple{<:Any, <:Real}} = nothing) =
+    withreframe!(Clip(freshid(), source, src_in, src_out, start, crop, FxSlot[], nothing,
+                      nothing, nothing, Dict{Symbol, AnimCurve}(), 1, UInt64(0), Float64(rate)),
+                 reframe)
 
 function Clip(source::VideoSource; src_in::Integer = 0, src_out::Integer = source.nframes,
               start::Integer = 0, rate::Real = 1.0)
     return Clip(source, src_in, src_out, start, (0.0, 0.0, 1.0, 1.0), rate)
 end
 
-"The identity reframe: fitted whole, centred, untouched by the user."
-const NEUTRALFRAME = (1.0, 0.0, 0.0)
+"""
+Seed a clip's placement from a (scale, x, y[, rotation°]) tuple — the shape a
+project file written before the transform became an effect holds. `nothing`, and
+anything identity, adds no effect at all.
+"""
+function withreframe!(clip::Clip, r)
+    r === nothing && return clip
+    t = reframe4(r)
+    t == NEUTRALFRAME && return clip
+    seteffect!(clip, TransformEffect(t[1], t[2], t[3], t[4]))
+    return clip
+end
+
+"The identity placement: fitted whole, centred, unrotated, untouched by the user."
+const NEUTRALFRAME = (1.0, 0.0, 0.0, 0.0)
+
+"""
+A reframe tuple as (scale, x, y, rotation°). Takes the 3-tuple too: projects
+saved before rotation existed hold one, and so does any caller that never cared.
+"""
+reframe4(r::NTuple{4, <:Real}) = Float64.(r)
+reframe4(r::NTuple{3, <:Real}) = (Float64(r[1]), Float64(r[2]), Float64(r[3]), 0.0)
 
 "Whether this clip is placed by the plain fit, with no manual zoom or shift."
-neutralframe(clip::Clip) = clip.reframe == NEUTRALFRAME
+neutralframe(clip::Clip) = transformof(clip) == NEUTRALFRAME
 
 """
     conformrate(source, framerate) -> Float64
@@ -368,8 +401,11 @@ end
 Split the clip containing timeline frame `n` at `n`; the right half is
 returned. No-op at a clip start or in a gap.
 """
-function split!(seq::Sequence, n::Integer)
-    i = clipat(seq, n)
+function split!(seq::Sequence, n::Integer, track::Union{Nothing, Integer} = nothing)
+    # `track` names the LANE to cut. Without it `clipat` answers with the topmost
+    # clip at `n`, so pressing S while V2 was selected cut V3 — the selection was
+    # never consulted at all.
+    i = track === nothing ? clipat(seq, n) : clipat(seq, n, Int(track))
     i === nothing && return nothing
     clip = seq.clips[i]
     n == clip.start && return nothing
@@ -385,9 +421,16 @@ function split!(seq::Sequence, n::Integer)
     right.blendfrom = clip.blendfrom
     # each half owns its stack: same effects, own slot ids, so the inspector and
     # the blend card can address one half's entry without touching the other's
-    append!(right.effects, [FxSlot(s.effect; enabled = s.enabled) for s in clip.effects])
-    right.colortrack = clip.colortrack    # keyed by absolute source frame, still valid
+    # each half owns its stack, with its own slot ids — and its own copy of the
+    # links, so cutting a blended clip does not give two slots the same partner
+    append!(right.effects, [FxSlot(freshid(), s.effect, s.enabled, copy(s.links))
+                            for s in clip.effects])
+    # keyed by absolute source frame, so both halves stay valid. Assigned
+    # directly: the stack was already copied above, slots and all, so going
+    # through `setmotiontrack!` would prepend a SECOND Stabilize slot.
+    right.colortrack = clip.colortrack
     right.motiontrack = clip.motiontrack
+    right.mattetrack = clip.mattetrack    # ditto — cutting a clip must not lose its matte
     for (key, curve) in clip.animations   # absolute-frame keyed, but each half gets
         right.animations[key] = AnimCurve(copy(curve.keys), curve.interp)
     end                                   # its OWN copy — halves must edit independently
@@ -411,18 +454,50 @@ and not arithmetic inlined in the drag handler.
 function trimclip!(seq::Sequence, clip::Clip, i::Integer, side::Symbol, n::Integer)
     if side === :right
         maxend = clip.start + timelineframes(clip, clip.source.nframes - clip.src_in)
-        i < length(seq.clips) && (maxend = min(maxend, seq.clips[i + 1].start))
-        newend = clamp(Int(n), clip.start + 1, maxend)
+        nxt = nextontrack(seq, clip)
+        nxt === nothing || (maxend = min(maxend, nxt.start))
+        # `max(…, clip.start + 1)`: a clip is never trimmed out of existence, and
+        # the bound it is clamped against must not invert. It did — the limit used
+        # to come from `seq.clips[i + 1]`, and that list is sorted by (track,
+        # start), so on a stack the "next clip" was usually one on ANOTHER track,
+        # often starting earlier. `src_out` then landed at or before `src_in` and
+        # the clip vanished mid-drag.
+        newend = clamp(Int(n), clip.start + 1, max(maxend, clip.start + 1))
         clip.src_out = sourceframe(clip, newend)
     else
-        minstart = max(i > 1 ? clipend(seq.clips[i - 1]) : 0,
+        prv = prevontrack(seq, clip)
+        minstart = max(prv === nothing ? 0 : clipend(prv),
                        clip.start - timelineframes(clip, clip.src_in))  # src_in stays ≥ 0
-        newstart = clamp(Int(n), minstart, clipend(clip) - 1)
+        newstart = clamp(Int(n), min(minstart, clipend(clip) - 1), clipend(clip) - 1)
         delta = newstart - clip.start
         clip.src_in += round(Int, delta * clip.rate)
         clip.start += delta
     end
     return clip
+end
+
+"The clip that follows `clip` ON ITS OWN TRACK, or `nothing`."
+function nextontrack(seq::Sequence, clip::Clip)
+    best = nothing
+    for c in seq.clips
+        c === clip && continue
+        c.track == clip.track || continue
+        c.start >= clipend(clip) || continue
+        (best === nothing || c.start < best.start) && (best = c)
+    end
+    return best
+end
+
+"The clip that precedes `clip` ON ITS OWN TRACK, or `nothing`."
+function prevontrack(seq::Sequence, clip::Clip)
+    best = nothing
+    for c in seq.clips
+        c === clip && continue
+        c.track == clip.track || continue
+        clipend(c) <= clip.start || continue
+        (best === nothing || clipend(c) > clipend(best)) && (best = c)
+    end
+    return best
 end
 
 """
@@ -486,9 +561,11 @@ end
 "Copy of the edit state for undo/redo. Sources and analysis tracks are shared."
 snapshot(seq::Sequence) =
     [Clip(c.id, c.source, c.src_in, c.src_out, c.start, c.crop,
-          [FxSlot(s.id, s.effect, s.enabled) for s in c.effects],
+          # links are copied, not shared: an undo that put back a slot whose
+          # link vector was the live one would not restore a removed partner
+          [FxSlot(s.id, s.effect, s.enabled, copy(s.links)) for s in c.effects],
           c.colortrack, c.motiontrack, c.mattetrack, deepcopy(c.animations), c.track,
-          c.blendfrom, c.rate, c.reframe)
+          c.blendfrom, c.rate)
      for c in seq.clips]
 
 "Restore a [`snapshot`](@ref) (the snapshot itself stays reusable)."
@@ -535,6 +612,36 @@ function freetrack(seq::Sequence, at::Integer, len::Integer, want::Integer)
             return tr
     end
     return ntracks(seq) + 1
+end
+
+"""
+    pushtracksup!(seq) -> seq
+
+Make room for a track UNDERNEATH: every existing clip moves up one lane, so lane
+1 is free for the clip that is about to land there.
+"""
+function pushtracksup!(seq::Sequence)
+    for c in seq.clips
+        c.track += 1
+    end
+    return seq
+end
+
+"""
+    compacttracks!(seq) -> seq
+
+Close gaps in the lane numbering, keeping the order. Inserting a track
+underneath moves everything up, and if the clip that moved DOWN was the only one
+on the old bottom lane, that lane is left empty — an empty lane in the middle of
+a stack is a hole in the timeline nobody asked for.
+"""
+function compacttracks!(seq::Sequence)
+    used = sort!(unique(c.track for c in seq.clips))
+    rank = Dict(t => i for (i, t) in enumerate(used))
+    for c in seq.clips
+        c.track = rank[c.track]
+    end
+    return seq
 end
 
 "Whether `clip` can sit at `newstart` without overlapping another clip."

@@ -186,7 +186,21 @@ the declared lane fails the export loudly instead of silently switching.
 opendecoder(source::VideoSource, ::KA.CPU) = SequentialReader(source)
 function opendecoder(source::VideoSource, backend)
     videocodec(source.path) in (:h264, :hevc) || return SequentialReader(source)
-    return openstream(backend, source.path, source.width, source.height)
+    # A mezzanine, when one exists, IS the decodable version of this source — the
+    # streaming preview already opens on it, and this path did not, so a source
+    # that plays fine (open-GOP HEVC, transcoded once) still threw
+    # "not GOP-seekable" at every reader that came through here: the matte's frame
+    # reader, the agent views, the export.
+    mezz = mezzaninepath(source)
+    path = isfile(mezz) ? mezz : source.path
+    try
+        return openstream(backend, path, source.width, source.height)
+    catch e
+        # a decoder that cannot open is not a reason to fail the render — the CPU
+        # reader can read anything ffmpeg can, it is only slower
+        @warn "GPU decode unavailable for $(basename(source.path)); reading on the CPU" exception = e
+        return SequentialReader(source)
+    end
 end
 
 """

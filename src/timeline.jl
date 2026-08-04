@@ -16,22 +16,48 @@ trim handles: hovering one shows a handle bar, dragging it adjusts the
 in/out point (the tooltip switches to the clip's length).
 """
 # ---- track geometry (shared by the timeline, drag targeting, the media-bin drop
-# ghost and the keyframe overlay): lanes fill axis-y 0.02..0.86; the strip above
-# (0.875..0.99) is the ALWAYS-VISIBLE "+ new track" drop zone.
+# ghost and the keyframe overlay): lanes fill axis-y `TRACKBASE`..0.86, with an
+# ALWAYS-VISIBLE "+ new track" drop zone at each end — above the top lane, and
+# below the bottom one. Stacking upward only was half an editor: a clip that
+# belongs UNDER everything had to be added on top and then every other clip moved.
+"Axis-y where the lanes start; below it is the drop zone for a track UNDERNEATH."
+const TRACKBASE = 0.09
+
 "Vertical share of the axis one lane takes with `ntr` stacked tracks."
-trackspan(ntr::Integer) = 0.84 / max(ntr, 1)
+trackspan(ntr::Integer) = (0.86 - TRACKBASE) / max(ntr, 1)
 
 "`(lo, hi)` axis-y band of `track` (1 = bottom) out of `ntr` lanes."
 function trackband(track::Integer, ntr::Integer)
     s = trackspan(ntr)
-    lo = 0.02 + (track - 1) * s
+    lo = TRACKBASE + (track - 1) * s
     return (lo, lo + s)
 end
 
-"Track a drop at axis-y `y` targets; anything above the top lane (the marked
-zone) is `ntr + 1` — a new track."
-trackat(y::Real, ntr::Integer) =
-    clamp(floor(Int, (Float64(y) - 0.02) / trackspan(ntr)) + 1, 1, ntr + 1)
+"""
+Track a drop at axis-y `y` targets, out of `ntr` lanes.
+
+`ntr + 1` is a new track ABOVE the stack (the zone over the top lane) and **0** is
+a new track UNDERNEATH it (the zone below the bottom lane) — the two ends of the
+same gesture, so building a stack downward costs a drag rather than a rebuild.
+"""
+function trackat(y::Real, ntr::Integer)
+    yy = Float64(y)
+    yy < TRACKBASE && return 0
+    return clamp(floor(Int, (yy - TRACKBASE) / trackspan(ntr)) + 1, 1, ntr + 1)
+end
+
+"""
+How far out of its lane a pressed clip must be dragged before the press counts as
+a MOVE rather than a scrub or a trim, as a fraction of the axis.
+
+Relative to the LANE, not absolute: the old fixed 0.18 was tuned against a single
+0.84-tall lane, and lanes get thinner with every track added. At four tracks the
+whole distance from the middle of the top lane to the new-track strip is 0.175 —
+under the threshold — so dropping onto "+ new track" did nothing at all, silently,
+and only once you had a few tracks.
+"""
+liftthreshold(ntr::Integer) = max(0.05, 0.21 * trackspan(ntr))
+laneslack(ntr::Integer) = max(0.012, 0.05 * trackspan(ntr))
 
 mutable struct Timeline
     const axis::Axis
@@ -87,8 +113,10 @@ mutable struct Timeline
     newtrackpos::Observable{Point2f}            # "+ new track" hint while dragging
     newtrackplot::Any
     newtrackzone::Observable{Rect2f}            # the permanent drop-zone strip above the lanes
+    newtrackzonelo::Observable{Rect2f}          # …and its mirror below them
     dragactive::Observable{Bool}                # a clip/bin drag is in flight → highlight the zone
     zonelabelpos::Observable{Point2f}           # left-anchored zone caption
+    zonelabelposlo::Observable{Point2f}
     presspick::Union{Nothing, Tuple{Int, Float64, Float64}}  # (clipindex, t, y) of a scrub press —
                                                 # dragging out of the lane converts it to a clip move
     gpurun::Any   # synchronous GPU-worker runner for thumbnail decoding (nothing = CPU)
@@ -160,8 +188,10 @@ mutable struct Timeline
                                       align = (:center, :center), visible = false)
         translate!(timeline.newtrackplot, 0, 0, 11)
         timeline.newtrackzone = Observable(Rect2f(0, 0.875, 1, 0.115))
+        timeline.newtrackzonelo = Observable(Rect2f(0, 0.005, 1, TRACKBASE - 0.01))
         timeline.dragactive = Observable(false)
         timeline.zonelabelpos = Observable(Point2f(0, 0.9325))
+        timeline.zonelabelposlo = Observable(Point2f(0, TRACKBASE / 2))
         zonefill = poly!(axis, timeline.newtrackzone;
                          color = map(a -> a ? (colors.accent, 0.12) : (colors.text, 0.0),
                                      timeline.dragactive), strokewidth = 0)
@@ -181,6 +211,28 @@ mutable struct Timeline
                                       timeline.dragactive))
         translate!(zonelabel, 0, 0, 3)
 
+        # the SAME zone below the lanes: a stack you can only grow upward is half
+        # an editor — putting a clip under everything meant adding it on top and
+        # moving every other clip out of its way
+        zonefilllo = poly!(axis, timeline.newtrackzonelo;
+                           color = map(a -> a ? (colors.accent, 0.10) : (colors.text, 0.04),
+                                       timeline.dragactive))
+        translate!(zonefilllo, 0, 0, 1)
+        zonelinelo = lines!(axis, map(timeline.newtrackzonelo) do r
+                                x0, y0 = r.origin; w, h = r.widths
+                                Point2f[(x0, y0), (x0 + w, y0), (x0 + w, y0 + h),
+                                        (x0, y0 + h), (x0, y0)]
+                            end; linestyle = :dot, linewidth = 1,
+                            color = map(a -> a ? (colors.accent, 1.0) : (colors.text, 0.3),
+                                        timeline.dragactive))
+        translate!(zonelinelo, 0, 0, 2)
+        zonelabello = text!(axis, timeline.zonelabelposlo;
+                            text = "+  new track underneath",
+                            fontsize = 10, align = (:left, :center),
+                            color = map(a -> a ? (colors.accent, 1.0) : (colors.text, 0.35),
+                                        timeline.dragactive))
+        translate!(zonelabello, 0, 0, 3)
+
         onany(axis.finallimits, axis.scene.viewport) do lims, vp
             x0, x1 = minimum(lims)[1], maximum(lims)[1]
             x1 > x0 || return
@@ -188,6 +240,7 @@ mutable struct Timeline
             timeline.pps[] = vp.widths[1] / (x1 - x0)
             timeline.bandheight[] = 0.84 * vp.widths[2]  # the lanes' share of the axis
             timeline.newtrackzone[] = Rect2f(x0, 0.875, x1 - x0, 0.115)
+            timeline.newtrackzonelo[] = Rect2f(x0, 0.005, x1 - x0, TRACKBASE - 0.01)
             updatetracklabels!(timeline)                 # badges stick to the left edge
             return
         end
@@ -361,6 +414,7 @@ function updatetracklabels!(timeline::Timeline)
         timeline.tracklabelpos[k][] = Point2f(x0 + xpad, 0.02 + (k - 0.5) * span)
     end
     timeline.zonelabelpos[] = Point2f(x0 + xpad, 0.9325)
+    timeline.zonelabelposlo[] = Point2f(x0 + xpad, TRACKBASE / 2)
     return nothing
 end
 
@@ -514,8 +568,10 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
                 # wobble during a horizontal scrub or an edge trim used to
                 # convert into a surprise clip move ("it moved my clip!")
                 clip = seq.clips[pk[1]]
-                blo, bhi = trackband(clip.track, ntracks(seq))
-                if (mp[2] > bhi + 0.04 || mp[2] < blo - 0.04) && abs(mp[2] - pk[3]) > 0.18
+                ntr0 = ntracks(seq)
+                blo, bhi = trackband(clip.track, ntr0)
+                slack, lift = laneslack(ntr0), liftthreshold(ntr0)
+                if (mp[2] > bhi + slack || mp[2] < blo - slack) && abs(mp[2] - pk[3]) > lift
                     timeline.scrubbing[] = false
                     timeline.presspick = nothing
                     timeline.dragclip = (clip, timelineframe(timeline, pk[2]) - clip.start)
@@ -637,17 +693,20 @@ function dragto!(timeline::Timeline, t::Real, y::Real = NaN)
     # dropping ONTO another clip rides up a lane instead of being refused: one lane
     # holds one clip at a time, but overlapping clips is how they blend — the ghost
     # shows the lane it will land on, so the lift is visible before the release
-    while !canplace(seq, clip, snapped, track) && track <= ntr
+    while track >= 1 && !canplace(seq, clip, snapped, track) && track <= ntr
         track += 1
     end
     timeline.dragstart = snapped
     timeline.dragtrack = track
-    timeline.dragvalid = canplace(seq, clip, snapped, track)
+    timeline.dragvalid = track == 0 || canplace(seq, clip, snapped, track)
     timeline.dragactive[] = true
 
-    n2 = max(ntr, track)                            # if dropping on a new track, shrink to fit
+    # the ghost sits IN the zone it targets. Drawing it in the band it will occupy
+    # AFTER the relayout put it straight on top of the current bottom lane, which
+    # reads as "it will land on V1" — the opposite of what the drop does.
+    n2 = max(ntr, track)
     g = min(0.02, trackspan(n2) * 0.15)
-    lo, hi = trackband(track, n2)
+    lo, hi = track == 0 ? (0.008, TRACKBASE - 0.013) : trackband(track, n2)
     lo += g; hi -= g
     timeline.ghost_rect[] = Rect2f(snapped / fps, lo, cliplength(clip) / fps, hi - lo)
     timeline.ghost_color[] = timeline.dragvalid ? (timeline.colors.accent_subtle, 0.55) :
@@ -655,7 +714,7 @@ function dragto!(timeline::Timeline, t::Real, y::Real = NaN)
     timeline.ghost_plot.visible = true
     timeline.snapline[] = didsnap && timeline.dragvalid ? [snapped / fps] : Float64[]
     # say it, don't imply it: dropping above the top lane creates a NEW track
-    if track > ntr
+    if track > ntr || track == 0
         timeline.newtrackpos[] = Point2f(snapped / fps + cliplength(clip) / fps / 2,
                                          (lo + hi) / 2)
         timeline.newtrackplot.visible = true
@@ -705,7 +764,13 @@ function finishdrag!(timeline::Timeline)
     if timeline.dragvalid && (timeline.dragstart != clip.start || timeline.dragtrack != clip.track)
         timeline.onedit()
         clip.start = max(timeline.dragstart, 0)
-        clip.track = timeline.dragtrack
+        if timeline.dragtrack == 0        # the zone below the bottom lane
+            pushtracksup!(timeline.sequence)
+            clip.track = 1
+            compacttracks!(timeline.sequence)   # no empty lane where it came from
+        else
+            clip.track = timeline.dragtrack
+        end
         sort!(timeline.sequence.clips, by = c -> (c.track, c.start))
         timeline.selected[] = something(findfirst(c -> c === clip, timeline.sequence.clips), 0)
         notify(timeline.playhead)  # frame under the playhead may have changed

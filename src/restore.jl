@@ -141,8 +141,8 @@ function restoreplane!(clip::Clip, f::Int, img, backend)
     per = get!(() -> Dict{Any, Tuple{Int, Any}}(), RESTOREPLANES, clip.id)
     hit = get(per, backend, nothing)
     hit === nothing || hit[1] == f && return hit[2]
-    dev = backend isa KA.CPU ? img : (d = KA.allocate(backend, RGB{N0f8}, size(img)...);
-                                      copyto!(d, img); d)
+    dev = KA.allocate(backend, RGB{N0f8}, size(img)...)   # one path, every backend
+    copyto!(dev, img)
     per[backend] = (f, dev)
     return dev
 end

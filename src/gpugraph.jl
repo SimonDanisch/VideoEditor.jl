@@ -13,6 +13,8 @@
 
 # ---------------------------------------------------------------- buffer pool
 
+using KernelAbstractions: @kernel, @index, @Const
+
 """
 Reuse device RGB images across frames and nodes. `acquire!` hands out a buffer of
 the requested size (allocating only when none is free); `release!` returns it. The
@@ -146,7 +148,10 @@ pointwiseop(::FxNode) = false
 
 struct SourceNode <: FxNode end                                      # the decoded frame
 struct MotionNode <: FxNode; input::Int; end                         # stabilization warp
-struct ColorTrackNode <: FxNode; input::Int; end                     # per-frame color stabilization
+struct ColorTrackNode <: FxNode                                      # per-frame color stabilization
+    input::Int
+    strength::Float32
+end
 struct RestoreNode <: FxNode                                         # model-restored frame
     input::Int
     strength::Float32
@@ -194,7 +199,7 @@ function eval_node!(n::MotionNode, ins, pool::BufferPool, canmutate, ctx::FxCont
 end
 function eval_node!(n::ColorTrackNode, ins, pool::BufferPool, canmutate, ctx::FxContext)
     out = canmutate ? ins[1] : copyacquire!(pool, ins[1])
-    applycolortrack!(out, ctx.clip, ctx.served[])
+    applycolortrack!(out, ctx.clip, ctx.served[]; strength = n.strength)
     return out
 end
 # like the matte, restored frames are keyed by the frame actually served
@@ -283,6 +288,8 @@ end
 
 # ---------------------------------------------------------------- build from a clip
 
+nodefor(::StabilizeEffect, input) = MotionNode(input)
+nodefor(e::FlickerEffect, input) = ColorTrackNode(input, e.strength)
 nodefor(e::RestoreEffect, input) = RestoreNode(input, e.strength)
 nodefor(e::MatteEffect, input) = MatteNode(input, e.strength, e.feather)
 nodefor(e::ColorEffect, input) = ColorNode(input, e.adj)             # specialized kernels
@@ -301,14 +308,12 @@ it shows the ORIGINAL frame, so it skips the effect stack too, not just the trac
 function graphof(clip::Clip; applytracks::Bool = true)
     nodes = FxNode[SourceNode()]
     cur = 1
-    if applytracks && clip.motiontrack !== nothing
-        push!(nodes, MotionNode(cur)); cur = length(nodes)
-    end
-    if applytracks && clip.colortrack !== nothing
-        push!(nodes, ColorTrackNode(cur)); cur = length(nodes)
-    end
     if applytracks
         for e in liveeffects(clip)          # enabled, non-neutral entries in stack order
+            e isa TransformEffect && continue   # placement, not pixels — see `layermatrix`
+            # a stabilize/flicker slot whose analysis was removed renders nothing
+            e isa StabilizeEffect && clip.motiontrack === nothing && continue
+            e isa FlickerEffect && clip.colortrack === nothing && continue
             push!(nodes, nodefor(e, cur)); cur = length(nodes)
         end
     end
@@ -342,10 +347,47 @@ function render(f, engine::FxEngine, source, clip::Clip, frame::Integer;
     graph = graphof(clip; applytracks = applytracks)
     out = execute!(graph, engine.pool, FxContext(source, clip, Int(frame), playing; exact))
     try
+        # The crop REMOVES picture. Doing it here — once, for every caller — is
+        # what makes that true: the preview blits this buffer straight to the
+        # screen, so a crop that only told the canvas placement where to sample
+        # was no crop at all in the preview. Zoom the viewer out and the material
+        # the crop had removed was still sitting there, stabilizer smear and all,
+        # while the export (which goes through `placelayer!`) had genuinely
+        # dropped it. Two answers to "what is this clip".
+        cropaway!(out, clip.crop)
         return f(out)
     finally
         release!(engine.pool, out)
     end
+end
+
+@kernel function cropaway_kernel!(buf, x0::Int32, y0::Int32, x1::Int32, y1::Int32)
+    i, j = @index(Global, NTuple)
+    @inbounds if i < x0 || i > x1 || j < y0 || j > y1
+        buf[i, j] = zero(eltype(buf))
+    end
+end
+
+"""
+    cropaway!(buf, crop) -> buf
+
+Black out everything outside the normalized `crop` rect, in place. A no-op for an
+uncropped clip, which is the common case and the reason this is a branch on the
+rect rather than a kernel that always runs.
+"""
+function cropaway!(buf, crop::NTuple{4, <:Real})
+    crop == (0.0, 0.0, 1.0, 1.0) && return buf
+    w, h = size(buf, 1), size(buf, 2)
+    x0 = clamp(floor(Int, crop[1] * w) + 1, 1, w)
+    y0 = clamp(floor(Int, crop[2] * h) + 1, 1, h)
+    x1 = clamp(ceil(Int, (crop[1] + crop[3]) * w), x0, w)
+    y1 = clamp(ceil(Int, (crop[2] + crop[4]) * h), y0, h)
+    (x0 == 1 && y0 == 1 && x1 == w && y1 == h) && return buf
+    backend = KA.get_backend(buf)
+    cropaway_kernel!(backend)(buf, Int32(x0), Int32(y0), Int32(x1), Int32(y1);
+                              ndrange = (w, h))
+    KA.synchronize(backend)
+    return buf
 end
 
 """
@@ -359,19 +401,31 @@ reframe cannot mean two things.
 """
 layermatrix(clip::Clip, layersize::Tuple{Int, Int}, canvas::Tuple{Int, Int}) =
     fitmatrix(clip.crop, layersize, canvas;
-              scale = clip.reframe[1], position = (clip.reframe[2], clip.reframe[3]))
+              scale = transformof(clip)[1],
+              position = (transformof(clip)[2], transformof(clip)[3]),
+              rotation = transformof(clip)[4])
 
 """
     placelayer!(dest, layer, clip) -> dest
 
 Draw one rendered layer into the canvas through [`layermatrix`](@ref). Pixels the
-layer does not cover are LEFT AS THEY ARE — so the bars show whatever the caller
+layer's CROP does not cover are LEFT AS THEY ARE — so the bars show whatever the caller
 put in `dest` first: black underneath the base layer, the canvas so far under a
 layer stacked above one (whose bars must stay clear, not paint black over the
 track below).
 """
 function placelayer!(dest, layer, clip::Clip)
-    warp!(dest, layer, layermatrix(clip, size(layer), size(dest)); skipoutside = true)
+    # The crop is the SOURCE RECT, not just where the fit samples from: cropping
+    # removes picture and makes the clip smaller, so scaling the result down must
+    # show canvas around it, never the material the crop took away (nor the
+    # stabilizer's border, which lives out there too).
+    w, h = size(layer)
+    x0 = clamp(floor(Int, clip.crop[1] * w) + 1, 1, w)
+    y0 = clamp(floor(Int, clip.crop[2] * h) + 1, 1, h)
+    x1 = clamp(ceil(Int, (clip.crop[1] + clip.crop[3]) * w), x0, w)
+    y1 = clamp(ceil(Int, (clip.crop[2] + clip.crop[4]) * h), y0, h)
+    warp!(dest, layer, layermatrix(clip, size(layer), size(dest));
+          skipoutside = true, bounds = (x0, y0, x1, y1))
     return dest
 end
 
@@ -386,11 +440,34 @@ letterbox bars are.
 """
 function canvasrect(clip::Clip, layersize::Tuple{Int, Int}, canvas::Tuple{Int, Int})
     M = layermatrix(clip, layersize, canvas)
-    lo = M * Vec3f(0.5f0, 0.5f0, 1.0f0)
-    hi = M * Vec3f(Float32(canvas[1]) + 0.5f0, Float32(canvas[2]) + 0.5f0, 1.0f0)
-    x0 = (lo[1] - 0.5) / layersize[1]
-    y0 = (lo[2] - 0.5) / layersize[2]
-    return (x0, y0, (hi[1] - 0.5) / layersize[1] - x0, (hi[2] - 0.5) / layersize[2] - y0)
+    # ALL FOUR corners, bounding-boxed. Two opposite corners describe the mapped
+    # region only while the map is axis-aligned; with a rotation in it they
+    # describe a diagonal, and the axis limits derived from that framed empty
+    # space — the preview went black the moment a clip was turned.
+    cs = (Vec3f(0.5f0, 0.5f0, 1),
+          Vec3f(Float32(canvas[1]) + 0.5f0, 0.5f0, 1),
+          Vec3f(0.5f0, Float32(canvas[2]) + 0.5f0, 1),
+          Vec3f(Float32(canvas[1]) + 0.5f0, Float32(canvas[2]) + 0.5f0, 1))
+    ps = map(q -> M * q, cs)
+    x0 = minimum(q -> (q[1] - 0.5) / layersize[1], ps)
+    x1 = maximum(q -> (q[1] - 0.5) / layersize[1], ps)
+    y0 = minimum(q -> (q[2] - 0.5) / layersize[2], ps)
+    y1 = maximum(q -> (q[2] - 0.5) / layersize[2], ps)
+    return (x0, y0, x1 - x0, y1 - y0)
+end
+
+"""
+    renderlayer!(pool, lclip, srcframe, source; …) -> device image
+
+One clip's finished layer: its effect graph run, its crop already removed. The
+buffer belongs to `pool` — release it.
+"""
+function renderlayer!(pool::BufferPool, lclip::Clip, srcframe::Integer, source;
+                      applytracks::Bool = true, playing::Bool = false, exact::Bool = false)
+    layer = execute!(graphof(lclip; applytracks = applytracks), pool,
+                     FxContext(source, lclip, Int(srcframe), playing; exact))
+    cropaway!(layer, lclip.crop)
+    return layer
 end
 
 """
@@ -425,28 +502,41 @@ function composite(f, engine::FxEngine, clips, n::Integer, sourcefor;
     W, H = Int(canvas[1]), Int(canvas[2])
     accum = acquire!(pool, (W, H))
     warpbuf = nothing
+    cover = nothing
     try
         for (k, clip) in enumerate(clips)
             srcframe = sourceframe(clip, n)
             source = sourcefor(clip, srcframe)
             source === nothing && return false
             lclip = withoutopacity(effectiveclip(clip, srcframe))
-            layer = execute!(graphof(lclip; applytracks = applytracks), pool,
-                             FxContext(source, lclip, srcframe, playing; exact))
+            layer = renderlayer!(pool, lclip, srcframe, source; applytracks, playing, exact)
             α = Float32(clamp(paramvalue(clip, :opacity, srcframe), 0.0, 1.0))
-            if k == 1                                   # the bottom layer sits on black:
-                fill!(accum, RGB{N0f8}(0, 0, 0))        # (1-α)·0 + α·layer = α·layer,
-                placelayer!(accum, layer, lclip)        # and the bars stay that black
+            # COVERAGE, per pixel: white where this layer is opaque, black where
+            # what is underneath must show through — the letterbox bars, and the
+            # background a matte removed. Keying paints that background black,
+            # which is right over nothing and wrong over a track: the black is
+            # opaque and hides the clip below. The coverage is placed through the
+            # same matrix as the picture, so the two cannot disagree.
+            cover === nothing && (cover = acquire!(pool, (W, H)))
+            alphalayer = acquire!(pool, size(layer))
+            # the SAME effect entry the graph keyed with, so the coverage matches
+            me = findeffect(lclip, MatteEffect)
+            hasmatte = me !== nothing && !isneutral(me) &&
+                       mattealpha!(alphalayer, lclip, srcframe;
+                                   strength = me.strength, feather = me.feather) !== nothing
+            hasmatte || fill!(alphalayer, RGB{N0f8}(1, 1, 1))
+            fill!(cover, RGB{N0f8}(0, 0, 0))             # outside the layer: fully clear
+            placelayer!(cover, alphalayer, lclip)
+            release!(pool, alphalayer)
+            if k == 1                                    # the bottom layer sits on black
+                fill!(accum, RGB{N0f8}(0, 0, 0))
+                placelayer!(accum, layer, lclip)
                 α < 0.999f0 && channellinear!(accum, Vec3f(α), Vec3f(0))
             else
                 warpbuf === nothing && (warpbuf = acquire!(pool, (W, H)))
-                # start from the canvas so far: where THIS layer doesn't reach,
-                # `warpbuf` still holds what is below and the blend leaves it be
-                # (blend(a, a, α) = a). A letterboxed upper layer therefore shows
-                # the track underneath through its bars instead of blacking it out.
-                copyto!(warpbuf, accum)
+                fill!(warpbuf, RGB{N0f8}(0, 0, 0))       # the layer ALONE, premultiplied
                 placelayer!(warpbuf, layer, lclip)
-                blend!(accum, accum, warpbuf, α)
+                overcompose!(accum, warpbuf, cover, α)
             end
             release!(pool, layer)
         end
@@ -455,6 +545,37 @@ function composite(f, engine::FxEngine, clips, n::Integer, sourcefor;
         return true
     finally
         warpbuf === nothing || release!(pool, warpbuf)
+        cover === nothing || release!(pool, cover)
         release!(pool, accum)
     end
+end
+
+@kernel function overcompose_kernel!(dst, @Const(layer), @Const(cover), α::Float32)
+    i, j = @index(Global, NTuple)
+    @inbounds begin
+        a = α * Float32(red(cover[i, j]))
+        b = dst[i, j]
+        l = layer[i, j]
+        dst[i, j] = RGB{N0f8}(
+            unitn0f8(α * Float32(red(l))   + Float32(red(b))   * (1.0f0 - a)),
+            unitn0f8(α * Float32(green(l)) + Float32(green(b)) * (1.0f0 - a)),
+            unitn0f8(α * Float32(blue(l))  + Float32(blue(b))  * (1.0f0 - a)))
+    end
+end
+
+"""
+    overcompose!(dst, layer, cover, α) -> dst
+
+`layer` over `dst`, where `cover` says how much of `dst` each pixel hides.
+
+`layer` is PREMULTIPLIED — keying already multiplied it by the matte and left the
+rest black — so this is `α·layer + dst·(1 − α·cover)`, not a lerp. That is what
+makes a keyed-out background transparent rather than black, and it subsumes the
+letterbox rule: outside the layer `cover` is 0 and `dst` survives untouched.
+"""
+function overcompose!(dst::AnyRGBFrame, layer::AnyRGBFrame, cover::AnyRGBFrame, α::Real)
+    backend = KA.get_backend(dst)
+    overcompose_kernel!(backend)(dst, layer, cover, Float32(α); ndrange = size(dst))
+    KA.synchronize(backend)
+    return dst
 end

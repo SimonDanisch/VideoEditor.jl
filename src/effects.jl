@@ -54,11 +54,103 @@ struct OpacityEffect <: Effect
     α::Float32
 end
 
+"""
+A loop search on this clip: the reference frames the user marked and the cut
+points found from them (see the loop finder's card).
+
+Renders NOTHING — `isneutral` is true, so the graph never sees it. It exists so
+that a search has a card on the clip it searches, like everything else the editor
+does to a clip.
+"""
+struct LoopFinderEffect <: Effect end
+isneutral(::LoopFinderEffect) = true
+
+"""
+The handle for a cross-dissolve into this clip: `seconds` is the shared length of
+the two halves.
+
+Also renders nothing — the fade itself is an `OpacityEffect` curve on each half,
+and `Transition` is what the composite reads. This is the entry in the stack that
+those belong to, and the slot a [`FxLink`](@ref) points at, so the two halves of
+one blend can find each other.
+"""
+struct BlendEffect <: Effect
+    seconds::Float64
+end
+BlendEffect(; seconds = 0.6) = BlendEffect(Float64(seconds))
+isneutral(::BlendEffect) = true
+
+"""
+Applies the clip's camera stabilization (see `analyzemotion!`).
+
+Holds nothing: the per-frame warps live on the clip's `MotionTrack`, for the same
+reason `MatteEffect` holds no pixels. What it adds is a PLACE IN THE STACK — the
+analysis used to be applied ahead of every effect by the graph builder, which
+meant there was no card to fold, no toggle to compare with, and no way to say
+"stabilize the cropped picture, not the raw one".
+"""
+struct StabilizeEffect <: Effect end
+
+"""
+Applies the clip's colour/exposure stabilization (see `analyzecolor!`).
+
+`strength` scales the correction toward identity, so the fix can be dialled back
+— or keyframed — without re-analyzing. It lives here rather than on the track
+because a parameter you tune belongs to the thing in the stack you tune it on.
+"""
+struct FlickerEffect <: Effect
+    strength::Float32
+end
+FlickerEffect(; strength = 1.0) = FlickerEffect(Float32(strength))
+
 isneutral(e::ColorEffect) = GPUFiltering.isneutral(e.adj)
 isneutral(e::BlurEffect) = e.σ <= 0
 isneutral(e::SharpenEffect) = e.amount <= 0
 isneutral(e::OpacityEffect) = e.α >= 0.999f0
+"""
+Where the clip sits on the canvas: scale, position and rotation on top of the
+automatic fit.
+
+An EFFECT, so it is added, folded, toggled, removed and keyframed like every
+other one — and so the transform gizmo has a card to belong to. It holds no
+pixels; `layermatrix` reads it when it places the layer, which is why there is no
+`TransformNode` in the graph.
+"""
+struct TransformEffect <: Effect
+    scale::Float64
+    x::Float64
+    y::Float64
+    rotation::Float64      # degrees, positive = clockwise on screen
+end
+TransformEffect(; scale = 1.0, x = 0.0, y = 0.0, rotation = 0.0) =
+    TransformEffect(Float64(scale), Float64(x), Float64(y), Float64(rotation))
+
+isneutral(e::TransformEffect) =
+    e.scale ≈ 1.0 && e.x == 0.0 && e.y == 0.0 && e.rotation == 0.0
+
+"""
+    transformof(clip) -> (scale, x, y, rotation°)
+
+The clip's placement. ONE reader, so "where is this clip" has one answer: the
+`TransformEffect` when it has one, the identity fit otherwise.
+"""
+transformof(clip::Clip) =
+    (e = findeffect(clip, TransformEffect);
+     e === nothing ? NEUTRALFRAME : (e.scale, e.x, e.y, e.rotation))
+
+"Write one component of the clip's placement, creating the effect if needed."
+function settransform(clip::Clip; scale = nothing, x = nothing, y = nothing, rotation = nothing)
+    s, px, py, r = transformof(clip)
+    seteffect!(clip, TransformEffect(scale === nothing ? s : clamp(Float64(scale), 0.1, 4.0),
+                                     x === nothing ? px : clamp(Float64(x), -1.0, 1.0),
+                                     y === nothing ? py : clamp(Float64(y), -1.0, 1.0),
+                                     rotation === nothing ? r : clamp(Float64(rotation), -180.0, 180.0)))
+    return nothing
+end
+
 isneutral(e::MatteEffect) = e.strength <= 0.001f0
+isneutral(e::FlickerEffect) = e.strength <= 0.001f0
+isneutral(::StabilizeEffect) = false   # the warp is either applied or the slot is off
 isneutral(e::RestoreEffect) = e.strength <= 0.001f0
 
 """
@@ -106,12 +198,23 @@ effectdict(e::SharpenEffect) =
 effectdict(e::OpacityEffect) = Dict{String, Any}("type" => "opacity", "alpha" => e.α)
 effectdict(e::RestoreEffect) =
     Dict{String, Any}("type" => "restore", "strength" => e.strength)
+effectdict(e::TransformEffect) =
+    Dict{String, Any}("type" => "transform", "scale" => e.scale, "x" => e.x, "y" => e.y,
+                      "rotation" => e.rotation)
 effectdict(e::MatteEffect) =
     Dict{String, Any}("type" => "matte", "strength" => e.strength, "feather" => e.feather)
+effectdict(::StabilizeEffect) = Dict{String, Any}("type" => "stabilize")
+effectdict(::LoopFinderEffect) = Dict{String, Any}("type" => "loopfinder")
+effectdict(e::BlendEffect) = Dict{String, Any}("type" => "blend", "seconds" => e.seconds)
+effectdict(e::FlickerEffect) = Dict{String, Any}("type" => "flicker", "strength" => e.strength)
 
-"A stack entry as a project-file dict: the effect plus its id and enabled state."
-slotdict(s::FxSlot) = merge(effectdict(s.effect),
-                            Dict{String, Any}("id" => string(s.id), "enabled" => s.enabled))
+"A stack entry as a project-file dict: the effect plus its id, enabled state and links."
+function slotdict(s::FxSlot)
+    d = merge(effectdict(s.effect),
+              Dict{String, Any}("id" => string(s.id), "enabled" => s.enabled))
+    isempty(s.links) || (d["links"] = [linkdict(l) for l in s.links])
+    return d
+end
 
 """
 Read a stack entry back. Files written before effects had ids (and before
@@ -123,7 +226,8 @@ function slotfromdict(d::AbstractDict)
         return FxSlot(effectfromdict(d["inner"]); enabled = false)
     end
     id = haskey(d, "id") ? parse(UInt64, d["id"]) : freshid()
-    return FxSlot(id, effectfromdict(d), get(d, "enabled", true))
+    links = FxLink[linkfromdict(l) for l in get(d, "links", [])]
+    return FxSlot(id, effectfromdict(d), get(d, "enabled", true), links)
 end
 
 function effectfromdict(d::AbstractDict)
@@ -136,6 +240,12 @@ function effectfromdict(d::AbstractDict)
     t == "opacity" && return OpacityEffect(Float32(d["alpha"]))
     t == "restore" && return RestoreEffect(Float32(d["strength"]))
     t == "matte" && return MatteEffect(Float32(d["strength"]), Float32(get(d, "feather", 0.0)))
+    t == "stabilize" && return StabilizeEffect()
+    t == "loopfinder" && return LoopFinderEffect()
+    t == "blend" && return BlendEffect(Float64(get(d, "seconds", 0.6)))
+    t == "flicker" && return FlickerEffect(Float32(get(d, "strength", 1.0)))
+    t == "transform" && return TransformEffect(scale = get(d, "scale", 1.0), x = get(d, "x", 0.0),
+                                               y = get(d, "y", 0.0), rotation = get(d, "rotation", 0.0))
     t == "plugin" && return plugineffectfromdict(d)   # requires the plugin registered
     error("unknown effect type: $t")
 end
@@ -177,6 +287,60 @@ function seteffect!(clip::Clip, e::Effect)
     return clip
 end
 
+"""
+    prependeffect!(clip, e) -> clip
+
+Put `e` at the FRONT of the stack, or update the existing slot of its kind in
+place (keeping its id, so anything pointing at it still does). This is where an
+ANALYSIS lands: stabilizing the raw picture and then colour-grading it is the
+order that was hard-wired into the graph builder before analyses had slots, so it
+stays the default — the user can drag it elsewhere afterwards.
+"""
+function prependeffect!(clip::Clip, e::Effect)
+    i = findfirst(s -> effectkey(s.effect) == effectkey(e), clip.effects)
+    if i === nothing
+        pushfirst!(clip.effects, FxSlot(e))
+    else
+        clip.effects[i].effect = e
+        clip.effects[i].enabled = true
+    end
+    return clip
+end
+
+"Drop every slot holding an effect of type `T` (returns how many went)."
+function removeeffects!(clip::Clip, ::Type{T}) where {T <: Effect}
+    n = count(s -> s.effect isa T, clip.effects)
+    filter!(s -> !(s.effect isa T), clip.effects)
+    return n
+end
+
+"""
+    setmotiontrack!(clip, track)
+    setcolortrack!(clip, track)
+
+Attach (or clear) an analysis AND the stack slot that applies it, together.
+
+Five different analyses produce a `MotionTrack`; every one goes through here, so
+"the clip is stabilized" and "the panel shows a Stabilize card" can never
+disagree. `nothing` removes both.
+"""
+function setmotiontrack!(clip::Clip, track)
+    clip.motiontrack = track
+    track === nothing ? removeeffects!(clip, StabilizeEffect) :
+                        prependeffect!(clip, StabilizeEffect())
+    return track
+end
+
+function setcolortrack!(clip::Clip, track)
+    clip.colortrack = track
+    if track === nothing
+        removeeffects!(clip, FlickerEffect)
+    else
+        prependeffect!(clip, FlickerEffect(track.strength))
+    end
+    return track
+end
+
 "Drop the slot with `id` (returns whether one went)."
 function removeslot!(clip::Clip, id::Integer)
     i = findfirst(s -> s.id == id, clip.effects)
@@ -192,14 +356,18 @@ curadj(clip::Clip) = (e = findeffect(clip, ColorEffect); e === nothing ? ColorAd
 withcolor(clip::Clip, adj::ColorAdjustments) = seteffect!(clip, ColorEffect(adj))
 
 """
-The animatable-parameter registry — the single table the keyframe engine and the
-editor iterate over. Each [`ParamSpec`](@ref) declares how one named parameter
-reads from / writes to a `Clip` (color and blur/sharpen live in the effect stack,
-opacity is an `OpacityEffect`, pan/zoom are the crop rect). Add a row here and the
-parameter is immediately keyframeable and shows up in the editor — nothing else
-in the pipeline needs to know about it.
+The animatable parameters of the built-in effects and of a clip's placement.
+Each [`ParamSpec`](@ref) declares how one named parameter reads from / writes to
+a `Clip` (color and blur/sharpen live in the effect stack, opacity is an
+`OpacityEffect`, pan/zoom are the crop rect).
+
+These are seeded into [`EFFECTS`](@ref) at load; ask the registry
+([`paramspecs`](@ref), [`paramspec`](@ref)) rather than this list, which is only
+the built-in half. A registered kind's parameters get their specs generated —
+these are hand-written because several of them (the crop rect, the placement)
+are not an effect's fields at all.
 """
-const PARAMS = ParamSpec[
+const BUILTINPARAMS = ParamSpec[
     ParamSpec(:opacity, "Opacity", :composite, 0.0, 1.0, 1.0,
         c -> (e = findeffect(c, OpacityEffect); e === nothing ? 1.0 : Float64(e.α)),
         (c, v) -> seteffect!(c, OpacityEffect(Float32(v)))),
@@ -245,19 +413,14 @@ const PARAMS = ParamSpec[
     # material that doesn't share the sequence's shape — 1.0 fits, >1 fills past
     # the edges, and the shift moves it inside the frame.
     ParamSpec(:scale, "Scale", :geometry, 0.1, 4.0, 1.0,
-        c -> c.reframe[1],
-        (c, v) -> (c.reframe = (clamp(Float64(v), 0.1, 4.0), c.reframe[2], c.reframe[3]))),
+        c -> transformof(c)[1], (c, v) -> settransform(c; scale = v)),
     ParamSpec(:pos_x, "Position X", :geometry, -1.0, 1.0, 0.0,
-        c -> c.reframe[2],
-        (c, v) -> (c.reframe = (c.reframe[1], clamp(Float64(v), -1.0, 1.0), c.reframe[3]))),
+        c -> transformof(c)[2], (c, v) -> settransform(c; x = v)),
     ParamSpec(:pos_y, "Position Y", :geometry, -1.0, 1.0, 0.0,
-        c -> c.reframe[3],
-        (c, v) -> (c.reframe = (c.reframe[1], c.reframe[2], clamp(Float64(v), -1.0, 1.0)))),
+        c -> transformof(c)[3], (c, v) -> settransform(c; y = v)),
+    ParamSpec(:rotation, "Rotation", :geometry, -180.0, 180.0, 0.0,
+        c -> transformof(c)[4], (c, v) -> settransform(c; rotation = v)),
 ]
-const PARAMBYKEY = Dict(p.key => p for p in PARAMS)
-
-"The [`ParamSpec`](@ref) for `key` (throws if unknown)."
-paramspec(key::Symbol) = PARAMBYKEY[key]
 
 # A stable, visually distinct color per animatable parameter — shared by its keyframe
 # curve and its ◆ toggle so a parameter's control and its line are easy to match.
@@ -267,7 +430,8 @@ const PARAMPALETTE = map(Makie.to_color,
 
 "A distinct, stable display color for parameter `key` (by its registry position)."
 function paramcolor(key::Symbol)
-    i = findfirst(p -> p.key == key, PARAMS)
+    specs = paramspecs()
+    i = findfirst(p -> p.key == key, specs)
     i === nothing && (i = abs(hash(key)) % length(PARAMPALETTE) + 1)
     return PARAMPALETTE[mod1(i, length(PARAMPALETTE))]
 end
@@ -275,13 +439,21 @@ end
 "Whether any registered parameter is keyframed on `clip`."
 isanimated(clip::Clip) = !isempty(clip.animations)
 
+"`clip` without its matte — what the matte pipeline renders through, so the seed
+is not computed from a frame the previous matte already keyed."
+withoutmatte(clip::Clip) =
+    Clip(clip.id, clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
+         filter(s -> !(s.effect isa MatteEffect), clip.effects),
+         clip.colortrack, clip.motiontrack, nothing, clip.animations, clip.track,
+         clip.blendfrom, clip.rate)
+
 "`clip` without its opacity effects — compositing reads opacity as the LAYER
 alpha, not a per-pixel fade to black."
 withoutopacity(clip::Clip) =
     Clip(clip.id, clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
          filter(s -> !(s.effect isa OpacityEffect), clip.effects),
          clip.colortrack, clip.motiontrack, clip.mattetrack, clip.animations, clip.track,
-              clip.blendfrom, clip.rate, clip.reframe)
+              clip.blendfrom, clip.rate)
 
 """
     effectiveclip(clip, srcframe) -> Clip
@@ -297,13 +469,16 @@ function effectiveclip(clip::Clip, srcframe::Integer)
     # own slots (same ids, same on/off) so a sampled value never writes into the
     # clip the user is editing
     ec = Clip(clip.id, clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
-              [FxSlot(s.id, s.effect, s.enabled) for s in clip.effects],
+              [FxSlot(s.id, s.effect, s.enabled, s.links) for s in clip.effects],
               clip.colortrack, clip.motiontrack, clip.mattetrack, clip.animations, clip.track,
-              clip.blendfrom, clip.rate, clip.reframe)
+              clip.blendfrom, clip.rate)
     for (key, curve) in clip.animations
-        haskey(PARAMBYKEY, key) || continue
+        # a project can hold a curve for a parameter this session has no effect
+        # registered for — skip it rather than fail the render
+        spec = paramspec(key, nothing)
+        spec === nothing && continue
         v = valueat(curve, srcframe)
-        v === nothing || paramspec(key).set(ec, v)
+        v === nothing || spec.set(ec, v)
     end
     return ec
 end
