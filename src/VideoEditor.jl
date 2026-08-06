@@ -12,6 +12,7 @@ using SAM2Runner
 using Printf
 using TOML
 using VideoIO
+import Artifacts
 import Base64
 import DSP
 import FFMPEG_jll

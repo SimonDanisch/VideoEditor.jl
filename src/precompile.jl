@@ -39,21 +39,36 @@ const KERNELS_VERSION = SAM2Runner.KERNELS_VERSION
 """
     editorassets() -> String
 
-A video to render during the workload. Any short clip will do; what is being
-frozen is the code path, not the content.
+The clip the workload renders, out of this package's own artifact. Any short clip
+will do; what is being frozen is the code path, not the content.
+
+Neither an environment variable nor a walk up the filesystem, which is what was
+here — and not a reach into `DNNKernels` for either, which is what it used. Both
+mechanisms are the ones `DNNKernels/src/assets.jl` records as deleted, for the
+reason it gives: a walk answers on the machine that happens to have the tree and
+nowhere else, so this froze the editor's kernels for one checkout and silently
+covered nothing for every other. A package owns its assets through its own
+`Artifacts.toml`, exactly as each model runner owns its weights, and nothing
+outside it constructs a path into them.
+
+`""` until `videoeditor-demo` is bound, and the workload skips — which is what it
+already did on every machine without the media tree, now said out loud instead of
+looking like coverage. Binding it is `create_artifact` over a short clip and
+`bind_artifact!` with the release URL; `dev/JuliaVision/tools/make_artifacts.jl`
+documents that flow and why the upload is a separate, deliberate step.
 """
 function editorassets()
-    p = get(ENV, "JULIA_VIDEOEDITOR_ASSET", "")
-    isempty(p) || return p
-    # Walked up from here rather than a fixed `../../..`, for the reason
-    # `DNNKernels.findasset` gives: the depth of the media directory above this
-    # package is a property of the checkout, not of the package, and encoding it
-    # here is what broke the model runners when they moved into a monorepo.
-    for c in ("media/demo_source.mp4", "media/birds_export.mp4", "media/demo_loop.mp4")
-        f = SAM2Runner.DNNKernels.findasset(c; from = @__DIR__)
-        isfile(f) && return f
-    end
-    return ""
+    toml = joinpath(dirname(@__DIR__), "Artifacts.toml")
+    isfile(toml) || return ""
+    meta = Artifacts.artifact_meta("videoeditor-demo", toml)
+    meta === nothing && return ""
+    # Resolved, not installed: a lazy artifact nobody has fetched leaves the
+    # workload with nothing to render, and downloading a video inside someone's
+    # precompilation is not this file's decision to make.
+    dir = Artifacts.artifact_path(Base.SHA1(meta["git-tree-sha1"]))
+    isdir(dir) || return ""
+    clip = joinpath(dir, "demo.mp4")
+    isfile(clip) ? clip : ""
 end
 
 """
