@@ -40,7 +40,10 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
         # stabilization controls live INLINE in the inspector dock (no modal);
         # stabopen ensures that dock is showing, stabclose is a no-op kept so the
         # beats read the same as before the restructure
-        stabopen() = (p.fxwidgets[:stabopen](); sleep(0.3))
+        # Stabilization is a CARD in the Effects panel now, not a dock of its own:
+        # this brings it into view (adding it if the clip has none), which is what
+        # a user reaching for it does.
+        stabopen() = (VE.showkind!(p, :stabilize); sleep(0.3))
         stabclose() = sleep(0.1)
 
         @testset "scrub selects and follows" begin
@@ -62,7 +65,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             press(pv(0.3, 0.3))
             moveto(pv(0.7, 0.7))
             release()
-            @test p.cropmode[]                 # persistent crop tool stays armed (re-drag to refine)
+            @test p.cropmode[]                 # persistent crop tool stays on (re-drag to refine)
             crop = p.sequence.clips[1].crop
             @test crop != (0.0, 0.0, 1.0, 1.0)
             @test 0.05 < crop[1] < 0.5 && 0.2 < crop[3] < 0.8
@@ -85,15 +88,19 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test !p.clipmodal.open[]
         end
 
-        @testset "hold-to-compare" begin
+        @testset "the eye bypasses the whole stack" begin
+            # Was a full-width "Hold to compare with the original" bar at the
+            # bottom of the panel; it is a 30px eye in the panel head now, and a
+            # TOGGLE rather than a hold (Simon, 2026-07-31: the bar took far too
+            # much space, and the same glyph is on every card).
             VE.opendock!(p, :effects); sleep(0.3)
-            comparebtn = p.fxwidgets[:compare]   # inspector: it bypasses the WHOLE stack
-            center = comparebtn.layoutobservables.computedbbox[]
-            pos = Point2f(center.origin .+ center.widths ./ 2)
+            eye = p.fxwidgets[:bypassall]
+            bb = eye.layoutobservables.computedbbox[]
+            pos = Point2f(bb.origin .+ bb.widths ./ 2)
             @test p.applytracks[]
-            press(pos)
+            press(pos); release(); sleep(0.2)
             @test !p.applytracks[]
-            release()
+            press(pos); release(); sleep(0.2)
             @test p.applytracks[]
             stabclose()
         end
@@ -302,13 +309,13 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
 
             stabbtn = p.fxwidgets[:analyze]
             stabcenter() = (sc = stabbtn.layoutobservables.computedbbox[]; Point2f(sc.origin .+ sc.widths ./ 2))
-            press(stabcenter()); release()       # arms the pick AND closes the modal
+            press(stabcenter()); release()       # starts the pick AND closes the modal
             @test p.onpick !== nothing
 
             keypress(Keyboard.escape)            # Esc cancels the pick
             @test p.onpick === nothing
 
-            # re-arm (reopen the modal, click Stabilize again) then pick on the preview
+            # start it again (reopen, click Stabilize) then pick on the preview
             # (pause first: a second click at the same spot within the dblclick window
             # would register as dblclick, not click)
             sleep(0.5)
@@ -317,7 +324,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test p.onpick !== nothing
             clip = VE.locate(p.sequence, p.playhead[])[1]
             clip.motiontrack = nothing
-            press(pv(0.5, 0.5)); release()       # modal closed by the arm → click reaches the preview
+            press(pv(0.5, 0.5)); release()       # modal closed by the start → click reaches the preview
             @test p.onpick === nothing
             t0 = time()
             while clip.motiontrack === nothing && time() - t0 < 15
@@ -517,7 +524,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test waitfor(() -> occursin("placed", p.status[]))  # async statusqueue
         end
 
-        @testset "toolbar tools: arm, click-to-act, cursor" begin
+        @testset "toolbar tools: pick up, click-to-act, cursor" begin
             toolbtn(lbl) = first(b for b in fig.content
                                  if b isa Makie.Button && b.label[] == lbl)
             click(b) = (bb = b.layoutobservables.computedbbox[];
@@ -533,14 +540,14 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             # click the timeline elsewhere → cut THERE, not at the playhead
             press(tlx(3.0)); release()
             @test length(p.sequence.clips) == nclips + 1
-            @test p.tool[] == :split               # persistent blade stays armed (Esc/✂ to stop)
+            @test p.tool[] == :split               # persistent blade stays on (Esc/✂ to stop)
             @test p.playhead[] == playhead_before  # the click cut, didn't scrub
             @test any(c -> c.start == 90, p.sequence.clips)  # cut at 3.0 s @30fps
             sleep(0.5)
             click(toolbtn("↶"))                   # undo tool
             @test length(p.sequence.clips) == nclips
             sleep(0.5)
-            click(toolbtn("▢"))                   # crop tool arms crop mode
+            click(toolbtn("▢"))                   # the crop tool starts crop mode
             @test p.tool[] == :crop
             @test p.cropmode[]
             keypress(Keyboard.escape)
@@ -596,7 +603,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             # lost its content scene forever after switching docks away and back —
             # generic hide! force-hid the scene, unhide! never re-synced it
             VE.opendock!(p, :effects); sleep(0.2)
-            for k in (:tools, :media, :effects, :export, :none, :effects)
+            for k in (:media, :effects, :export, :none, :effects)
                 VE.opendock!(p, k); sleep(0.1)
             end
             sleep(0.2)
@@ -619,15 +626,16 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test !p.fxwidgets[:palettemodal].open[]
             @test length(clip.effects) == nfx + 1
             @test clip.effects[end].effect isa VE.SharpenEffect
-            # Stabilization is findable the same way, but it is a TOOL now: the entry
-            # takes you to the Tools dock instead of stacking a section (Simon,
-            # 2026-07-27 — "stabilization should move to tools")
+            # Stabilization is findable the same way and behaves the same way:
+            # it is an effect kind like any other, so the palette ADDS it and its
+            # card carries the mode menu and the analyze button.
+            nstab = length(clip.effects)
             p.fxwidgets[:paletteopen]()
-            p.fxwidgets[:palettequery][] = "stab"
+            p.fxwidgets[:palettequery][] = "stabil"
             keypress(Keyboard.enter)
-            @test waitfor(() -> p.dockopen[] === :tools)
-            @test haskey(p.fxwidgets, :modemenu) && haskey(p.fxwidgets, :analyze)
-            VE.opendock!(p, :effects); sleep(0.3)
+            @test waitfor(() -> length(clip.effects) == nstab + 1)
+            @test clip.effects[end].effect isa VE.StabilizeEffect
+            @test waitfor(() -> haskey(p.fxwidgets, :modemenu) && haskey(p.fxwidgets, :analyze))
             # PARAMETER labels hit too: "bright" finds the Color kind (Premiere-style)
             nfx2 = length(clip.effects)
             p.fxwidgets[:paletteopen]()
@@ -681,8 +689,11 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             rects = menuscene.plots[1][1][]
             tr = Makie.translation(menuscene)[]
             row1 = Point2f(sum(extrema(rects[1])) ./ 2 .+ Point2f(tr[1], tr[2]))
-            # the overlap is REAL — this is the whole point of the regression
-            @test row1 in p.fxwidgets[:compare].layoutobservables.computedbbox[]
+            # The overlap is REAL — the whole point of the regression. What sits
+            # under the dropdown is the filter box now (the compare button moved
+            # below it), and the rule is the same: a widget drawn under an open
+            # menu must not swallow the row you click.
+            @test row1 in p.fxwidgets[:fxfilterbox].layoutobservables.computedbbox[]
             press(row1); release(); sleep(0.3)
             @test !menu.is_open[]
             @test length(clip.effects) == nfx + 1
@@ -700,11 +711,11 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             len = clip.src_out - clip.src_in         # frames survive earlier trim tests
             fkey = clip.src_in + (3 * len) ÷ 4       # keyed frame (both params)
             ffree = clip.src_in + (2 * len) ÷ 5      # key-free frame for the Alt-add
-            VE.armkeyframe!(p, :brightness)
-            VE.armkeyframe!(p, :sharpen)
+            VE.startanimating!(p, :brightness)
+            VE.startanimating!(p, :sharpen)
             VE.setkey!(clip.animations[:brightness], fkey, VE.paramspec(:brightness).hi)
             VE.setkey!(clip.animations[:sharpen], fkey, VE.paramspec(:sharpen).lo)
-            VE.armkeyframe!(p, :brightness)          # focus = brightness
+            VE.startanimating!(p, :brightness)          # focus = brightness
             notify(p.playhead); sleep(0.3)
             curvepos(key, sf) = begin                # figure pixel on `key`'s curve at SOURCE frame sf
                 ntr = VE.ntracks(p.sequence)
@@ -770,9 +781,9 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
                         vp.origin[2] + (y - minimum(lims)[2]) /
                             (maximum(lims)[2] - minimum(lims)[2]) * vp.widths[2])
             end
-            trio() = p.fxwidgets[:kfacc_contrast]    # re-fetch: arming rebuilds the stack
+            trio() = p.fxwidgets[:kfacc_contrast]    # re-fetch: keying rebuilds the stack
 
-            # --- ◆ arms: first key at the playhead, label flips ◇ → ◆ ---
+            # --- ◆ starts animating: first key at the playhead, label flips ◇ → ◆ ---
             @test !VE.clipanimated(clip, :contrast)
             @test Makie.to_value(trio()[2].label) == "◇"
             notify(trio()[2].clicks); sleep(0.3)
@@ -884,7 +895,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test !VE.clipanimated(clip, :contrast)
 
             # --- E2E: the keys really drive the render — sampled ends of the ramp ---
-            notify(trio()[2].clicks); sleep(0.3)                   # re-arm at the playhead
+            notify(trio()[2].clicks); sleep(0.3)                   # start it again at the playhead
             clip = VE.locate(p.sequence, p.playhead[])[1]
             sf0 = VE.playheadframe(p, clip)
             VE.setkey!(clip.animations[:contrast], sf0, 0.2)
@@ -976,7 +987,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
         @testset "slider writes keys while playing (live keying)" begin
             press(tlx(1.2)); release(); sleep(0.2)
             clip = VE.locate(p.sequence, p.playhead[])[1]
-            VE.armkeyframe!(p, :contrast); sleep(0.3)
+            VE.startanimating!(p, :contrast); sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             farm = clip.animations[:contrast].keys[1].frame
             VE.play!(p); sleep(0.5)                    # playhead advancing
@@ -1000,7 +1011,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             press(tlx(2.0)); release()               # playhead onto the clip
             nbefore = VE.seqlength(p.sequence)
             nclips0 = length(p.sequence.clips)
-            VE.opendock!(p, :tools)                  # card clicks need the dock open
+            VE.opendock!(p, :effects)                # card clicks need the panel open
             VE.activatetool!(p, :loopfinder)
             @test VE.activetoolname(p)[] === :loopfinder
             ctx = VE.activetool(p)[2]
@@ -1009,7 +1020,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test length(p.fxwidgets[:toolcards][3]) == 1   # reference card added
             pts = ctx.state[:hintpts][]
             @test !isempty(pts)
-            # ▼ click CUTS there — the timeline keeps its length, the tool stays armed
+            # ▼ click CUTS there — the timeline keeps its length, the tool stays on
             press(datapos(pts[1][1], pts[1][2])); release(); sleep(0.3)
             @test length(p.sequence.clips) == nclips0 + 1
             @test VE.seqlength(p.sequence) == nbefore
@@ -1085,7 +1096,10 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             slot = VE.findslot(c2, VE.OpacityEffect)
             @test slot !== nothing
             slot.enabled = false
-            @test isempty(collect(VE.liveeffects(c2)))
+            # …and no OPACITY is applied any more. Not `isempty`: stabilization is
+            # an effect too now, so a clip that was stabilized earlier in this
+            # session still has its Stabilize slot in the stack.
+            @test !any(e -> e isa VE.OpacityEffect, VE.liveeffects(c2))
             @test VE.clipanimated(c2, :opacity)          # the curve is untouched
             slot.enabled = true
 
@@ -1219,10 +1233,10 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             clip = p.sequence.clips[1]
             clip.mattetrack = nothing
             filter!(s -> !(s.effect isa VE.MatteEffect), clip.effects)
-            VE.opendock!(p, :tools)
+            VE.opendock!(p, :effects)
             VE.activatetool!(p, :matte); sleep(0.5)
             col = VE.mattecollect(p)
-            @test col !== nothing                       # marking is armed…
+            @test col !== nothing                       # marking is running…
             @test col.scene.visible[]                   # …and the overlay is up
             @test col.scene.captures_mouse              # so nothing else gets the click
             moveto(pv(0.5, 0.5))                        # routing is asked about a POSITION
@@ -1231,7 +1245,14 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             press(pv(0.5, 0.5)); release(); sleep(0.2)  # one foreground point
             @test length(col.points) == 1
             @test length(col.fg[]) == 1
-            @test waitfor(() -> clip.mattetrack !== nothing)
+            # The first mark of the session, and the only one that pays a cold
+            # model. Measured on this path: `seedmask` (SAM 2) 2.5 s, and
+            # `previewmatte` 38.6 s — because the live preview runs the
+            # *propagation* model on the marked frame, so the first mark loads
+            # MatAnyone and specializes its GEMM tiles for this clip's matte
+            # resolution. The 6 s default never covered that; every later mark
+            # here is warm and keeps it.
+            @test waitfor(() -> clip.mattetrack !== nothing; s = 120)
             @test size(clip.mattetrack.alpha, 3) == 1   # THIS frame only
             fx = VE.findeffect(clip, VE.MatteEffect)
             @test fx !== nothing && fx.strength < 1.0f0 # background dimmed, not black
@@ -1264,14 +1285,35 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             # the card system does — with the card id. Zero-arg closures threw
             # inside the render loop, which is why clicking a card spammed errors
             # and its × did nothing.
+            # Esc above ENDED the collect: `endmattecollect!` turns the listeners
+            # off and deletes `:mattecollect`, so the old `col` is detached and
+            # its `points` can never change again — marking has to be started again and
+            # `col` re-taken before the sequence continues. (As written this asked
+            # a detached collect to grow to 2 points, which it cannot do; the
+            # assertion had never run, because every earlier failure in this file
+            # aborted the testset before reaching it.)
+            # …and Esc leaves the TOOL active while the collect is gone, so a
+            # single `activatetool!` would toggle the tool OFF rather than restart it
+            # it. Off, then on — which is what clicking the toolbar button twice
+            # does — gives a fresh collect to mark into.
+            VE.activatetool!(p, :matte); VE.activatetool!(p, :matte); sleep(0.5)
+            col = VE.mattecollect(p)
+            @test col !== nothing
             press(pv(0.35, 0.62)); release(); sleep(0.2)  # a spot with no dot on it
-            @test length(col.points) == 2                # …so this ADDS, not removes
+            @test length(col.points) == 1                # a fresh collect: this ADDS
             keypress(Keyboard.enter)                     # propagate (built-in propagator)
             @test waitfor(() -> clip.mattetrack !== nothing && size(clip.mattetrack.alpha, 3) > 1;
                           s = 30)
-            VE.activatetool!(p, :matte); sleep(0.5)      # rebuilds the cards
+            # No `activatetool!` here, despite what the old comment said. The
+            # cards rebuild themselves: `runmatte!`'s completion calls
+            # `refreshmattepanel!`, which bumps `TOOLSVERSION`, and the dock
+            # rebuilds on that. Toggling the tool does the opposite —
+            # `deactivatetool!` runs `cleartoolcards!`, and `rebuild()` fires only
+            # on `TOOLSVERSION`, the fold button, or activating a *folded* tool,
+            # so nothing puts them back. That is what made this unreachable.
+            @test waitfor(() -> (c = get(p.fxwidgets, :toolcards, nothing);
+                                 c !== nothing && !isempty(c[3])); s = 15)
             cards = get(p.fxwidgets, :toolcards, nothing)
-            @test cards !== nothing && !isempty(cards[3])
             for c in cards[3]
                 c[5] === nothing || c[5](c[1])           # onclick(id)
             end

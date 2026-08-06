@@ -183,8 +183,8 @@ function tooldefinitions()
         tool("add_source", "Append a video file as a new clip at the end of the timeline (a differing framerate is conformed to the sequence).",
              Dict("path" => str("video file path")), ["path"]),
     ]
-    # registered effect plugins → one tool each (reflects new plugins on every list)
-    for p in PLUGINS
+    # every addable effect kind → one tool each (reflects new kinds on every list)
+    for p in addablekinds()
         props = Dict{String, Any}("time" => t)
         for pr in p.params
             props[String(pr.name)] = num("$(pr.label) ($(pr.min)..$(pr.max), default $(pr.default))")
@@ -279,9 +279,9 @@ function calltool(srv::MCPServer, name::String, args)
                                 "seam_score" => round(score, digits = 4)))
     elseif name == "define_effect"
         # author + register a new plugin (mutates the global registry, not the player)
-        before = Set(p.name for p in PLUGINS)
+        before = Set(p.name for p in effectkinds())
         definepluginfromcode!(String(args["code"]))
-        added = [String(p.name) for p in PLUGINS if !(p.name in before)]
+        added = [String(p.name) for p in effectkinds() if !(p.name in before)]
         return textcontent(Dict("registered" => added,
             "call_with" => ["effect_$n" for n in added],
             "note" => "re-list tools (tools/list) to see the new effect_<name> tool"))
@@ -382,13 +382,13 @@ function calltool(srv::MCPServer, name::String, args)
         elseif name == "add_source"
             clip = addsource!(player, String(args["path"]))  # snapshots itself
             statedict(player)
-        elseif startswith(name, "effect_") && haskey(PLUGINBYNAME, Symbol(name[8:end]))
+        elseif startswith(name, "effect_") && kindbyname(Symbol(name[8:end])) !== nothing
             clip = clipattime(args["time"])
             clip === nothing && return "no clip at that time"
-            p = PLUGINBYNAME[Symbol(name[8:end])]
+            p = kindbyname(Symbol(name[8:end]))
             snapshot!(player)
-            kw = (; (pr.name => Float64(get(args, String(pr.name), pr.default)) for pr in p.params)...)
-            seteffect!(clip, plugineffect(p.name; kw...))
+            nt = NamedTuple(pr.name => Float64(get(args, String(pr.name), pr.default)) for pr in p.params)
+            seteffect!(clip, p.make(nt))
             syncsliders!(player, clip)
             refreshedit!(player)
             "applied $(p.label)"
@@ -451,10 +451,10 @@ function renderpreview(player::Player, t::Float64, width::Int)
         sleep(0.01)
         time() > deadline && error("frame $srcframe not decodable within 3s")
     end
-    # the same graph as preview/export; a private engine — this runs on the MCP
-    # task, the player's cpuengine pool belongs to the render thread
+    # the same graph as preview/export; a private engine on the declared backend —
+    # this runs on the MCP task, the player's engine pool belongs to the render thread
     ec = effectiveclip(clip, srcframe)
-    render(FxEngine(KA.CPU()), scratch, ec, Int(srcframe)) do out
+    render(FxEngine(player.analysisbackend), scratch, ec, Int(srcframe)) do out
         warp!(preview, out, ec.crop)
         KA.synchronize(KA.get_backend(preview))
     end

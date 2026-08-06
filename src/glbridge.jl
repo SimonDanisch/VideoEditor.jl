@@ -16,9 +16,8 @@
 # Error policy: a GPU render error is a BUG, not a mode. Playback pauses
 # LOUDLY (status + logged backtrace) and the render backend stays what the
 # config declared — no silent CPU continuation, no error-driven switching.
-# The ONLY CPU tier is the deterministic `gpubusy` gate: while a long GPU
-# job (warmup, analysis, mezzanine) occupies the single-writer worker,
-# presents take the CPU path for the duration instead of queueing behind it.
+# There is no CPU tier. A present during a long job queues behind it on the
+# single-writer worker; it does not take a second path.
 
 "Per-resolution GPU presentation state (see `presentgpu!`). The shared image is
 DOUBLE-BUFFERED: GLMakie's render loop runs as a concurrent task, so blitting
@@ -28,11 +27,9 @@ present blits into the texture GLMakie is NOT showing, then swaps."
 mutable struct GPUPreview
     width::Int
     height::Int
-    inline::Bool   # Lava context is owned by the main thread → run jobs inline
     # worker-owned (Lava)
     packed::Any          # LavaArray{UInt32,1} — RGBA pack scratch for the blit
     eimages::Vector{Any} # 2 Lava.ExternalImage back/front buffers
-    engine::Any          # FxEngine — owns the effect graph's reusable device buffers
     # main-thread-owned (GL)
     gltex::Vector{Any}   # the 2 imported GL texture wrappers
     cur::Int             # index (1/2) of the buffer GLMakie currently samples
@@ -43,7 +40,7 @@ mutable struct GPUPreview
                          # object holds, and uploading linear CPU pixels into the
                          # imported optimal-tiled external texture shreds the image
 end
-GPUPreview() = GPUPreview(0, 0, false, nothing, Any[], nothing, Any[], 1, true, nothing)
+GPUPreview() = GPUPreview(0, 0, nothing, Any[], Any[], 1, true, nothing)
 
 """
 A GPU render error is a BUG, not a mode: playback pauses LOUDLY (status + log)
@@ -59,14 +56,24 @@ function gpurendererror!(player::Player, err)
 end
 
 """
-Run `f` on the player's pinned GPU worker and wait for its result. `long = true`
-marks jobs that hold the worker for more than a frame period (stream warmup,
-cold kernel compiles): while any is queued or running, `gpuready` turns false
-and presents take the CPU lane instead of stalling behind it in the job queue.
+    previewrobj(player) -> RenderObject | nothing
+
+The preview image's GL render object, or `nothing` when there is none to talk to.
+
+A CLOSED window keeps its plots but empties its render cache, so the lookup that
+swaps the preview texture threw a bare `KeyError` — which surfaced as "GPU render
+ERROR, playback paused" for what is simply a window that is gone. Presenting into
+a closed screen is a no-op, not a failure.
 """
-function rungpusync(f::Function, player::Player; long::Bool = false)
-    long && Threads.atomic_add!(player.gpubusy, 1)
-    try
+function previewrobj(player::Player)
+    scr = player.screen
+    (scr === nothing || !isopen(scr)) && return nothing
+    return get(scr.cache, objectid(player.previewplot), nothing)
+end
+
+"Run `f` on the player's pinned GPU worker and wait for its result."
+function rungpusync(f::Function, player::Player)
+    let
         done = Channel{Any}(1)
         rungpu(player) do
             try
@@ -78,26 +85,29 @@ function rungpusync(f::Function, player::Player; long::Bool = false)
         ok, val = take!(done)
         ok || throw(val)
         return val
-    finally
-        long && Threads.atomic_sub!(player.gpubusy, 1)
     end
 end
 
 """
-Run `f` on whichever thread owns the Lava context. Normally that is the
-player's pinned GPU worker (the context is created there on first use);
-when Lava was already used on the main thread before this player existed,
-the single-writer BatchQueue belongs to main — detected once via the
-worker's assertion, after which jobs run inline (presentation already
-happens on the main thread, so inline is both legal and lower-latency).
+Run `f` on whichever thread owns the render engine's context.
+
+Every call into `player.engine` goes through this, presentation and card previews
+alike: a Lava `BatchQueue` binds to the thread that first touched it, and which
+thread that was depends on what ran first — the pinned worker (analysis, the
+usual case) or main (Lava already used before this player existed). So the owner
+is *discovered*, once, from the worker's own assertion, and never configured.
 """
-function rungpuowned(f::Function, player::Player, gp::GPUPreview)
-    gp.inline && return f()
+function runowned(f::Function, player::Player)
+    player.engineinline && return f()
+    # already ON the worker (analysis jobs render too): posting to the queue only
+    # this task drains would wait for itself
+    w = player.gpuworker
+    w === nothing || current_task() !== w.task || return f()
     try
         return rungpusync(f, player)
     catch e
         if e isa AssertionError && occursin("single-writer", e.msg)
-            gp.inline = true
+            player.engineinline = true
             return f()
         end
         rethrow()
@@ -114,10 +124,9 @@ current before its texture is replaced).
 function setupgpupreview!(player::Player, gp::GPUPreview, W::Integer, H::Integer)
     # VideoEditor doesn't depend on Lava — reach it through the backend's module
     lavamod = parentmodule(typeof(player.analysisbackend))
-    fds = rungpuowned(player, gp) do
+    fds = runowned(player) do
         backend = player.analysisbackend
-        gp.engine !== nothing && emptyengine!(gp.engine)   # drop old-resolution graph buffers
-        gp.engine = nothing
+        emptyengine!(player.engine)        # drop old-resolution graph buffers
         gp.packed = KA.allocate(backend, UInt32, Int(W) * Int(H))   # RGBA pack scratch
         empty!(gp.eimages)
         map(1:2) do _   # double buffer: blit into one while GL samples the other
@@ -132,7 +141,8 @@ function setupgpupreview!(player::Player, gp::GPUPreview, W::Integer, H::Integer
     GLMakie.GLFW.MakeContextCurrent(screen.glscreen)
     getfn(n) = GLMakie.GLFW.GetProcAddress(n)
     GL = GLMakie.ModernGL
-    robj = screen.cache[objectid(player.previewplot)]
+    robj = previewrobj(player)
+    robj === nothing && error("the preview window is gone — cannot set up the GPU chain")
     old = robj.uniforms[:image]
     gp.origtex === nothing && (gp.origtex = old)   # re-setups see OUR texture here
     empty!(gp.gltex)
@@ -178,29 +188,35 @@ converts it in place (fully-GPU, disk→VRAM path, no CPU frame) — otherwise t
 CPU frame `player.frame[]` is uploaded once. Returns `true` when on screen; `false`
 (after flagging `failed`) hands the job back to the CPU path.
 """
-function presentgpu!(player::Player, clip::Clip, srcframe::Integer; stream = nothing)
+function presentgpu!(player::Player, clip::Clip, srcframe::Integer;
+                     stream = nothing, source = nothing)
     gp = player.gpupreview
     try
-        # source = the streaming decoder (disk→VRAM) or the CPU frame (one upload)
-        source = stream === nothing ? player.frame[] : stream
-        W, H = framesize(source)
+        # source = the streaming decoder (disk→VRAM) or a decoded CPU frame (one upload)
+        src = stream !== nothing ? stream : source !== nothing ? source : player.frame[]
+        # the CANVAS, not the layer: a clip's crop, reframe and rotation are baked
+        # in by `placelayer!` here exactly as the export bakes them
+        W, H = canvassize(player.sequence)
         if (gp.width, gp.height) != (W, H)
             notify(player.frame)  # settle plot geometry for the new size first
             setupgpupreview!(player, gp, W, H)
         end
         nxt = gp.doublebuffer ? 3 - gp.cur : gp.cur   # blit target (see doublebuffer)
-        rungpuowned(player, gp) do
-            gp.engine === nothing && (gp.engine = FxEngine(player.analysisbackend))
-            render(gp.engine, source, clip, Int(srcframe); applytracks = player.applytracks[],
-                   playing = player.playing[]) do out
-                gp.packed .= packrgba.(reshape(out, gp.width * gp.height))
+        ok = runowned(player) do
+            composite(player.engine, [clip], n_of(player, clip, srcframe), (_, _) -> src;
+                      canvas = (W, H), applytracks = player.applytracks[],
+                      playing = player.playing[]) do canvas
+                gp.packed .= packrgba.(reshape(canvas, W * H))
                 copyto!(gp.eimages[nxt], gp.packed)        # device blit + wait
                 nothing
             end
         end
+        ok === true || return false
         # main thread again: swap the shown texture (the render loop is a sibling
         # task on this thread, so the swap can't interleave with a GL draw)
-        player.screen.cache[objectid(player.previewplot)].uniforms[:image] = gp.gltex[nxt]
+        robj = previewrobj(player)
+        robj === nothing && return false     # the window is gone: nothing to show it on
+        robj.uniforms[:image] = gp.gltex[nxt]
         gp.cur = nxt
         player.screen.requires_update = true
         return true
@@ -229,9 +245,8 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
         nxt = gp.doublebuffer ? 3 - gp.cur : gp.cur   # same switch as presentgpu!
         # the GPU tier of ONE composite (see `composite`): its only job is to
         # name each layer's stream and to blit the finished canvas
-        ok = rungpuowned(player, gp) do
-            gp.engine === nothing && (gp.engine = FxEngine(player.analysisbackend))
-            composite(gp.engine, clips, n, (clip, _) -> player.gpucache[clip.source];
+        ok = runowned(player) do
+            composite(player.engine, clips, n, (clip, _) -> player.gpucache[clip.source];
                       canvas = (W, H), applytracks = player.applytracks[],
                       playing = player.playing[]) do canvas
                 gp.packed .= packrgba.(reshape(canvas, W * H))
@@ -239,7 +254,9 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
             end
         end
         ok === true || return false
-        player.screen.cache[objectid(player.previewplot)].uniforms[:image] = gp.gltex[nxt]
+        robj = previewrobj(player)
+        robj === nothing && return false     # the window is gone: nothing to show it on
+        robj.uniforms[:image] = gp.gltex[nxt]
         gp.cur = nxt
         player.screen.requires_update = true
         return true
@@ -258,7 +275,7 @@ errored — the caller then falls through to the CPU lane, which decodes it exac
 function primeframe!(player::Player, stream::GpuVideoStream, n::Integer)
     gp = player.gpupreview
     try
-        rungpuowned(player, gp) do
+        runowned(player) do
             frameat!(stream, n)
             nothing
         end
@@ -298,7 +315,9 @@ next GPU present swaps the external texture back in. No-op on CPU-only players.
 function showcpuframe!(player::Player)
     gp = player.gpupreview
     (gp isa GPUPreview && gp.origtex !== nothing) || return nothing
-    player.screen.cache[objectid(player.previewplot)].uniforms[:image] = gp.origtex
+    robj = previewrobj(player)
+    robj === nothing && return nothing
+    robj.uniforms[:image] = gp.origtex
     player.screen.requires_update = true
     return nothing
 end
@@ -320,20 +339,26 @@ function preloadgpu!(player::Player, source::VideoSource)
     haskey(player.gpucache, source) && return nothing
     # One probe per source, not one per present. `ensurestreams!` runs on every
     # frame that is shown, so a source that is not directly streamable used to be
-    # re-probed forever: each attempt raised `gpubusy` (presents dropped to the
-    # CPU tier and the progress indicator flickered), failed, logged, and
-    # overwrote the mezzanine's own status line. The retry that matters is the
+    # re-probed forever: each attempt failed, logged, and overwrote the
+    # mezzanine's own status line. The retry that matters is the
     # one `startmezzanine!` makes itself once the transcode has landed.
+    # ONE probe per source per session. The retry that matters is the single
+    # explicit one `startmezzanine!` makes when its transcode lands; everything
+    # else is `ensurestreams!` running per present, and per analysis, and per
+    # matte click. The old escape hatch ("…unless a mezzanine file exists") made
+    # that memo useless for exactly the sources that need it, and the transcode's
+    # own retry then re-entered this on failure — transcode → probe → fail →
+    # transcode, two sources interleaving, forever, at one warning per turn.
+    jobs = get!(() -> Set{String}(), player.fxwidgets, :mezzjobs)
+    source.path in jobs && return nothing        # a transcode is running; it retries itself
     probed = get!(() -> Set{String}(), player.fxwidgets, :gpuprobed)
-    mezzready = isfile(mezzaninepath(source))
-    (source.path in probed && !mezzready) && return nothing
+    source.path in probed && return nothing
     push!(probed, source.path)
     stream = nothing
     # a mezzanine transcoded earlier for this source IS the streamable version —
     # a later run opens on it directly instead of failing the probe again
     mezz = mezzaninepath(source)
     path = isfile(mezz) ? mezz : source.path
-    Threads.atomic_add!(player.gpubusy, 1)   # presents stay on the CPU tier during warmup
     try
         stream = openstream(player.analysisbackend, path, source.width, source.height;
                             capacity = GPU_STREAM_CAPACITY)
@@ -359,13 +384,17 @@ function preloadgpu!(player::Player, source::VideoSource)
         msg = sprint(showerror, e)
         if occursin("VRAM budget", msg)
             setstatus!(player, "$(basename(source.path)): CPU decode — $msg")
+        elseif isfile(mezzaninepath(source))
+            # the mezzanine is already there and STILL will not open: transcoding
+            # it again cannot change that, so this is terminal for the GPU tier
+            setstatus!(player, "$(basename(source.path)): CPU decode — its mezzanine " *
+                               "will not open on the GPU either")
         else
             setstatus!(player, "$(basename(source.path)): not GPU-streamable, transcoding once")
             startmezzanine!(player, source)
         end
         @warn "GPU stream unavailable; staying on CPU decode" exception = e
     finally
-        Threads.atomic_sub!(player.gpubusy, 1)
     end
     return nothing
 end
@@ -421,9 +450,10 @@ function autodetectgpu!(player::Player)
     end
     capable || return nothing
     player.analysisbackend = LavaBackend()               # wraps the worker-owned context
+    player.engine = FxEngine(player.analysisbackend)     # the engine follows the backend
     player.gpupreview = GPUPreview()
     haskey(player.fxwidgets, :lanechip) && (player.fxwidgets[:lanechip][] = "GPU")
-    setgpurun!(player.timeline, (f; long = false) -> rungpusync(f, player; long))  # GPU thumbnails from here on
+    setgpurun!(player.timeline, f -> rungpusync(f, player))   # GPU thumbnails from here on
     for src in unique(c.source for c in player.sequence.clips)
         Threads.@spawn preloadgpu!(player, src)
     end
@@ -437,9 +467,8 @@ end
 effect graph's buffer pool."
 function freegpucache!(player::Player)
     gp = player.gpupreview
-    if gp isa GPUPreview && gp.engine !== nothing
-        try; rungpusync(player) do; emptyengine!(gp.engine); end; catch; end
-        gp.engine = nothing
+    if gp isa GPUPreview
+        try; rungpusync(player) do; emptyengine!(player.engine); end; catch; end
     end
     isempty(player.gpucache) && return nothing
     for s in values(player.gpucache)

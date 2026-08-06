@@ -53,20 +53,25 @@ function analyzecolor!(clip::Clip; cutoff::Real = 0.5, backend = KA.CPU(), progr
     jump(m) = n < 2 ? 0.0 : mean(abs.(diff(vec(sum(m, dims = 2)))))
     was, becomes = jump(means), jump(target_μ)
     reduction = was > 0 ? clamp(1 - becomes / was, 0.0, 1.0) : 0.0
-    clip.colortrack = ColorTrack(gains, offsets, clip.src_in, 1.0f0, reduction)
+    setcolortrack!(clip, ColorTrack(gains, offsets, clip.src_in, 1.0f0, reduction))
     progress === nothing || progress(n, n)
     return clip.colortrack
 end
 
-"Apply the clip's color stabilization for `srcframe`, if analyzed. The track's
-`strength` scales the correction toward identity (used by the CPU path AND the
-GPU graph's ColorTrackNode, which calls this same function)."
-function applycolortrack!(buf::AnyRGBFrame, clip::Clip, srcframe::Integer)
+"""
+Apply the clip's colour stabilization for `srcframe`, if analyzed. `strength`
+scales the correction toward identity; it comes from the `FlickerEffect` in the
+clip's stack, which is what the user tunes, and falls back to the track's own
+value for a track loaded from a project written before the effect existed.
+"""
+function applycolortrack!(buf::AnyRGBFrame, clip::Clip, srcframe::Integer;
+                          strength::Real = clip.colortrack === nothing ? 1.0f0 :
+                                           clip.colortrack.strength)
     track = clip.colortrack
     track === nothing && return buf
     i = srcframe - track.src_in + 1
     1 <= i <= length(track.gains) || return buf
-    s = clamp(track.strength, 0.0f0, 1.0f0)
+    s = clamp(Float32(strength), 0.0f0, 1.0f0)
     s <= 0.0f0 && return buf
     g = 1.0f0 .+ s .* (track.gains[i] .- 1.0f0)
     o = s .* track.offsets[i]

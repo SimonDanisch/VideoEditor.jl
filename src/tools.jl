@@ -88,40 +88,26 @@ tooltime(player::Player, n::Integer) = n / player.sequence.framerate
 toolband(player::Player, clip::Clip) = trackband(clip.track, ntracks(player.sequence))
 
 """
-A registered GUI tool: `activate(ctx::ToolContext)` draws its hints and wires
-its clicks; `deactivate(ctx)` is extra teardown (plots and handlers recorded
-through the context are removed automatically). Register with
-[`registertool!`](@ref); the Tools dock lists it live.
-"""
-struct EditorTool
-    name::Symbol
-    label::String
-    description::String
-    panel::Any       # fills the card body — ALWAYS, armed or not (project state)
-    activate::Any    # what clicking the card header DOES
-    deactivate::Any
-end
+    registertool!(name, label, description; activate, deactivate = ctx -> nothing, panel)
 
-const TOOLS = EditorTool[]
-const TOOLBYNAME = Dict{Symbol, EditorTool}()
-const TOOLSVERSION = Observables.Observable(0)   # bumped on every (re)registration
+Register a premade editing operation: `panel(ctx)` fills its card body (always,
+active or not — it shows project state), `activate(ctx)` is what asking for the
+operation does, and `deactivate(ctx)` is extra teardown beyond the plots and
+handlers the context already tracks.
 
+The short form of [`registereffect!`](@ref) for a kind whose card is its own body
+and its own action rather than a row of sliders. There is no separate tool
+registry any more: a tool IS an effect kind, and the Effects panel lists it next
+to Blur.
 """
-    registertool!(name, label, description; activate, deactivate = ctx -> nothing)
+registertool!(name::Symbol, label::AbstractString, description::AbstractString;
+              activate, deactivate = ctx -> nothing, panel = ctx -> nothing) =
+    registereffect!(EffectKind(name, label; description, body = panel,
+                               activate, deactivate, analysis = true))
 
-Register a GUI tool — a premade editing operation that shows hints on the
-thumb track and acts on the user's clicks. Live: callable any time, from any
-package or the MCP agent, and the Tools panel picks it up immediately.
-"""
-function registertool!(name::Symbol, label::AbstractString, description::AbstractString;
-                       activate, deactivate = ctx -> nothing, panel = ctx -> nothing)
-    t = EditorTool(name, String(label), String(description), panel, activate, deactivate)
-    TOOLBYNAME[name] = t
-    i = findfirst(q -> q.name == name, TOOLS)
-    i === nothing ? push!(TOOLS, t) : (TOOLS[i] = t)
-    TOOLSVERSION[] = TOOLSVERSION[] + 1
-    return t
-end
+"Every kind that has a card body or an action of its own — what the Tools dock lists."
+toolkinds(registry::EffectRegistry = EFFECTS) =
+    filter(k -> k.activate !== nothing || k.body !== nothing, registry.kinds)
 
 """
 Hard-wrap `text` at `cols` characters. A Makie `Label` with `word_wrap = true`
@@ -169,12 +155,12 @@ function deactivatetool!(player::Player)
 end
 
 """
-    activatetool!(player, name) -> ToolContext | nothing
+    activatetool!(player, name) -> ctx
 
-Run what clicking tool `name`'s header does. Tools that stay ON (the loop finder
-draws hints and reads clicks) hold the armed slot until clicked again; tools that
-just DO something (blend) act and hand the slot straight back — a card's body
-content does not depend on this either way, it is built by the tool's `panel`.
+Run what a card's action does. Kinds that stay ON (the loop finder draws hints
+and reads clicks) hold the active slot until asked again; kinds that just DO
+something (blend) act and hand it straight back — a card's body does not depend
+on this either way, it is built by the kind's `body`.
 """
 function activatetool!(player::Player, name::Symbol)
     cur = activetool(player)
@@ -184,137 +170,20 @@ function activatetool!(player::Player, name::Symbol)
         return nothing
     end
     deactivatetool!(player)
-    tool = TOOLBYNAME[name]
+    tool = kindbyname(name)
+    tool === nothing && return nothing
     ctx = ToolContext(player, name)
     player.fxwidgets[:activetool] = (tool, ctx)
     activetoolname(player)[] = name
-    tool.activate(ctx)
+    tool.activate === nothing || tool.activate(ctx)
     return ctx
 end
 
-# --------------------------------------------------------------- Tools panel
-
-"The Tools dock: one CARD per registered tool — the same section visual as the
-inspector's effect stack. The header row [▾ · Tool name] arms the tool (click
-again puts it away); the body holds the tool's description, its OWN action slot
-and its OWN preview cards, so nothing of one tool renders under another's.
-Rebuilt live on [`registertool!`](@ref)."
-function buildtoolspanel!(player::Player, gridpos, uicolors)
-    # tellheight = TRUE on purpose: the dock is a scrollable Subfigure and derives
-    # its content size from the layout's determined height. With the height hidden
-    # the Subfigure thought the content was 0 tall, so nothing scrolled and long
-    # cards were simply cut off at the bottom.
-    panel = GridLayout(gridpos; valign = :top)
-    Label(panel[1, 1], "Tools"; font = :bold, halign = :left, tellwidth = false)
-    rows = GridLayout(panel[2, 1])
-    colsize!(panel, 1, Makie.Relative(1.0))
-    active = activetoolname(player)
-    built = Any[]
-    folded = Dict{Symbol, Bool}()
-    actionslots = Dict{Symbol, Any}()   # tool name → its body control slot
-    rowslots = Dict{Symbol, Any}()      # tool name → its body LIST rows
-    cardslots = Dict{Symbol, Any}()     # tool name → its body image-card rows
-    panelctxs = Dict{Symbol, ToolContext}()   # tool name → its always-on card content
-    cardbg = Makie.lerp_oklab(RGBf(Makie.to_color(uicolors.background)),
-                              RGBf(1, 1, 1), 0.075)
-    scene = player.dockpanels[:tools].sf.scene
-    cards = Any[]   # (id, box, im, label, onclick, removebtn) — image cards
-    player.fxwidgets[:toolslots] = (actionslots, rowslots)
-    player.fxwidgets[:toolcards] = (cardslots, scene, cards)
-    player.fxwidgets[:toolpanels] = panelctxs
-    function rebuild()
-        for ctx in values(panelctxs)     # drop the previous cards' content + listeners
-            cleartoolcontext!(ctx)
-        end
-        # …and the cards themselves. Their image plots live in the DOCK SCENE, not
-        # in the panel layout, so rebuilding the panels leaves them drawn: after
-        # "Remove matte" a mark's thumbnail kept floating between two other tools'
-        # cards, belonging to nothing.
-        cleartoolcards!(player)
-        empty!(panelctxs)
-        foreach(Makie.delete!, built)
-        empty!(built)
-        empty!(actionslots); empty!(rowslots); empty!(cardslots)
-        for (k, tool) in enumerate(TOOLS)
-            open = !get(folded, tool.name, false)
-            card = GridLayout(rows[k, 1])
-            push!(built, card)
-            Box(card[1:(open ? 2 : 1), 1]; color = cardbg,
-                strokecolor = uicolors.border, strokewidth = 1, cornerradius = 6,
-                tellwidth = false, tellheight = false)
-            Box(card[1, 1]; color = uicolors.surface, strokewidth = 0,
-                cornerradius = 5, tellwidth = false, tellheight = false)
-            hgl = GridLayout(card[1, 1]; alignmode = Makie.Outside(8, 8, 5, 5))
-            fold = Button(hgl[1, 1]; label = open ? "▾" : "▸", width = 24)
-            on(fold.clicks) do _
-                folded[tool.name] = open
-                activetoolname(player)[] === tool.name && deactivatetool!(player)
-                rebuild()
-            end
-            arm = Button(hgl[1, 2]; label = tool.label, tellwidth = false,
-                         width = Makie.Relative(1.0), halign = :left, font = :bold)
-            on(_ -> activatetool!(player, tool.name), arm.clicks)
-            on(active; update = true) do a
-                armed = a === tool.name
-                arm.buttoncolor[] = armed ? uicolors.accent : uicolors.surface
-                arm.labelcolor[] = armed ? uicolors.text_on_accent : uicolors.text
-            end
-            colsize!(card, 1, Makie.Relative(1.0))
-            open || continue
-            body = GridLayout(card[2, 1]; alignmode = Makie.Outside(10, 10, 10, 6))
-            # `halign` places the BLOCK; `justification` sets the lines inside it,
-            # and its default centres them — which is why a wrapped description
-            # read as ragged centred text floating in the card instead of a
-            # left-aligned paragraph under the header.
-            Label(body[1, 1], wraptext(tool.description); fontsize = 11, halign = :left,
-                  justification = :left, color = uicolors.text_muted, tellwidth = false)
-            # A slot starts EMPTY, and an empty GridLayout has no determinable
-            # height — which makes the whole card, the panel and finally the dock's
-            # content size indeterminate, so the Subfigure never scrolls and long
-            # cards are simply cut off. A zero-size spacer in a side column keeps
-            # every slot measurable while claiming nothing.
-            actionslots[tool.name] = measurable!(GridLayout(body[2, 1]))
-            rowslots[tool.name] = measurable!(GridLayout(body[3, 1]))
-            cardslots[tool.name] = measurable!(GridLayout(body[4, 1]))
-            # the card shows the PROJECT's state, not the tool's mode: its content
-            # is built now and stays, armed or not
-            ctx = ToolContext(player, tool.name)
-            panelctxs[tool.name] = ctx
-            try
-                tool.panel(ctx)
-            catch e
-                @error "tool panel failed" tool = tool.name exception = (e, catch_backtrace())
-            end
-        end
-        return
-    end
-    on(_ -> rebuild(), TOOLSVERSION)
-    rebuild()
-    on(active) do a   # activating a folded tool unfolds its card first
-        (a !== :none && get(folded, a, false)) || return
-        folded[a] = false
-        rebuild()
-    end
-    # one shared click handler: hit-test the image cards in figure pixels
-    on(events(player.fig).mousebutton; priority = 30) do event
-        (event.button == Mouse.left && event.action == Mouse.press &&
-         player.dockopen[] === :tools && !isempty(cards)) || return Consume(false)
-        # cards are hit-tested by bbox, which cannot see an overlay (modal,
-        # dropdown) drawn on top of them — Makie's event routing can
-        Makie.receives_events(player.dockpanels[:tools].sf.scene) || return Consume(false)
-        mp = events(player.fig).mouseposition[]
-        for (id, frame, _, _, onclick, _, _) in cards
-            bb = frame.layoutobservables.computedbbox[]
-            if bb.origin[1] <= mp[1] <= bb.origin[1] + bb.widths[1] &&
-               bb.origin[2] <= mp[2] <= bb.origin[2] + bb.widths[2]
-                onclick === nothing || onclick(id)
-                return Consume(true)
-            end
-        end
-        return Consume(false)
-    end
-    return panel
-end
+# The Tools dock is gone. `buildtoolspanel!` built a second card list, with its
+# own fold state and its own copy of the panel machinery, into a dock beside the
+# Inspector — and since both wrote `player.fxwidgets[:toolslots]`, whichever
+# rebuilt last owned the slots every tool body then built into. The card bodies
+# below are unchanged; the Effects panel builds them (`withtoolslots!`).
 
 """
 Make an (initially empty) layout report a height: GridLayoutBase treats a layout
@@ -326,28 +195,45 @@ function measurable!(gl)
     return gl
 end
 
-"The card slot (`:controls` or `:rows`) this context fills, or `nothing`."
+"""
+The card slot this context fills, or `nothing`: `:controls` above the card list,
+`:rows` the list itself, `:footer` below it.
+"""
 function toolslot(ctx::ToolContext, which::Symbol)
     slots = get(ctx.player.fxwidgets, :toolslots, nothing)
     slots === nothing && return nothing
-    return get(which === :rows ? slots[2] : slots[1], ctx.tool, nothing)
+    d = which === :rows ? slots[2] : which === :footer ? slots[3] : slots[1]
+    return get(d, ctx.tool, nothing)
 end
 
 """
-    toolaction!(ctx, label, callback)
+    toolaction!(ctx, label, callback; footer = false)
 
 Add an action button to this tool's card. Repeated calls STACK, in call order;
 `ctx.callbacks` addresses them for tests and MCP.
+
+`footer = true` puts it BELOW the tool's cards instead of above them — for the
+action that consumes the whole list ("Apply matte to clip" under the frames that
+were marked), which above the list reads as a control for something else.
 """
-function toolaction!(ctx::ToolContext, label::AbstractString, callback)
-    slot = toolslot(ctx, :controls)
+function toolaction!(ctx::ToolContext, label::AbstractString, callback;
+                     footer::Bool = false)
+    slot = toolslot(ctx, footer ? :footer : :controls)
     slot === nothing && return nothing
     push!(ctx.callbacks, callback)
     i = length(ctx.callbacks)
-    b = Button(slot[length(ctx.controls) + 1, 1]; label = String(label), tellwidth = false,
+    # Controls stack by `ctx.controls`; the footer counts its own slot, because a
+    # footer button in `ctx.controls` would advance the CONTROL row too and leave
+    # a gap — and one empty row makes a layout indeterminate, which collapses the
+    # whole card.
+    r = footer ? count(c -> c.content isa Button, slot.content) + 1 :
+                 length(ctx.controls) + 1
+    b = Button(slot[r, 1]; label = String(label), tellwidth = false,
                width = Makie.Relative(1.0))
     on(_ -> (f = ctx.callbacks[i]; f === nothing || f()), b.clicks)
-    push!(ctx.controls, b)
+    # cleanup goes through `ctx.rows` for a footer so the control row count stays
+    # exactly the number of controls
+    push!(footer ? ctx.rows : ctx.controls, b)
     return b
 end
 
@@ -450,6 +336,57 @@ function toolrows!(ctx::ToolContext, entries::Vector)
 end
 
 """
+    toolcard!(build, ctx; caption, onremove) -> card
+
+ONE card holding a whole feature: a header row `[caption … ×]` and, under it,
+whatever `build(body, blocks)` puts in the `body` layout — labels, buttons,
+checkboxes, a picture. Everything the callback creates goes into `blocks` so the
+next rebuild can delete it.
+
+The card is the unit the user acts on, so the × belongs to the card and not to a
+picture inside it: closing it takes the whole feature off the clip.
+"""
+function toolcard!(build::Function, ctx::ToolContext; caption::AbstractString = "",
+                   onremove = nothing)
+    tc = get(ctx.player.fxwidgets, :toolcards, nothing)
+    tc === nothing && return 0
+    cardslots, scene, cards = tc
+    cardrows = get(cardslots, ctx.tool, nothing)
+    cardrows === nothing && return 0
+    colors = ctx.player.timeline.colors
+    cardbg = Makie.lerp_oklab(RGBf(Makie.to_color(colors.background)), RGBf(1, 1, 1), 0.075)
+    id = length(cards) + 1
+    cell = cardrows[id, 1]
+    frame = Box(cell; color = cardbg, strokecolor = colors.border, strokewidth = 1,
+                cornerradius = 6, tellwidth = false, tellheight = false)
+    # The header spans the card EDGE TO EDGE — the outer layout carries no padding
+    # and the two rows bring their own. Inset by the body's margin it read as a
+    # label floating inside the card rather than as the card's own title bar, which
+    # is what the effect cards above it look like.
+    g = GridLayout(cell)
+    blocks = Any[]
+    push!(blocks, Box(g[1, 1]; color = colors.surface, strokewidth = 0, cornerradius = 5,
+                      tellwidth = false, tellheight = false))
+    head = GridLayout(g[1, 1]; alignmode = Makie.Outside(8, 6, 4, 4))
+    lbl = Label(head[1, 1], String(caption); fontsize = 11, halign = :left,
+                color = (colors.text, 0.75), tellwidth = false)
+    rm = nothing
+    if onremove !== nothing
+        rm = Button(head[1, 2]; label = "×", width = 22, height = 20)
+        on(_ -> onremove(id), rm.clicks)
+    end
+    # Registered BEFORE the content is built, and `blocks` is the same vector the
+    # builder appends to: a build that throws (or one superseded while an async
+    # preview lands) then still leaves everything it made in the teardown list.
+    # Orphaned scene plots do not just leak — they keep drawing, stacked over the
+    # card that replaced them.
+    entry = (; id, frame, im = nothing, lbl, onclick = nothing, rm, box = nothing, blocks)
+    push!(cards, entry)
+    build(GridLayout(g[2, 1]; alignmode = Makie.Outside(8, 8, 6, 8)), blocks)
+    return entry
+end
+
+"""
     tooladdcard!(ctx, img; caption = "", onclick = nothing, onremove = nothing) -> id
 
 Append a preview card (image + caption) to the active tool's card area in its
@@ -497,9 +434,16 @@ function tooladdcard!(ctx::ToolContext, img::AbstractMatrix{RGB{N0f8}};
     end
     im = image!(scene, lift(v -> (v[1], v[2]), xy), lift(v -> (v[3], v[4]), xy), imgobs;
                 space = :pixel, interpolate = true,
-                visible = lift(d -> d === :tools, ctx.player.dockopen))
+                visible = lift(d -> d === :effects, ctx.player.dockopen))
     translate!(im, 0, 0, 20)
-    push!(cards, (id, frame, im, lbl, onclick, rm, box))
+    # NAMED, like the entry `toolcard!` registers: everything that reads this list
+    # reads it by field (`c.onclick`, `c.frame`, `c.blocks`), so a positional tuple
+    # here made every click on the tools panel throw a `FieldError` instead.
+    # `blocks` is empty because the teardown loop already names every block this
+    # card made (frame, box, lbl, im, rm) — but the field has to BE there: the
+    # list is read by field, so a positional tuple made every click on the tools
+    # panel throw a `FieldError` instead of selecting a card.
+    push!(cards, (; id, frame, im, lbl, onclick, rm, box, blocks = Any[]))
     return id
 end
 
@@ -521,13 +465,22 @@ function cleartoolcards!(player::Player)
     tc = get(player.fxwidgets, :toolcards, nothing)
     tc === nothing && return nothing
     _, scene, cards = tc
-    for (_, frame, im, lbl, _, rm, box) in cards
-        try
-            Makie.delete!(frame); Makie.delete!(box); Makie.delete!(lbl)
-            Makie.delete!(scene, im)
-            rm === nothing || Makie.delete!(rm)
-        catch
+    for c in cards
+        for b in (c.frame, c.box, c.lbl, c.im, c.rm, c.blocks...)
+            b === nothing && continue
+            try
+                b isa Makie.AbstractPlot ? Makie.delete!(scene, b) : Makie.delete!(b)
+            catch
+            end
         end
+    end
+    # …and a SWEEP. Every card picture is a plot in this scene and every one of
+    # them is recreated by the rebuild that follows, so anything still here is an
+    # orphan: a card built but never registered, or one whose blocks list this
+    # loop did not know about. An orphan does not merely leak — it keeps drawing,
+    # at its old rectangle, stacked over the card that replaced it.
+    for pl in copy(scene.plots)
+        pl isa Makie.Image && (try Makie.delete!(scene, pl) catch end)
     end
     empty!(cards)
     return nothing
@@ -580,7 +533,7 @@ function showloopmarkers!(ctx::ToolContext)
     return nothing
 end
 
-"▼ click: CUT the timeline at that hint (undoable) — the tool stays armed."
+"▼ click: CUT the timeline at that hint (undoable) — the tool stays active."
 function loopcutat!(ctx::ToolContext, k::Integer)
     player = ctx.player
     st = ctx.state
@@ -1127,7 +1080,7 @@ function activateblend!(ctx::ToolContext)
                     fit = blendfit(player))
         markpair!(player, i, j)
     end
-    deactivatetool!(player)   # nothing stays armed — the card keeps showing the blends
+    deactivatetool!(player)   # nothing stays active — the card keeps showing the blends
     return nothing
 end
 
@@ -1170,14 +1123,14 @@ function stabilizepanel!(ctx::ToolContext)
     return nothing
 end
 
-"Run (or arm) the analysis the Stabilize card is set to."
+"Run the analysis the Stabilize card is set to (object lock waits for a click first)."
 function runstabilize!(ctx::ToolContext)
     player = ctx.player
     player.stabinfo[] == "analyzing…" &&
         return setstatus!(player, "analysis already running — progress in the bottom right")
     mode = get(ctx.state, :mode, :similarity)
     if mode === :objectlock
-        armpick!(player)      # the next preview click picks the subject to lock on
+        startobjectpick!(player)      # the next preview click picks the subject to lock on
     else
         analyzeat!(player, (c; kwargs...) ->
                        analyzemotion!(c; mode, backend = player.analysisbackend, kwargs...),
@@ -1186,12 +1139,15 @@ function runstabilize!(ctx::ToolContext)
     return nothing
 end
 
-registertool!(:stabilize, "Stabilize",
-    "Locks the SELECTED clip. Camera lock holds the framing like a tripod. " *
-    "Object lock keeps one subject still — click it in the preview afterwards. " *
-    "Smooth keeps the camera moves and only takes the shake out.";
-    panel = stabilizepanel!, activate = ctx -> (runstabilize!(ctx);
-                                                deactivatetool!(ctx.player)))
+registereffect!(EffectKind(:stabilize, "Stabilize";
+    description = "Locks the SELECTED clip. Camera lock holds the framing like a tripod. " *
+        "Object lock keeps one subject still — click it in the preview afterwards. " *
+        "Smooth keeps the camera moves and only takes the shake out.",
+    make = _ -> StabilizeEffect(),
+    matches = e -> e isa StabilizeEffect,
+    read = _ -> NamedTuple(),
+    body = stabilizepanel!,
+    activate = ctx -> (runstabilize!(ctx); deactivatetool!(ctx.player))))
 
 # --------------------------------------------------------------- Flicker tool
 
@@ -1236,7 +1192,7 @@ function flickerpanel!(ctx::ToolContext)
         (loc === nothing || loc[1].colortrack === nothing) &&
             return setstatus!(player, "no flicker fix on this clip")
         snapshot!(player)
-        loc[1].colortrack = nothing
+        setcolortrack!(loc[1], nothing)
         notify(player.playhead)
         setstatus!(player, "flicker fix removed (Ctrl+Z restores)")
     end)
@@ -1262,20 +1218,35 @@ function runflickerfix!(ctx::ToolContext)
     return nothing
 end
 
-registertool!(:flicker, "Fix flicker",
-    "Evens out exposure/colour jitter on the SELECTED clip: everything faster " *
-    "than the cutoff is treated as flicker, slower changes survive.";
-    panel = flickerpanel!, activate = runflickerfix!)
+registereffect!(EffectKind(:flicker, "Fix flicker";
+    description = "Evens out exposure/colour jitter on the SELECTED clip: everything faster " *
+        "than the cutoff is treated as flicker, slower changes survive.",
+    params = [FxParam(:strength, "Strength"; min = 0.0, max = 1.0, default = 1.0)],
+    kfkeys = [:flicker_strength],
+    make = nt -> FlickerEffect(Float32(nt.strength)),
+    matches = e -> e isa FlickerEffect,
+    read = e -> (strength = Float64(e.strength),),
+    body = flickerpanel!, activate = runflickerfix!))
 
-registertool!(:loopfinder, "Loop finder",
-    "Each reference card holds one frame; ▼ hints on the thumb track mark the " *
-    "frames most similar to the SELECTED card — click a ▼ to cut there. " *
-    "Find adds the playhead frame as another reference.";
-    activate = activateloopfinder!)
+registereffect!(EffectKind(:loopfinder, "Loop finder";
+    description = "Each reference card holds one frame; ▼ hints on the thumb track mark the " *
+        "frames most similar to the SELECTED card — click a ▼ to cut there. " *
+        "Find adds the playhead frame as another reference.",
+    make = _ -> LoopFinderEffect(),
+    matches = e -> e isa LoopFinderEffect,
+    read = _ -> NamedTuple(),
+    activate = activateloopfinder!, analysis = true))
 
-registertool!(:blend, "Blend clips",
-    "Mark two clips (Shift+click), then click this header — the later clip fades in.";
-    panel = blendpanel!, activate = activateblend!)
+registereffect!(EffectKind(:blend, "Blend clips";
+    description = "Mark two clips (Shift+click), then press the button — the later clip " *
+        "fades in. The two halves link to each other, so each card shows the other's " *
+        "fade next to its own.",
+    params = [FxParam(:seconds, "Length (s)"; min = 0.1, max = 3.0, default = 0.6)],
+    kfkeys = [:blend_seconds],
+    make = nt -> BlendEffect(Float64(nt.seconds)),
+    matches = e -> e isa BlendEffect,
+    read = e -> (seconds = e.seconds,),
+    body = blendpanel!, activate = activateblend!, analysis = true))
 
 # ----------------------------------------------------------------- Matte tool
 
@@ -1296,44 +1267,453 @@ step, and its `Matte`/`Feather` sliders are keyframable like any other param.
 """
 function mattepanel!(ctx::ToolContext)
     player = ctx.player
+    loc = editclip(player)
+    clip = loc === nothing ? nothing : loc[1]
     toollabel!(ctx, player.matteinfo)
-    # WHICH seed the clicks will produce. The difference between an object
-    # boundary and a painted disc decides the quality of the whole matte, so it
-    # is not a detail to leave the user guessing at — and when the weights are
-    # missing, saying so is the only way anyone would know why it got worse.
-    toollabel!(ctx, player.segmenter === nothing ?
-                    "seed: discs (no SAM 2 weights) — DRAG to cover the subject" :
-                    "seed: $(seedbackendname(player.segmenter)) — click the subject")
-    # the button says what it DOES; how to work it belongs in the description,
-    # which has room to wrap — a Button label has none and simply overflows
-    toolaction!(ctx, "Mark subject", () -> armmattepick!(ctx))
-    toolaction!(ctx, "Re-propagate", () -> runmatte!(ctx))
-    toolaction!(ctx, "Remove matte", () -> removematte!(player))
-    refreshmattecards!(ctx)
-    # Opening the panel is the earliest honest signal that a matte is coming, and
-    # the user is still deciding where to click — much better than paying the
-    # model's one-time specialization cost on their first mark.
-    if hasmattemodel() && !MATTEWARMED[]
-        # at the resolution `analyzematte!` will actually use for this clip
-        # Must match `analyzematte!`'s own sizing exactly, `min` clamp included:
-        # warming the wrong tile shapes buys nothing, because the GEMM
-        # specializes per tile and the real clip then pays the stall anyway.
-        loc0 = editclip(player)
-        mw, mh = if loc0 === nothing
-            480, 270
-        else
-            sw, sh = loc0[1].source.width, loc0[1].source.height
-            w = min(480, sw)
-            w, max(1, round(Int, sh * w / sw))
+    col = mattecollect(player)
+    marking = col !== nothing && clip !== nothing && col.clip === clip
+    marks = clip === nothing ? Dict{Int, Matrix{UInt8}}() : mattemarks(player, clip)
+    if clip === nothing || (!marking && isempty(marks) && clip.mattetrack === nothing)
+        # no card on this clip: drop the published one too, or "is there a card?"
+        # keeps answering yes with a handle to blocks that no longer exist
+        delete!(player.fxwidgets, :mattecard)
+        toolaction!(ctx, "Mark subject", () -> startmattepick!(ctx))
+        warmmattepanel!(ctx)
+        return nothing
+    end
+    matteviewrow!(ctx)
+    # one card per marked frame, plus the frame being marked — its points are not
+    # a mark yet, they become one when the session is committed
+    frames = collect(keys(marks))
+    marking && !(col.srcframe in frames) && push!(frames, col.srcframe)
+    sort!(frames)
+    live = nothing
+    for f in frames
+        w = matteseedcard!(ctx, clip, f, marking && col.srcframe == f)
+        w.live && (live = w)
+    end
+    # published so a click during marking can repaint the live card's pills in
+    # place — a full rebuild per click loses the one arriving mid-rebuild
+    live === nothing ? delete!(player.fxwidgets, :mattecard) :
+                       (player.fxwidgets[:mattecard] = live)
+    toolaction!(ctx, "Apply matte to clip", () -> applymattenow!(ctx, clip); footer = true)
+    warmmattepanel!(ctx)
+    return nothing
+end
+
+"""
+The preview's picture while a matte is being made: the finished matte, or SAM 2's
+segmentation with each object outlined in its colour.
+
+On the PANEL rather than in a card, because it is one state for the whole clip —
+with one card per marked frame there is no card that owns it.
+"""
+function matteviewrow!(ctx::ToolContext)
+    slot = toolslot(ctx, :controls)
+    slot === nothing && return nothing
+    player = ctx.player
+    v = mattecardview(player)[]
+    row = GridLayout(slot[length(ctx.controls) + 1, 1])
+    off = Makie.RGBf(0.22, 0.23, 0.26)
+    b1 = Button(row[1, 1]; label = "Matte", fontsize = 11, height = 22, tellwidth = false,
+                width = Makie.Relative(1.0), buttoncolor = v === :matte ? MATTECOLORS[2] : off)
+    b2 = Button(row[1, 2]; label = "SAM 2", fontsize = 11, height = 22, tellwidth = false,
+                width = Makie.Relative(1.0), buttoncolor = v === :sam2 ? MATTECOLORS[2] : off)
+    on(_ -> setmatteview!(player, :matte), b1.clicks)
+    on(_ -> setmatteview!(player, :sam2), b2.clicks)
+    # EXACTLY ONE entry, like every other control helper: the next control's row
+    # is `length(ctx.controls) + 1`, so pushing the two buttons as well left rows
+    # 3 and 4 empty — and an empty row makes the whole layout indeterminate, which
+    # collapsed the effect card to a 64 px sliver. `delete!` on a GridLayout
+    # recurses into its content, so the buttons still get cleaned up with it.
+    push!(ctx.controls, row)
+    return (b1, b2)
+end
+
+"""
+Apply: commit whatever is being marked, then propagate across the clip.
+
+A marking session's points are not marks yet — they become one when the session
+ends — so applying mid-marking used to find an empty mark dict and answer "mark
+the subject on a frame first" at somebody who had just marked two birds.
+Committing IS what Apply means here.
+"""
+function applymattenow!(ctx::ToolContext, clip::Clip)
+    c = mattecollect(ctx.player)
+    if c !== nothing && c.clip === clip && !isempty(c.points)
+        finishmattecollect!(c)
+    else
+        runmatte!(ctx; clip = clip)
+    end
+    return nothing
+end
+
+"""
+Which view the matte card and the preview are showing: `:matte`, the finished
+result, or `:sam2`, the segmentation with each object outlined in its colour. One
+state, because they are two ways of looking at the same thing and never both.
+
+On the PLAYER, not on the tool context: the dock rebuilds every panel context from
+scratch on each refresh, so a control that wrote its state there would have it
+discarded by the very rebuild it triggered — the toggle flipped back on screen and
+nothing ever changed.
+"""
+mattecardview(player::Player) = get!(() -> Ref(:matte), player.fxwidgets, :matteview)
+
+"""
+Every frame the user marked on this clip, keyed by source frame.
+
+Held next to the player rather than on the track because a mark is an input to
+propagation and the track is its output: re-running must see every mark, not the
+seed frames the last run happened to record. Keyed by clip id so it survives
+sorting and undo.
+"""
+mattemarks(player::Player, clip::Clip) =
+    get!(() -> Dict{Int, Matrix{UInt8}}(), player.mattemarks, clip.id)
+
+"""
+Propagate the marks across the clip, on the analysis backend, off the UI thread.
+
+The reader is the clip's own post-fx frame stream, so the model tracks the
+subject through the stabilised, cropped picture the user is looking at.
+"""
+function runmatte!(ctx::ToolContext; clip = nothing, seeds = nothing)
+    player = ctx.player
+    if clip === nothing
+        loc = editclip(player)
+        loc === nothing && return setstatus!(player, "matte: no clip under the playhead")
+        clip = loc[1]
+    end
+    marks = seeds === nothing ? mattemarks(player, clip) : seeds
+    isempty(marks) &&
+        return setstatus!(player, "matte: mark the subject on a frame first")
+    player.matteinfo[] == "matting…" &&
+        return setstatus!(player, "matte: already running — progress in the bottom right")
+    player.matteinfo[] = "matting…"
+    setstatus!(player, "matte: propagating from $(length(marks)) marked frame(s)")
+    runanalysis(player) do
+        try
+            reader = framereader(clip, player.engine)
+            track = analyzematte!(clip, reader, marks; progress = (d, t) -> begin
+                player.jobprogress[] = d / max(t, 1)
+            end)
+            put!(player.uiqueue, () -> begin
+                freematteplanes!(track)
+                findeffect(clip, MatteEffect) === nothing &&
+                    push!(clip.effects, FxSlot(MatteEffect()))
+                cov = mattecoverage(track)
+                player.matteinfo[] = "matte: $(length(track.seeds)) marked frame(s), " *
+                                     "$(size(track.alpha, 3)) frames, " *
+                                     "$(round(Int, 100cov))% kept"
+                player.jobprogress[] = NaN
+                refreshmattepanel!(player)
+                notify(player.playhead)
+                # A matte that keeps everything (or nothing) renders as no visible
+                # change, which reads as a broken tool — so report the number.
+                setstatus!(player, if cov > 0.97 || cov < 0.02
+                        "matte covers $(round(Int, 100cov))% of the frame — mark more of " *
+                        "the subject, or a background point where it spills"
+                    else
+                        "matte ready — Matte/Feather are keyframable in the inspector"
+                    end)
+            end)
+        catch e
+            put!(player.uiqueue, () -> begin
+                player.matteinfo[] = "matte failed"
+                player.jobprogress[] = NaN
+                setstatus!(player, "matte failed: $(sprint(showerror, e))")
+            end)
         end
-        player.matteinfo[] = "warming up the model…"
-        runanalysis(player; gpu = hasmattemodel()) do
-            try
-                warmmatte!(mw, mh)
-                put!(player.uiqueue, () -> (player.matteinfo[] = "ready — mark the subject"))
-            catch e
-                put!(player.uiqueue, () -> (player.matteinfo[] = "model warm-up failed"))
+    end
+    return nothing
+end
+
+"""
+The card's ×: take the matte off this clip completely — a marking session in
+progress, the marks it collected, the propagated track and the effect slot. The
+card exists from the first click on, so this is also how you abandon one.
+"""
+function removematte!(player::Player)
+    loc = editclip(player)
+    loc === nothing && return setstatus!(player, "matte: no clip under the playhead")
+    clip = loc[1]
+    snapshot!(player)          # track, marks and the effect all come back together
+    col = mattecollect(player)
+    col === nothing || col.clip !== clip || cancelmattecollect!(col)
+    clip.mattetrack === nothing || freematteplanes!(clip.mattetrack)
+    clip.mattetrack = nothing
+    delete!(player.mattemarks, clip.id)
+    i = findfirst(s -> s.effect isa MatteEffect, clip.effects)
+    i === nothing || deleteat!(clip.effects, i)
+    player.matteinfo[] = "no matte"
+    refreshmattepanel!(player; structure = true)
+    notify(player.playhead)
+    setstatus!(player, "matte removed")
+    return nothing
+end
+
+"""
+Colours for matte objects, cycled. The SAME colour identifies an object's points
+in the preview, its bar in the card and its outline in the SAM 2 view — that is
+the whole feedback that `+ object` did something.
+"""
+const MATTECOLORS = (RGBf(0.35, 0.86, 0.36), RGBf(0.30, 0.66, 1.00), RGBf(1.00, 0.78, 0.25),
+                     RGBf(0.98, 0.45, 0.85), RGBf(0.40, 0.95, 0.90), RGBf(1.00, 0.55, 0.30))
+
+mattecolor(obj::Integer) = MATTECOLORS[mod1(Int(obj), length(MATTECOLORS))]
+
+"""
+The object ids present in `points`, in the order the objects were started.
+[`mattegroups`](@ref) orders its groups the same way, so group *i* is object
+`matteobjectids(points)[i]` — the card used to recover the id with `unique`,
+which is first-appearance order and disagrees the moment an object is deleted.
+"""
+matteobjectids(points::AbstractVector{<:Tuple{<:Real, <:Real, Bool, Int}}) =
+    sort!(unique(q[4] for q in points))
+
+"""
+Which objects the card shows for a live marking session: every object with a
+point, plus the one `+ object` just started. That last one has nothing in
+`points` yet and would otherwise be invisible — pressing `+ object` would look
+like it did nothing until the next click landed.
+"""
+function mattecardobjects(col)
+    ids = matteobjectids(col.points)
+    col.object > 0 && !(col.object in ids) && push!(ids, col.object)
+    return ids
+end
+
+"""
+ONE card for ONE marked frame: which objects were marked there, and the × that
+un-marks that frame.
+
+Per FRAME because a mark is per frame. Propagation drifts, you go back, you mark
+another frame — the list of marks is the list of corrections, and each one has to
+be removable on its own. This × used to take the entire matte off the clip
+instead, so "drop this correction" deleted all the work; taking the whole effect
+off is the effect card's own ×, one level up.
+"""
+function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::Bool)
+    player = ctx.player
+    # the FULL palette (the timeline's is a six-colour subset with no `text_muted`)
+    colors = player.fxwidgets[:uicolors]
+    col    = live ? mattecollect(player) : nothing
+    ids    = col === nothing ? Int[] : mattecardobjects(col)
+    pillwidgets = Any[]
+
+    card = toolcard!(ctx; caption = "frame $seedframe",
+                     onremove = _ -> removematteseed!(player, clip, seedframe)) do g, blocks
+        r = 0
+        if col !== nothing
+            # One PILL per object, in that object's own colour — the same colour
+            # its points have in the preview and its outline has in the SAM 2
+            # view. Selected is a brighter fill plus its own outline, so "which
+            # object do my clicks land in" is answerable without reading text.
+            # `measurable!`: an empty nested layout has no determinable height, and
+            # one such cell makes the whole card indeterminate.
+            pills = measurable!(GridLayout(g[r += 1, 1]))
+            for (k, id) in enumerate(ids)
+                n = count(q -> q[4] == id, col.points)
+                # lit = WHERE THE NEXT CLICK LANDS (`object`), not `selected`,
+                # which is the isolate-its-dots toggle. A fresh session and a
+                # fresh `+ object` both light their pill at once, so pressing it
+                # visibly did something before any point exists.
+                sel = col.object == id
+                base = mattecolor(id)
+                fill = Makie.lerp_oklab(RGBf(Makie.to_color(colors.background)), base,
+                                        sel ? 0.55 : 0.16)
+                pill = Button(pills[k, 1]; label = "$n point$(n == 1 ? "" : "s")",
+                              fontsize = 11, height = 24, tellwidth = false,
+                              width = Makie.Relative(1.0), cornerradius = 12,
+                              buttoncolor = fill,
+                              buttoncolor_hover = Makie.lerp_oklab(RGBf(Makie.to_color(colors.background)),
+                                                                   base, 0.35),
+                              buttoncolor_active = base,
+                              labelcolor = sel ? RGBf(0.09, 0.09, 0.10) : colors.text,
+                              strokewidth = sel ? 2 : 1,
+                              strokecolor = sel ? base : (base, 0.4))
+                on(_ -> selectmatteobject!(player, id), pill.clicks)
+                bx = Button(pills[k, 2]; label = "×", fontsize = 11, width = 22, height = 24,
+                            buttoncolor = (:transparent, 0.0), strokewidth = 0,
+                            labelcolor = colors.text_muted,
+                            buttoncolor_hover = Makie.lerp_oklab(RGBf(Makie.to_color(colors.background)),
+                                                                 RGBf(1, 0.4, 0.35), 0.35))
+                on(_ -> deletematteobject!(player, id), bx.clicks)
+                push!(blocks, pill, bx)
+                push!(pillwidgets, (; object = id, pill, remove = bx))
             end
+            colsize!(pills, 1, Makie.Auto(false, 1.0))
+            # An explicit height for the pill row: without it the nested layout
+            # reported one row's worth however many pills it held, and everything
+            # below was laid straight over the ones that did not fit.
+            isempty(ids) || rowsize!(g, r, Makie.Fixed(28 * length(ids)))
+
+            # UNDER the pills, because that is where the thing it makes appears.
+            # Further clicks on a subject REFINE it — that is what SAM 2 does with
+            # several positive points — so "this is a different thing" has to be
+            # said, not guessed.
+            newobj = Button(g[r += 1, 1]; label = "+ object", fontsize = 11, height = 24,
+                            tellwidth = false, width = Makie.Relative(1.0),
+                            cornerradius = 12, buttoncolor = (:transparent, 0.0),
+                            strokewidth = 1, strokecolor = (colors.text, 0.28),
+                            labelcolor = colors.text_muted,
+                            buttoncolor_hover = colors.surface)
+            on(newobj.clicks) do _
+                c = mattecollect(player)
+                c === nothing && return setstatus!(player, "matte: mark a subject first")
+                c.object = (isempty(c.points) ? 0 : maximum(q[4] for q in c.points)) + 1
+                c.selected = c.object
+                refreshmattepanel!(player; structure = true)
+                setstatus!(player, "matte: object $(c.object) — click the next subject")
+            end
+            push!(blocks, newobj)
+        else
+            # Not the frame being marked: the way back to it. `gotomatteseed!`
+            # moves the playhead AND starts marking, which is the whole reason to
+            # press it — so there is no separate "edit points" button.
+            jump = Button(g[r += 1, 1]; label = "go to frame $seedframe", fontsize = 11,
+                          height = 24, tellwidth = false, width = Makie.Relative(1.0))
+            on(_ -> gotomatteseed!(ctx, clip, seedframe), jump.clicks)
+            push!(blocks, jump)
+        end
+        nothing
+    end
+    return (; clip, srcframe = Int(seedframe), live,
+            nobj = length(ids), pills = pillwidgets,
+            removebtn = card === 0 ? nothing : card.rm)
+end
+
+"""
+Un-mark ONE frame: the selection made there goes, the rest of the matte stays.
+
+The effect, the other marks and the propagated track are untouched — removing a
+correction must not delete the work it was correcting. When the LAST mark goes
+the track is dropped too, because nothing the user asked for derives it any more,
+but the effect slot stays: its × is the one that means "take this off the clip".
+"""
+function removematteseed!(player::Player, clip::Clip, frame::Integer)
+    snapshot!(player)
+    col = mattecollect(player)
+    col === nothing || col.clip !== clip || col.srcframe != Int(frame) || cancelmattecollect!(col)
+    marks = mattemarks(player, clip)
+    delete!(marks, Int(frame))
+    if isempty(marks)
+        clip.mattetrack === nothing || freematteplanes!(clip.mattetrack)
+        clip.mattetrack = nothing
+        player.matteinfo[] = "no matte"
+        setstatus!(player, "matte: last mark removed — mark a frame to key again")
+    else
+        setstatus!(player, "matte: frame $frame un-marked — Apply to propagate from the rest")
+    end
+    refreshmattepanel!(player; structure = true)
+    notify(player.playhead)
+    return nothing
+end
+
+"Switch the matte view; the preview and the card both follow it."
+function setmatteview!(player::Player, v::Symbol)
+    mattecardview(player)[] = v
+    col = mattecollect(player)
+    col === nothing || showmatteview!(col)
+    refreshmattepanel!(player; structure = true)
+    setstatus!(player, v === :sam2 ? "matte view: SAM 2 segmentation" : "matte view: matte")
+    return nothing
+end
+
+"Select an object: its points come forward, the others dim."
+function selectmatteobject!(player::Player, obj::Integer)
+    col = mattecollect(player)
+    col === nothing && return setstatus!(player, "matte: nothing being marked")
+    col.selected = col.selected == obj ? 0 : Int(obj)
+    col.object = col.selected == 0 ? col.object : Int(obj)   # further clicks refine THIS one
+    refreshmattedots!(col)
+    refreshmattepanel!(player; structure = true)
+    setstatus!(player, col.selected == 0 ? "matte: no object selected" :
+                       "matte: object $obj selected — clicks refine it")
+    return nothing
+end
+
+"Drop an object and everything marked for it."
+function deletematteobject!(player::Player, obj::Integer)
+    col = mattecollect(player)
+    col === nothing && return setstatus!(player, "matte: nothing being marked")
+    filter!(q -> q[4] != obj, col.points)
+    col.selected == obj && (col.selected = 0)
+    # …and move the clicks somewhere that still exists: the card lights the pill
+    # for `object`, so leaving it on the deleted one shows a phantom empty group
+    # and the next click resurrects it.
+    if col.object == obj
+        rest = matteobjectids(col.points)
+        col.object = isempty(rest) ? 1 : last(rest)
+    end
+    refreshmattedots!(col)
+    isempty(col.points) ? clearlivematte!(col) : livematte!(col)
+    refreshmattepanel!(player; structure = true)
+    setstatus!(player, "matte: object $obj removed")
+    return nothing
+end
+
+"""
+Back to the frame this seed belongs to, ready to edit its points.
+
+The card's picture is a FROZEN seed frame, not a live preview: moving the playhead
+leaves it alone (its points come off the screen, since they describe that frame
+and no other), and this is the way back to it.
+"""
+function gotomatteseed!(ctx::ToolContext, clip::Clip, seedframe::Integer)
+    player = ctx.player
+    n = clip.start + (Int(seedframe) - clip.src_in)
+    player.playhead[] = clamp(n, clip.start, clipend(clip) - 1)
+    mattecollect(player) === nothing && startmattepick!(ctx)
+    setstatus!(player, "matte: back at frame $seedframe — its points are editable again")
+    return nothing
+end
+
+"""
+Repaint the card's picture and caption where they stand.
+
+A checkbox must not rebuild the dock: the rebuild deletes and recreates every
+tool's blocks, and a second click arriving mid-rebuild lands on a block that is
+being replaced — one toggle in four was simply lost. Only the image and the
+caption depend on the toggles, and both are observables.
+"""
+function repaintmattecard!(player::Player)
+    w = get(player.fxwidgets, :mattecard, nothing)
+    w === nothing && return false
+    loc = editclip(player)
+    # a different clip needs a different CARD, not a repaint
+    (loc === nothing || loc[1] !== w.clip) && return false
+    col = mattecollect(player)
+    (col === nothing || col.clip !== w.clip || col.srcframe != w.srcframe) && return false
+    # …and so does a new object: it brings its own pill, which a repaint cannot add
+    ids = mattecardobjects(col)
+    length(ids) == w.nobj || return false
+    for p in w.pills
+        n = count(q -> q[4] == p.object, col.points)
+        p.pill.label[] = "$n point$(n == 1 ? "" : "s")"
+    end
+    return true
+end
+
+"Warm the propagation model once, while the user is still choosing where to click."
+function warmmattepanel!(ctx::ToolContext)
+    player = ctx.player
+    MATTEWARMED[] && return nothing
+    loc0 = editclip(player)
+    mw, mh = if loc0 === nothing
+        480, 270
+    else
+        cw, ch = mattelayersize(loc0[1])
+        w = min(480, cw)
+        w, max(1, round(Int, ch * w / cw))
+    end
+    player.matteinfo[] = "warming up the model…"
+    runanalysis(player) do
+        try
+            warmmatte!(mw, mh)
+            put!(player.uiqueue, () -> (player.matteinfo[] = "ready — mark the subject"))
+        catch e
+            put!(player.uiqueue, () -> (player.matteinfo[] = "model warm-up failed"))
         end
     end
     return nothing
@@ -1362,7 +1742,7 @@ mutable struct MatteCollect
     clip::Clip
     srcframe::Int
     scene::Makie.Scene                              # the overlay; owns plots + events
-    points::Vector{Tuple{Float64, Float64, Bool}}   # normalized source coords, foreground?
+    points::Vector{Tuple{Float64, Float64, Bool, Int}}  # matte coords, foreground?, object
     fg::Observable{Vector{Point2f}}                 # canvas coords, for the dots
     bg::Observable{Vector{Point2f}}
     listeners::Vector{Any}
@@ -1379,7 +1759,14 @@ mutable struct MatteCollect
     # cheap repeat, and worse, a recomputation is a chance for what propagates to
     # differ from what was previewed.
     lastseed::Any
-    lastseedpoints::Vector{Tuple{Float64, Float64, Bool}}
+    lastseedpoints::Vector{Tuple{Float64, Float64, Bool, Int}}
+    object::Int      # the object being marked; `+ object` starts the next one
+    selected::Int    # object whose bar is selected in the card (0 = none)
+    lastmasks::Any   # per-object masks from the last preview, for the SAM 2 view
+    # The post-fx frame the seed was computed from, kept so the card can draw a
+    # picture without re-rendering: the render belongs to the worker that owns the
+    # Lava context, and the card is built on the UI thread.
+    lastframe::Any
 end
 
 """
@@ -1422,11 +1809,25 @@ function matteoverlay(player::Player)
                          camera = ax.scene.camera, clear = false, visible = false)
         Makie.translate!(sc, 0, 0, 10)
         fg, bg = Observable(Point2f[]), Observable(Point2f[])
-        scatter!(sc, fg; color = (:limegreen, 0.75), marker = :circle,
-                 markersize = 9, strokewidth = 1, strokecolor = (:black, 0.6))
-        scatter!(sc, bg; color = (:orangered, 0.75), marker = :xcross,
-                 markersize = 9, strokewidth = 1, strokecolor = (:black, 0.6))
-        (scene = sc, fg = fg, bg = bg)
+        # per-point colour vectors, and they stay vectors: Makie type-locks a
+        # scalar-vs-vector attribute at creation, so starting scalar would refuse
+        # the per-object colours later
+        fgcolor = Observable(RGBAf[]); bgcolor = Observable(RGBAf[])
+        scatter!(sc, fg; color = fgcolor, marker = :circle,
+                 markersize = 10, strokewidth = 1, strokecolor = (:black, 0.6))
+        scatter!(sc, bg; color = bgcolor, marker = :xcross,
+                 markersize = 10, strokewidth = 1, strokecolor = (:black, 0.6))
+        # one contour per palette colour, reused: the object count changes with
+        # every click, and plots created per change in a scene that outlives them
+        # are a leak that keeps drawing
+        contours = map(1:length(MATTECOLORS)) do k
+            ct = contour!(sc, Float32[0, 1], Float32[0, 1], zeros(Float32, 2, 2);
+                          levels = [0.5f0], color = MATTECOLORS[k], linewidth = 2,
+                          visible = false)
+            Makie.translate!(ct, 0, 0, 5)
+            ct
+        end
+        (scene = sc, fg = fg, bg = bg, fgcolor = fgcolor, bgcolor = bgcolor, contours = contours)
     end
 end
 
@@ -1443,7 +1844,7 @@ on the clip — rather than a bespoke overlay, so what is shown while marking is
 literally what the finished key looks like, at the strength and feather the
 inspector is set to.
 """
-function armmattepick!(ctx::ToolContext)
+function startmattepick!(ctx::ToolContext)
     player = ctx.player
     loc = editclip(player)
     loc === nothing && return setstatus!(player, "matte: move the playhead onto a clip first")
@@ -1457,11 +1858,11 @@ function armmattepick!(ctx::ToolContext)
                      # that a long drag stays a few dozen points
     sc.visible[] = true
     sc.captures_mouse = true
-    col = MatteCollect(ctx, clip, Int(srcframe), sc, Tuple{Float64, Float64, Bool}[],
+    col = MatteCollect(ctx, clip, Int(srcframe), sc, Tuple{Float64, Float64, Bool, Int}[],
                        ov.fg, ov.bg, Any[],
                        clip.mattetrack, nothing, nothing, nothing,
                        findeffect(clip, MatteEffect) !== nothing, false, false,
-                       nothing, Tuple{Float64, Float64, Bool}[])
+                       nothing, Tuple{Float64, Float64, Bool, Int}[], 1, 0, nothing, nothing)
     push!(col.listeners, on(events(sc).mousebutton) do event
         Makie.receives_events(sc) || return Consume(false)
         event.button in (Mouse.left, Mouse.right) || return Consume(false)
@@ -1503,6 +1904,24 @@ function armmattepick!(ctx::ToolContext)
     setstatus!(player, (clicks ? "matte: CLICK the subject (right-click excludes) · " :
                                  "matte: DRAG over the subject (right-drag excludes) · ") *
                        "Ctrl+Z or Backspace undoes · Enter propagates · Esc cancels")
+    # deferred: this runs inside the button's own callback, and the refresh
+    # rebuilds that button
+    # The points describe ONE frame. Move the playhead and they come off the
+    # screen (the card keeps the frozen picture, and its "go to frame" brings both
+    # back), so the next frame can be seeded on its own instead of collecting
+    # clicks that belong to somewhere else.
+    push!(col.listeners, on(player.playhead) do n
+        # NO `receives_events` guard here: hiding the scene is exactly what this
+        # does, and a hidden scene receives nothing — the guard would make the
+        # points impossible to bring back.
+        onseed = clip.start + (col.srcframe - clip.src_in) == n
+        sc.visible[] == onseed && return nothing
+        sc.visible[] = onseed
+        onseed || setstatus!(player, "matte: left frame $(col.srcframe) — its points are " *
+                                     "kept; press the card's picture to go back")
+        return nothing
+    end)
+    put!(player.uiqueue, () -> refreshmattepanel!(player; structure = true))
     return nothing
 end
 
@@ -1524,20 +1943,19 @@ first landed inside the first one's disc and deleted it instead of adding.
 function addmattepoint!(col::MatteCollect, p, foreground::Bool;
                        hit::Real = 14, remove::Bool = true, live::Bool = true)
     player = col.ctx.player
-    sx, sy = previewtosource(player, col.clip, col.srcframe, p)
-    sw, sh = col.clip.source.width, col.clip.source.height
-    nx, ny = clamp(sx / sw, 0.0, 1.0), clamp(sy / sh, 0.0, 1.0)
+    # Matte space (post-fx, cropped), not source: `framereader` renders what the
+    # user sees, so only the crop fit has to come off.
+    nx, ny = previewtomatte(player, col.clip, col.srcframe, p)
     # compared where the user is pointing — on the canvas — not in source pixels,
     # so the hit area is the dot's size however far the preview is zoomed.
     # `remove = false` while a stroke is being painted: a drag lays points close
     # together on purpose and would otherwise erase the ones it just made.
     ondot = remove ? findlast(eachindex(col.points)) do i
-            q = sourcetopreview(player, col.clip, col.srcframe,
-                                (col.points[i][1] * sw, col.points[i][2] * sh))
+            q = mattetopreview(player, col.clip, col.srcframe, col.points[i])
             (q[1] - p[1])^2 + (q[2] - p[2])^2 <= hit^2
         end : nothing
     if ondot === nothing
-        push!(col.points, (nx, ny, foreground))
+        push!(col.points, (nx, ny, foreground, col.object))
     else
         deleteat!(col.points, ondot)
     end
@@ -1558,6 +1976,58 @@ function dropmattepoint!(col::MatteCollect)
 end
 
 """
+Draw the SAM 2 view: each object's boundary, in its object's colour, over the
+plain frame — and take the live matte off while it is up, since the two are two
+ways of looking at the same thing.
+
+The outlines are `contour!` plots over each object's mask, placed at the clip's
+crop rect in preview coordinates (the masks live in matte space). A fixed pool,
+one per palette colour, because the number of objects changes with every click
+and creating plots per change in a scene that outlives them is a leak.
+"""
+function showmatteview!(col::MatteCollect)
+    player = col.ctx.player
+    ov = matteoverlay(player)
+    sam2 = mattecardview(player)[] === :sam2
+    masks = col.lastmasks
+    lay = (col.clip.source.width, col.clip.source.height)
+    cr = col.clip.crop
+    for (k, ct) in enumerate(ov.contours)
+        m = (sam2 && masks !== nothing && k <= length(masks)) ? masks[k] : nothing
+        if m === nothing
+            ct.visible[] = false
+            continue
+        end
+        mw, mh = size(m)
+        ct[1][] = range(cr[1] * lay[1], (cr[1] + cr[3]) * lay[1], length = mw)
+        ct[2][] = range(cr[2] * lay[2], (cr[2] + cr[4]) * lay[2], length = mh)
+        ct[3][] = Float32.(m)
+        ct.color[] = mattecolor(k)
+        ct.visible[] = true
+    end
+    # the matte is the OTHER view of the same thing: SAM 2 up means the plain
+    # frame with outlines, and switching back has to put the live matte BACK —
+    # leaving it off was "the toggle does nothing" in the other direction
+    if sam2
+        col.clip.mattetrack === col.prevtrack || clearlivematte!(col)
+    elseif col.lastseed !== nothing && col.clip.mattetrack === col.prevtrack
+        livematte!(col)
+    end
+    matteinfo!(col)
+    notify(player.playhead)
+    return nothing
+end
+
+"""
+The selection as the segmenter takes it: one vector of `(x, y, foreground)` per
+object, in the order the objects were started.
+"""
+function mattegroups(points::AbstractVector{<:Tuple{<:Real, <:Real, Bool, Int}})
+    ids = sort!(unique(q[4] for q in points))
+    return [[(q[1], q[2], q[3]) for q in points if q[4] == id] for id in ids]
+end
+
+"""
 Redraw the dots from `col.points`.
 
 Rebuilt from the source of truth rather than pushed/popped alongside it: the two
@@ -1567,12 +2037,20 @@ its point is even after the playhead moved or the clip was reframed.
 """
 function refreshmattedots!(col::MatteCollect)
     player = col.ctx.player
-    sw, sh = col.clip.source.width, col.clip.source.height
+    ov = matteoverlay(player)
     fg, bg = Point2f[], Point2f[]
-    for (nx, ny, isfg) in col.points
-        q = sourcetopreview(player, col.clip, col.srcframe, (nx * sw, ny * sh))
-        push!(isfg ? fg : bg, Point2f(q))
+    fgc, bgc = RGBAf[], RGBAf[]
+    for (nx, ny, isfg, obj) in col.points
+        q = Point2f(mattetopreview(player, col.clip, col.srcframe, (nx, ny)))
+        # dimmed unless it belongs to the selected object — that is what selecting
+        # a bar in the card SHOWS
+        a = (col.selected == 0 || col.selected == obj) ? 0.95f0 : 0.30f0
+        c = RGBAf(mattecolor(obj), a)
+        push!(isfg ? fg : bg, q)
+        push!(isfg ? fgc : bgc, c)
     end
+    ov.fgcolor[] = fgc
+    ov.bgcolor[] = bgc
     col.fg[] = fg
     col.bg[] = bg
     return nothing
@@ -1583,8 +2061,17 @@ function clearlivematte!(col::MatteCollect)
     col.clip.mattetrack === nothing || freematteplanes!(col.clip.mattetrack)
     col.clip.mattetrack = col.prevtrack
     restorematteeffect!(col)
-    col.ctx.player.matteinfo[] = "marking — no points"
+    matteinfo!(col)
     notify(col.ctx.player.playhead)
+    return nothing
+end
+
+"The one place that says what is being marked, so no path can leave it stale."
+function matteinfo!(col::MatteCollect)
+    n = length(col.points)
+    col.ctx.player.matteinfo[] = n == 0 ? "marking — no points" :
+        "marking — $n point(s) on $(length(mattegroups(col.points))) object(s), " *
+        "frame $(col.srcframe)"
     return nothing
 end
 
@@ -1616,20 +2103,25 @@ function livematte!(col::MatteCollect)
     # then nothing at all for a minute reads as a tool that does not work.
     setstatus!(player, segmenterready(player.segmenter) ?
                        "matte: segmenting…" :
-                       "matte: building the $(seedbackendname(player.segmenter)) model — " *
+                       "matte: building the SAM 2 model — " *
                        "first click of the session, this one takes a while")
     player.jobprogress[] = 0.0   # footer spinner, so the wait is visible too
-    runanalysis(player; gpu = player.segmenter !== nothing) do
+    runanalysis(player) do
         try
-            frame = framereader(player, col.clip)(col.srcframe)
-            mask = seedmask(col.clip, frame, points; segmenter = player.segmenter,
-                            key = (col.clip.id, col.srcframe))
+            frame = framereader(col.clip, player.engine)(col.srcframe)
+            mask, per = seedmasks(col.clip, frame, mattegroups(points);
+                                  segmenter = player.segmenter,
+                                  key = (col.clip.id, col.srcframe))
             alpha = previewmatte(col.clip, frame, mask)
             put!(player.uiqueue, () -> begin
                 if mattecollect(player) === col         # not cancelled meanwhile
                     col.lastseed = mask
                     col.lastseedpoints = points
+                    col.lastframe = frame
+                    col.lastmasks = per
                     showlivematte!(col, alpha)
+                    showmatteview!(col)
+                    refreshmattepanel!(player)      # the card gains the seed outline
                     setstatus!(player, "matte: $(length(points)) point$(length(points) == 1 ? "" : "s") — " *
                                "selection covers $(round(100 * count(!=(0x00), mask) / length(mask); digits = 1))%" *
                                " · Enter to propagate")
@@ -1679,7 +2171,9 @@ function showlivematte!(col::MatteCollect, alpha::Matrix{UInt8}; strength = 0.85
         col.prevmatte = something(findeffect(col.clip, MatteEffect), MatteEffect())
         seteffect!(col.clip, MatteEffect(; strength, feather = col.prevmatte.feather))
     end
-    player.matteinfo[] = "marking — $(length(col.points)) point(s), this frame only"
+    nobj = isempty(col.points) ? 1 : length(unique(q[4] for q in col.points))
+    player.matteinfo[] = "marking — $(length(col.points)) point(s) on $nobj object(s), " *
+                         "this frame only"
     notify(player.playhead)
     return nothing
 end
@@ -1713,11 +2207,11 @@ function finishmattecollect!(col::MatteCollect)
     points = copy(col.points)
     player = ctx.player
     setstatus!(player, "matte: reading the marked frame…")
-    runanalysis(player; gpu = player.segmenter !== nothing) do
+    runanalysis(player) do
         try
-            frame = framereader(player, clip)(srcframe)
-            mask = seedmask(clip, frame, points; segmenter = player.segmenter,
-                            key = (clip.id, Int(srcframe)))
+            frame = framereader(clip, player.engine)(srcframe)
+            mask = seedmask(clip, frame, mattegroups(points);
+                            segmenter = player.segmenter, key = (clip.id, Int(srcframe)))
             put!(player.uiqueue, () -> addmatteseed!(ctx, clip, srcframe, mask))
         catch e
             put!(player.uiqueue,
@@ -1764,148 +2258,48 @@ end
 "Record a mark at `srcframe` and re-propagate the clip."
 function addmatteseed!(ctx::ToolContext, clip::Clip, srcframe::Integer, mask)
     player = ctx.player
+    snapshot!(player)          # a committed mark is an edit, undoable like any other
     seeds = mattemarks(player, clip)
     seeds[Int(srcframe)] = mask
     runmatte!(ctx; clip = clip, seeds = seeds)
     return nothing
 end
 
+
 """
-The marks for `clip`, live.
+Bring the matte UI up to date.
 
-Held next to the player rather than on the track because a mark is an input to
-propagation and the track is its output: re-running must see every mark, not the
-seed frames the last run happened to record. Keyed by clip id so it survives
-sorting and undo.
+`structure = true` when the CARD itself must appear or disappear (a matte was
+removed, marking was active, another clip was selected) — that is the only case
+worth a dock rebuild. Everything else is a repaint of the card that is already
+there: a rebuild recreates every tool's blocks and its scene plots, and it throws
+the user's scroll position away, which turns "click a checkbox" into "scroll back
+down to the card again".
 """
-mattemarks(player::Player, clip::Clip) =
-    get!(() -> Dict{Int, Matrix{UInt8}}(), player.mattemarks, clip.id)
-
-function runmatte!(ctx::ToolContext; clip = nothing, seeds = nothing)
-    player = ctx.player
-    if clip === nothing
-        loc = editclip(player)
-        loc === nothing && return setstatus!(player, "matte: no clip under the playhead")
-        clip = loc[1]
-    end
-    marks = seeds === nothing ? mattemarks(player, clip) : seeds
-    isempty(marks) &&
-        return setstatus!(player, "matte: mark the subject on a frame first")
-    player.matteinfo[] == "matting…" &&
-        return setstatus!(player, "matte: already running — progress in the bottom right")
-    player.matteinfo[] = "matting…"
-    setstatus!(player, "matte: propagating from $(length(marks)) marked frame(s) " *
-                       "($(mattebackendname()))")
-    runanalysis(player; gpu = hasmattemodel()) do
-        try
-            reader = framereader(player, clip)
-            track = analyzematte!(clip, reader, marks; progress = (d, t) -> begin
-                player.jobprogress[] = d / max(t, 1)
-            end)
-            put!(player.uiqueue, () -> begin
-                freematteplanes!(track)
-                findeffect(clip, MatteEffect) === nothing &&
-                    push!(clip.effects, FxSlot(MatteEffect()))
-                cov = mattecoverage(track)
-                player.matteinfo[] = "matte: $(length(track.seeds)) marked frame(s), " *
-                                     "$(size(track.alpha, 3)) frames, " *
-                                     "$(round(Int, 100cov))% kept ($(mattebackendname()))"
-                player.jobprogress[] = NaN
-                refreshmattepanel!(player)
-                notify(player.playhead)
-                # A matte that keeps everything (or nothing) renders as no visible
-                # change at all, and the user reads that as "the tool is broken".
-                # The built-in propagator does exactly that on most footage — it is
-                # a stand-in, not a matting model — so say which one ran and what
-                # it produced instead of reporting "ready" either way.
-                setstatus!(player, if cov > 0.97 || cov < 0.02
-                        "matte covers $(round(Int, 100cov))% of the frame — " *
-                        (hasmattemodel() ? "mark more of the subject, or a background point where it spills" :
-                                           "no matting model is installed, so this is the built-in stand-in " *
-                                           "(run `usematanyone!()` for the real one)")
-                    else
-                        "matte ready ($(mattebackendname())) — Matte/Feather are keyframable in the inspector"
-                    end)
-            end)
-        catch e
-            put!(player.uiqueue, () -> begin
-                player.matteinfo[] = "matte failed"
-                player.jobprogress[] = NaN
-                setstatus!(player, "matte failed: $(sprint(showerror, e))")
-            end)
-        end
-    end
-    return nothing
-end
-
-function removematte!(player::Player)
-    loc = editclip(player)
-    loc === nothing && return setstatus!(player, "matte: no clip under the playhead")
-    clip = loc[1]
-    clip.mattetrack === nothing && return setstatus!(player, "no matte on this clip")
-    freematteplanes!(clip.mattetrack)
-    clip.mattetrack = nothing
-    delete!(player.mattemarks, clip.id)
-    i = findfirst(s -> s.effect isa MatteEffect, clip.effects)
-    i === nothing || deleteat!(clip.effects, i)
-    player.matteinfo[] = "no matte"
-    refreshmattepanel!(player)
-    notify(player.playhead)
-    setstatus!(player, "matte removed")
-    return nothing
-end
-
-"One card per marked frame: jump to it, or drop the mark and re-propagate."
-function refreshmattecards!(ctx::ToolContext)
-    player = ctx.player
-    loc = editclip(player)
-    loc === nothing && return nothing
-    clip = loc[1]
-    marks = mattemarks(player, clip)
-    for f in sort!(collect(keys(marks)))
-        thumb = mattecardimage(marks[f])
-        tl = clip.start + (f - clip.src_in)
-        # `onclick`/`onremove` are handed the CARD id (see `tooladdcard!`); taking
-        # no argument made every click on a mark — and every × — a MethodError in
-        # the render loop, which is why the button looked dead.
-        tooladdcard!(ctx, thumb; caption = "frame $tl",
-                     onclick = _ -> (player.playhead[] = tl),
-                     onremove = _ -> begin
-                         delete!(marks, f)
-                         isempty(marks) ? removematte!(player) : runmatte!(ctx; clip = clip)
-                     end)
-    end
-    return nothing
-end
-
-"A small preview of one mark, so a card shows WHICH region was marked."
-function mattecardimage(mask::AbstractMatrix{UInt8})
-    w, h = 48, 27
-    img = Matrix{RGB{N0f8}}(undef, w, h)
-    sw, sh = size(mask)
-    @inbounds for j in 1:h, i in 1:w
-        v = mask[clamp(round(Int, (i - 0.5) * sw / w + 0.5), 1, sw),
-                 clamp(round(Int, (j - 0.5) * sh / h + 0.5), 1, sh)]
-        img[i, j] = v > 0 ? RGB{N0f8}(1, 1, 1) : RGB{N0f8}(0.15, 0.15, 0.18)
-    end
-    return img
-end
-
-"Rebuild the Tools dock and the inspector after the matte changed either."
-function refreshmattepanel!(player::Player)
-    TOOLSVERSION[] += 1                       # tool cards
+function refreshmattepanel!(player::Player; structure::Bool = false)
     r = get(player.fxwidgets, :fxlistrefresh, nothing)
     r === nothing || r()                      # inspector: the MatteEffect card
+    (structure || !repaintmattecard!(player)) && (EFFECTS.version[] += 1)
     return nothing
 end
 
-registertool!(:matte, "Matte",
-    "Isolates a subject on the SELECTED clip. CLICK the subject (right-click " *
-    "marks what is NOT it), then Enter: SAM 2 turns each click into an object " *
-    "boundary, and that seed is propagated across the clip. Mark another frame " *
-    "wherever it drifts. Without SAM 2's weights the seed is a painted disc " *
-    "instead — then drag to cover the subject, and the panel says so.";
-    panel = mattepanel!, activate = ctx -> armmattepick!(ctx))
+# ONE kind: the parameters that tune the matte AND the card that produces it.
+# Split across two registries these were two entries with the same name — a
+# "Matte" row of sliders in the Inspector that could not make a matte, and a
+# "Matte" card in Tools that could not tune one.
+registereffect!(EffectKind(:matte, "Matte";
+    description = "Isolates a subject on the SELECTED clip. CLICK the subject (right-click " *
+        "marks what is NOT it), then Enter: SAM 2 turns each click into an object " *
+        "boundary, and that seed is propagated across the clip. Mark another frame " *
+        "wherever it drifts. Both models see the clip AFTER its effects — cropped and " *
+        "stabilized — so a tighter crop is also a faster, easier matte.",
+    params = [FxParam(:strength, "Matte"; min = 0.0, max = 1.0, default = 1.0),
+              FxParam(:feather, "Feather"; min = 0.0, max = 1.0, default = 0.0)],
+    kfkeys = [:matte_strength, :matte_feather],
+    make = nt -> MatteEffect(Float32(nt.strength), Float32(nt.feather)),
+    matches = e -> e isa MatteEffect,
+    read = e -> (strength = Float64(e.strength), feather = Float64(e.feather)),
+    body = mattepanel!, activate = startmattepick!, analysis = true))
 
 
 # --------------------------------------------------------------- Restore tool
@@ -1955,9 +2349,9 @@ function runrestore!(ctx::ToolContext)
     first = clamp(srcframe - n ÷ 2, clip.src_in, max(clip.src_in, clip.src_out - n))
     player.restoreinfo[] = "restoring…"
     setstatus!(player, "restore: $n frames from $(first)")
-    runanalysis(player; gpu = RESTOREMODEL[] !== nothing) do
+    runanalysis(player) do
         try
-            reader = framereader(player, clip)
+            reader = framereader(clip, player.engine)
             got = restorewindow!(clip, reader, first, n;
                                  progress = (d, t) -> (player.jobprogress[] = d / max(t, 1)))
             put!(player.uiqueue, () -> begin
@@ -1980,7 +2374,12 @@ function runrestore!(ctx::ToolContext)
     return nothing
 end
 
-registertool!(:restore, "Restore",
-    "Runs an upscaling/restoration model over frames around the playhead on the " *
-    "SELECTED clip. Needs a model installed (examples/basicvsrpp.jl).";
-    panel = restorepanel!, activate = ctx -> runrestore!(ctx))
+registereffect!(EffectKind(:restore, "Restore";
+    description = "Runs an upscaling/restoration model over frames around the playhead on the " *
+        "SELECTED clip. Needs a model installed (examples/basicvsrpp.jl).",
+    params = [FxParam(:strength, "Restore"; min = 0.0, max = 1.0, default = 1.0)],
+    kfkeys = [:restore_strength],
+    make = nt -> RestoreEffect(Float32(nt.strength)),
+    matches = e -> e isa RestoreEffect,
+    read = e -> (strength = Float64(e.strength),),
+    body = restorepanel!, activate = runrestore!, analysis = true))

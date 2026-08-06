@@ -116,7 +116,7 @@ function gputhumbloop(cache::ThumbnailCache)
     ok = try
         # `long`: cold this compiles decode + convert + downscale — warm them all
         # HERE so the per-thumb jobs below stay bounded and presents interleave
-        cache.gpurun(; long = true) do
+        cache.gpurun() do
             stream = openstream(LavaBackend(), source.path, source.width, source.height;
                                 vrambudget = 2^30)
             dev = KA.allocate(LavaBackend(), RGB{N0f8}, (source.width, source.height))

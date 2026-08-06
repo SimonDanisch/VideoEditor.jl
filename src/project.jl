@@ -1,11 +1,22 @@
 """
-    saveproject(path, seq)
+    saveproject(path, seq; checkpoint = true) -> path
     loadproject(path) -> Sequence
 
-Project files are plain TOML of the edit metadata — source paths, in/out
-points, timeline positions and crops. Sources are re-probed on load.
+A project file is JSON of the edit metadata — source paths, in/out points,
+timeline positions, crops, effects, analyses. Sources are re-probed on load, so
+the file stays small and readable; matte alpha, the one thing too big for text,
+sits next to it as raw planes.
+
+JSON rather than TOML because a project is a tree — clips holding effects holding
+parameters — and TOML says that in table-array syntax nobody reads twice. A
+project file is something you may have to open in an editor at 2am.
+
+Writing is ATOMIC (write a temp, rename) and keeps the previous version as a
+checkpoint: an interrupted save must not be able to destroy the last good one.
+TOML projects still LOAD — the format is sniffed, not assumed — so older files
+keep working.
 """
-function saveproject(path::AbstractString, seq::Sequence)
+function saveproject(path::AbstractString, seq::Sequence; checkpoint::Bool = true)
     dict = Dict{String, Any}(
         "framerate" => seq.framerate,
         "clips" => [clipdict(clip) for clip in seq.clips],
@@ -17,9 +28,50 @@ function saveproject(path::AbstractString, seq::Sequence)
          for t in seq.transitions])
     # overlays are edits like any other — a lost title is a lost edit
     isempty(seq.overlays) || (dict["overlays"] = [overlaydict(ov) for ov in seq.overlays])
-    open(io -> TOML.print(io, dict), path, "w")
+    checkpoint && checkpointproject(path)
+    tmp = path * ".part"
+    open(io -> JSON.print(io, dict, 2), tmp, "w")
+    mv(tmp, path; force = true)          # atomic: a half-written file never replaces the good one
     savemattes(path, seq)
     return path
+end
+
+"""
+Keep the file that is about to be overwritten.
+
+Checkpoints go to `<dir>/.<name>.checkpoints/` with a sortable timestamp, newest
+`CHECKPOINTS` kept. Undo dies with the session; a project you saved over an hour
+ago does not have to.
+"""
+const CHECKPOINTS = 20
+
+function checkpointproject(path::AbstractString)
+    isfile(path) || return nothing
+    dir = joinpath(dirname(path), "." * basename(path) * ".checkpoints")
+    isdir(dir) || mkpath(dir)
+    stamp = Dates.format(Dates.unix2datetime(mtime(path)), "yyyymmdd-HHMMSS")
+    try
+        cp(path, joinpath(dir, stamp * "-" * basename(path)); force = true)
+    catch e
+        @warn "could not write a project checkpoint" exception = e
+        return nothing
+    end
+    keep = sort!(readdir(dir))
+    for old in keep[1:max(0, length(keep) - CHECKPOINTS)]
+        try; rm(joinpath(dir, old); force = true); catch; end
+    end
+    return dir
+end
+
+"""
+    projectcheckpoints(path) -> Vector{String}
+
+Every kept version of `path`, oldest first — what a "revert to…" list reads.
+"""
+function projectcheckpoints(path::AbstractString)
+    dir = joinpath(dirname(path), "." * basename(path) * ".checkpoints")
+    isdir(dir) || return String[]
+    return [joinpath(dir, f) for f in sort!(readdir(dir))]
 end
 
 function clipdict(clip::Clip)
@@ -31,7 +83,6 @@ function clipdict(clip::Clip)
         "track" => clip.track,
         "crop" => collect(clip.crop),
         "rate" => clip.rate,        # conform factor; 1.0 on native-rate clips
-        "reframe" => collect(clip.reframe),   # manual (scale, x, y) over the fit
         "id" => string(clip.id),
         "blendfrom" => string(clip.blendfrom),
         "effects" => [slotdict(s) for s in clip.effects],
@@ -75,8 +126,20 @@ function clipdict(clip::Clip)
     return cd
 end
 
+"""
+Parse a project file, whatever it was written as.
+
+Sniffed, not assumed: JSON starts with `{`. Projects written before the format
+moved to JSON are TOML and still open — a file format change must not strand the
+edits somebody already saved.
+"""
+function readprojectdict(path::AbstractString)
+    txt = read(path, String)
+    return startswith(lstrip(txt), "{") ? JSON.parse(txt) : TOML.parse(txt)
+end
+
 function loadproject(path::AbstractString)
-    dict = TOML.parsefile(path)
+    dict = readprojectdict(path)
     missing_sources = unique(String[cd["source"] for cd in dict["clips"] if !isfile(cd["source"])])
     isempty(missing_sources) ||
         error("project references missing video file(s):\n  " * join(missing_sources, "\n  ") *
@@ -87,7 +150,8 @@ function loadproject(path::AbstractString)
         # files written before conforming existed hold only native-rate clips
         clip = Clip(source, cd["src_in"], cd["src_out"], cd["start"],
                     Tuple(Float64.(cd["crop"])), Float64(get(cd, "rate", 1.0)),
-                    Tuple(Float64.(get(cd, "reframe", collect(NEUTRALFRAME)))))
+                    # a 3-tuple here is a project saved before rotation existed
+                    reframe4(Tuple(Float64.(get(cd, "reframe", collect(NEUTRALFRAME))))))
         clip.track = Int(get(cd, "track", 1))
         # ids are part of the edit: a blend points at its partner by id, and the
         # inspector at a stack entry. Files written before ids existed simply keep
@@ -97,19 +161,22 @@ function loadproject(path::AbstractString)
         for ed in get(cd, "effects", [])
             push!(clip.effects, slotfromdict(ed))
         end
+        # An analysis and the stack slot that applies it are attached together
+        # (`setmotiontrack!`), which is also how a project written before analyses
+        # had slots gets its cards: the track is there, so the slot is made.
         if haskey(cd, "motiontrack")
             mt = cd["motiontrack"]
-            clip.motiontrack = MotionTrack(
+            setmotiontrack!(clip, MotionTrack(
                 [Mat3f(Float32.(v)...) for v in mt["transforms"]], Int(mt["src_in"]),
                 Symbol(get(mt, "mode", "unknown")),
-                haskey(mt, "basecrop") ? NTuple{4, Float64}(mt["basecrop"]) : nothing)
+                haskey(mt, "basecrop") ? NTuple{4, Float64}(mt["basecrop"]) : nothing))
         end
         if haskey(cd, "colortrack")
             ct = cd["colortrack"]
-            clip.colortrack = ColorTrack(
+            setcolortrack!(clip, ColorTrack(
                 [Vec3f(Float32.(v)...) for v in ct["gains"]],
                 [Vec3f(Float32.(v)...) for v in ct["offsets"]], Int(ct["src_in"]),
-                Float32(get(ct, "strength", 1.0)))   # absent in older project files
+                Float32(get(ct, "strength", 1.0))))   # absent in older project files
         end
         if haskey(cd, "matte")
             mt = cd["matte"]

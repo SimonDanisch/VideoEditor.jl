@@ -3,6 +3,7 @@ using Test
 import VideoEditor as VE
 import VideoEditor.VideoIO as VideoIO
 import FFMPEG_jll
+using LinearAlgebra: I        # refactor.jl builds identity MotionTracks
 
 testvideo = joinpath(mktempdir(), "test.mp4")
 run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -f lavfi -i testsrc2=size=320x180:rate=30 -t 4 -c:v libx264 -g 30 -pix_fmt yuv420p $testvideo`,
@@ -16,6 +17,8 @@ run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -f lavfi -i smptebars=size=480x270:rate=
 testvideo15 = joinpath(mktempdir(), "test15.mp4")
 run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -f lavfi -i testsrc2=size=180x320:rate=15 -t 4 -c:v libx264 -g 15 -pix_fmt yuv420p $testvideo15`,
              stdout = devnull, stderr = devnull))
+
+include("refactor.jl")   # registry, analyses-as-slots, links, commands
 
 @testset "VideoSource" begin
     src = VideoSource(testvideo)
@@ -360,7 +363,7 @@ end
     # register a plugin directly (any package can) — it becomes an effect kind
     VE.registerplugin!(:testfx, "Test FX", [VE.FxParam(:k, "k", 0.0, 1.0, 1.0)],
                        p -> VE.Pointwise((c, uv) -> c * Float32(p.k)))
-    @test haskey(VE.PLUGINBYNAME, :testfx)
+    @test VE.kindbyname(:testfx) !== nothing
     @test any(k -> k.name == :testfx, VE.effectkinds())            # shows in the Add-effect surface
 
     # …and via the MCP `define_effect` code path (live Base.eval authoring)
@@ -368,7 +371,7 @@ end
         registerplugin!(:mcpfx, "MCP FX", [FxParam(:gain, "gain", 0.0, 2.0, 1.0)],
                         p -> Pointwise((c, uv) -> c * Float32(p.gain)))
     """)
-    @test haskey(VE.PLUGINBYNAME, :mcpfx)
+    @test VE.kindbyname(:mcpfx) !== nothing
     @test any(t -> t["name"] == "effect_mcpfx", VE.tooldefinitions())  # surfaces as an MCP tool
 
     # a plugin effect applies through the shared kernel + roundtrips through the project dict
@@ -393,7 +396,7 @@ end
     include(joinpath(pkgdir(VideoEditor), "examples", "example_plugins.jl"))  # must not error
     f = fill(VE.RGB{VE.N0f8}(0.4, 0.6, 0.3), 16, 16)
     for name in (:invert, :sepia, :posterize, :levels, :edges, :emboss)
-        @test haskey(VE.PLUGINBYNAME, name)
+        @test VE.kindbyname(name) !== nothing
         g = copy(f); VE.applyeffect!(g, similar(g), similar(g), VE.plugineffect(name))
         @test all(px -> isfinite(Float32(px.r)), g)      # every example plugin applies cleanly
     end
@@ -941,35 +944,41 @@ canui && include("fuzz.jl")   # random edit programs vs the picture (needs a Pla
 end
 
 @testset "matte: SAM 2 is the seed by default" begin
-    # The editor segments out of the box — no include, no opt-in call. Before
-    # this, `seedmask` painted discs around clicks unless somebody had run
-    # `usesam2!()` by hand, and nothing in the UI said which one you were
-    # getting, so a matte seeded from a 130 px blob looked like a broken model.
-    @test VE.sam2ready() == isfile(joinpath(VE.SAM2Runner.assetdir(), "weights.safetensors"))
-    if VE.sam2ready()
-        @test VE.defaultsegmenter() === VE.sam2seed
-        @test VE.seedbackendname(VE.defaultsegmenter()) == "SAM 2"
-    else
-        @test VE.defaultsegmenter() === nothing   # discs, and the panel says so
-    end
+    # The editor segments out of the box — no include, no opt-in call.
+    # SAM 2 is not optional: `defaultsegmenter` is it, unconditionally, and a
+    # missing model is a loud failure rather than a quieter disc-painting mode.
+    @test VE.defaultsegmenter() === VE.sam2seed
 
     # …and it is a PARAMETER, not a global switch: pass another and it is used,
     # with nothing left installed anywhere afterwards
     called = Ref(false)
     mine = (frame, points; key = nothing) -> (called[] = true; fill(0xff, size(frame)))
-    @test VE.seedbackendname(mine) == "custom model"
-    @test VE.seedbackendname(nothing) == "discs"
     src = VideoSource(testvideo)
     clip = Clip(src)
     frame = fill(VE.RGB{VE.N0f8}(0.5, 0.5, 0.5), src.width, src.height)
     m = VideoEditor.seedmask(clip, frame, [(0.5, 0.5, true)]; segmenter = mine)
     @test called[] && size(m) == size(frame) && all(==(0xff), m)
-    # explicit `nothing` is the disc fallback, reachable without unsetting anything
-    d = VideoEditor.seedmask(clip, frame, [(0.5, 0.5, true)]; segmenter = nothing)
+    # no segmenter is an error, not a silent disc: the discs are their own method
+    @test_throws ErrorException VideoEditor.seedmask(clip, frame, [(0.5, 0.5, true)];
+                                                     segmenter = nothing)
+    d = VideoEditor.seedmask(clip, [(0.5, 0.5, true)])
     @test size(d) == size(frame) && any(!=(0x00), d) && !all(==(0xff), d)
 end
 
 @testset "matte track, effect and keyframes" begin
+    # What this testset asserts is the track/effect/keyframe plumbing, so it pins a
+    # trivial propagator (hold the seed across the clip) instead of inheriting
+    # whatever is installed: VideoEditor registers the real MatAnyone propagator at
+    # load, and then this would (a) assert disc geometry against a segmentation
+    # model and (b) drive a GPU model from the main thread, which after
+    # `interactions.jl` no longer owns the Lava context — "BatchQueue is
+    # single-writer".
+    prevprop = VideoEditor.MATTEPROPAGATOR[]
+    VideoEditor.registermatte!((frames, seeds; progress = nothing) -> begin
+        k0 = minimum(keys(seeds))
+        repeat(seeds[k0], 1, 1, length(frames))
+    end)
+    try
     src = VideoSource(testvideo2)              # smptebars 480x270, strong colour blocks
     clip = Clip(src; src_in = 0, src_out = 12)
 
@@ -1010,7 +1019,7 @@ end
     @test !VideoEditor.isneutral(MatteEffect(1.0, 0.0))
     @test VideoEditor.effectfromdict(VideoEditor.effectdict(MatteEffect(0.7, 0.2))) ==
           MatteEffect(0.7f0, 0.2f0)
-    k = only(filter(x -> x.name === :matte, VideoEditor.BUILTIN_KINDS))
+    k = VideoEditor.kindbyname(:matte)
     @test k.kfkeys == [:matte_strength, :matte_feather]
     @test k.matches(MatteEffect(1.0, 0.0))
     @test k.read(MatteEffect(0.5, 0.25)) == (strength = 0.5, feather = 0.25)
@@ -1059,14 +1068,17 @@ end
         fill(0xff, size(frames[1])..., length(frames))
     end)
     try
-        @test VideoEditor.hasmattemodel()
+        @test VideoEditor.MATTEPROPAGATOR[] !== nothing
         t4 = VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); mattewidth = 96)
         @test called[] == 1
         @test all(==(0xff), t4.alpha)
     finally
         VideoEditor.MATTEPROPAGATOR[] = nothing
     end
-    @test !VideoEditor.hasmattemodel()
+    @test VideoEditor.MATTEPROPAGATOR[] === nothing
+    finally
+        VideoEditor.MATTEPROPAGATOR[] = prevprop   # put back what was installed
+    end
 end
 
 @testset "restore effect and cache" begin
@@ -1133,7 +1145,7 @@ end
         @test !VideoEditor.isneutral(RestoreEffect(1.0))
         @test VideoEditor.effectfromdict(VideoEditor.effectdict(RestoreEffect(0.6))) ==
               RestoreEffect(0.6f0)
-        k = only(filter(x -> x.name === :restore, VideoEditor.BUILTIN_KINDS))
+        k = VideoEditor.kindbyname(:restore)
         @test k.kfkeys == [:restore_strength]
         @test k.read(RestoreEffect(0.5)) == (strength = 0.5,)
 

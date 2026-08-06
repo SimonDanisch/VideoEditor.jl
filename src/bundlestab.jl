@@ -218,13 +218,13 @@ function bundlelock!(clip::Clip; analysis_width::Integer = 480, window::Integer 
     if length(tracks) < 8
         # too textureless to bundle — leave an identity lock
         transforms = fill(Mat3f(1, 0, 0, 0, 1, 0, 0, 0, 1), n)
-        clip.motiontrack = MotionTrack(transforms, clip.src_in, :similarity)
+        setmotiontrack!(clip, MotionTrack(transforms, clip.src_in, :similarity))
         return clip.motiontrack
     end
     A, B, TX, TY = bundleadjust(tracks, n; iters, huber)
     transforms = [Mat3f(A[f], B[f], 0, -B[f], A[f], 0, scale * TX[f], scale * TY[f], 1)
                   for f in 1:n]
-    clip.motiontrack = MotionTrack(transforms, clip.src_in, :similarity)
+    setmotiontrack!(clip, MotionTrack(transforms, clip.src_in, :similarity))
     progress === nothing || progress(n, n)
     return clip.motiontrack
 end

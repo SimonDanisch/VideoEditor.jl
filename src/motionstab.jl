@@ -85,7 +85,7 @@ function analyzemotion!(clip::Clip; mode::Symbol = :similarity, analysis_width::
         end
     end
     mode === :perspective && limitkeystone!(transforms, source.width, source.height)
-    clip.motiontrack = MotionTrack(transforms, clip.src_in, mode)
+    setmotiontrack!(clip, MotionTrack(transforms, clip.src_in, mode))
     progress === nothing || progress(n, n)
     return clip.motiontrack
 end
@@ -167,8 +167,8 @@ a device-resident gray is used in place (the GPU-decode analyses keep the
 frame on the device — no transfer at all)."
 function detectfeatures(backend, gray::Matrix{Float32}, maxpoints::Integer,
                         border::Integer)
-    gdev = backend isa KA.CPU ? gray :
-           (d = KA.allocate(backend, Float32, size(gray)); copyto!(d, gray); d)
+    gdev = KA.allocate(backend, Float32, size(gray))   # one path, every backend
+    copyto!(gdev, gray)
     return goodfeatures(backend, gdev; maxpoints = maxpoints, border = border)
 end
 detectfeatures(backend, gray::AbstractMatrix{Float32}, maxpoints::Integer, border::Integer) =
@@ -351,8 +351,8 @@ function cameralock!(clip::Clip; point = nothing, window::Integer = 96,
     finally
         close(dec)
     end
-    clip.motiontrack = MotionTrack(transforms, clip.src_in,
-                                   point === nothing ? :similarity : :objectlock)
+    setmotiontrack!(clip, MotionTrack(transforms, clip.src_in,
+                                      point === nothing ? :similarity : :objectlock))
     progress === nothing || progress(n, n)
     return clip.motiontrack
 end
@@ -573,7 +573,16 @@ function applymotiontrack!(buf::AnyRGBFrame, tmp::AnyRGBFrame, clip::Clip, srcfr
     M == Mat3f(1, 0, 0, 0, 1, 0, 0, 0, 1) && return buf
     s = size(buf, 1) / clip.source.width
     s ≈ 1 || (M = scaletosource(M, s))
-    warp!(tmp, buf, M)
+    # BLACK outside the source, not a replicated edge pixel. A stabilization warp
+    # shifts and rotates the frame, so its borders sample past the picture; with
+    # the kernel's default the last row/column smears across that gap in long
+    # horizontal streaks. The safety crop normally hides them, which makes the
+    # smear invisible right up until somebody reframes outward — and then it is
+    # the ugliest thing on screen. `skipoutside` leaves those pixels alone, so
+    # they have to be cleared first: the scratch buffer comes from the pool with
+    # the previous frame still in it.
+    fill!(tmp, zero(eltype(tmp)))
+    warp!(tmp, buf, M; skipoutside = true)
     KA.synchronize(KA.get_backend(buf))
     return copyto!(buf, tmp)
 end
