@@ -321,6 +321,26 @@ end
 end
 
 
+@testset "a split carries EVERY analysis result, not just the ones on the Clip" begin
+    # `colortrack`/`motiontrack`/`mattetrack` are Clip fields, so `split!` copies
+    # them by assignment and there is a comment there making sure of it. Restore's
+    # cache is a module global keyed by clip id, and the right half is minted with
+    # `freshid()` — so splitting a restored clip silently dropped the restoration
+    # on the right half. `RestoreCache`'s own docstring claimed otherwise ("keyed
+    # by absolute source frame so it survives splits and trims like the tracks
+    # do"): true of the frames inside the cache, false of the cache itself.
+    src = VideoSource(testvideo)
+    seq = Sequence(src)
+    c = seq.clips[1]
+    VE.putrestored!(VE.restorecache(c), 50, VE.RGBFrame(undef, 4, 4))
+    @test VE.hasrestored(c, 50)
+    right = split!(seq, 40)                  # frame 50 lands in the RIGHT half
+    @test right.id != c.id                   # …which is a different identity …
+    @test VE.hasrestored(right, 50)          # … and must still be restored
+    @test VE.restorecache(right) === VE.restorecache(c)   # shared, as the tracks are
+end
+
+
 @testset "blend pairing survives everything" begin
     # Simon, 2026-07-27: "was gibts denn zu suchen? wir markieren 2 clips, und dann
     # merken wir uns die" — the pair is REMEMBERED by clip id, never re-derived from
