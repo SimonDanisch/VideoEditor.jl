@@ -1081,6 +1081,65 @@ end
     end
 end
 
+@testset "matte progress is weighted by work, not by phase count" begin
+    # The two phases are ~1:20 in cost, and reporting them as equal halves made
+    # the bar reach 50% after 4% of the wall clock — measured on the birds clip:
+    # decode+fx 8.8 s against 187.0 s of propagation. It read as a hang.
+    #
+    # Asserted structurally rather than by timing: after the READ loop the bar
+    # must sit at `decodeshare`, not at one half. A timing assertion would be
+    # flaky and would not say what went wrong.
+    prevprop = VideoEditor.MATTEPROPAGATOR[]
+    VideoEditor.registermatte!((frames, seeds; progress = nothing) -> begin
+        n = length(frames)
+        progress === nothing || (for j in 1:n; progress(j, n); end)
+        fill(0xff, size(frames[1])..., n)
+    end)
+    try
+        src = VideoSource(testvideo2)
+        clip = Clip(src; src_in = 0, src_out = 11)
+        mask = VideoEditor.seedmask(clip, (0.1, 0.1, 0.4, 0.4))
+        reader = let sr = VideoEditor.SequentialReader(src),
+                     buf = VideoEditor.RGBFrame(undef, src.width, src.height)
+            sf -> (VideoEditor.readframe!(buf, sr, Int(sf)); copy(buf))
+        end
+        n = VideoEditor.srclength(clip)
+
+        fr = Float64[]
+        VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); mattewidth = 96,
+                                  decodeshare = 0.05,
+                                  progress = (d, t) -> push!(fr, d / t))
+        @test !isempty(fr)
+        @test issorted(fr)                       # never goes backwards
+        @test fr[end] ≈ 1.0                      # and lands exactly on full
+        @test maximum(fr) <= 1.0 + 1e-9          # never past its own end
+        # the READ phase is the first `n` ticks and must end at `decodeshare`
+        @test fr[n] ≈ 0.05 atol = 1e-3
+        # the old behaviour — half the bar for the read phase — must be gone
+        @test fr[n] < 0.2
+
+        # the share is honoured, so a caller that measures a different split can say so
+        fr2 = Float64[]
+        VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); mattewidth = 96,
+                                  decodeshare = 0.5,
+                                  progress = (d, t) -> push!(fr2, d / t))
+        @test fr2[n] ≈ 0.5 atol = 1e-3
+
+        # A MID-CLIP seed propagates backward then forward — `head + tail` is
+        # `n + 1` steps, and reporting them against `n` used to walk the bar
+        # past its own end.
+        clipm = Clip(src; src_in = 0, src_out = 11)
+        frm = Float64[]
+        VideoEditor.analyzematte!(clipm, reader, Dict(5 => mask); mattewidth = 96,
+                                  progress = (d, t) -> push!(frm, d / t))
+        @test issorted(frm)
+        @test maximum(frm) <= 1.0 + 1e-9
+        @test frm[end] ≈ 1.0
+    finally
+        VideoEditor.MATTEPROPAGATOR[] = prevprop
+    end
+end
+
 @testset "restore effect and cache" begin
     src = VideoSource(testvideo2)
     clip = Clip(src; src_in = 0, src_out = 6)

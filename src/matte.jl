@@ -386,7 +386,24 @@ sampled back up when applied, because a matte that tracks a subject does not nee
 per-pixel source detail and a full-resolution one costs a clip's worth of memory.
 """
 function analyzematte!(clip::Clip, readframe, seeds::Dict{Int, <:AbstractMatrix};
-                       mattewidth::Integer = 480, progress = nothing)
+                       mattewidth::Integer = 480, progress = nothing,
+                       # What share of the bar the READ phase gets. The two
+                       # phases are nothing like equal work, and reporting them
+                       # as equal halves is what made this tool look broken:
+                       # MEASURED on the birds clip (869 frames, 1080x1920
+                       # source, project crop, real SAM 2 seed) reading through
+                       # the post-fx stream,
+                       #
+                       #     decode + fx     8.8 s    10.1 ms/frame
+                       #     propagation   187.0 s   215.0 ms/frame
+                       #
+                       # so half the bar covered 4% of the wall clock: it raced
+                       # to 50% in under nine seconds of a 196-second job and
+                       # then crawled, which reads as a hang rather than as
+                       # progress. A kwarg and not a constant because it is a
+                       # measurement, not a law — it moves with the source
+                       # resolution and with `mattewidth`.
+                       decodeshare::Real = 0.05)
     n = srclength(clip)
     n > 0 || error("cannot matte an empty clip")
     isempty(seeds) && error("matting needs at least one marked frame")
@@ -394,11 +411,17 @@ function analyzematte!(clip::Clip, readframe, seeds::Dict{Int, <:AbstractMatrix}
     sw, sh = size(first)
     mw = min(Int(mattewidth), sw)
     mh = max(1, round(Int, sh * mw / sw))
+    # One place decides what fraction of the job is done; both phases report
+    # into it. Permille rather than (done, total) counts so the two phases can
+    # carry different weights without the caller knowing there are two.
+    share = clamp(Float64(decodeshare), 0.0, 1.0)
+    report = progress === nothing ? nothing :
+             frac -> progress(round(Int, 1000 * clamp(frac, 0.0, 1.0)), 1000)
     frames = Vector{Matrix{RGB{N0f8}}}(undef, n)
     for k in 1:n
         f = k == 1 ? first : readframe(clip.src_in + k - 1)
         frames[k] = downscale(f, mw, mh)   # area-average, from thumbnails.jl
-        progress === nothing || progress(k, 2n)
+        report === nothing || report(share * k / n)
     end
     localseeds = Dict{Int, Matrix{UInt8}}()
     for (sf, m) in seeds
@@ -408,10 +431,12 @@ function analyzematte!(clip::Clip, readframe, seeds::Dict{Int, <:AbstractMatrix}
     end
     isempty(localseeds) && error("no marked frame falls inside the clip")
     prop = matteprop()
-    alpha = propagateboth(prop, frames, localseeds, mw, mh, n, progress)
+    onstep = report === nothing ? nothing :
+             (d, t) -> report(share + (1 - share) * d / max(t, 1))
+    alpha = propagateboth(prop, frames, localseeds, mw, mh, n, onstep)
     track = MatteTrack(alpha, clip.src_in, sort!(collect(keys(seeds))))
     clip.mattetrack = track
-    progress === nothing || progress(2n, 2n)
+    report === nothing || report(1.0)
     return track
 end
 
@@ -432,13 +457,16 @@ So the prefix is propagated as its own sequence, reversed — same model, same
 seed, running backwards in time — and the two halves are stitched at the seed.
 """
 function propagateboth(prop, frames::Vector{<:AbstractMatrix}, seeds::Dict{Int, <:AbstractMatrix},
-                       mw::Integer, mh::Integer, n::Integer, progress)
+                       mw::Integer, mh::Integer, n::Integer, onstep)
     k = minimum(keys(seeds))
     alpha = Array{UInt8}(undef, mw, mh, n)
-    # total work for the progress bar: the tail plus the prefix, once each
+    # total work: the tail plus the prefix, once each. That is `n + 1`, not `n`
+    # — the seed frame is propagated by both halves — and reporting it against
+    # `n` used to walk the bar slightly past its own end on a mid-clip seed.
     tail, head = n - k + 1, k
+    total = head + tail
     done = Ref(0)
-    step = (d, t) -> progress === nothing ? nothing : progress(n + done[] + d, 2n)
+    step = onstep === nothing ? nothing : (d, t) -> onstep(done[] + d, total)
     if k > 1
         back = prop(frames[k:-1:1], Dict(k - sf + 1 => m for (sf, m) in seeds if sf <= k);
                     progress = step)
