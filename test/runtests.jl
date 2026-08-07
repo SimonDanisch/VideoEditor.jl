@@ -432,6 +432,39 @@ end
     reddiff = mean(abs.(Float32.(getfield.(early, :r)) .- Float32.(getfield.(late, :r))))
     @test reddiff > 0.1  # the two sources' content really alternates
 
+    # A source the hardware decoder REFUSES must reach the CPU reader, not throw.
+    # `opendecoder` wraps `openstream` in a try/catch for exactly this, but
+    # `openstream` only demuxes — `GpuVideoStream` builds its decoder lazily in
+    # `startfeed!`, which is where the chroma check lives — so a 4:4:4 file
+    # opened cleanly and then threw from the FIRST READ, past the fallback and
+    # out through `framereader`. It now probes inside the try, as `graysource`
+    # in campath.jl already did.
+    v444 = joinpath(mktempdir(), "yuv444.mp4")
+    run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -f lavfi -i testsrc2=size=320x180:rate=30 -t 1
+                  -c:v libx264 -g 30 -pix_fmt yuv444p $v444`,
+                 stdout = devnull, stderr = devnull))
+    @test readchomp(`$(FFMPEG_jll.ffprobe()) -v error -select_streams v:0
+                     -show_entries stream=pix_fmt -of csv=p=0 $v444`) == "yuv444p"
+    let gpu = VE.Lava.LavaBackend(), src444 = VideoSource(v444), src420 = VideoSource(testvideo)
+        # THE ANCHOR. If 4:2:0 does not take the GPU path on this machine then
+        # both cases fall back for unrelated reasons and the assertion below
+        # cannot tell a fixed `opendecoder` from a broken one — so say so rather
+        # than pass silently.
+        d420 = VE.opendecoder(src420, gpu)
+        if d420 isa VE.SequentialReader
+            @info "GPU decode unavailable here — 4:4:4 fallback test cannot discriminate; skipped"
+        else
+            @test VE.opendecoder(src444, gpu) isa VE.SequentialReader   # fell back
+            # and the fallback must actually READ, advancing frames
+            r = VE.opendecoder(src444, gpu)
+            f = VE.RGBFrame(undef, src444.width, src444.height)
+            a = copy(VE.readframe!(f, r, 0))
+            b = copy(VE.readframe!(f, r, 10))
+            @test a != b
+        end
+        d420 isa VE.SequentialReader || close(d420)
+    end
+
     # projects roundtrip with several sources
     path = joinpath(mktempdir(), "multi.toml")
     saveproject(path, seq)

@@ -194,7 +194,23 @@ function opendecoder(source::VideoSource, backend)
     mezz = mezzaninepath(source)
     path = isfile(mezz) ? mezz : source.path
     try
-        return openstream(backend, path, source.width, source.height)
+        s = openstream(backend, path, source.width, source.height)
+        # PROBE, inside the `try`. `openstream` only demuxes: `GpuVideoStream`
+        # builds its `H264Decoder` lazily, per GOP, in `startfeed!`, and that is
+        # where the format checks live. So a profile the hardware cannot decode —
+        # 4:4:4 (`chroma_format_idc = 3`), more reference frames than the DPB
+        # allows — opened cleanly here and then threw from the FIRST READ, past
+        # this fallback, out through `framereader` and into whatever asked for a
+        # frame. The fallback was decoration for exactly the sources it existed
+        # for. `graysource` in campath.jl already does this; the analyses that
+        # use it have been fine, and this path had the same bug the whole time.
+        try
+            exactframeat!(s, 0)
+        catch
+            close(s)
+            rethrow()
+        end
+        return s
     catch e
         # a decoder that cannot open is not a reason to fail the render — the CPU
         # reader can read anything ffmpeg can, it is only slower
