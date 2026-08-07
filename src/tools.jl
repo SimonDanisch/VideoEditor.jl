@@ -1393,6 +1393,12 @@ function runmatte!(ctx::ToolContext; clip = nothing, seeds = nothing)
     setstatus!(player, "matte: propagating from $(length(marks)) marked frame(s)")
     runanalysis(player) do
         try
+            # No cap: the matte is drawn into the layer, so computing it smaller
+            # is an edge rebuilt from fewer samples than the layer can show. It
+            # is not a quality dial either — the propagator is causal, so a
+            # different input resolution tracks the subject differently. Cost is
+            # linear in matte area (607 ms/megapixel measured), which is what a
+            # `maxside` cap buys back if a clip is ever too slow to matte.
             reader = framereader(clip, player.engine)
             track = analyzematte!(clip, reader, marks; progress = (d, t) -> begin
                 player.jobprogress[] = d / max(t, 1)

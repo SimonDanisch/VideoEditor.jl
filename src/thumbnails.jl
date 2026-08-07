@@ -203,9 +203,16 @@ Area-average downscale of a (w, h) frame to (tw, th): every output pixel is
 the mean of its full source cell, so decimation cannot alias (nearest-neighbor
 sampling every ~12th pixel is what made the timeline thumbnails look mangled).
 Falls back to nearest-neighbor when the target is not actually smaller.
+
+A same-size request returns a copy rather than resampling. The nearest-neighbor
+branch is NOT the identity at `tw == w`: `round(i - 0.5)` rounds halves to even,
+so it maps 3 to 2 and 5 to 4, duplicating every other column. Callers that pass
+the frame's own size — an uncapped `previewmatte` does — got a quietly mangled
+frame back.
 """
 function downscale(frame::RGBFrame, tw::Integer, th::Integer)
     w, h = size(frame)
+    (tw == w && th == h) && return copy(frame)
     thumb = RGBFrame(undef, tw, th)
     if tw >= w || th >= h   # upscale: no cells to average
         for j in 1:th, i in 1:tw

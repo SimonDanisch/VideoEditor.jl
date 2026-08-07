@@ -1025,7 +1025,7 @@ end
                  buf = VideoEditor.RGBFrame(undef, src.width, src.height)
         sf -> (VideoEditor.readframe!(buf, sr, Int(sf)); copy(buf))
     end
-    track = VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); mattewidth = 96)
+    track = VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); maxside = 96)
     @test clip.mattetrack === track
     @test size(track.alpha, 3) == 12
     @test track.seeds == [0]
@@ -1102,7 +1102,7 @@ end
     end)
     try
         @test VideoEditor.MATTEPROPAGATOR[] !== nothing
-        t4 = VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); mattewidth = 96)
+        t4 = VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); maxside = 96)
         @test called[] == 1
         @test all(==(0xff), t4.alpha)
     finally
@@ -1114,56 +1114,63 @@ end
     end
 end
 
-@testset "matte progress is weighted by work, not by phase count" begin
-    # The two phases are ~1:20 in cost, and reporting them as equal halves made
-    # the bar reach 50% after 4% of the wall clock — measured on the birds clip:
-    # decode+fx 8.8 s against 187.0 s of propagation. It read as a hang.
+@testset "matte reads and propagates in one interleaved pass" begin
+    # There used to be two phases — read every frame into a Vector, then
+    # propagate — costing ~1:20, and reporting them as equal halves put the bar
+    # at 50% after 4% of the wall clock (birds clip: decode+fx 8.8 s against
+    # 187.0 s). It read as a hang, and it held the whole clip in RAM.
     #
-    # Asserted structurally rather than by timing: after the READ loop the bar
-    # must sit at `decodeshare`, not at one half. A timing assertion would be
-    # flaky and would not say what went wrong.
+    # Now frames are FETCHED (see `MatteFrames`), so there is one phase and no
+    # share to tune. Asserted structurally, not by timing: the reader must still
+    # be being called after propagation has started reporting. Collecting frames
+    # up front would satisfy every monotonicity check below and fail this one.
     prevprop = VideoEditor.MATTEPROPAGATOR[]
+    # This stand-in has to FETCH each frame as it goes, the way the real
+    # propagator does. One that only touched `frames[1]` read a single frame
+    # under streaming and could not tell deferred reads from eager ones.
     VideoEditor.registermatte!((frames, seeds; progress = nothing) -> begin
         n = length(frames)
-        progress === nothing || (for j in 1:n; progress(j, n); end)
-        fill(0xff, size(frames[1])..., n)
+        out = Array{UInt8}(undef, size(frames[1])..., n)
+        for j in 1:n
+            frames[j]
+            out[:, :, j] .= 0xff
+            progress === nothing || progress(j, n)
+        end
+        out
     end)
     try
         src = VideoSource(testvideo2)
         clip = Clip(src; src_in = 0, src_out = 11)
         mask = VideoEditor.seedmask(clip, (0.1, 0.1, 0.4, 0.4))
+        nread = Ref(0)
         reader = let sr = VideoEditor.SequentialReader(src),
                      buf = VideoEditor.RGBFrame(undef, src.width, src.height)
-            sf -> (VideoEditor.readframe!(buf, sr, Int(sf)); copy(buf))
+            sf -> (nread[] += 1; VideoEditor.readframe!(buf, sr, Int(sf)); copy(buf))
         end
         n = VideoEditor.srclength(clip)
 
         fr = Float64[]
-        VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); mattewidth = 96,
-                                  decodeshare = 0.05,
-                                  progress = (d, t) -> push!(fr, d / t))
+        readsattick = Int[]
+        VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); maxside = 96,
+                                  progress = (d, t) -> (push!(fr, d / t);
+                                                        push!(readsattick, nread[])))
         @test !isempty(fr)
         @test issorted(fr)                       # never goes backwards
         @test fr[end] ≈ 1.0                      # and lands exactly on full
         @test maximum(fr) <= 1.0 + 1e-9          # never past its own end
-        # the READ phase is the first `n` ticks and must end at `decodeshare`
-        @test fr[n] ≈ 0.05 atol = 1e-3
-        # the old behaviour — half the bar for the read phase — must be gone
-        @test fr[n] < 0.2
-
-        # the share is honoured, so a caller that measures a different split can say so
-        fr2 = Float64[]
-        VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); mattewidth = 96,
-                                  decodeshare = 0.5,
-                                  progress = (d, t) -> push!(fr2, d / t))
-        @test fr2[n] ≈ 0.5 atol = 1e-3
+        # THE streaming property: reading is not finished when propagation
+        # starts reporting. Collecting frames into a Vector first would make
+        # every count below equal `n` from the first tick on.
+        @test readsattick[1] < n
+        @test issorted(readsattick)
+        @test readsattick[end] >= n              # and all of them do get read
 
         # A MID-CLIP seed propagates backward then forward — `head + tail` is
         # `n + 1` steps, and reporting them against `n` used to walk the bar
         # past its own end.
         clipm = Clip(src; src_in = 0, src_out = 11)
         frm = Float64[]
-        VideoEditor.analyzematte!(clipm, reader, Dict(5 => mask); mattewidth = 96,
+        VideoEditor.analyzematte!(clipm, reader, Dict(5 => mask); maxside = 96,
                                   progress = (d, t) -> push!(frm, d / t))
         @test issorted(frm)
         @test maximum(frm) <= 1.0 + 1e-9
