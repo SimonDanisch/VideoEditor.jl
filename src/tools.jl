@@ -1701,25 +1701,34 @@ function repaintmattecard!(player::Player)
     return true
 end
 
-"Warm the propagation model once, while the user is still choosing where to click."
+"""
+Warm the propagation model once, while the user is still choosing where to click.
+
+The size has to be the size the tool will really ask for: the cooperative-matrix
+GEMM specializes per tile shape, so warming at a different resolution leaves the
+specialization to be paid again on the first click — which is the click the user
+is watching. That is `mattereadsize(clip, nothing)`, the same call `framereader`
+and `analyzematte!` make, not a resolution of this function's own choosing.
+
+With no clip selected there is no size to know; 480x270 is then a guess that at
+least loads the model, and the first click pays for its own shape.
+"""
 function warmmattepanel!(ctx::ToolContext)
     player = ctx.player
     MATTEWARMED[] && return nothing
     loc0 = editclip(player)
-    mw, mh = if loc0 === nothing
-        480, 270
-    else
-        cw, ch = mattelayersize(loc0[1])
-        w = min(480, cw)
-        w, max(1, round(Int, ch * w / cw))
-    end
+    mw, mh = loc0 === nothing ? (480, 270) : mattereadsize(loc0[1], nothing)
     player.matteinfo[] = "warming up the model…"
     runanalysis(player) do
         try
             warmmatte!(mw, mh)
             put!(player.uiqueue, () -> (player.matteinfo[] = "ready — mark the subject"))
         catch e
-            put!(player.uiqueue, () -> (player.matteinfo[] = "model warm-up failed"))
+            bt = catch_backtrace()
+            put!(player.uiqueue, () -> begin
+                player.matteinfo[] = "model warm-up failed: $(briefly(e))"
+                @error "matte warm-up failed" exception = (e, bt)
+            end)
         end
     end
     return nothing

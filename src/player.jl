@@ -194,10 +194,17 @@ struct GPUWorker
     end
 end
 
+"Post `f` to a worker directly — for callers that own a [`GPUWorker`] but no `Player`
+(the test suite's GPU beats, which must reach Lava on the same pinned thread the
+editor uses, or they fix ownership on main and every later analysis asserts)."
+function rungpu(f::Function, w::GPUWorker)
+    put!(w.jobs, f)
+    return nothing
+end
+
 function rungpu(f::Function, player::Player)
     player.gpuworker === nothing && (player.gpuworker = GPUWorker())
-    put!(player.gpuworker.jobs, f)
-    return nothing
+    return rungpu(f, player.gpuworker)
 end
 
 """

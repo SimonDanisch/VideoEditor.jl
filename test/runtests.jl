@@ -445,24 +445,39 @@ end
                  stdout = devnull, stderr = devnull))
     @test readchomp(`$(FFMPEG_jll.ffprobe()) -v error -select_streams v:0
                      -show_entries stream=pix_fmt -of csv=p=0 $v444`) == "yuv444p"
-    let gpu = VE.Lava.LavaBackend(), src444 = VideoSource(v444), src420 = VideoSource(testvideo)
+    # ON THE PINNED WORKER, not here. A Lava `BatchQueue` belongs to the thread that
+    # first builds the Vulkan context, and this is the suite's first touch of Lava —
+    # so calling `LavaBackend()` inline made MAIN the owner for the rest of the
+    # session, and every later analysis, which the editor runs on its pinned worker
+    # by design, died on "BatchQueue is single-writer". That is what took the matte
+    # marking beats in `interactions.jl` down (they pass when run on their own,
+    # where nothing has claimed the context first). Every `GPUWorker` pins to the
+    # same thread, so borrowing one here puts the whole suite on the editor's owner.
+    # The assertions stay out here: a testset's state is task-local, so an `@test`
+    # inside the worker records nowhere.
+    probe = VE.rungpusync(VE.GPUWorker()) do
+        gpu = VE.Lava.LavaBackend()
+        src444, src420 = VideoSource(v444), VideoSource(testvideo)
         # THE ANCHOR. If 4:2:0 does not take the GPU path on this machine then
         # both cases fall back for unrelated reasons and the assertion below
         # cannot tell a fixed `opendecoder` from a broken one — so say so rather
         # than pass silently.
         d420 = VE.opendecoder(src420, gpu)
-        if d420 isa VE.SequentialReader
-            @info "GPU decode unavailable here — 4:4:4 fallback test cannot discriminate; skipped"
-        else
-            @test VE.opendecoder(src444, gpu) isa VE.SequentialReader   # fell back
-            # and the fallback must actually READ, advancing frames
-            r = VE.opendecoder(src444, gpu)
-            f = VE.RGBFrame(undef, src444.width, src444.height)
-            a = copy(VE.readframe!(f, r, 0))
-            b = copy(VE.readframe!(f, r, 10))
-            @test a != b
-        end
-        d420 isa VE.SequentialReader || close(d420)
+        d420 isa VE.SequentialReader && return nothing
+        close(d420)
+        fellback = VE.opendecoder(src444, gpu) isa VE.SequentialReader
+        # and the fallback must actually READ, advancing frames
+        r = VE.opendecoder(src444, gpu)
+        f = VE.RGBFrame(undef, src444.width, src444.height)
+        a = copy(VE.readframe!(f, r, 0))
+        b = copy(VE.readframe!(f, r, 10))
+        return (fellback = fellback, advanced = a != b)
+    end
+    if probe === nothing
+        @info "GPU decode unavailable here — 4:4:4 fallback test cannot discriminate; skipped"
+    else
+        @test probe.fellback
+        @test probe.advanced
     end
 
     # projects roundtrip with several sources

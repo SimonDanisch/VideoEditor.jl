@@ -82,11 +82,17 @@ neither one softened an edge.
     u = un * Float32(mw) + 0.5f0
     v = vn * Float32(mh) + 0.5f0
     a = if feather > 0.0f0
-        # 5×5 binomial taps, spaced up to 2 plane texels apart — the plane is 480
-        # wide against a 1080-wide source, so full feather is a ±9 source-pixel
-        # ramp. At feather 0 the spacing is 0, every tap lands on the same place
-        # and this collapses to the single sample below: continuous, and it can
-        # only ever soften.
+        # 5×5 binomial taps, spaced up to 2 plane texels apart, so full feather
+        # reaches ±4 texels. At feather 0 the spacing is 0, every tap lands on the
+        # same place and this collapses to the single sample below: continuous,
+        # and it can only ever soften.
+        #
+        # NOTE the reach is in PLANE texels, so it scales with the matte's
+        # resolution — and the matte is now the clip's full cropped source
+        # (`mattereadsize` defaults to no cap), not the 480-wide plane this was
+        # tuned against. Full feather used to be ±9 source pixels (4 texels ×
+        # 1080/480); it is ±4 now, and less of the picture still on a 4K source.
+        # The control's meaning should not depend on the analysis resolution.
         s = feather * 2.0f0
         acc = 0.0f0
         for dy in Int32(-2):Int32(2), dx in Int32(-2):Int32(2)
@@ -214,8 +220,10 @@ function matteplane!(track::MatteTrack, i::Int, backend)
     return dev
 end
 
+const MATTEWARMED = Ref(false)
+
 """
-    warmmatte!() -> Bool
+    warmmatte!(w, h) -> Bool
 
 Run the propagator once on a tiny synthetic clip, to pay its first-call cost
 somewhere the user is not waiting.
@@ -227,13 +235,12 @@ entries in, zero added). It is Julia specializing the graph's execution paths.
 Most of that is size-independent, but not all: warming at 64x48 absorbed 97.9 s
 and still left 12.5 s on the first real 240x136 clip, because the
 cooperative-matrix GEMM specializes per tile shape (`Val{BLK}`). So warm at the
-size that will actually be used — `w`/`h` should be the matte resolution the
-tool will ask for, not a token.
+size that will actually be used — `w`/`h` should be `mattereadsize` of the clip
+the tool is about to matte, not a token. The defaults are for the caller that
+has no clip yet and can only choose to load the model at all.
 
 Returns whether it ran (false when no propagator is installed, or it already has).
 """
-const MATTEWARMED = Ref(false)
-
 function warmmatte!(w::Integer = 480, h::Integer = 270)
     MATTEWARMED[] && return false
     MATTEWARMED[] = true
@@ -269,9 +276,16 @@ freematteplanes!() = (empty!(MATTEPLANES); nothing)
     registermatte!(f)
 
 Install the matte propagator. `f(frames, seeds; progress) -> Array{UInt8,3}`
-receives the clip's frames as `Vector{Matrix{RGB{N0f8}}}` at matte resolution and
-`seeds::Dict{Int, Matrix{UInt8}}` (index into `frames` → the user's rough
-selection, 0/255), and returns `(w, h, nframes)` alpha.
+receives the clip's frames at matte resolution and `seeds::Dict{Int,
+Matrix{UInt8}}` (index into `frames` → the user's rough selection, 0/255), and
+returns `(w, h, nframes)` alpha.
+
+`frames` is an **`AbstractVector{Matrix{RGB{N0f8}}}`, not a `Vector`** — what
+arrives is a `view` of a [`MatteFrames`](@ref), which decodes on index and keeps
+nothing. So a runner must use it as a sequence (`length`, `size(frames[1])`,
+`frames[k]`) and must NOT `collect` it: that materialises the whole clip and puts
+back the 763 MB, plus the two-phase progress bar, that streaming removed. Index
+FORWARD — the readers are sequential decoders and random access costs a seek.
 
 This is the seam a model runner plugs into. VideoEditor deliberately does not
 depend on one: the editor owns the track, the UI and the render path, and the
@@ -396,8 +410,8 @@ end
 The clip's frames at matte resolution, decoded when asked for and not before.
 
 **Nothing here caches a clip.** The propagator says what it does per frame and
-this hands it one; indexing decodes and downscales that frame and keeps nothing,
-so a propagation costs one frame of memory rather than all of them. It used to
+this hands it one; indexing decodes that frame and keeps nothing, so a
+propagation costs one frame of memory rather than all of them. It used to
 build the whole `Vector` up front, which on the birds clip (869 frames at
 480x610) was 763 MB held for the three minutes the model ran, and split the job
 into a read phase and a propagate phase that no progress bar could weight
@@ -768,15 +782,19 @@ every frame of the clip once, in order, which is exactly what a sequential
 decoder is good at, and it keeps the analysis off the single-writer Vulkan queue
 that the preview is using to stay responsive.
 
-`maxside` caps the short side, via [`mattereadsize`](@ref), and when it bites the
-resize happens **on the device, before the download**. A host-side one meant
-pulling the full layer across the bus and throwing most of it away: 756x960 is
-2.18 MB a frame to produce the 878 KB the model reads, plus a host resize, 869
-times. `areadownscale!` is the same kernel the thumbnail worker downloads
-through, for the same reason.
+**The default is NO cap and nothing in the editor passes one**, so what the model
+reads is the clip's whole cropped source — full resolution, no resample anywhere
+on this path. That is deliberate: the matte's edge is the product, and a matte
+reconstructed from fewer samples than the layer can show is a worse edge, not a
+cheaper one. See [`mattereadsize`](@ref) for why downscaling is not a quality
+dial at all here.
 
-The default — no cap — is the layer itself, which is what marking and the live
-preview need anyway, because a click's coordinates live in layer space.
+`maxside` therefore exists for one case that has not come up: a clip too slow to
+matte at all. When it does bite it caps the short side and the resize happens
+**on the device, before the download** — a host-side one would pull the full
+layer across the bus and throw most of it away (756x960 is 2.18 MB a frame to
+produce 878 KB, plus a host resize, 869 times). `areadownscale!` is the same
+kernel the thumbnail worker downloads through, for the same reason.
 """
 function framereader(clip::Clip, engine::FxEngine;
                      maxside::Union{Nothing,Integer} = nothing)
