@@ -337,7 +337,12 @@ the model says so by returning three proposals.
 """
 function sam2seed(frame, points; key = nothing)
     if SAM2MODEL[] === nothing
-        model = SAM2Runner.sam2model(; backend = Lava.LavaBackend())
+        # `replaydecode = false`: the decoder's captured sequence does not survive
+        # a garbage collection, and marking a matte is precisely the pattern that
+        # provokes one — a click, host work to show the result, another click. The
+        # editor was losing the device on the second mark. Recording each decode
+        # fresh costs about 6% of a click and is the only version that runs.
+        model = SAM2Runner.sam2model(; backend = Lava.LavaBackend(), replaydecode = false)
         SAM2MODEL[] = SAM2Runner.sam2segmenter(model; pick = :confident)
     end
     return SAM2MODEL[](frame, points; key)
