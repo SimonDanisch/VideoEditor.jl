@@ -379,6 +379,19 @@ end
     @test VE.findslot(seq2.clips[2], VE.OpacityEffect) === nothing
 end
 
+"""
+Apply `e` to `img` exactly as the graph's `PixelNode` does — the same `applykind!`,
+the same `needsfresh` decision, just without a pool. There used to be a second
+renderer here (`applyeffect!` → `applykindcpu!`) that these tests reached for; it
+had no caller in `src/`, so the suite was the only thing keeping a second
+definition of every built-in alive. Test the path that ships.
+"""
+function applyfx(img, e)
+    k = VE.fxkind(e)
+    out = VE.needsfresh(k) ? similar(img) : img
+    return VE.applykind!(out, img, k)
+end
+
 @testset "plugin registry + MCP authoring" begin
     # register a plugin directly (any package can) — it becomes an effect kind
     VE.registerplugin!(:testfx, "Test FX", [VE.FxParam(:k, "k", 0.0, 1.0, 1.0)],
@@ -396,8 +409,7 @@ end
 
     # a plugin effect applies through the shared kernel + roundtrips through the project dict
     e = VE.plugineffect(:mcpfx; gain = 0.25)
-    f = fill(VE.RGB{VE.N0f8}(0.8, 0.8, 0.8), 8, 8)
-    VE.applyeffect!(f, similar(f), similar(f), e)
+    f = applyfx(fill(VE.RGB{VE.N0f8}(0.8, 0.8, 0.8), 8, 8), e)
     @test all(px -> Float32(px.r) < 0.8, f)                        # gain 0.25 darkens
     @test VE.plugineffectfromdict(VE.effectdict(e)).params.gain == 0.25
 
@@ -407,8 +419,9 @@ end
     @test VE.fxkind(soften) isa VE.Stencil
     edge = fill(VE.RGB{VE.N0f8}(0.0, 0.0, 0.0), 16, 16)
     edge[9:end, :] .= VE.RGB{VE.N0f8}(1.0, 1.0, 1.0)               # sharp black/white seam
-    VE.applyeffect!(edge, similar(edge), similar(edge), soften)
-    @test any(px -> 0.1 < Float32(px.r) < 0.9, edge)              # box blur softened the seam
+    out = applyfx(edge, soften)
+    @test out !== edge                                             # a Stencil needs a fresh buffer
+    @test any(px -> 0.1 < Float32(px.r) < 0.9, out)               # box blur softened the seam
 end
 
 @testset "example plugins load (how-to-hack reference)" begin
@@ -417,7 +430,7 @@ end
     f = fill(VE.RGB{VE.N0f8}(0.4, 0.6, 0.3), 16, 16)
     for name in (:invert, :sepia, :posterize, :levels, :edges, :emboss)
         @test VE.kindbyname(name) !== nothing
-        g = copy(f); VE.applyeffect!(g, similar(g), similar(g), VE.plugineffect(name))
+        g = applyfx(copy(f), VE.plugineffect(name))
         @test all(px -> isfinite(Float32(px.r)), g)      # every example plugin applies cleanly
     end
 end

@@ -131,9 +131,10 @@ applykind!(out, inp, k::Stencil) = stencil!(out, inp, k.f, k.radius)
 needsfresh(::Pointwise) = false
 needsfresh(::Stencil) = true
 
-# CPU effect stack (`applyeffects!`): the same callbacks, run in place with scratch
-applykindcpu!(buf, tmp, k::Pointwise) = pointwise!(buf, buf, k.f)
-applykindcpu!(buf, tmp, k::Stencil) = (stencil!(tmp, buf, k.f, k.radius); copyto!(buf, tmp); buf)
+# `applykind!` is the ONLY one. There was an `applykindcpu!` beside it that called
+# the identical kernels and differed only in buffer discipline (in-place with a
+# caller's scratch, rather than the pool's `out`) — a second name for one
+# operation, on a second traversal that nothing in `src/` called. Both deleted.
 
 # built-in opacity is just a pointwise scale toward black — no dedicated kernel
 fxkind(e::OpacityEffect) = (a = e.α; Pointwise((c, uv) -> c * a))

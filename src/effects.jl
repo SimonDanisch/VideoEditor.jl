@@ -1,8 +1,10 @@
 """
-Non-destructive per-clip effects, interpreted in stack order by
-`applyeffects!`. All pixel work is done by GPUFiltering kernels through
-KernelAbstractions — the same code runs on whatever backend the buffers
-live on (CPU today; LavaArrays once frames are GPU-resident).
+Non-destructive per-clip effects, interpreted in stack order by `graphof` and run
+by `execute!` — the one renderer, whatever the tier. All pixel work is GPUFiltering
+kernels through KernelAbstractions, and the buffers come from a `BufferPool` built
+on the engine's backend, so the same code runs on host `Matrix`es under `KA.CPU()`
+and on `LavaArray`s on the GPU. There is no CPU stack and no GPU stack; there is
+one graph and a backend parameter.
 """
 abstract type Effect end
 
@@ -169,23 +171,18 @@ function findslot(clip::Clip, id::Integer)
     return i === nothing ? nothing : clip.effects[i]
 end
 
-"Apply `clip`'s effect stack to `buf` in place, using two same-size scratch buffers."
-function applyeffects!(buf::AnyRGBFrame, tmp1::AnyRGBFrame, tmp2::AnyRGBFrame, clip::Clip)
-    for e in liveeffects(clip)
-        applyeffect!(buf, tmp1, tmp2, e)
-    end
-    KA.synchronize(KA.get_backend(buf))
-    return buf
-end
-
-# Effects with a specialized/multi-pass kernel apply it directly.
-applyeffect!(buf, tmp1, tmp2, e::ColorEffect) = coloradjust!(buf, e.adj)
-applyeffect!(buf, tmp1, tmp2, e::BlurEffect) =
-    (gaussianblur!(tmp1, buf, e.σ; tmp = tmp2); copyto!(buf, tmp1))
-applyeffect!(buf, tmp1, tmp2, e::SharpenEffect) =
-    (unsharpmask!(tmp1, buf, e.σ, e.amount; tmp = tmp2); copyto!(buf, tmp1))
-# Callback effects (`fxkind`, incl. plugins) run the SAME kernel the GPU graph uses.
-applyeffect!(buf, tmp1, tmp2, e::Effect) = applykindcpu!(buf, tmp1, fxkind(e))
+# There is no second walker over the stack here. `execute!` (gpugraph.jl) is the
+# ONE renderer, and it is not GPU-specific: its `BufferPool` allocates through
+# `KA.allocate(backend, …)`, so on `KA.CPU()` it hands out host `Matrix`es and
+# runs the identical kernels. The tier is the engine's backend, a parameter —
+# never a second code path.
+#
+# There used to be one anyway: `applyeffects!` walked `liveeffects` with two
+# scratch buffers, plus `applyeffect!` methods that re-stated what Color, Blur
+# and Sharpen do, plus an `applykindcpu!` that differed from `applykind!` only in
+# buffer discipline. Nothing in `src/` ever called it — the whole thing was dead,
+# kept alive by three tests, so the suite was exercising a second definition of
+# every built-in that shipped to nobody. Deleted 2026-08-07.
 
 # ------------------------------------------------------------- serialization
 
