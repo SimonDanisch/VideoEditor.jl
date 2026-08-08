@@ -71,6 +71,9 @@ alpha space, which at `f = 1` mapped alpha 1 to 0.84 and alpha 0 to 0.16 — the
 subject went translucent and the background bled through everywhere. That is what
 `strength` does, one slider up, so the two controls did the same thing and
 neither one softened an edge.
+
+`feather = 1` reaches ±1/120 of the crop's width — about 32 pixels of transition
+band on a 1920-wide render, whatever resolution the matte was analyzed at.
 """
 @inline function mattealphaat(alpha, i, j, w, h, mw::Int32, mh::Int32,
                               strength::Float32, feather::Float32,
@@ -82,18 +85,23 @@ neither one softened an edge.
     u = un * Float32(mw) + 0.5f0
     v = vn * Float32(mh) + 0.5f0
     a = if feather > 0.0f0
-        # 5×5 binomial taps, spaced up to 2 plane texels apart, so full feather
-        # reaches ±4 texels. At feather 0 the spacing is 0, every tap lands on the
-        # same place and this collapses to the single sample below: continuous,
-        # and it can only ever soften.
+        # 5×5 binomial taps. At feather 0 the spacing is 0, every tap lands on
+        # the same place and this collapses to the single sample below:
+        # continuous, and it can only ever soften.
         #
-        # NOTE the reach is in PLANE texels, so it scales with the matte's
-        # resolution — and the matte is now the clip's full cropped source
-        # (`mattereadsize` defaults to no cap), not the 480-wide plane this was
-        # tuned against. Full feather used to be ±9 source pixels (4 texels ×
-        # 1080/480); it is ±4 now, and less of the picture still on a 4K source.
-        # The control's meaning should not depend on the analysis resolution.
-        s = feather * 2.0f0
+        # The reach is a FRACTION OF THE PICTURE, not a texel count. It used to
+        # be `feather * 2` texels of spacing — ±4 texels at full feather — which
+        # made the control mean whatever the analysis happened to be sized at:
+        # `mattereadsize` no longer caps the plane at 480 wide, so the same
+        # slider softened a 34-pixel band on the plane it was tuned against and
+        # a 4-pixel band on a 4K source. Dividing by 240 keeps the tuned value
+        # (mw/240 = 2 at mw = 480) and makes full feather reach ±mw/120, i.e.
+        # 1/120 of the crop's width, at every resolution.
+        #
+        # Five taps over a widening reach means the taps themselves spread
+        # apart on a fine plane — the softening is a scaled copy of the tuned
+        # kernel, not a better-sampled one.
+        s = feather * Float32(mw) / 240.0f0
         acc = 0.0f0
         for dy in Int32(-2):Int32(2), dx in Int32(-2):Int32(2)
             acc += binom5(dx) * binom5(dy) *

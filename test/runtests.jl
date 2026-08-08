@@ -1095,6 +1095,26 @@ end
     # somewhere the matte actually darkened the background
     @test any(keyed[i] != frame[i] for i in eachindex(frame))
 
+    # --- feather reaches a fraction of the PICTURE, not a count of plane texels
+    # Key a white frame against black over a hard vertical edge: the output IS
+    # the alpha, so the run of pixels that are neither fully in nor fully out is
+    # the softness the user sees. Analyzing the same edge four times finer must
+    # not change it — the reach used to be a fixed ±4 texels, so raising
+    # `mattereadsize` (which no longer caps at 480) quietly narrowed the band
+    # from 34 output pixels to 8.
+    featherband = function (mw, mh)
+        cl = Clip(src; src_in = 0, src_out = 1)
+        a = zeros(UInt8, mw, mh, 1)
+        a[1:(mw ÷ 2), :, 1] .= 0xff
+        cl.mattetrack = VideoEditor.MatteTrack(a, 0)
+        buf = fill(RGB{N0f8}(1, 1, 1), 480, 270)
+        VideoEditor.applymatte!(buf, cl, 0; strength = 1.0, feather = 1.0)
+        row = [Float32(buf[i, 135].r) for i in 1:480]
+        findlast(>(0.02f0), row) - findfirst(<(0.98f0), row) + 1
+    end
+    @test featherband(480, 270) > 4                      # it softens at all
+    @test featherband(480, 270) == featherband(1920, 1080) == featherband(3840, 2160)
+
     # --- effect: registries, neutrality, serialization
     @test VideoEditor.isneutral(MatteEffect(0.0, 0.0))
     @test !VideoEditor.isneutral(MatteEffect(1.0, 0.0))
