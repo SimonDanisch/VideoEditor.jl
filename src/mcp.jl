@@ -454,9 +454,14 @@ function renderpreview(player::Player, t::Float64, width::Int)
     # the same graph as preview/export; a private engine on the declared backend —
     # this runs on the MCP task, the player's engine pool belongs to the render thread
     ec = effectiveclip(clip, srcframe)
-    render(FxEngine(player.analysisbackend), scratch, ec, Int(srcframe)) do out
-        warp!(preview, out, ec.crop)
-        KA.synchronize(KA.get_backend(preview))
+    engine = FxEngine(player.analysisbackend)
+    try
+        render(engine, scratch, ec, Int(srcframe)) do out
+            warp!(preview, out, ec.crop)
+            KA.synchronize(KA.get_backend(preview))
+        end
+    finally
+        emptyengine!(engine)
     end
     return preview
 end

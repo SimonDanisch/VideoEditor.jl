@@ -459,6 +459,7 @@ function autodetectgpu!(player::Player)
     end
     capable || return nothing
     player.analysisbackend = LavaBackend()               # wraps the worker-owned context
+    emptyengine!(player.engine)                          # its plans hold pool regions now
     player.engine = FxEngine(player.analysisbackend)     # the engine follows the backend
     player.gpupreview = GPUPreview()
     haskey(player.fxwidgets, :lanechip) && (player.fxwidgets[:lanechip][] = "GPU")
