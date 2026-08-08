@@ -470,15 +470,19 @@ costs a resize on every frame.
 
 Frames stream (see [`MatteFrames`](@ref)); reading and propagating interleave, so
 there is one phase and the progress bar needs no weighting between two.
+
+`propagator` defaults to the installed one and is a kwarg for the same reason the
+segmenter is: `src/precompile.jl` has to drive this function to trace it, and
+`registermatte!`ing a built model during precompilation would serialise that
+model's device buffers — and the context they belong to — into the package image.
 """
 function analyzematte!(clip::Clip, readframe, seeds::Dict{Int, <:AbstractMatrix};
-                       maxside::Union{Nothing,Integer} = nothing, progress = nothing)
+                       maxside::Union{Nothing,Integer} = nothing, progress = nothing,
+                       propagator = matteprop())
     n = srclength(clip)
     n > 0 || error("cannot matte an empty clip")
     isempty(seeds) && error("matting needs at least one marked frame")
     mw, mh = mattereadsize(clip, maxside)
-    report = progress === nothing ? nothing :
-             frac -> progress(round(Int, 1000 * clamp(frac, 0.0, 1.0)), 1000)
     # Frames are FETCHED, not collected. Reading and propagating interleave, so
     # there is one phase to report and no share to tune between two — which is
     # what `decodeshare` existed for and why it is gone.
@@ -490,13 +494,37 @@ function analyzematte!(clip::Clip, readframe, seeds::Dict{Int, <:AbstractMatrix}
         localseeds[k] = mattemaskscale(m, mw, mh)
     end
     isempty(localseeds) && error("no marked frame falls inside the clip")
-    prop = matteprop()
-    onstep = report === nothing ? nothing : (d, t) -> report(d / max(t, 1))
-    alpha = propagateboth(prop, frames, localseeds, mw, mh, n, onstep)
+    alpha = propagateboth(propagator, frames, localseeds, mw, mh, n, progress)
     track = MatteTrack(alpha, clip.src_in, sort!(collect(keys(seeds))))
     clip.mattetrack = track
-    report === nothing || report(1.0)
+    progress === nothing || progress(1000, 1000)
     return track
+end
+
+"""
+Progress reporting into the propagator, as ONE type.
+
+The propagator takes a `progress` callback, and Julia specializes its whole body
+on that callback's type — so a closure over the caller's UI state made every
+caller its own specialization, and `src/precompile.jl` could only ever trace one
+of them. That is what left ~54 s of inference on the *first* propagate tick, with
+the bar frozen at 0 while it ran.
+
+`report` is `Any` on purpose. One `MatteProgress` type means one specialization
+of the propagator; the dynamic call it costs is once per frame, against ~100 ms
+of model work. `done` is the frames already finished by the other half (see
+[`propagateboth`](@ref)), so the two halves report one continuous scale.
+"""
+struct MatteProgress
+    report::Any                 # (done::Int, total::Int) -> anything, or `nothing`
+    done::Base.RefValue{Int}
+    total::Int
+end
+function (p::MatteProgress)(d, t)
+    p.report === nothing && return nothing
+    frac = clamp((p.done[] + d) / max(p.total, 1), 0.0, 1.0)
+    p.report(round(Int, 1000 * frac), 1000)
+    return nothing
 end
 
 """
@@ -516,16 +544,16 @@ So the prefix is propagated as its own sequence, reversed — same model, same
 seed, running backwards in time — and the two halves are stitched at the seed.
 """
 function propagateboth(prop, frames::AbstractVector, seeds::Dict{Int, <:AbstractMatrix},
-                       mw::Integer, mh::Integer, n::Integer, onstep)
+                       mw::Integer, mh::Integer, n::Integer, progress)
     k = minimum(keys(seeds))
     alpha = Array{UInt8}(undef, mw, mh, n)
     # total work: the tail plus the prefix, once each. That is `n + 1`, not `n`
     # — the seed frame is propagated by both halves — and reporting it against
     # `n` used to walk the bar slightly past its own end on a mid-clip seed.
     tail, head = n - k + 1, k
-    total = head + tail
-    done = Ref(0)
-    step = onstep === nothing ? nothing : (d, t) -> onstep(done[] + d, total)
+    # ONE type, whatever the caller's callback is — see [`MatteProgress`](@ref).
+    # Passing `nothing` here instead would be a second specialization again.
+    step = MatteProgress(progress, Ref(0), head + tail)
     if k > 1
         # The prefix is the one part that cannot stream: it is propagated
         # BACKWARDS and the readers are sequential decoders, so asking for
@@ -541,7 +569,7 @@ function propagateboth(prop, frames::AbstractVector, seeds::Dict{Int, <:Abstract
         for j in 1:head
             @inbounds alpha[:, :, j] = @view back[:, :, head - j + 1]
         end
-        done[] = head
+        step.done[] = head
         empty!(pre)              # the tail does not need it, and it is `k` frames
     end
     # …and the tail streams: `k:n` is forward order, so each `frames[j]` is the

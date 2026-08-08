@@ -165,20 +165,39 @@ end
                 # 94.3 s on the first run, 74.4 s of it Julia, and it has to be
                 # traced here rather than in `MatAnyoneRunner` for the same
                 # reason the segmenter is — loading `VideoEditor` invalidates
-                # what a model package cached. Two frames and `warmup = 1`: the
-                # shapes and the frame count do not change which methods get
-                # inferred, and a 10-step warmup would only make precompilation
-                # slower.
+                # what a model package cached. Three frames and `warmup = 1`: the
+                # shapes do not change which methods get inferred, and a 10-step
+                # warmup would only make precompilation slower.
+                #
+                # Driven through `analyzematte!`, NOT by calling `prop` on a
+                # `Vector` of frames. The editor never hands it one: frames
+                # stream, so what reaches the propagator is a `SubArray` over a
+                # `MatteFrames{typeof(reader)}`, and Julia specializes on that
+                # container. Tracing the `Vector` form left the real one to infer
+                # at runtime — 54 s on the first propagate tick, landing as a
+                # frozen progress bar the moment the user starts a matte.
+                #
+                # The seed sits on the MIDDLE frame so both halves of
+                # `propagateboth` are traced: the forward tail, and the reversed
+                # prefix, whose `view(pre, k:-1:1)` is a third container type
+                # again.
                 if matready
                     prop = MatAnyoneRunner.matanyonepropagator(; backend, warmup = 1)
-                    seed = zeros(UInt8, size(markframe)...)
-                    seed[(size(markframe,1)÷3):(2size(markframe,1)÷3),
-                         (size(markframe,2)÷3):(2size(markframe,2)÷3)] .= 0xff
-                    prop([markframe, markframe], Dict(1 => seed))
+                    mclip = Clip(src; src_in = clip.src_in, src_out = clip.src_in + 3)
+                    seed = zeros(UInt8, src.width, src.height)
+                    seed[(src.width ÷ 3):(2src.width ÷ 3),
+                         (src.height ÷ 3):(2src.height ÷ 3)] .= 0xff
                     # Deliberately NOT `registermatte!(prop)`: running `prop`
                     # built its model, and installing it would serialise those
                     # device buffers — and the context they belong to — into the
-                    # package image. `__init__` registers a fresh lazy one.
+                    # package image. `__init__` registers a fresh lazy one; the
+                    # `propagator` kwarg is what lets this trace the real path
+                    # without touching that global.
+                    analyzematte!(mclip, framereader(mclip, engine),
+                                  Dict(mclip.src_in + 1 => seed);
+                                  propagator = prop,
+                                  progress = (d, t) -> nothing)
+                    freematteplanes!()
                 end
                 KA.synchronize(backend)
             end
