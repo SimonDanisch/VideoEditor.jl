@@ -462,6 +462,11 @@ function loopsignatures(clip::Clip; matchwidth::Integer = 64,
         for i in 1:n                           # sequential decode (no per-frame seeks)
             smallrgbinto!(small, ws, dec, clip.src_in + i - 1)
             applymotiontrack!(small, stmp, clip, clip.src_in + i - 1)
+            # `applymotiontrack!` no longer syncs for itself — the graph does one
+            # at the end and does not need a stall per node. This caller is not
+            # the graph: it `collect`s on the host on the next line, so it has to
+            # wait here.
+            KA.synchronize(backend)
             reg = downscale(collect(@view small[cx0:cx1, cy0:cy1]), gw, gh)
             g = @view frames[:, :, i]
             @inbounds for b in 1:gh, a in 1:gw
@@ -583,6 +588,5 @@ function applymotiontrack!(buf::AnyRGBFrame, tmp::AnyRGBFrame, clip::Clip, srcfr
     # the previous frame still in it.
     fill!(tmp, zero(eltype(tmp)))
     warp!(tmp, buf, M; skipoutside = true)
-    KA.synchronize(KA.get_backend(buf))
     return copyto!(buf, tmp)
 end

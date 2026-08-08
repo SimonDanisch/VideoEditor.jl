@@ -161,7 +161,6 @@ function applymatte!(buf::AnyRGBFrame, clip::Clip, srcframe::Integer;
                            Float32(clamp(feather, 0.0, 1.0)), bg,
                            Float32(cr[1]), Float32(cr[2]), Float32(cr[3]), Float32(cr[4]);
                            ndrange = size(buf))
-    KA.synchronize(backend)
     return buf
 end
 
@@ -193,7 +192,6 @@ function mattealpha!(dst::AnyRGBFrame, clip::Clip, srcframe::Integer;
                                 Float32(clamp(feather, 0.0, 1.0)),
                                 Float32(cr[1]), Float32(cr[2]), Float32(cr[3]), Float32(cr[4]);
                                 ndrange = size(dst))
-    KA.synchronize(backend)
     return dst
 end
 

@@ -183,6 +183,5 @@ function applyrestore!(buf::AnyRGBFrame, clip::Clip, srcframe::Integer;
     dev = restoreplane!(clip, Int(srcframe), img, backend)
     restore_kernel!(backend)(buf, dev, Int32(size(img, 1)), Int32(size(img, 2)), s;
                              ndrange = size(buf))
-    KA.synchronize(backend)
     return buf
 end

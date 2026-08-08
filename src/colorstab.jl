@@ -76,6 +76,5 @@ function applycolortrack!(buf::AnyRGBFrame, clip::Clip, srcframe::Integer;
     g = 1.0f0 .+ s .* (track.gains[i] .- 1.0f0)
     o = s .* track.offsets[i]
     channellinear!(buf, Vec3f(g), Vec3f(o))
-    KA.synchronize(KA.get_backend(buf))
     return buf
 end
