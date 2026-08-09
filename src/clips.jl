@@ -431,6 +431,11 @@ function split!(seq::Sequence, n::Integer, track::Union{Nothing, Integer} = noth
     right.colortrack = clip.colortrack
     right.motiontrack = clip.motiontrack
     right.mattetrack = clip.mattetrack    # ditto — cutting a clip must not lose its matte
+    # …and restore, which is NOT a field here: it lives in a module global keyed
+    # by clip id, so it does not come along by assignment and `right` has a fresh
+    # one. Five storage schemes for "per-frame analysis result" is why this had to
+    # be remembered separately at all — see `sharerestore!`.
+    sharerestore!(clip, right)
     for (key, curve) in clip.animations   # absolute-frame keyed, but each half gets
         right.animations[key] = AnimCurve(copy(curve.keys), curve.interp)
     end                                   # its OWN copy — halves must edit independently

@@ -71,21 +71,30 @@ function previewrobj(player::Player)
     return get(scr.cache, objectid(player.previewplot), nothing)
 end
 
-"Run `f` on the player's pinned GPU worker and wait for its result."
-function rungpusync(f::Function, player::Player)
-    let
-        done = Channel{Any}(1)
-        rungpu(player) do
-            try
-                put!(done, (true, f()))
-            catch e
-                put!(done, (false, e))
-            end
+"""
+Run `f` on a pinned GPU worker and wait for its result — given either the worker
+itself or the `Player` that owns one.
+
+Exceptions are carried back and rethrown here rather than escaping on the worker's
+task, where nothing would see them.
+"""
+function rungpusync(f::Function, w::GPUWorker)
+    done = Channel{Any}(1)
+    rungpu(w) do
+        try
+            put!(done, (true, f()))
+        catch e
+            put!(done, (false, e))
         end
-        ok, val = take!(done)
-        ok || throw(val)
-        return val
     end
+    ok, val = take!(done)
+    ok || throw(val)
+    return val
+end
+
+function rungpusync(f::Function, player::Player)
+    player.gpuworker === nothing && (player.gpuworker = GPUWorker())
+    return rungpusync(f, player.gpuworker)
 end
 
 """

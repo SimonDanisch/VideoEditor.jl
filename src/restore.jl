@@ -68,6 +68,30 @@ hasrestored(clip::Clip, srcframe::Integer) = haskey(restorecache(clip).frames, I
 clearrestore!(clip::Clip) = (delete!(RESTORECACHES, clip.id); nothing)
 clearrestore!() = (empty!(RESTORECACHES); nothing)
 
+"""
+    sharerestore!(src, dst)
+
+Give `dst` the same restored frames as `src`.
+
+**Because this cache is keyed by clip id in a module global instead of living on
+the `Clip`, it does not follow an assignment the way `mattetrack` and the other
+tracks do** — and [`split!`](@ref) mints its right half through `freshid()`. So
+splitting a restored clip used to drop the restoration on the right half
+silently, while the line above it in `split!` took explicit care that the matte
+survived. The docstring on [`RestoreCache`](@ref) already claimed this worked
+("keyed by absolute source frame so it survives splits and trims like the tracks
+do"): true of the frames *inside* the cache, false of the cache itself.
+
+Shared, not copied, exactly as the tracks are. The frames are keyed by absolute
+source frame, so one cache indexes correctly from both halves; the two then share
+the eviction budget, which is the same bargain a shared track makes.
+"""
+function sharerestore!(src::Clip, dst::Clip)
+    c = get(RESTORECACHES, src.id, nothing)
+    c === nothing || (RESTORECACHES[dst.id] = c)
+    return nothing
+end
+
 function putrestored!(c::RestoreCache, f::Integer, img)
     f = Int(f)
     haskey(c.frames, f) || push!(c.order, f)

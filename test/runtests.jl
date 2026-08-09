@@ -321,6 +321,26 @@ end
 end
 
 
+@testset "a split carries EVERY analysis result, not just the ones on the Clip" begin
+    # `colortrack`/`motiontrack`/`mattetrack` are Clip fields, so `split!` copies
+    # them by assignment and there is a comment there making sure of it. Restore's
+    # cache is a module global keyed by clip id, and the right half is minted with
+    # `freshid()` — so splitting a restored clip silently dropped the restoration
+    # on the right half. `RestoreCache`'s own docstring claimed otherwise ("keyed
+    # by absolute source frame so it survives splits and trims like the tracks
+    # do"): true of the frames inside the cache, false of the cache itself.
+    src = VideoSource(testvideo)
+    seq = Sequence(src)
+    c = seq.clips[1]
+    VE.putrestored!(VE.restorecache(c), 50, VE.RGBFrame(undef, 4, 4))
+    @test VE.hasrestored(c, 50)
+    right = split!(seq, 40)                  # frame 50 lands in the RIGHT half
+    @test right.id != c.id                   # …which is a different identity …
+    @test VE.hasrestored(right, 50)          # … and must still be restored
+    @test VE.restorecache(right) === VE.restorecache(c)   # shared, as the tracks are
+end
+
+
 @testset "blend pairing survives everything" begin
     # Simon, 2026-07-27: "was gibts denn zu suchen? wir markieren 2 clips, und dann
     # merken wir uns die" — the pair is REMEMBERED by clip id, never re-derived from
@@ -359,6 +379,19 @@ end
     @test VE.findslot(seq2.clips[2], VE.OpacityEffect) === nothing
 end
 
+"""
+Apply `e` to `img` exactly as the graph's `PixelNode` does — the same `applykind!`,
+the same `needsfresh` decision, just without a pool. There used to be a second
+renderer here (`applyeffect!` → `applykindcpu!`) that these tests reached for; it
+had no caller in `src/`, so the suite was the only thing keeping a second
+definition of every built-in alive. Test the path that ships.
+"""
+function applyfx(img, e)
+    k = VE.fxkind(e)
+    out = VE.needsfresh(k) ? similar(img) : img
+    return VE.applykind!(out, img, k)
+end
+
 @testset "plugin registry + MCP authoring" begin
     # register a plugin directly (any package can) — it becomes an effect kind
     VE.registerplugin!(:testfx, "Test FX", [VE.FxParam(:k, "k", 0.0, 1.0, 1.0)],
@@ -376,8 +409,7 @@ end
 
     # a plugin effect applies through the shared kernel + roundtrips through the project dict
     e = VE.plugineffect(:mcpfx; gain = 0.25)
-    f = fill(VE.RGB{VE.N0f8}(0.8, 0.8, 0.8), 8, 8)
-    VE.applyeffect!(f, similar(f), similar(f), e)
+    f = applyfx(fill(VE.RGB{VE.N0f8}(0.8, 0.8, 0.8), 8, 8), e)
     @test all(px -> Float32(px.r) < 0.8, f)                        # gain 0.25 darkens
     @test VE.plugineffectfromdict(VE.effectdict(e)).params.gain == 0.25
 
@@ -387,8 +419,9 @@ end
     @test VE.fxkind(soften) isa VE.Stencil
     edge = fill(VE.RGB{VE.N0f8}(0.0, 0.0, 0.0), 16, 16)
     edge[9:end, :] .= VE.RGB{VE.N0f8}(1.0, 1.0, 1.0)               # sharp black/white seam
-    VE.applyeffect!(edge, similar(edge), similar(edge), soften)
-    @test any(px -> 0.1 < Float32(px.r) < 0.9, edge)              # box blur softened the seam
+    out = applyfx(edge, soften)
+    @test out !== edge                                             # a Stencil needs a fresh buffer
+    @test any(px -> 0.1 < Float32(px.r) < 0.9, out)               # box blur softened the seam
 end
 
 @testset "example plugins load (how-to-hack reference)" begin
@@ -397,7 +430,7 @@ end
     f = fill(VE.RGB{VE.N0f8}(0.4, 0.6, 0.3), 16, 16)
     for name in (:invert, :sepia, :posterize, :levels, :edges, :emboss)
         @test VE.kindbyname(name) !== nothing
-        g = copy(f); VE.applyeffect!(g, similar(g), similar(g), VE.plugineffect(name))
+        g = applyfx(copy(f), VE.plugineffect(name))
         @test all(px -> isfinite(Float32(px.r)), g)      # every example plugin applies cleanly
     end
 end
@@ -431,6 +464,54 @@ end
     close(reader)
     reddiff = mean(abs.(Float32.(getfield.(early, :r)) .- Float32.(getfield.(late, :r))))
     @test reddiff > 0.1  # the two sources' content really alternates
+
+    # A source the hardware decoder REFUSES must reach the CPU reader, not throw.
+    # `opendecoder` wraps `openstream` in a try/catch for exactly this, but
+    # `openstream` only demuxes — `GpuVideoStream` builds its decoder lazily in
+    # `startfeed!`, which is where the chroma check lives — so a 4:4:4 file
+    # opened cleanly and then threw from the FIRST READ, past the fallback and
+    # out through `framereader`. It now probes inside the try, as `graysource`
+    # in campath.jl already did.
+    v444 = joinpath(mktempdir(), "yuv444.mp4")
+    run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -f lavfi -i testsrc2=size=320x180:rate=30 -t 1
+                  -c:v libx264 -g 30 -pix_fmt yuv444p $v444`,
+                 stdout = devnull, stderr = devnull))
+    @test readchomp(`$(FFMPEG_jll.ffprobe()) -v error -select_streams v:0
+                     -show_entries stream=pix_fmt -of csv=p=0 $v444`) == "yuv444p"
+    # ON THE PINNED WORKER, not here. A Lava `BatchQueue` belongs to the thread that
+    # first builds the Vulkan context, and this is the suite's first touch of Lava —
+    # so calling `LavaBackend()` inline made MAIN the owner for the rest of the
+    # session, and every later analysis, which the editor runs on its pinned worker
+    # by design, died on "BatchQueue is single-writer". That is what took the matte
+    # marking beats in `interactions.jl` down (they pass when run on their own,
+    # where nothing has claimed the context first). Every `GPUWorker` pins to the
+    # same thread, so borrowing one here puts the whole suite on the editor's owner.
+    # The assertions stay out here: a testset's state is task-local, so an `@test`
+    # inside the worker records nowhere.
+    probe = VE.rungpusync(VE.GPUWorker()) do
+        gpu = VE.Lava.LavaBackend()
+        src444, src420 = VideoSource(v444), VideoSource(testvideo)
+        # THE ANCHOR. If 4:2:0 does not take the GPU path on this machine then
+        # both cases fall back for unrelated reasons and the assertion below
+        # cannot tell a fixed `opendecoder` from a broken one — so say so rather
+        # than pass silently.
+        d420 = VE.opendecoder(src420, gpu)
+        d420 isa VE.SequentialReader && return nothing
+        close(d420)
+        fellback = VE.opendecoder(src444, gpu) isa VE.SequentialReader
+        # and the fallback must actually READ, advancing frames
+        r = VE.opendecoder(src444, gpu)
+        f = VE.RGBFrame(undef, src444.width, src444.height)
+        a = copy(VE.readframe!(f, r, 0))
+        b = copy(VE.readframe!(f, r, 10))
+        return (fellback = fellback, advanced = a != b)
+    end
+    if probe === nothing
+        @info "GPU decode unavailable here — 4:4:4 fallback test cannot discriminate; skipped"
+    else
+        @test probe.fellback
+        @test probe.advanced
+    end
 
     # projects roundtrip with several sources
     path = joinpath(mktempdir(), "multi.toml")
@@ -992,7 +1073,7 @@ end
                  buf = VideoEditor.RGBFrame(undef, src.width, src.height)
         sf -> (VideoEditor.readframe!(buf, sr, Int(sf)); copy(buf))
     end
-    track = VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); mattewidth = 96)
+    track = VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); maxside = 96)
     @test clip.mattetrack === track
     @test size(track.alpha, 3) == 12
     @test track.seeds == [0]
@@ -1069,7 +1150,7 @@ end
     end)
     try
         @test VideoEditor.MATTEPROPAGATOR[] !== nothing
-        t4 = VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); mattewidth = 96)
+        t4 = VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); maxside = 96)
         @test called[] == 1
         @test all(==(0xff), t4.alpha)
     finally
@@ -1078,6 +1159,72 @@ end
     @test VideoEditor.MATTEPROPAGATOR[] === nothing
     finally
         VideoEditor.MATTEPROPAGATOR[] = prevprop   # put back what was installed
+    end
+end
+
+@testset "matte reads and propagates in one interleaved pass" begin
+    # There used to be two phases — read every frame into a Vector, then
+    # propagate — costing ~1:20, and reporting them as equal halves put the bar
+    # at 50% after 4% of the wall clock (birds clip: decode+fx 8.8 s against
+    # 187.0 s). It read as a hang, and it held the whole clip in RAM.
+    #
+    # Now frames are FETCHED (see `MatteFrames`), so there is one phase and no
+    # share to tune. Asserted structurally, not by timing: the reader must still
+    # be being called after propagation has started reporting. Collecting frames
+    # up front would satisfy every monotonicity check below and fail this one.
+    prevprop = VideoEditor.MATTEPROPAGATOR[]
+    # This stand-in has to FETCH each frame as it goes, the way the real
+    # propagator does. One that only touched `frames[1]` read a single frame
+    # under streaming and could not tell deferred reads from eager ones.
+    VideoEditor.registermatte!((frames, seeds; progress = nothing) -> begin
+        n = length(frames)
+        out = Array{UInt8}(undef, size(frames[1])..., n)
+        for j in 1:n
+            frames[j]
+            out[:, :, j] .= 0xff
+            progress === nothing || progress(j, n)
+        end
+        out
+    end)
+    try
+        src = VideoSource(testvideo2)
+        clip = Clip(src; src_in = 0, src_out = 11)
+        mask = VideoEditor.seedmask(clip, (0.1, 0.1, 0.4, 0.4))
+        nread = Ref(0)
+        reader = let sr = VideoEditor.SequentialReader(src),
+                     buf = VideoEditor.RGBFrame(undef, src.width, src.height)
+            sf -> (nread[] += 1; VideoEditor.readframe!(buf, sr, Int(sf)); copy(buf))
+        end
+        n = VideoEditor.srclength(clip)
+
+        fr = Float64[]
+        readsattick = Int[]
+        VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); maxside = 96,
+                                  progress = (d, t) -> (push!(fr, d / t);
+                                                        push!(readsattick, nread[])))
+        @test !isempty(fr)
+        @test issorted(fr)                       # never goes backwards
+        @test fr[end] ≈ 1.0                      # and lands exactly on full
+        @test maximum(fr) <= 1.0 + 1e-9          # never past its own end
+        # THE streaming property: reading is not finished when propagation
+        # starts reporting. Collecting frames into a Vector first would make
+        # every count below equal `n` from the first tick on.
+        @test readsattick[1] < n
+        @test issorted(readsattick)
+        @test readsattick[end] >= n              # and all of them do get read
+
+        # A MID-CLIP seed propagates backward then forward — `head + tail` is
+        # `n + 1` steps, and reporting them against `n` used to walk the bar
+        # past its own end.
+        clipm = Clip(src; src_in = 0, src_out = 11)
+        frm = Float64[]
+        VideoEditor.analyzematte!(clipm, reader, Dict(5 => mask); maxside = 96,
+                                  progress = (d, t) -> push!(frm, d / t))
+        @test issorted(frm)
+        @test maximum(frm) <= 1.0 + 1e-9
+        @test frm[end] ≈ 1.0
+    finally
+        VideoEditor.MATTEPROPAGATOR[] = prevprop
     end
 end
 
