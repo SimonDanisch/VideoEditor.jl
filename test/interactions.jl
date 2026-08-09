@@ -1394,6 +1394,34 @@ end
     @test true
 end
 
+# `EFFECTS` is a global registry and the effects panel puts two listeners on its
+# `version`. A closed player used to keep both, which is not a slow leak but a
+# live fault: the corpse's handler `put!`s onto its own closed `uiqueue` and
+# throws, `notify` abandons the rest of the listener list, and the LIVE player's
+# panel silently stops rebuilding — which is how a Matte card lost the "Apply
+# matte to clip" button a walkthrough was about to click.
+@testset "a closed player lets go of the global effect registry" begin
+    n0 = length(VE.EFFECTS.version.listeners)
+    p1 = Player(testvideo; gpupreview = false)
+    sleep(1.0)
+    @test length(VE.EFFECTS.version.listeners) > n0
+    close(p1)
+    sleep(0.5)
+    @test length(VE.EFFECTS.version.listeners) == n0
+
+    p2 = Player(testvideo; gpupreview = false)
+    try
+        sleep(1.0)
+        VE.EFFECTS.version[] += 1     # the bump the matte panel does; must not throw
+        sleep(0.3)
+        @test length(p2.fxwidgets[:fxcards]) == 0   # panel still live and rebuilding
+    finally
+        close(p2)
+    end
+    sleep(0.5)
+    @test length(VE.EFFECTS.version.listeners) == n0
+end
+
 @testset "Player opens a saved project" begin
     src = VideoSource(testvideo)
     seq = Sequence(src)

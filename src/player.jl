@@ -3173,6 +3173,17 @@ function Base.close(player::Player)
         deactivatetool!(player)   # tool handlers reference the dying scenes
     catch
     end
+    # Listeners this player put on GLOBAL observables. They must come off before
+    # the queues below close, or the next player in this process shares a notify
+    # list with a corpse that throws (see `:fxglobalobs` in fxpanel.jl).
+    for o in get(player.fxwidgets, :fxglobalobs, ())
+        try
+            Makie.Observables.off(o)
+        catch e
+            @warn "could not remove a global listener on close" exception = e
+        end
+    end
+    delete!(player.fxwidgets, :fxglobalobs)
     freegpucache!(player)
     foreach(sp -> stop!(sp.worker), values(player.pools))
     stop!(player.timeline)
