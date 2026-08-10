@@ -197,7 +197,6 @@ end
                                   Dict(mclip.src_in + 1 => seed);
                                   propagator = prop,
                                   progress = (d, t) -> nothing)
-                    freematteplanes!()
                 end
                 KA.synchronize(backend)
             end

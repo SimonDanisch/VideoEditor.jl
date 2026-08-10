@@ -7,7 +7,8 @@ reason. Producing a matte is an *analysis* — expensive, sequential, and it wan
 the whole clip — so it runs once into a [`MatteTrack`](@ref) and the render path
 only ever samples that track. Nothing per-frame runs a model; there is no
 per-clip model state to keep alive across scrubs, transitions and export, and the
-GPU and CPU tiers stay one code path because both call [`applymatte!`](@ref).
+GPU and CPU tiers stay one code path because the track reaches the kernel the one
+way every per-frame plane does — as a [`PlaneOp`](@ref), through the graph.
 
 The user's edit is the set of *seed* frames (matte keyframes) plus a rough
 selection at each. Propagation fills the frames between them. `MatteTrack.alpha`
@@ -142,88 +143,104 @@ end
     end
 end
 
-"""
-    applymatte!(buf, clip, srcframe; strength, feather, bg)
+# ── the matte as a plane op (see `PlaneOp` in gpugraph.jl) ────────────────────
+#
+# The track holds every frame's alpha on the host — it is the thing that gets
+# saved and edited — and the kernel needs the current frame's plane on whatever
+# device is rendering. That upload is now the graph's, through the one route
+# every per-frame plane takes; it used to be a `KA.allocate` per frame behind a
+# module global keyed by `(track, backend)`, outside the pool and never freed.
 
-Key `buf` against the clip's matte for `srcframe`, in place. A no-op when the
-clip has no track or the frame is outside it, so scrubbing past the analyzed
-range shows the plain frame rather than a hole.
+planeeltype(::MatteOp) = UInt8
+passname(::MatteOp) = "matte"
 
-Called by the GPU graph's `MatteNode` *and* the CPU stack — the same function on
-both, which is what keeps preview and export identical.
 """
-function applymatte!(buf::AnyRGBFrame, clip::Clip, srcframe::Integer;
-                     strength::Real = 1.0, feather::Real = 0.0,
+The object whose bytes a matte plane holds: the track. Compared by identity, so a
+re-propagation — which is always a NEW `MatteTrack` under an unchanged clip and
+frame — writes the plane again. This is what replaced eight `freematteplanes!`
+calls scattered through the matte tools, whose job was to drop a device cache
+that a new track had made stale.
+"""
+planesource(::MatteOp, clip::Clip, ::Integer) = clip.mattetrack
+
+"The analysed matte's resolution — usually smaller than the source, and sampled
+bilinearly when applied. `nothing` when the clip has no matte."
+planeshape(::MatteOp, clip::Clip) =
+    clip.mattetrack === nothing ? nothing : mattesize(clip.mattetrack)
+
+function planedata(::MatteOp, clip::Clip, srcframe::Integer)
+    t = clip.mattetrack
+    t === nothing && return nothing
+    i = Int(srcframe) - t.src_in + 1
+    1 <= i <= size(t.alpha, 3) || return nothing
+    # One frame of a `(w, h, n)` array is contiguous, so this is a view into the
+    # track and not a copy of it.
+    n = size(t.alpha, 1) * size(t.alpha, 2)
+    return view(reshape(t.alpha, :), ((i - 1) * n + 1):(i * n))
+end
+
+"""
+    applyplane!(buf, plane, op::MatteOp, clip)
+
+Key `buf` against the matte plane, in place: the subject survives, the background
+goes to `bg`.
+"""
+function applyplane!(buf::AnyRGBFrame, plane, op::MatteOp, clip::Clip;
                      bg::Vec3f = Vec3f(0, 0, 0))
-    track = clip.mattetrack
-    track === nothing && return buf
-    s = Float32(clamp(strength, 0.0, 1.0))
+    s = clamp(op.strength, 0.0f0, 1.0f0)
     s <= 0.0f0 && return buf
-    i = srcframe - track.src_in + 1
-    1 <= i <= size(track.alpha, 3) || return buf
     backend = KA.get_backend(buf)
-    mw, mh = mattesize(track)
-    plane = matteplane!(track, i, backend)
     cr = clip.crop
-    matte_kernel!(backend)(buf, plane, Int32(mw), Int32(mh), s,
-                           Float32(clamp(feather, 0.0, 1.0)), bg,
+    matte_kernel!(backend)(buf, plane, Int32(size(plane, 1)), Int32(size(plane, 2)), s,
+                           clamp(op.feather, 0.0f0, 1.0f0), bg,
                            Float32(cr[1]), Float32(cr[2]), Float32(cr[3]), Float32(cr[4]);
                            ndrange = size(buf))
     return buf
 end
 
 """
-    mattealpha!(dst, clip, srcframe; strength, feather) -> dst | nothing
+    mattealpha!(dst, plane, op, clip) -> dst
 
-The clip's matte as a COVERAGE image the size of `dst` (white = keep, black =
-show what is underneath), or `nothing` when this clip has no matte at this frame.
+The matte as a COVERAGE image the size of `dst` (white = keep, black = show what
+is underneath).
 
 This is what makes a matte transparent instead of black. Keying paints the
 removed background with `bg`, which is right when nothing is underneath and
 wrong the moment there is: the black is opaque and covers the track below.
-`applymatte!` and this share [`mattealphaat`](@ref), so the coverage the
-compositor honours is exactly the coverage that was keyed.
+This and [`applyplane!`](@ref) share [`mattealphaat`](@ref) *and now the plane
+itself* — the compositor is handed the buffer the keying read, so the coverage it
+honours cannot be a frame off the coverage that was keyed.
 """
-function mattealpha!(dst::AnyRGBFrame, clip::Clip, srcframe::Integer;
-                     strength::Real = 1.0, feather::Real = 0.0)
-    track = clip.mattetrack
-    track === nothing && return nothing
-    s = Float32(clamp(strength, 0.0, 1.0))
-    s <= 0.0f0 && return nothing
-    i = srcframe - track.src_in + 1
-    1 <= i <= size(track.alpha, 3) || return nothing
+function mattealpha!(dst::AnyRGBFrame, plane, op::MatteOp, clip::Clip)
     backend = KA.get_backend(dst)
-    mw, mh = mattesize(track)
-    plane = matteplane!(track, i, backend)
     cr = clip.crop
-    mattealpha_kernel!(backend)(dst, plane, Int32(mw), Int32(mh), s,
-                                Float32(clamp(feather, 0.0, 1.0)),
+    mattealpha_kernel!(backend)(dst, plane,
+                                Int32(size(plane, 1)), Int32(size(plane, 2)),
+                                clamp(op.strength, 0.0f0, 1.0f0),
+                                clamp(op.feather, 0.0f0, 1.0f0),
                                 Float32(cr[1]), Float32(cr[2]), Float32(cr[3]), Float32(cr[4]);
                                 ndrange = size(dst))
     return dst
 end
 
 """
-One matte frame on `backend`, uploaded on demand and cached.
+    applymatte!(buf, clip, srcframe; strength, feather, bg)
 
-The track holds every frame's alpha on the host — it is the thing that gets
-saved and edited — but the kernel needs the current frame's plane on whatever
-device is rendering. Caching per `(track, backend, frame)` keeps a scrub from
-re-uploading the same plane, and keys on the backend because the CPU and GPU
-engines alternate frame to frame while the GPU warms up.
+The host-side form: key a HOST buffer straight from the clip's track. A no-op
+when the clip has no matte or the frame is outside it, so scrubbing past the
+analyzed range shows the plain frame rather than a hole.
+
+In the render path the plane is a graph resource and the node calls
+[`applyplane!`](@ref); this exists so a tool or a test can key one frame without
+building a graph for it.
 """
-const MATTEPLANES = IdDict{MatteTrack, Dict{Any, Tuple{Int, Any}}}()
-
-function matteplane!(track::MatteTrack, i::Int, backend)
-    per = get!(() -> Dict{Any, Tuple{Int, Any}}(), MATTEPLANES, track)
-    hit = get(per, backend, nothing)
-    hit === nothing || hit[1] == i && return hit[2]
-    # One path for every backend — no `backend isa CPU`.
-    host = collect(@view track.alpha[:, :, i])
-    dev = KA.allocate(backend, UInt8, size(host)...)
-    copyto!(dev, host)
-    per[backend] = (i, dev)
-    return dev
+function applymatte!(buf::AnyRGBFrame, clip::Clip, srcframe::Integer;
+                     strength::Real = 1.0, feather::Real = 0.0,
+                     bg::Vec3f = Vec3f(0, 0, 0))
+    op = MatteOp(Float32(clamp(strength, 0.0, 1.0)), Float32(clamp(feather, 0.0, 1.0)))
+    d = planedata(op, clip, srcframe)
+    d === nothing && return buf
+    return applyplane!(buf, reshape(d, planeshape(op, clip)), op, clip; bg)
 end
 
 const MATTEWARMED = Ref(false)
@@ -271,10 +288,6 @@ end
 mattelayersize(clip::Clip) =
     (max(1, round(Int, clip.crop[3] * clip.source.width)),
      max(1, round(Int, clip.crop[4] * clip.source.height)))
-
-"Drop cached device planes for `track` (or all of them)."
-freematteplanes!(track::MatteTrack) = (delete!(MATTEPLANES, track); nothing)
-freematteplanes!() = (empty!(MATTEPLANES); nothing)
 
 # ---------------------------------------------------------------- producing
 

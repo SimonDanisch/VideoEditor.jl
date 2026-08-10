@@ -441,16 +441,16 @@ is not computed from a frame the previous matte already keyed."
 withoutmatte(clip::Clip) =
     Clip(clip.id, clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
          filter(s -> !(s.effect isa MatteEffect), clip.effects),
-         clip.colortrack, clip.motiontrack, nothing, clip.animations, clip.track,
-         clip.blendfrom, clip.rate)
+         clip.colortrack, clip.motiontrack, nothing, clip.restorecache, clip.animations,
+         clip.track, clip.blendfrom, clip.rate)
 
 "`clip` without its opacity effects — compositing reads opacity as the LAYER
 alpha, not a per-pixel fade to black."
 withoutopacity(clip::Clip) =
     Clip(clip.id, clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
          filter(s -> !(s.effect isa OpacityEffect), clip.effects),
-         clip.colortrack, clip.motiontrack, clip.mattetrack, clip.animations, clip.track,
-              clip.blendfrom, clip.rate)
+         clip.colortrack, clip.motiontrack, clip.mattetrack, clip.restorecache,
+         clip.animations, clip.track, clip.blendfrom, clip.rate)
 
 """
     effectiveclip(clip, srcframe) -> Clip
@@ -467,8 +467,8 @@ function effectiveclip(clip::Clip, srcframe::Integer)
     # clip the user is editing
     ec = Clip(clip.id, clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
               [FxSlot(s.id, s.effect, s.enabled, s.links) for s in clip.effects],
-              clip.colortrack, clip.motiontrack, clip.mattetrack, clip.animations, clip.track,
-              clip.blendfrom, clip.rate)
+              clip.colortrack, clip.motiontrack, clip.mattetrack, clip.restorecache,
+              clip.animations, clip.track, clip.blendfrom, clip.rate)
     for (key, curve) in clip.animations
         # a project can hold a curve for a parameter this session has no effect
         # registered for — skip it rather than fail the render

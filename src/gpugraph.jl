@@ -33,36 +33,49 @@ The decoded source frame's size, from whatever `render` was handed: a
 framesize(s) = size(s)                                   # a CPU RGBFrame
 framesize(s::GpuVideoStream) = (s.width, s.height)
 
-# fill `out` with the decoded source frame (device-resident decode, or one upload);
-# `served` reports which frame the stream really delivered. `exact` selects the
-# export policy (exactframeat!) over the preview's latency-bounded serve.
-function sourceinto!(out, s::GpuVideoStream, frame; prefetch::Bool = false,
-                     served = nothing, exact::Bool = false)
-    f = exact ? exactframeat!(s, frame) : frameat!(s, frame; prefetch, served)
-    nv12torgb!(out, f.y, f.uv; bt601 = s.bt601)
-    return out
-end
-sourceinto!(out, s, frame; prefetch::Bool = false, served = nothing, exact::Bool = false) =
-    copyto!(out, s)
+"""
+    decodesource(source, frame; playing, served, exact) -> what the source pass reads
+
+Get the frame BEFORE the plan runs. `frameat!` is latency-bounded: under a scrub
+it serves the nearest already-decoded frame rather than `frame` and reports which
+through `served`, and every per-frame result — a stabilization warp, a matte
+plane — has to be sampled at THAT index or it lands on a different picture and
+the preview jerks while the decode catches up.
+
+This used to be the first thing the source pass body did, which meant `served`
+was not settled until the plan was already running: the decode's own submits
+landed in the middle of the plan's recording, and a plane upload had nowhere in
+the schedule to go. Out here it is settled before `run!`, so the planes are
+written at the position the graph reserved for them.
+
+`exact` is the EXPORT policy — precisely `frame`, cost what it may — and it
+cannot serve anything else, so it leaves `served` alone.
+"""
+decodesource(s::GpuVideoStream, frame::Integer; playing::Bool = false,
+             served = nothing, exact::Bool = false) =
+    exact ? exactframeat!(s, frame) : frameat!(s, frame; prefetch = playing, served)
+decodesource(s, frame::Integer; playing::Bool = false, served = nothing,
+             exact::Bool = false) = s
+
+"Fill `out` with the frame `decodesource` handed back: a colour convert off the
+decoder's NV12 planes, or one upload of a CPU frame."
+sourceinto!(out, s::GpuVideoStream, f) = (nv12torgb!(out, f.y, f.uv; bt601 = s.bt601); out)
+sourceinto!(out, s, f) = copyto!(out, f)
 
 """
-What a pass body reads at record time, so the plan it belongs to can be
-replayed for another frame — or another clip with the same structure — without
-recompiling. `served` is set by the source pass: a streaming source under its
-latency budget may serve the nearest already-decoded frame instead of `frame`
-(see `frameat!`), and the PER-FRAME track transforms must then be sampled at
-the SERVED index, or a stabilization transform for `frame` lands on a different
-image and the preview jerks wildly while the decode catches up.
+What a pass body reads at record time, so the plan it belongs to can be replayed
+for another frame — or another clip with the same structure — without
+recompiling. `served` is a `Ref` because that is what [`frameat!`](@ref) writes
+into; by the time any body runs it holds the frame the source really delivered.
 """
 mutable struct FxState
     source::Any
+    decoded::Any                      # what `decodesource` handed back
     clip::Any
     frame::Int
     served::Base.RefValue{Int}
-    playing::Bool                     # sequential playback: prefetch the next GOP
-    exact::Bool                       # the EXPORT policy: precisely `frame`, cost what it may
 end
-FxState() = FxState(nothing, nothing, 0, Ref(0), false, false)
+FxState() = FxState(nothing, nothing, nothing, 0, Ref(0))
 
 """
 The 2-D view a kernel gets over a resource's 1-D storage — a transient's arena
@@ -125,23 +138,171 @@ struct ColorTrackNode <: FxNode                                      # per-frame
     input::Int
     strength::Float32
 end
-struct RestoreNode <: FxNode                                         # model-restored frame
-    input::Int
-    strength::Float32
-end
-struct MatteNode <: FxNode                                           # per-frame subject matte
-    input::Int
-    strength::Float32
-    feather::Float32
-end
 struct ColorNode <: FxNode; input::Int; adj::ColorAdjustments; end
 struct BlurNode <: FxNode; input::Int; σ::Float32; end
 struct SharpenNode <: FxNode; input::Int; σ::Float32; amount::Float32; end
 struct PixelNode{K <: FxKind} <: FxNode; input::Int; kind::K; end    # a callback effect
 
+# ---------------------------------------------------------------- plane ops
+"""
+What a node reads BESIDES the picture, when what it reads is a whole image:
+a matte's alpha, a restoration model's finished frame. The other kind of
+per-frame analysis result — a colour gain, a warp matrix — is a handful of
+numbers and rides along as a kernel argument, which is why those stay
+ordinary nodes.
+
+One type for all of them, because everything around a plane is the same: which
+store slot holds it, when it has to be rewritten, that the rewrite is the
+graph's business and not the kernel's, and that a frame the analysis does not
+cover renders nothing rather than keying against whatever was there last. What
+differs is four small methods — [`planeeltype`](@ref), [`planeshape`](@ref),
+[`planedata`](@ref), [`applyplane!`](@ref) — defined next to the kernel that
+needs them, in `matte.jl` and `restore.jl`.
+
+Before this the two were separate nodes with a `KA.allocate` apiece behind a
+module global, a per-frame device allocation outside the pool that nothing ever
+freed, and the compositor did its own third lookup to find out whether the frame
+it was placing had been keyed.
+"""
+abstract type PlaneOp end
+
+"Key the subject out of the background against the clip's matte."
+struct MatteOp <: PlaneOp
+    strength::Float32
+    feather::Float32
+end
+
+"Blend a restoration model's finished picture over the decoded one."
+struct RestoreOp <: PlaneOp
+    strength::Float32
+end
+
+"""
+The node a [`PlaneOp`](@ref) becomes. `shape` is the plane's size, carried here
+because it is part of the PLAN SIGNATURE: the plane is a graph resource, so a
+clip whose matte was analysed at another resolution needs its own plan rather
+than a buffer of the wrong size.
+"""
+struct PlaneNode{O <: PlaneOp} <: FxNode
+    input::Int
+    op::O
+    shape::Tuple{Int, Int}
+end
+
+"""
+    planeshape(node) -> (w, h) | nothing
+
+The plane this node reads, for the plan signature. `nothing` for every node that
+reads none, which is most of them.
+"""
+planeshape(::FxNode) = nothing
+planeshape(n::PlaneNode) = n.shape
+
+# ---------------------------------------------------------------- the buffer store
+
+"""
+One device buffer, and what is currently in it.
+
+`source`/`frame` are why a scrub that comes back to a frame costs no upload: they
+say which analysis result the bytes already are. A scratch slot leaves them empty
+and never asks.
+"""
+mutable struct PlaneSlot
+    buf::Any
+    source::Any
+    frame::Int
+end
+
+"""
+Every device buffer the editor owns that is not a graph transient: the
+compositor's scratch, and the per-frame analysis planes the nodes read.
+
+Keyed by role and shape, so two clips whose mattes were analysed at the same size
+share one buffer — and, because the shape is part of the plan signature, one
+plan. The bytes come from the Mantle pool, which is the point of the type. There
+were five schemes for "a device buffer that is not a transient": two
+`KA.allocate` caches behind module globals (the matte's and the restoration's,
+neither of them ever freed), the canvas scratch, the alpha layers, and the
+restored frames themselves. None of them was visible to the allocator that
+places everything else.
+"""
+struct BufferStore
+    device::Any
+    slots::Dict{Any, PlaneSlot}
+end
+BufferStore(device) = BufferStore(device, Dict{Any, PlaneSlot}())
+
+"The slot for `key`, `n` elements of `T`, created on first use."
+slot!(s::BufferStore, key, ::Type{T}, n::Integer) where {T} =
+    get!(() -> PlaneSlot(Mantle.Buffer(s.device, T, Int(n)), nothing, 0), s.slots, key)
+
+"""
+    scratch!(store, role, T, dims) -> 2-D view
+
+A working buffer of fixed role and size — the compositor's accumulator, its warp
+target, a coverage layer. Persistent because the compositor is not inside a graph
+yet; pool-backed because everything else is.
+"""
+scratch!(s::BufferStore, role::Symbol, ::Type{T}, dims::Tuple{Int, Int}) where {T} =
+    frameview(slot!(s, (role, T, dims), T, prod(dims)).buf, dims)
+
+function Base.empty!(s::BufferStore)
+    for sl in values(s.slots)
+        Mantle.free!(sl.buf)
+    end
+    empty!(s.slots)
+    return s
+end
+
+"""
+A node's plane, bound into one compiled chain: the store slot that holds it, the
+`Update` that writes it at the position the graph reserved, the node's parameter
+`Ref` (where the live op is), and whether the node has anything to apply this
+frame.
+"""
+struct PlaneBinding
+    key::Any
+    update::Any                       # a Mantle UpdateRef
+    params::Any                       # Ref{<:PlaneNode}
+    dims::Tuple{Int, Int}
+    active::Base.RefValue{Bool}
+end
+
+"The plane's buffer as a 2-D view — what the kernel gets, and what the compositor
+is handed so its coverage comes from the same bytes the keying read."
+planeview(s::BufferStore, b::PlaneBinding) = frameview(s.slots[b.key].buf, b.dims)
+
+"""
+Put this frame's plane in its buffer, unless it is already there.
+
+Fired from [`runchain!`](@ref) BEFORE `run!`, because an `Update`'s write
+position is at the head of the schedule — which is exactly why the decode had to
+move out of the source pass: `served` has to be settled by now.
+
+"Already there" is decided by [`planesource`](@ref) — the analysis result's
+IDENTITY, not the clip and the frame, which do not change when a matte is
+re-propagated under them.
+
+The data handed to the update is a VIEW into the track (or the restore cache),
+retained rather than copied until the write happens later in the same `run!`;
+nothing mutates an analysis result during a render.
+"""
+function loadplane!(s::BufferStore, b::PlaneBinding, clip::Clip, frame::Int)
+    op = b.params[].op
+    d = planedata(op, clip, frame)
+    b.active[] = d !== nothing
+    d === nothing && return false
+    sl = s.slots[b.key]
+    src = planesource(op, clip, frame)
+    sl.source === src && sl.frame == frame && return true
+    b.update(d)
+    sl.source, sl.frame = src, frame
+    return true
+end
+
 # ---------------------------------------------------------------- the chain as passes
 #
-# chainpass!(graph, node, params, cur, state, dims) -> transient
+# chainpass!(graph, node, params, cur, ctx, dims) -> transient
 #
 # Adds ONE pass to the graph and returns the transient the next node reads.
 # `cur` is the incoming image; `params` is a `Ref{typeof(node)}` the body reads
@@ -149,59 +310,74 @@ struct PixelNode{K <: FxKind} <: FxNode; input::Int; kind::K; end    # a callbac
 # new plan. In-place nodes declare `read + write` on `cur` itself — in a chain
 # every node is its input's last consumer, so there is nothing to copy.
 
-"The source pass: decode (or upload) the frame into the chain's first transient."
-function chainpass!(g, ::SourceNode, ::Nothing, state::FxState, dims)
+"""
+What building one chain needs beyond the graph: the store its planes come from,
+the state its bodies read, and the plane bindings collected on the way out. A
+context rather than four arguments threaded through every `chainpass!`.
+"""
+struct ChainBuild
+    store::BufferStore
+    state::FxState
+    planes::Vector{PlaneBinding}
+end
+ChainBuild(store::BufferStore) = ChainBuild(store, FxState(), PlaneBinding[])
+
+"The source pass: colour-convert (or upload) the frame `decodesource` produced
+into the chain's first transient."
+function chainpass!(g, ::SourceNode, ::Nothing, ctx::ChainBuild, dims)
     cur = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
+    st = ctx.state
     Mantle.custom!(g, "source") do p
         Mantle.use(p, cur; write = true)
-        () -> sourceinto!(frameview(cur, dims), state.source, state.frame;
-                          prefetch = state.playing, served = state.served,
-                          exact = state.exact)
+        () -> sourceinto!(frameview(cur, dims), st.source, st.decoded)
     end
     return cur
 end
 
-function chainpass!(g, ::MotionNode, pr, cur, state::FxState, dims)
+function chainpass!(g, ::MotionNode, pr, cur, ctx::ChainBuild, dims)
     tmp = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
+    st = ctx.state
     Mantle.custom!(g, "stabilize") do p
         Mantle.use(p, cur; read = true, write = true)
         Mantle.use(p, tmp; write = true)
         () -> applymotiontrack!(frameview(cur, dims), frameview(tmp, dims),
-                                state.clip, state.served[])
+                                st.clip, st.served[])
     end
     return cur
 end
 
-function chainpass!(g, ::ColorTrackNode, pr, cur, state::FxState, dims)
+function chainpass!(g, ::ColorTrackNode, pr, cur, ctx::ChainBuild, dims)
+    st = ctx.state
     Mantle.custom!(g, "colour track") do p
         Mantle.use(p, cur; read = true, write = true)
-        () -> applycolortrack!(frameview(cur, dims), state.clip, state.served[];
+        () -> applycolortrack!(frameview(cur, dims), st.clip, st.served[];
                                strength = pr[].strength)
     end
     return cur
 end
 
-# like the matte, restored frames are keyed by the frame actually served
-function chainpass!(g, ::RestoreNode, pr, cur, state::FxState, dims)
-    Mantle.custom!(g, "restore") do p
+"""
+One pass for every [`PlaneOp`](@ref): the plane is a declared `read`, so the
+graph orders it against the update that wrote it and nothing has to reach around
+the graph for a second input. Everything specific to the op is behind
+`applyplane!`.
+"""
+function chainpass!(g, n::PlaneNode, pr, cur, ctx::ChainBuild, dims)
+    key = (:plane, typeof(n.op), n.shape)
+    sl = slot!(ctx.store, key, planeeltype(n.op), prod(n.shape))
+    b = PlaneBinding(key, Mantle.Update(g, sl.buf), pr, n.shape, Ref(false))
+    push!(ctx.planes, b)
+    st = ctx.state
+    Mantle.custom!(g, passname(n.op)) do p
         Mantle.use(p, cur; read = true, write = true)
-        () -> applyrestore!(frameview(cur, dims), state.clip, state.served[];
-                            strength = pr[].strength)
+        Mantle.use(p, sl.buf; read = true)
+        () -> b.active[] &&
+              applyplane!(frameview(cur, dims), frameview(sl.buf, n.shape), pr[].op, st.clip)
     end
     return cur
 end
 
-# the matte is per-frame data like the tracks above, so it samples `served` too
-function chainpass!(g, ::MatteNode, pr, cur, state::FxState, dims)
-    Mantle.custom!(g, "matte") do p
-        Mantle.use(p, cur; read = true, write = true)
-        () -> applymatte!(frameview(cur, dims), state.clip, state.served[];
-                          strength = pr[].strength, feather = pr[].feather)
-    end
-    return cur
-end
-
-function chainpass!(g, ::ColorNode, pr, cur, state::FxState, dims)
+function chainpass!(g, ::ColorNode, pr, cur, ctx::ChainBuild, dims)
     Mantle.custom!(g, "colour") do p
         Mantle.use(p, cur; read = true, write = true)
         () -> coloradjust!(frameview(cur, dims), pr[].adj)
@@ -209,7 +385,7 @@ function chainpass!(g, ::ColorNode, pr, cur, state::FxState, dims)
     return cur
 end
 
-function chainpass!(g, ::BlurNode, pr, cur, state::FxState, dims)
+function chainpass!(g, ::BlurNode, pr, cur, ctx::ChainBuild, dims)
     dst = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
     tmp = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
     Mantle.custom!(g, "blur") do p
@@ -222,7 +398,7 @@ function chainpass!(g, ::BlurNode, pr, cur, state::FxState, dims)
     return dst
 end
 
-function chainpass!(g, ::SharpenNode, pr, cur, state::FxState, dims)
+function chainpass!(g, ::SharpenNode, pr, cur, ctx::ChainBuild, dims)
     dst = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
     tmp = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
     Mantle.custom!(g, "sharpen") do p
@@ -235,7 +411,7 @@ function chainpass!(g, ::SharpenNode, pr, cur, state::FxState, dims)
     return dst
 end
 
-function chainpass!(g, n::PixelNode, pr, cur, state::FxState, dims)
+function chainpass!(g, n::PixelNode, pr, cur, ctx::ChainBuild, dims)
     if needsfresh(n.kind)
         out = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
         Mantle.custom!(g, "effect") do p
@@ -254,14 +430,36 @@ end
 
 # ---------------------------------------------------------------- build from a clip
 
-nodefor(::StabilizeEffect, input) = MotionNode(input)
-nodefor(e::FlickerEffect, input) = ColorTrackNode(input, e.strength)
-nodefor(e::RestoreEffect, input) = RestoreNode(input, e.strength)
-nodefor(e::MatteEffect, input) = MatteNode(input, e.strength, e.feather)
-nodefor(e::ColorEffect, input) = ColorNode(input, e.adj)             # specialized kernels
-nodefor(e::BlurEffect, input) = BlurNode(input, e.σ)
-nodefor(e::SharpenEffect, input) = SharpenNode(input, e.σ, e.amount)
-nodefor(e::Effect, input) = PixelNode(input, fxkind(e))              # callback effects (incl. plugins)
+"""
+    nodefor(effect, input, clip) -> FxNode | nothing
+
+The node an effect renders as, or `nothing` when its ANALYSIS is not there: a
+stabilize slot whose track was removed, a matte that was never analysed, a
+restoration whose first window has not come back yet. Saying so in the structure
+is what keeps the plan honest about what it will read — and it is one rule now,
+where the matte and the restoration used to answer it a second time inside their
+kernels and the compositor a third time on its own.
+"""
+nodefor(::StabilizeEffect, input, clip) =
+    clip.motiontrack === nothing ? nothing : MotionNode(input)
+nodefor(e::FlickerEffect, input, clip) =
+    clip.colortrack === nothing ? nothing : ColorTrackNode(input, e.strength)
+nodefor(e::RestoreEffect, input, clip) = planenode(RestoreOp(e.strength), input, clip)
+nodefor(e::MatteEffect, input, clip) = planenode(MatteOp(e.strength, e.feather), input, clip)
+nodefor(e::ColorEffect, input, clip) = ColorNode(input, e.adj)       # specialized kernels
+nodefor(e::BlurEffect, input, clip) = BlurNode(input, e.σ)
+nodefor(e::SharpenEffect, input, clip) = SharpenNode(input, e.σ, e.amount)
+nodefor(e::Effect, input, clip) = PixelNode(input, fxkind(e))        # callback effects (incl. plugins)
+
+"A plane node for `op`, or `nothing` when the clip has no plane for it to read.
+The shape comes from the same `planeshape` the node carries into the plan
+signature, so what the plan reserves and what the analysis produced cannot
+disagree."
+function planenode(op::PlaneOp, input::Int, clip::Clip)
+    sh = planeshape(op, clip)
+    sh === nothing && return nothing
+    return PlaneNode(input, op, sh)
+end
 
 """
 A clip's render chain as a node list, source first. The compiled form is the
@@ -286,10 +484,9 @@ function graphof(clip::Clip; applytracks::Bool = true)
     if applytracks
         for e in liveeffects(clip)          # enabled, non-neutral entries in stack order
             e isa TransformEffect && continue   # placement, not pixels — see `layermatrix`
-            # a stabilize/flicker slot whose analysis was removed renders nothing
-            e isa StabilizeEffect && clip.motiontrack === nothing && continue
-            e isa FlickerEffect && clip.colortrack === nothing && continue
-            push!(nodes, nodefor(e, cur)); cur = length(nodes)
+            n = nodefor(e, cur, clip)
+            n === nothing && continue           # its analysis is not there: renders nothing
+            push!(nodes, n); cur = length(nodes)
         end
     end
     return FxGraph(nodes)
@@ -306,96 +503,93 @@ struct ChainPlan
     plan::Any                 # a Mantle Plan — concrete per backend
     state::FxState
     params::Vector{Any}       # Ref{<:FxNode}, parallel to the nodes after the source
+    planes::Vector{PlaneBinding}   # the per-frame planes this chain reads
     out::Any                  # the output transient
     dims::Tuple{Int,Int}
 end
 
+"The chain's finished picture: a 2-D view over the plan's output transient. It
+stays valid until the same plan runs again — consume it (blit/download/compose)
+before then, never hold it."
+chainimage(cp::ChainPlan) = frameview(cp.out, cp.dims)
+
 """
-What makes two node lists the same plan: the frame size and the node TYPES in
-order. Values are deliberately not part of it — they flow through the parameter
-`Ref`s, so a keyframed parameter costs a store, not a recompile.
+The chain's binding for a kind of [`PlaneOp`](@ref), or `nothing` when it has
+none. How the compositor gets at the very buffer the keying read, instead of
+asking the clip a second time and hoping the two answers agree.
+"""
+function planebinding(cp::ChainPlan, ::Type{O}) where {O <: PlaneOp}
+    for b in cp.planes
+        b.params[].op isa O && return b
+    end
+    return nothing
+end
+
+"""
+What makes two node lists the same plan: the frame size, and the node types in
+order together with the shape of any plane they read. Values are deliberately not
+part of it — they flow through the parameter `Ref`s, so a keyframed parameter
+costs a store and not a recompile. A plane's SHAPE is not a value in that sense:
+it sizes a graph resource, so a matte analysed at another resolution has to get
+its own plan.
 """
 plansignature(nodes, dims, applytracks) =
-    (dims, applytracks, Tuple(typeof(n) for n in nodes))
+    (dims, applytracks, Tuple((typeof(n), planeshape(n)) for n in nodes))
 
 function buildchain(engine, nodes::Vector{FxNode}, dims)
     g = Mantle.Graph(engine.device)
-    state = FxState()
-    cur = chainpass!(g, nodes[1], nothing, state, dims)
+    ctx = ChainBuild(engine.store)
+    cur = chainpass!(g, nodes[1], nothing, ctx, dims)
     params = Any[]
     for n in Iterators.drop(nodes, 1)
         pr = Ref(n)
         push!(params, pr)
-        cur = chainpass!(g, n, pr, cur, state, dims)
+        cur = chainpass!(g, n, pr, cur, ctx, dims)
     end
-    return ChainPlan(Mantle.Plan(g), state, params, cur, dims)
-end
-
-"""
-The compositor's scratch, as persistent `Mantle.Buffer`s: fixed roles, canvas
-sized, created on first use. These are outside any graph — stage 4 of the move
-brings the compositor itself in; what matters today is that their bytes come
-from the same pool as everything else.
-"""
-mutable struct CanvasScratch
-    accum::Any
-    warpbuf::Any
-    cover::Any
-end
-CanvasScratch() = CanvasScratch(nothing, nothing, nothing)
-
-function canvasbuffer!(cs::CanvasScratch, field::Symbol, dev, dims)
-    b = getfield(cs, field)
-    if b === nothing
-        b = Mantle.Buffer(dev, RGB{N0f8}, prod(dims))
-        setfield!(cs, field, b)
-    end
-    return frameview(b, dims)
+    return ChainPlan(Mantle.Plan(g), ctx.state, params, ctx.planes, cur, dims)
 end
 
 """
 Owns the render resources so callers pass one handle. `device` is the Mantle
-device — it owns the pool every transient and every scratch buffer comes from —
-and `plans` caches one compiled chain per (structure, size) so a stable
-timeline renders with no allocation and no compilation after warm-up.
+device — it owns the pool every transient, every plane and every scratch buffer
+comes from — `plans` caches one compiled chain per (structure, size) so a stable
+timeline renders with no allocation and no compilation after warm-up, and `store`
+is every device buffer that is not a transient.
 """
 mutable struct FxEngine
     backend::Any
     device::Any
     plans::Dict{Any,ChainPlan}
-    canvases::Dict{Tuple{Int,Int},CanvasScratch}
-    alphalayers::Dict{Tuple{Int,Int},Any}
+    store::BufferStore
 end
-FxEngine(backend) = FxEngine(backend, Mantle.Device(backend), Dict{Any,ChainPlan}(),
-                             Dict{Tuple{Int,Int},CanvasScratch}(), Dict{Tuple{Int,Int},Any}())
+function FxEngine(backend)
+    dev = Mantle.Device(backend)
+    return FxEngine(backend, dev, Dict{Any,ChainPlan}(), BufferStore(dev))
+end
 
 """
-Give every cached plan's regions and every scratch buffer back to the pool.
-Explicit — Mantle frees nothing by finalizer, so dropping an engine without
-this leaks its regions until the pool is trimmed.
+Give every cached plan's regions and every buffer in the store back to the pool.
+Explicit — Mantle frees nothing by finalizer, so dropping an engine without this
+leaks its regions until the pool is trimmed.
 """
 function emptyengine!(e::FxEngine)
     for cp in values(e.plans)
-        Mantle.free!(cp.plan)
+        Mantle.free!(cp.plan)          # the plans first: they hold updates into the store
     end
     empty!(e.plans)
-    for cs in values(e.canvases), b in (cs.accum, cs.warpbuf, cs.cover)
-        b === nothing || Mantle.release!(Mantle.region(b.store))
-    end
-    empty!(e.canvases)
-    for b in values(e.alphalayers)
-        Mantle.release!(Mantle.region(b.store))
-    end
-    empty!(e.alphalayers)
+    empty!(e.store)
     return nothing
 end
 
 """
-    runchain!(engine, source, clip, frame; applytracks, playing, exact) -> device image
+    runchain!(engine, source, clip, frame; applytracks, playing, exact) -> ChainPlan
 
-Run `clip`'s chain for one frame and return the output: a 2-D view over the
-plan's output transient. It stays valid until the same plan runs again —
-consume it (blit/download/compose) before then, never hold it.
+Run `clip`'s chain for one frame and return the compiled chain that ran: it holds
+the output ([`chainimage`](@ref)) and the planes the compositor needs.
+
+The decode happens here rather than inside the source pass, because what a
+streaming source really serves decides which frame every per-frame result is
+sampled at — see [`decodesource`](@ref).
 """
 function runchain!(engine::FxEngine, source, clip::Clip, frame::Integer;
                    applytracks::Bool = true, playing::Bool = false, exact::Bool = false)
@@ -409,13 +603,15 @@ function runchain!(engine::FxEngine, source, clip::Clip, frame::Integer;
     st.clip = clip
     st.frame = Int(frame)
     st.served[] = Int(frame)
-    st.playing = playing
-    st.exact = exact
     for i in eachindex(cp.params)            # the store a changed parameter costs
         cp.params[i][] = nodes[i + 1]
     end
+    st.decoded = decodesource(source, st.frame; playing, served = st.served, exact)
+    for b in cp.planes                       # `served` is settled: the planes can be written
+        loadplane!(engine.store, b, clip, st.served[])
+    end
     Mantle.run!(cp.plan)
-    return frameview(cp.out, cp.dims)
+    return cp
 end
 
 """
@@ -429,7 +625,7 @@ streaming source then prefetches its next GOP (see [`frameat!`](@ref)).
 """
 function render(f, engine::FxEngine, source, clip::Clip, frame::Integer;
                 applytracks::Bool = true, playing::Bool = false, exact::Bool = false)
-    out = runchain!(engine, source, clip, frame; applytracks, playing, exact)
+    out = chainimage(runchain!(engine, source, clip, frame; applytracks, playing, exact))
     # The crop REMOVES picture. Doing it here — once, for every caller — is
     # what makes that true: the preview blits this buffer straight to the
     # screen, so a crop that only told the canvas placement where to sample
@@ -537,16 +733,17 @@ function canvasrect(clip::Clip, layersize::Tuple{Int, Int}, canvas::Tuple{Int, I
 end
 
 """
-    renderlayer!(engine, lclip, srcframe, source; …) -> device image
+    renderlayer!(engine, lclip, srcframe, source; …) -> ChainPlan
 
-One clip's finished layer: its chain run, its crop already removed. The view is
-valid until the same plan runs again — compose it before then.
+One clip's finished layer: its chain run, its crop already removed. The chain is
+returned rather than the image because the compositor needs its matte plane too;
+both are valid until the same plan runs again, so compose before then.
 """
 function renderlayer!(engine::FxEngine, lclip::Clip, srcframe::Integer, source;
                       applytracks::Bool = true, playing::Bool = false, exact::Bool = false)
-    layer = runchain!(engine, source, lclip, srcframe; applytracks, playing, exact)
-    cropaway!(layer, lclip.crop)
-    return layer
+    cp = runchain!(engine, source, lclip, srcframe; applytracks, playing, exact)
+    cropaway!(chainimage(cp), lclip.crop)
+    return cp
 end
 
 """
@@ -578,14 +775,14 @@ function composite(f, engine::FxEngine, clips, n::Integer, sourcefor;
                    canvas::Tuple{Integer, Integer},
                    applytracks::Bool = true, playing::Bool = false, exact::Bool = false)
     W, H = Int(canvas[1]), Int(canvas[2])
-    cs = get!(CanvasScratch, engine.canvases, (W, H))
-    accum = canvasbuffer!(cs, :accum, engine.device, (W, H))
+    accum = scratch!(engine.store, :accum, RGB{N0f8}, (W, H))
     for (k, clip) in enumerate(clips)
         srcframe = sourceframe(clip, n)
         source = sourcefor(clip, srcframe)
         source === nothing && return false
         lclip = withoutopacity(effectiveclip(clip, srcframe))
-        layer = renderlayer!(engine, lclip, srcframe, source; applytracks, playing, exact)
+        cp = renderlayer!(engine, lclip, srcframe, source; applytracks, playing, exact)
+        layer = chainimage(cp)
         α = Float32(clamp(paramvalue(clip, :opacity, srcframe), 0.0, 1.0))
         # COVERAGE, per pixel: white where this layer is opaque, black where
         # what is underneath must show through — the letterbox bars, and the
@@ -593,17 +790,17 @@ function composite(f, engine::FxEngine, clips, n::Integer, sourcefor;
         # which is right over nothing and wrong over a track: the black is
         # opaque and hides the clip below. The coverage is placed through the
         # same matrix as the picture, so the two cannot disagree.
-        cover = canvasbuffer!(cs, :cover, engine.device, (W, H))
-        abuf = get!(engine.alphalayers, size(layer)) do
-            Mantle.Buffer(engine.device, RGB{N0f8}, prod(size(layer)))
+        cover = scratch!(engine.store, :cover, RGB{N0f8}, (W, H))
+        alphalayer = scratch!(engine.store, :alphalayer, RGB{N0f8}, size(layer))
+        # the chain's OWN matte binding: same plane, same frame, same strength as
+        # the keying that just ran. Asking the clip a second time was a second
+        # answer to "is this layer matted", and the two could differ by a frame.
+        mb = planebinding(cp, MatteOp)
+        if mb !== nothing && mb.active[]
+            mattealpha!(alphalayer, planeview(engine.store, mb), mb.params[].op, lclip)
+        else
+            fill!(alphalayer, RGB{N0f8}(1, 1, 1))
         end
-        alphalayer = frameview(abuf, size(layer))
-        # the SAME effect entry the graph keyed with, so the coverage matches
-        me = findeffect(lclip, MatteEffect)
-        hasmatte = me !== nothing && !isneutral(me) &&
-                   mattealpha!(alphalayer, lclip, srcframe;
-                               strength = me.strength, feather = me.feather) !== nothing
-        hasmatte || fill!(alphalayer, RGB{N0f8}(1, 1, 1))
         fill!(cover, RGB{N0f8}(0, 0, 0))                 # outside the layer: fully clear
         placelayer!(cover, alphalayer, lclip)
         if k == 1                                        # the bottom layer sits on black
@@ -611,7 +808,7 @@ function composite(f, engine::FxEngine, clips, n::Integer, sourcefor;
             placelayer!(accum, layer, lclip)
             α < 0.999f0 && channellinear!(accum, Vec3f(α), Vec3f(0))
         else
-            warpbuf = canvasbuffer!(cs, :warpbuf, engine.device, (W, H))
+            warpbuf = scratch!(engine.store, :warpbuf, RGB{N0f8}, (W, H))
             fill!(warpbuf, RGB{N0f8}(0, 0, 0))           # the layer ALONE, premultiplied
             placelayer!(warpbuf, layer, lclip)
             overcompose!(accum, warpbuf, cover, α)

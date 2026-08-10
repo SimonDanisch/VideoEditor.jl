@@ -59,6 +59,23 @@ MatteTrack(alpha::Array{UInt8, 3}, src_in::Integer, seeds::AbstractVector{<:Inte
 mattesize(t::MatteTrack) = (size(t.alpha, 1), size(t.alpha, 2))
 
 """
+Restored frames for one clip, bounded (see `restore.jl`).
+
+Keyed by absolute source frame like the tracks above, and here for the same
+reason `FxLink` is: `Clip` has a field of it. Unlike a track it is a CACHE — a
+clip's worth of 4x frames is far too much to keep or to save — so `order` is an
+insertion queue that evicts the oldest window past `limit`. A plain LRU would be
+better if playback ever ran backwards, which it does not.
+"""
+mutable struct RestoreCache
+    const frames::Dict{Int, Matrix{RGB{N0f8}}}
+    const order::Vector{Int}
+    limit::Int
+end
+RestoreCache(limit::Integer = 96) =
+    RestoreCache(Dict{Int, Matrix{RGB{N0f8}}}(), Int[], Int(limit))
+
+"""
 Source of stable identities for clips and effect slots. Position in a vector and
 `objectid` both die on the first sort, undo or project reload — anything that has
 to POINT at a clip or an effect (a blend at its partner, the inspector at a stack
@@ -126,6 +143,12 @@ mutable struct Clip
     colortrack::Union{Nothing, ColorTrack}
     motiontrack::Union{Nothing, MotionTrack}
     mattetrack::Union{Nothing, MatteTrack}
+    # The fourth analysis result, and a field like the other three. It used to be
+    # a module global keyed by clip id, which is how `split!` came to drop a
+    # clip's restoration silently while taking explicit care of its matte: an id
+    # is minted fresh for the right half, so nothing followed. `nothing` until a
+    # window is restored; a cache, so it is never written to a project file.
+    restorecache::Union{Nothing, RestoreCache}
     const animations::Dict{Symbol, AnimCurve}  # keyframed params (see keyframes.jl)
     track::Int                  # stacking layer; higher = on top (1 = base)
     blendfrom::UInt64           # clip this one blends away FROM (0 = nothing)
@@ -135,7 +158,8 @@ end
 Clip(source::VideoSource, src_in, src_out, start, crop, rate::Real = 1.0,
      reframe::Union{Nothing, NTuple{<:Any, <:Real}} = nothing) =
     withreframe!(Clip(freshid(), source, src_in, src_out, start, crop, FxSlot[], nothing,
-                      nothing, nothing, Dict{Symbol, AnimCurve}(), 1, UInt64(0), Float64(rate)),
+                      nothing, nothing, nothing, Dict{Symbol, AnimCurve}(), 1, UInt64(0),
+                      Float64(rate)),
                  reframe)
 
 function Clip(source::VideoSource; src_in::Integer = 0, src_out::Integer = source.nframes,
@@ -431,11 +455,11 @@ function split!(seq::Sequence, n::Integer, track::Union{Nothing, Integer} = noth
     right.colortrack = clip.colortrack
     right.motiontrack = clip.motiontrack
     right.mattetrack = clip.mattetrack    # ditto — cutting a clip must not lose its matte
-    # …and restore, which is NOT a field here: it lives in a module global keyed
-    # by clip id, so it does not come along by assignment and `right` has a fresh
-    # one. Five storage schemes for "per-frame analysis result" is why this had to
-    # be remembered separately at all — see `sharerestore!`.
-    sharerestore!(clip, right)
+    # Shared, not copied, exactly as the tracks are: the frames are keyed by
+    # absolute source frame, so one cache indexes correctly from both halves. The
+    # two then share the eviction budget, which is the bargain a shared track
+    # makes anyway.
+    right.restorecache = clip.restorecache
     for (key, curve) in clip.animations   # absolute-frame keyed, but each half gets
         right.animations[key] = AnimCurve(copy(curve.keys), curve.interp)
     end                                   # its OWN copy — halves must edit independently
@@ -569,8 +593,8 @@ snapshot(seq::Sequence) =
           # links are copied, not shared: an undo that put back a slot whose
           # link vector was the live one would not restore a removed partner
           [FxSlot(s.id, s.effect, s.enabled, copy(s.links)) for s in c.effects],
-          c.colortrack, c.motiontrack, c.mattetrack, deepcopy(c.animations), c.track,
-          c.blendfrom, c.rate)
+          c.colortrack, c.motiontrack, c.mattetrack, c.restorecache,
+          deepcopy(c.animations), c.track, c.blendfrom, c.rate)
      for c in seq.clips]
 
 "Restore a [`snapshot`](@ref) (the snapshot itself stays reusable)."

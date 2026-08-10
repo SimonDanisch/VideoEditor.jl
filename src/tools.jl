@@ -1404,7 +1404,6 @@ function runmatte!(ctx::ToolContext; clip = nothing, seeds = nothing)
                 player.jobprogress[] = d / max(t, 1)
             end)
             put!(player.uiqueue, () -> begin
-                freematteplanes!(track)
                 findeffect(clip, MatteEffect) === nothing &&
                     push!(clip.effects, FxSlot(MatteEffect()))
                 cov = mattecoverage(track)
@@ -1446,7 +1445,6 @@ function removematte!(player::Player)
     snapshot!(player)          # track, marks and the effect all come back together
     col = mattecollect(player)
     col === nothing || col.clip !== clip || cancelmattecollect!(col)
-    clip.mattetrack === nothing || freematteplanes!(clip.mattetrack)
     clip.mattetrack = nothing
     delete!(player.mattemarks, clip.id)
     i = findfirst(s -> s.effect isa MatteEffect, clip.effects)
@@ -1604,7 +1602,6 @@ function removematteseed!(player::Player, clip::Clip, frame::Integer)
     marks = mattemarks(player, clip)
     delete!(marks, Int(frame))
     if isempty(marks)
-        clip.mattetrack === nothing || freematteplanes!(clip.mattetrack)
         clip.mattetrack = nothing
         player.matteinfo[] = "no matte"
         setstatus!(player, "matte: last mark removed — mark a frame to key again")
@@ -2073,7 +2070,6 @@ end
 
 "Back to the picture the clip had before this marking, with no points left."
 function clearlivematte!(col::MatteCollect)
-    col.clip.mattetrack === nothing || freematteplanes!(col.clip.mattetrack)
     col.clip.mattetrack = col.prevtrack
     restorematteeffect!(col)
     matteinfo!(col)
@@ -2177,7 +2173,6 @@ function showlivematte!(col::MatteCollect, alpha::Matrix{UInt8}; strength = 0.85
     player = col.ctx.player
     track = MatteTrack(reshape(alpha, size(alpha, 1), size(alpha, 2), 1),
                        col.srcframe, [col.srcframe])
-    col.clip.mattetrack === nothing || freematteplanes!(col.clip.mattetrack)
     col.clip.mattetrack = track
     if col.prevmatte === nothing                       # first preview of this marking
         # `findeffect` hands back the EFFECT (`findslot` is the one that returns
@@ -2240,7 +2235,6 @@ end
 function cancelmattecollect!(col::MatteCollect)
     endmattecollect!(col)
     restorematteeffect!(col)
-    col.clip.mattetrack === nothing || freematteplanes!(col.clip.mattetrack)
     col.clip.mattetrack = col.prevtrack
     if !col.hadeffect                      # we added it; take it back off again
         i = findfirst(s -> s.effect isa MatteEffect, col.clip.effects)

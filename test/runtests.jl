@@ -324,20 +324,19 @@ end
 @testset "a split carries EVERY analysis result, not just the ones on the Clip" begin
     # `colortrack`/`motiontrack`/`mattetrack` are Clip fields, so `split!` copies
     # them by assignment and there is a comment there making sure of it. Restore's
-    # cache is a module global keyed by clip id, and the right half is minted with
-    # `freshid()` — so splitting a restored clip silently dropped the restoration
-    # on the right half. `RestoreCache`'s own docstring claimed otherwise ("keyed
-    # by absolute source frame so it survives splits and trims like the tracks
-    # do"): true of the frames inside the cache, false of the cache itself.
+    # cache used to be a module global keyed by clip id, and the right half is
+    # minted with `freshid()` — so splitting a restored clip silently dropped the
+    # restoration on the right half. It is a Clip field now, and this is the test
+    # that says so.
     src = VideoSource(testvideo)
     seq = Sequence(src)
     c = seq.clips[1]
-    VE.putrestored!(VE.restorecache(c), 50, VE.RGBFrame(undef, 4, 4))
+    VE.putrestored!(VE.restorecache!(c), 50, VE.RGBFrame(undef, 4, 4))
     @test VE.hasrestored(c, 50)
     right = split!(seq, 40)                  # frame 50 lands in the RIGHT half
     @test right.id != c.id                   # …which is a different identity …
     @test VE.hasrestored(right, 50)          # … and must still be restored
-    @test VE.restorecache(right) === VE.restorecache(c)   # shared, as the tracks are
+    @test right.restorecache === c.restorecache          # shared, as the tracks are
 end
 
 
@@ -1142,9 +1141,10 @@ end
     e1b = VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 11), MatteEffect)
     @test e1b.strength ≈ 1.0f0 && e1b.feather ≈ 0.5f0
 
-    # --- the graph builds a MatteNode for it
+    # --- the graph builds a matte plane node for it, sized by the analysed track
     g = VideoEditor.graphof(VideoEditor.effectiveclip(clip, 11))
-    @test any(n -> n isa VideoEditor.MatteNode, g.nodes)
+    mn = g.nodes[findfirst(n -> n isa VideoEditor.PlaneNode{VideoEditor.MatteOp}, g.nodes)]
+    @test mn.shape == VideoEditor.mattesize(clip.mattetrack)
 
     # --- project round-trip: seeds in the file, alpha in the sidecar
     path = joinpath(mktempdir(), "matte.toml")
@@ -1180,6 +1180,86 @@ end
     finally
         VideoEditor.MATTEPROPAGATOR[] = prevprop   # put back what was installed
     end
+end
+
+@testset "per-frame planes go through the graph" begin
+    # A matte's alpha and a restoration's picture are whole images, not a handful
+    # of numbers, so they reach the kernel as a `PlaneOp`: a pool-backed buffer
+    # the graph writes through `Update` and the node's pass declares a read on.
+    # Each one used to be a `KA.allocate` per frame behind a module global —
+    # outside the pool, never freed, and invisible to the graph that ordered
+    # everything around it. The properties below are what that route has to have.
+    src = VideoSource(testvideo)
+    frame = fill(VE.RGB{VE.N0f8}(0.2, 0.6, 0.9), src.width, src.height)
+
+    clip = VE.Clip(src)
+    alpha = zeros(UInt8, 160, 90, 10)
+    alpha[40:120, 20:70, :] .= 0xff
+    clip.mattetrack = MatteTrack(alpha, clip.src_in, [clip.src_in])
+    push!(clip.effects, VE.FxSlot(MatteEffect(; strength = 1.0)))
+    f0 = clip.src_in
+
+    # the node carries the plane's shape, because that shape sizes a graph
+    # resource and so belongs in the plan signature
+    node = VE.graphof(clip).nodes[end]
+    @test node isa VE.PlaneNode{VE.MatteOp}
+    @test node.shape == VE.mattesize(clip.mattetrack)
+
+    engine = VE.FxEngine(VE.KA.CPU())
+    cp = VE.runchain!(engine, frame, clip, f0)
+    out = copy(VE.chainimage(cp))
+    @test out == VE.applymatte!(copy(frame), clip, f0; strength = 1.0)
+    @test out[3, 3] == VE.RGB{VE.N0f8}(0, 0, 0)                     # background keyed
+    @test out[src.width ÷ 2, src.height ÷ 2] != VE.RGB{VE.N0f8}(0, 0, 0)
+
+    # a changed parameter is a store, not a new plan — the plane did not move
+    plans = length(engine.plans)
+    clip.effects[end] = VE.FxSlot(MatteEffect(; strength = 0.5))
+    half = copy(VE.chainimage(VE.runchain!(engine, frame, clip, f0)))
+    @test length(engine.plans) == plans
+    @test half != out
+
+    # the SAME frame of the SAME clip is already in the buffer: nothing to write
+    b = only(cp.planes)
+    VE.loadplane!(engine.store, b, clip, f0)
+    @test (@atomic b.update.pending) === nothing
+
+    # …but a re-propagation is a NEW track under an unchanged clip and frame, and
+    # a stamp that could not see that would render the old alpha forever. This is
+    # what replaced the eight explicit `freematteplanes!` calls.
+    alpha2 = zeros(UInt8, 160, 90, 10); alpha2[10:40, 10:30, :] .= 0xff
+    clip.mattetrack = MatteTrack(alpha2, clip.src_in, [clip.src_in])
+    clip.effects[end] = VE.FxSlot(MatteEffect(; strength = 1.0))
+    fresh = copy(VE.chainimage(VE.runchain!(engine, frame, clip, f0)))
+    @test fresh == VE.applymatte!(copy(frame), clip, f0; strength = 1.0)
+    @test fresh != out
+
+    # outside the analysed range the node renders nothing — not the last plane
+    @test copy(VE.chainimage(VE.runchain!(engine, frame, clip, f0 + 50))) == frame
+    @test !only(cp.planes).active[]
+
+    # the compositor's coverage is the chain's own matte binding, so "is this
+    # layer keyed" has ONE answer: where the matte removed the background the
+    # track below shows through, rather than the black the keying painted.
+    base = VE.Clip(src)
+    top = VE.Clip(src); top.track = 2
+    top.mattetrack = MatteTrack(alpha, top.src_in, [top.src_in])
+    push!(top.effects, VE.FxSlot(MatteEffect(; strength = 1.0)))
+    red  = fill(VE.RGB{VE.N0f8}(1, 0, 0), src.width, src.height)
+    blue = fill(VE.RGB{VE.N0f8}(0, 0, 1), src.width, src.height)
+    eng2 = VE.FxEngine(VE.KA.CPU())
+    canvas = Ref{Any}(nothing)
+    @test VE.composite(eng2, [base, top], 0, (c, sf) -> c === base ? red : blue;
+                       canvas = (src.width, src.height)) do cv
+        canvas[] = copy(cv)
+    end
+    @test canvas[][src.width ÷ 2, src.height ÷ 2] == VE.RGB{VE.N0f8}(0, 0, 1)
+    @test canvas[][3, 3] == VE.RGB{VE.N0f8}(1, 0, 0)
+
+    # every buffer the engine owns comes back to the pool, planes included
+    VE.emptyengine!(engine); VE.emptyengine!(eng2)
+    @test isempty(engine.store.slots) && isempty(engine.plans)
+    @test isempty(eng2.store.slots)
 end
 
 @testset "matte reads and propagates in one interleaved pass" begin
@@ -1285,7 +1365,7 @@ end
         @test called[] == 1
         @test VideoEditor.hasrestored(clip, 0)
         @test !VideoEditor.hasrestored(clip, 5)          # outside the window
-        img = VideoEditor.restorecache(clip).frames[0]
+        img = clip.restorecache.frames[0]
         @test size(img) == (2 * src.width, 2 * src.height)
 
         # applying: same function the graph node calls
@@ -1325,12 +1405,13 @@ end
         @test VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 0), RestoreEffect).strength ≈ 0.0f0
         @test VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 5), RestoreEffect).strength ≈ 1.0f0
 
-        # the graph builds a RestoreNode
+        # the graph builds a restore plane node, sized by what the model returned
         g = VideoEditor.graphof(VideoEditor.effectiveclip(clip, 5))
-        @test any(n -> n isa VideoEditor.RestoreNode, g.nodes)
+        rn = g.nodes[findfirst(n -> n isa VideoEditor.PlaneNode{VideoEditor.RestoreOp}, g.nodes)]
+        @test rn.shape == (2 * src.width, 2 * src.height)
     finally
         VideoEditor.RESTOREMODEL[] = nothing
-        VideoEditor.clearrestore!()
+        VideoEditor.clearrestore!(clip)
     end
     @test !VideoEditor.hasrestoremodel()
 end

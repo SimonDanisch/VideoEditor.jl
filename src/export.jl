@@ -147,12 +147,15 @@ end
 
 framesize(sr::SequentialReader) = (sr.source.width, sr.source.height)
 
-function sourceinto!(out, sr::SequentialReader, frame; prefetch::Bool = false,
-                     served = nothing, exact::Bool = false)
-    readframe!(sr.host, sr, frame)   # always exact — sequential decode by construction
-    out === sr.host || copyto!(out, sr.host)
-    return out
-end
+# Split the same way the streaming source is (see `decodesource`): the read
+# happens before the plan runs, the pass only moves the pixels. There is no
+# `served` to settle here — a sequential decode is exact by construction — but
+# one shape for every source is what keeps the source pass a single method.
+decodesource(sr::SequentialReader, frame::Integer; playing::Bool = false,
+             served = nothing, exact::Bool = false) =
+    readframe!(sr.host, sr, frame)
+
+sourceinto!(out, sr::SequentialReader, f) = (out === f || copyto!(out, f); out)
 
 "Frame-sized working buffer on `backend` (a plain host frame on the CPU)."
 allocframe(::KA.CPU, dims::NTuple{2, Int}) = RGBFrame(undef, dims...)
