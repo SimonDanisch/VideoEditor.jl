@@ -66,9 +66,13 @@ leaves that to the axis limits — see the framing check)."
 function uncropped(clip::Clip, n::Integer, engine, readers)
     sf = VE.sourceframe(clip, n)
     ec = effectiveclip(clip, sf)
+    # Positional, so it has to track `Clip`'s fields: `reframe` left when framing
+    # became a `TransformEffect`, and `restorecache` arrived when the restore
+    # cache stopped being a module global. Nothing caught either, because this
+    # file is not in `runtests.jl`.
     flat = Clip(ec.id, ec.source, ec.src_in, ec.src_out, ec.start, (0.0, 0.0, 1.0, 1.0),
-                ec.effects, ec.colortrack, ec.motiontrack, ec.mattetrack, ec.animations,
-                ec.track, ec.blendfrom, ec.rate, ec.reframe)
+                ec.effects, ec.colortrack, ec.motiontrack, ec.mattetrack, ec.restorecache,
+                ec.animations, ec.track, ec.blendfrom, ec.rate)
     dec = get!(() -> VE.opendecoder(clip.source, engine.backend), readers, clip.source.path)
     out = RGBFrame(undef, clip.source.width, clip.source.height)
     VE.render(engine, dec, flat, sf; exact = true) do layer

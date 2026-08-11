@@ -877,8 +877,13 @@ function showframe!(player::Player, n::Integer; standin::Bool = !atrest(player))
     end
     loc = locate(player.sequence, n)
     if loc === nothing
-        fill!(player.composebuf, RGB{N0f8}(0, 0, 0))
-        copyto!(player.frame[], player.composebuf)
+        # Straight into the published frame. `composebuf` is sized to the DECODE
+        # resolution (`ensuredecodesize!`) and `frame[]` to the canvas, so
+        # blacking one and copying it into the other is only ever right when a
+        # clip happens to match the canvas — with nothing under the playhead
+        # there is no clip to make it so, and a 320x180 decode buffer went into a
+        # 214x108 frame.
+        fill!(player.frame[], RGB{N0f8}(0, 0, 0))
         showcpuframe!(player)
         notify(player.frame)
         return true
