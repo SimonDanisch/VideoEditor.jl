@@ -87,7 +87,9 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     addmenu = Menu(panel[2, 1]; prompt = "+  Add effect…", default = nothing,
                    searchable = true, search_placeholder = "type to filter…",
                    options = menuopts(), tellwidth = false)
-    on(EFFECTS.version) do _
+    # EFFECTS is a GLOBAL registry, so this listener outlives the player unless it
+    # is taken off again — see `:fxglobalobs` below.
+    menuobs = on(EFFECTS.version) do _
         addmenu.options[] = menuopts()
     end
     on(addmenu.selection) do sel
@@ -241,7 +243,14 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     # its preview thumbnails) asks for a rebuild by bumping the registry version.
     # That used to be the Tools dock's cue; it is this panel's now, and losing it
     # is why the matte stopped showing anything after the first mark.
-    on(_ -> rebuildstack(force = true), EFFECTS.version)
+    stackobs = on(_ -> rebuildstack(force = true), EFFECTS.version)
+    # Both of these hang off a global registry, so a closed player keeps reacting
+    # to every effect-registry bump for the rest of the process. That is not a
+    # slow leak, it is a live fault: the dead player's handler `put!`s onto its
+    # closed `uiqueue` and throws, and `notify` abandons the remaining listeners —
+    # so the LIVE player's panel silently stops rebuilding, and its Matte card
+    # loses the button that was about to be clicked. `close` takes them off again.
+    player.fxwidgets[:fxglobalobs] = Any[menuobs, stackobs]
     rebuildstack()
 
     # Esc clears the filter — the one key everyone tries first.

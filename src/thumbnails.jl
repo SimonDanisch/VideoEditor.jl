@@ -110,6 +110,8 @@ finished thumb crosses to the host. Every GPU touch goes through `cache.gpurun`
 (the player's pinned worker — Lava is single-writer). Falls back to the CPU
 loop when the stream won't open.
 """
+const THUMBLOG = Tuple{Symbol, Int, Int, Float64}[]
+
 function gputhumbloop(cache::ThumbnailCache)
     source = cache.source
     stream = dev = thumbdev = nothing
@@ -150,6 +152,8 @@ function gputhumbloop(cache::ThumbnailCache)
                 f = frameat!(stream, n)              # resident now — pure ring hit
                 nv12torgb!(dev, f.y, f.uv; bt601 = stream.bt601)
                 areadownscale!(thumbdev, dev)
+                # The device→host copy has to wait for the downscale kernel.
+                KA.synchronize(LavaBackend())
                 copyto!(host, thumbdev)
                 nothing
             end
@@ -172,6 +176,10 @@ function thumbloop(cache::ThumbnailCache)
     scratch = RGBFrame(undef, source.width, source.height)
     scratch_hw = PermutedDimsArray(scratch, (2, 1))
     position = -1  # frame index the reader will produce next, -1 = unknown
+    # Whether `scratch` has EVER been filled. It starts as `undef`, so storing it
+    # before the first successful `read!` publishes uninitialized memory — see the
+    # guard below, which is what the timeline's black leading tile was.
+    filled = false
     try
         while cache.running[]
             s = lock(() -> isempty(cache.wishlist) ? nothing : popfirst!(cache.wishlist), cache.lock)
@@ -187,7 +195,23 @@ function thumbloop(cache::ThumbnailCache)
             while position <= n && cache.running[]
                 read!(reader, scratch_hw)
                 position += 1
+                filled = true
             end
+            # `stop!` flips `running` to hand this source over to the GPU worker,
+            # and `setgpurun!` does exactly that a moment after a Player is built —
+            # right on top of this loop's FIRST request. Losing that race used to
+            # publish the still-`undef` `scratch` as second 0's thumbnail: the
+            # timeline's leading tile came out black, or streaked with whatever
+            # was in the memory, and stayed that way for the whole session because
+            # `request!` skips any second already in `thumbs`. It read as a decode
+            # bug and is not one — every frame here decodes correctly; the loop
+            # simply stored a frame it had not read.
+            #
+            # `position > n` with `filled` already true is NOT this case: a repeat
+            # request for a second already in `scratch` legitimately reads nothing
+            # and stores the frame it holds.
+            cache.running[] || break
+            filled || continue
             storethumb!(cache, Int(s), downscale(scratch, cache.thumbwidth, cache.thumbheight))
         end
     catch e

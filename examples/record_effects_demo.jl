@@ -35,7 +35,7 @@ fig.scene.events.hasfocus[] = false
 
 # off-camera: short clip + a neutral Color effect already in the stack (starts vivid-neutral)
 seq.clips[1].src_out = 180
-push!(seq.clips[1].effects, VE.ColorEffect())
+VE.seteffect!(seq.clips[1], VE.ColorEffect())
 VE.refreshedit!(player)
 player.fxwidgets[:fxlistrefresh]()
 player.playhead[] = 0

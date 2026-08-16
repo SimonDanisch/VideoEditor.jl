@@ -36,8 +36,8 @@ fig.scene.events.hasfocus[] = false
 # once it's stacked over the first, the composite is obviously a blend.
 half = max(VE.seqlength(seq) ÷ 2, 30)
 top = VE.split!(seq, half)
-push!(top.effects, VE.ColorEffect(saturation = 1.8f0, temperature = 0.5f0))
-push!(top.effects, VE.OpacityEffect(0.5f0))
+VE.seteffect!(top, VE.ColorEffect(saturation = 1.8f0, temperature = 0.5f0))
+VE.seteffect!(top, VE.OpacityEffect(0.5f0))
 VE.refreshedit!(player)
 player.playhead[] = 0
 
