@@ -72,7 +72,8 @@ include("precompile.jl")  # LAST: the workload runs the render + matte paths, so
 
 export VideoSource, Player, Clip, Sequence
 export play!, pause!, step!
-export split!, deleteclip!, moveclip!, addsource!, saveproject, loadproject
+export split!, deleteclip!, moveclip!, copyclip, copyclips!, pasteclips!,
+       addsource!, saveproject, loadproject
 export ColorEffect, BlurEffect, SharpenEffect, MatteEffect, seteffect!
 export MatteTrack, analyzematte!, applymatte!, registermatte!, seedmask
 export sam2seed, sam2ready, defaultsegmenter

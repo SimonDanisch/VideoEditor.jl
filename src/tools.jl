@@ -1488,6 +1488,18 @@ function mattecardobjects(col)
 end
 
 """
+Corner radius of the matte card's object pills.
+
+**5, not 12.** At `height = 24` a radius of 12 is exactly half the height, i.e. a
+full stadium — the roundest a rounded rectangle can be — and it read as a
+different design language from every other control in the editor, which sits at
+3–6. It also renders badly: at half-height the two arcs meet with no straight
+edge between them, so the stroke has no flat run to sit on and the outline looks
+lumpy where the curves join.
+"""
+const PILLRADIUS = 5
+
+"""
 ONE card for ONE marked frame: which objects were marked there, and the × that
 un-marks that frame.
 
@@ -1528,7 +1540,7 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
                                         sel ? 0.55 : 0.16)
                 pill = Button(pills[k, 1]; label = "$n point$(n == 1 ? "" : "s")",
                               fontsize = 11, height = 24, tellwidth = false,
-                              width = Makie.Relative(1.0), cornerradius = 12,
+                              width = Makie.Relative(1.0), cornerradius = PILLRADIUS,
                               buttoncolor = fill,
                               buttoncolor_hover = Makie.lerp_oklab(RGBf(Makie.to_color(colors.background)),
                                                                    base, 0.35),
@@ -1547,21 +1559,26 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
                 push!(pillwidgets, (; object = id, pill, remove = bx))
             end
             colsize!(pills, 1, Makie.Auto(false, 1.0))
-            # An explicit height for the pill row: without it the nested layout
-            # reported one row's worth however many pills it held, and everything
-            # below was laid straight over the ones that did not fit.
-            isempty(ids) || rowsize!(g, r, Makie.Fixed(28 * length(ids)))
 
             # UNDER the pills, because that is where the thing it makes appears.
             # Further clicks on a subject REFINE it — that is what SAM 2 does with
             # several positive points — so "this is a different thing" has to be
             # said, not guessed.
-            newobj = Button(g[r += 1, 1]; label = "+ object", fontsize = 11, height = 24,
-                            tellwidth = false, width = Makie.Relative(1.0),
-                            cornerradius = 12, buttoncolor = (:transparent, 0.0),
+            #
+            # In the pills' OWN grid, column 1, not the card's outer grid. Outside
+            # it, the button stretched the full card width while every pill above
+            # stopped short by the `×` column, so the one control that makes a new
+            # pill was the one control that did not line up with them.
+            newobj = Button(pills[length(ids) + 1, 1]; label = "+ object", fontsize = 11,
+                            height = 24, tellwidth = false, width = Makie.Relative(1.0),
+                            cornerradius = PILLRADIUS, buttoncolor = (:transparent, 0.0),
                             strokewidth = 1, strokecolor = (colors.text, 0.28),
                             labelcolor = colors.text_muted,
                             buttoncolor_hover = colors.surface)
+            # …which makes the row one taller than the object count. Without an
+            # explicit height the nested layout reported one row's worth however
+            # many it held, and everything below was laid over what did not fit.
+            rowsize!(g, r, Makie.Fixed(28 * (length(ids) + 1)))
             on(newobj.clicks) do _
                 c = mattecollect(player)
                 c === nothing && return setstatus!(player, "matte: mark a subject first")

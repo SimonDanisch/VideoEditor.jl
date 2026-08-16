@@ -469,6 +469,48 @@ function split!(seq::Sequence, n::Integer, track::Union{Nothing, Integer} = noth
 end
 
 """
+    copyclip(clip; start = clip.start, track = clip.track) -> Clip
+
+An independent copy of `clip` — the same source range, the same effect stack, the
+same analysis — placed at `start` on `track`. Not inserted into any sequence.
+
+**What is copied and what is shared follows [`split!`](@ref) exactly**, because
+the question is the same one: a derived clip reads the same source frames, so
+anything keyed by absolute source frame is correct to share and expensive to
+duplicate.
+
+* **Fresh:** the clip `id`, and one `id` per [`FxSlot`](@ref) with its own copy of
+  the links. Two slots sharing an id would make the inspector and the blend card
+  address both at once. The `Effect` inside a slot is shared and that is safe —
+  every effect is an immutable `struct`, so a parameter change replaces it rather
+  than mutating what the other clip reads.
+* **Shared:** `colortrack`, `motiontrack`, `mattetrack` and `restorecache`. All
+  four are keyed by absolute source frame and the copy covers the same frames, so
+  one analysis indexes correctly from both — and re-running a matte to duplicate
+  it would cost minutes.
+* **Copied:** the animation curves. Keyframes are the one thing you edit per
+  clip, so the two must move independently.
+* **Dropped:** `blendfrom`. It names another clip by id, and a copy landing
+  somewhere else in the timeline has no business blending away from that clip's
+  partner. `split!` keeps it because its left half genuinely continues the same
+  blend; a copy does not.
+"""
+function copyclip(clip::Clip; start::Integer = clip.start, track::Integer = clip.track)
+    c = Clip(clip.source, clip.src_in, clip.src_out, start, clip.crop, clip.rate)
+    c.track = track
+    append!(c.effects, [FxSlot(freshid(), s.effect, s.enabled, copy(s.links))
+                        for s in clip.effects])
+    c.colortrack = clip.colortrack
+    c.motiontrack = clip.motiontrack
+    c.mattetrack = clip.mattetrack
+    c.restorecache = clip.restorecache
+    for (key, curve) in clip.animations
+        c.animations[key] = AnimCurve(copy(curve.keys), curve.interp)
+    end
+    return c
+end
+
+"""
     trimclip!(seq, clip, i, side, n) -> clip
 
 Move one edge of `clip` (`i` = its index in `seq.clips`) to timeline frame `n`.

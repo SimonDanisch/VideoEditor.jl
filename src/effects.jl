@@ -349,6 +349,27 @@ end
 # ---------------------------------------------------- animatable parameters
 
 clampunit(v::Real) = clamp(Float64(v), 0.0, 1.0)
+
+"""
+How far outside the source a crop rect may reach, as a fraction of the source.
+
+`1.0` means the rect can start a full frame-width left of the picture and end a
+full frame-width right of it, so a canvas can be grown to three times the
+source's size in each axis before a bound is hit. A bound exists at all only
+because these are sliders and a slider needs ends; the crop TOOL is not limited
+by it, since dragging a rectangle states the size directly.
+
+Not unbounded, and not a "canvas size" property either: the rect IS the canvas,
+so growing it is the same gesture as shrinking it — which is what makes "crop
+outward" mean "make the project bigger" without a second concept.
+"""
+const CROPREACH = 1.0
+
+"A crop origin: outside the picture is allowed, absurdly far outside is not."
+cropunit(v::Real) = clamp(Float64(v), -CROPREACH, 1.0 + CROPREACH)
+
+"A crop extent: never degenerate, and free to exceed the source."
+cropextent(v::Real) = clamp(Float64(v), 0.05, 1.0 + 2CROPREACH)
 curadj(clip::Clip) = (e = findeffect(clip, ColorEffect); e === nothing ? ColorAdjustments() : e.adj)
 withcolor(clip::Clip, adj::ColorAdjustments) = seteffect!(clip, ColorEffect(adj))
 
@@ -397,14 +418,20 @@ const BUILTINPARAMS = ParamSpec[
         c -> (e = findeffect(c, MatteEffect); e === nothing ? 0.0 : Float64(e.feather)),
         (c, v) -> (e = findeffect(c, MatteEffect);
                    seteffect!(c, MatteEffect(e === nothing ? 1.0f0 : e.strength, Float32(v))))),
-    ParamSpec(:crop_x, "Pan X", :geometry, 0.0, 1.0, 0.0,
-        c -> c.crop[1], (c, v) -> (c.crop = (clampunit(v), c.crop[2], c.crop[3], c.crop[4]))),
-    ParamSpec(:crop_y, "Pan Y", :geometry, 0.0, 1.0, 0.0,
-        c -> c.crop[2], (c, v) -> (c.crop = (c.crop[1], clampunit(v), c.crop[3], c.crop[4]))),
-    ParamSpec(:crop_w, "Zoom W", :geometry, 0.05, 1.0, 1.0,
-        c -> c.crop[3], (c, v) -> (c.crop = (c.crop[1], c.crop[2], clamp(Float64(v), 0.05, 1.0), c.crop[4]))),
-    ParamSpec(:crop_h, "Zoom H", :geometry, 0.05, 1.0, 1.0,
-        c -> c.crop[4], (c, v) -> (c.crop = (c.crop[1], c.crop[2], c.crop[3], clamp(Float64(v), 0.05, 1.0)))),
+    # The crop rect may sit OUTSIDE the picture, which is how the canvas grows:
+    # the rect is what gets rendered, `canvassize` is its size in source pixels,
+    # and the warp leaves whatever it cannot reach as background. So the ranges
+    # run past the image rather than stopping at its edges — clamped to `0..1`
+    # these sliders could only ever shrink a project, and there was no way at all
+    # to make one taller. `CROPREACH` is how far past the edge they go.
+    ParamSpec(:crop_x, "Pan X", :geometry, -CROPREACH, 1.0 + CROPREACH, 0.0,
+        c -> c.crop[1], (c, v) -> (c.crop = (cropunit(v), c.crop[2], c.crop[3], c.crop[4]))),
+    ParamSpec(:crop_y, "Pan Y", :geometry, -CROPREACH, 1.0 + CROPREACH, 0.0,
+        c -> c.crop[2], (c, v) -> (c.crop = (c.crop[1], cropunit(v), c.crop[3], c.crop[4]))),
+    ParamSpec(:crop_w, "Zoom W", :geometry, 0.05, 1.0 + 2CROPREACH, 1.0,
+        c -> c.crop[3], (c, v) -> (c.crop = (c.crop[1], c.crop[2], cropextent(v), c.crop[4]))),
+    ParamSpec(:crop_h, "Zoom H", :geometry, 0.05, 1.0 + 2CROPREACH, 1.0,
+        c -> c.crop[4], (c, v) -> (c.crop = (c.crop[1], c.crop[2], c.crop[3], cropextent(v)))),
     # …and where the cropped picture SITS in the canvas. The fit is automatic
     # (whole, centred, black bars); these three are the manual override for
     # material that doesn't share the sequence's shape — 1.0 fits, >1 fills past

@@ -110,6 +110,16 @@ mutable struct Player
     # where load-time and plugin registration land; a second editor can be given
     # its own and differ.
     const effects::EffectRegistry
+    # Clips taken by Ctrl+C, already detached from the sequence.
+    #
+    # They are full [`copyclip`](@ref) results rather than references, so the
+    # clipboard survives deleting what was copied — the copy shares the source's
+    # analysis and nothing that a later edit can invalidate.
+    clipboard::Vector{Clip}
+    # Whether a `retrypresent` refiner is running. One at a time, so exactly one
+    # thing presents and it always targets the current playhead — see there for
+    # what many of them did to a scrub.
+    const refining::Threads.Atomic{Bool}
 end
 
 """
@@ -325,7 +335,7 @@ function Player(path::AbstractString; capacity::Integer = 64,
     # thumbnails decode on the GPU too — through the pinned worker (single-writer)
     wantgpu && setgpurun!(player.timeline, f -> rungpusync(f, player))
     audiopreview && (player.audio = AudioPreview())
-    retrypresent(player, 0)
+    retrypresent(player)
     for src in unique(c.source for c in sequence.clips)  # projects may be multi-source
         needsproxy(src; maxpixels = proxythreshold) && startproxy!(player, src)
         # with the GPU preview on, stream-decode each source on the GPU so playback
@@ -368,7 +378,7 @@ function startproxy!(player::Player, source::VideoSource;
             player.pools[source] = SourcePool(proxy; capacity = player.capacity)
             old === nothing || stop!(old.worker)
             notify(player.playhead)  # re-present through the proxy
-            player.playing[] || retrypresent(player, player.playhead[])
+            player.playing[] || retrypresent(player)
             setstatus!(player, "preview proxy ready — $(proxy.width)×$(proxy.height)")
         end)
     catch e
@@ -458,7 +468,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     Observable(VideoSource[]), Any[], nothing, Observable(:none),
                     Ref(1.0), Observable(:opacity), Observable(true),
                     Threads.Atomic{Float64}(NaN), Dict{Any, Any}(), FxEngine(analysisbackend),
-                    effects)
+                    effects, Clip[], Threads.Atomic{Bool}(false))
     player.fxwidgets[:lanechip] = lanechip
     @async for s in player.statusqueue  # main-thread consumer: threads → observable
         status[] = s
@@ -706,7 +716,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     end
                 end
             end
-            playing[] || retrypresent(player, n)
+            playing[] || retrypresent(player)
         end
     end
 
@@ -1102,23 +1112,48 @@ function present!(player::Player)
 end
 
 """
-While the playhead sits at `n`, keep refining until the EXACT frame is on screen
-(each attempt advances the stream's decode) — or until the playhead moves on.
-When the frame never arrives inside `budget` seconds the preview shows the
-decoder's best and SAYS so, rather than holding a stale image without a word.
+Keep refining until the EXACT frame under the playhead is on screen (each attempt
+advances the stream's decode). When it never arrives inside `budget` seconds the
+preview shows the decoder's best and SAYS so, rather than holding a stale image
+without a word.
+
+**One refiner at a time, and it reads the playhead rather than capturing it.**
+
+This used to spawn a task per call, each closing over the frame it was asked for
+and looping `while playhead[] == n`. A scrub calls it once per frame, so dozens
+ran at once, and the guard was checked BEFORE the render: a task could pass it,
+spend a few milliseconds compositing, and publish its frame after a newer task had
+already published a later one. The screen then held a frame from behind the
+playhead — intermittently, and more often the heavier the chain, which is why it
+surfaced as a matte or a stabilized warp "moving behind" rather than as a plainly
+wrong picture.
+
+Publishing cannot be stale if nothing holds a stale target. The single task reads
+`playhead[]` fresh on every pass, so it always renders what the user is looking at
+and the frame that reaches the screen is the last one asked for. `showframe!` is
+left alone: it puts frame `n` on screen, which is all it should ever mean, and
+trim preview still uses it to show an edge frame the playhead is nowhere near.
 """
-function retrypresent(player::Player, n::Integer; budget::Real = 20.0)
-    @async begin
+function retrypresent(player::Player; budget::Real = 20.0)
+    Threads.atomic_cas!(player.refining, false, true) === false || return nothing
+    @async try
         deadline = time() + budget
-        while player.playhead[] == n && !player.playing[]
-            showframe!(player, n) && (player.presented += 1; break)
-            if time() > deadline
+        while !player.playing[]
+            n = player.playhead[]        # the CURRENT frame, never a captured one
+            if showframe!(player, n)
+                player.presented += 1
+                player.playhead[] == n && break   # …unless it moved while we rendered
+                deadline = time() + budget
+            elseif time() > deadline
                 showframe!(player, n; standin = true)
                 setstatus!(player, "frame $n never finished decoding — showing the nearest decoded frame")
                 break
+            else
+                sleep(0.005)
             end
-            sleep(0.005)
         end
+    finally
+        player.refining[] = false
     end
     return nothing
 end
@@ -1321,7 +1356,7 @@ function playloop(player::Player)
     # Playback presents stand-ins to keep moving (frameat!'s latency budget), and
     # nothing retries while playing. The moment it stops — Space, K, a GPU render
     # error, the end of the sequence — the screen owes the frame the playhead is ON.
-    retrypresent(player, player.playhead[])
+    retrypresent(player)
     return nothing
 end
 
@@ -1342,6 +1377,67 @@ function split!(player::Player)
     end
     refreshedit!(player)
     return nothing
+end
+
+"""
+    copyclips!(player) -> Int
+
+Take the marked clips — or the one being edited — onto the clipboard. Ctrl+C.
+
+Copies at the point of taking rather than storing references, so deleting what
+you copied does not empty the clipboard. Positions are kept relative to the
+earliest clip taken, which is what lets [`pasteclips!`](@ref) rebuild a multi-clip
+arrangement at the playhead instead of collapsing it to one point.
+"""
+function copyclips!(player::Player)
+    seq = player.sequence
+    marked = player.timeline.selection[]
+    clips = if length(marked) > 1
+        [seq.clips[i] for i in marked if 1 <= i <= length(seq.clips)]
+    else
+        loc = editclip(player)
+        loc === nothing ? Clip[] : [loc[1]]
+    end
+    isempty(clips) && (setstatus!(player, "nothing selected to copy"); return 0)
+    base = minimum(c.start for c in clips)
+    empty!(player.clipboard)
+    for c in clips
+        push!(player.clipboard, copyclip(c; start = c.start - base))
+    end
+    setstatus!(player, "copied $(length(clips)) clip$(length(clips) == 1 ? "" : "s")")
+    return length(clips)
+end
+
+"""
+    pasteclips!(player) -> Int
+
+Drop the clipboard at the playhead, each clip on the first lane at or above its
+own that has room. Ctrl+V.
+
+Searching upward for a free lane is right HERE and wrong for a drag: a paste has
+no target lane under the cursor to honour, so the only alternative to finding one
+is refusing. A drag does have one, which is why `dragto!` refuses instead — see
+the note there on what riding upward cost when it did.
+"""
+function pasteclips!(player::Player)
+    isempty(player.clipboard) && (setstatus!(player, "clipboard is empty"); return 0)
+    seq = player.sequence
+    at = player.playhead[]
+    snapshot!(player)
+    n = 0
+    for c in player.clipboard
+        start = at + c.start                    # relative offsets, restored around the playhead
+        track = c.track
+        while track <= ntracks(seq) && !canplace(seq, c, start, track)
+            track += 1
+        end
+        push!(seq.clips, copyclip(c; start, track))
+        n += 1
+    end
+    sort!(seq.clips, by = c -> (c.track, c.start))
+    refreshedit!(player)
+    setstatus!(player, "pasted $n clip$(n == 1 ? "" : "s")")
+    return n
 end
 
 function Base.deleteat!(player::Player)
@@ -1816,7 +1912,7 @@ function refreshedit!(player::Player)
     relayout!(player.timeline)
     ensurestreams!(player)
     notify(player.playhead)
-    player.playing[] || retrypresent(player, player.playhead[])
+    player.playing[] || retrypresent(player)
     return nothing
 end
 
@@ -2020,11 +2116,34 @@ function finishcrop!(player::Player, corner::Point2f)
     W, H = size(player.frame[])  # preview data coords = displayed (maybe proxy) pixels
     x0, x1 = minmax(anchor[1], corner[1])
     y0, y1 = minmax(anchor[2], corner[2])
-    x0, x1 = clamp(x0 / W, 0.0, 1.0), clamp(x1 / W, 0.0, 1.0)
-    y0, y1 = clamp(y0 / H, 0.0, 1.0), clamp(y1 / H, 0.0, 1.0)
-    (x1 - x0 < 0.01 || y1 - y0 < 0.01) && return nothing  # degenerate drag
+    # NOT clamped to the picture. A crop rectangle may sit partly — or wholly —
+    # outside it, which is how Photoshop's crop tool grows a canvas: drag past the
+    # edge and the result is bigger than what you started with, with the new area
+    # empty. Clamping to `0..1` made this tool able to shrink a project and never
+    # to enlarge one, so "make the canvas taller" had no gesture at all.
+    #
+    # `canvassize` already multiplies these by the source's pixels, so a width
+    # past 1.0 IS a wider canvas; nothing downstream needed a new concept. What
+    # falls outside the source renders as the letterbox background, which
+    # `placelayer!` already paints for every clip that does not fill the canvas.
+    x0, x1 = x0 / W, x1 / W
+    y0, y1 = y0 / H, y1 / H
+    # A degenerate drag is still degenerate, but the floor is on the SIZE, not on
+    # where it sits: a 5%-wide crop hanging off the left edge is a real request.
+    (x1 - x0 < 0.01 || y1 - y0 < 0.01) && return nothing
+    before = canvassize(player.sequence)
     clip.crop = (x0, y0, x1 - x0, y1 - y0)
     applycrop!(player, clip)
+    # Say what the canvas became, and say so LOUDLY when it grew. A crop that only
+    # ever removed picture needed no readout — the result was on screen. One that
+    # can add empty space does: the new area looks like the letterbox bars a
+    # differently-shaped clip already gets, so "did that resize my project or just
+    # letterbox this clip?" is a real question the status bar can answer.
+    after = canvassize(player.sequence)
+    grew = after[1] > before[1] || after[2] > before[2]
+    setstatus!(player, grew ?
+        "canvas $(before[1])×$(before[2]) → $(after[1])×$(after[2]) — cropped outward, the new area is empty" :
+        "canvas $(after[1])×$(after[2])")
     return nothing
 end
 
@@ -2064,6 +2183,12 @@ function wirekeys(player::Player)
             split!(player)
         elseif (event.key == Keyboard.x || event.key == Keyboard.delete) && ispress
             deleteat!(player)
+        elseif event.key == Keyboard.c && ispress &&
+               ispressed(player.fig, Keyboard.left_control | Keyboard.right_control)
+            copyclips!(player)          # BEFORE bare `c`, which is the crop tool
+        elseif event.key == Keyboard.v && ispress &&
+               ispressed(player.fig, Keyboard.left_control | Keyboard.right_control)
+            pasteclips!(player)
         elseif event.key == Keyboard.c && ispress
             usetool!(player, :crop)
         elseif event.key == Keyboard.t && ispress
