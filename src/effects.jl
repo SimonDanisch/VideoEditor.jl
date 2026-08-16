@@ -1,10 +1,10 @@
 """
 Non-destructive per-clip effects, interpreted in stack order by `graphof` and run
-by `execute!` — the one renderer, whatever the tier. All pixel work is GPUFiltering
-kernels through KernelAbstractions, and the buffers come from a `BufferPool` built
-on the engine's backend, so the same code runs on host `Matrix`es under `KA.CPU()`
-and on `LavaArray`s on the GPU. There is no CPU stack and no GPU stack; there is
-one graph and a backend parameter.
+as a Mantle graph — the one renderer, whatever the tier. All pixel work is
+GPUFiltering kernels through KernelAbstractions, and the buffers are transients
+placed by the engine's Mantle device, so the same code runs on host memory under
+`KA.CPU()` and on the GPU through Lava. There is no CPU stack and no GPU stack;
+there is one graph and a backend parameter.
 """
 abstract type Effect end
 
@@ -171,11 +171,11 @@ function findslot(clip::Clip, id::Integer)
     return i === nothing ? nothing : clip.effects[i]
 end
 
-# There is no second walker over the stack here. `execute!` (gpugraph.jl) is the
-# ONE renderer, and it is not GPU-specific: its `BufferPool` allocates through
-# `KA.allocate(backend, …)`, so on `KA.CPU()` it hands out host `Matrix`es and
-# runs the identical kernels. The tier is the engine's backend, a parameter —
-# never a second code path.
+# There is no second walker over the stack here. `runchain!` (gpugraph.jl) is
+# the ONE renderer, and it is not GPU-specific: the engine's Mantle device backs
+# its transients with host memory on `KA.CPU()` and VRAM through Lava, and the
+# passes run the identical kernels either way. The tier is the engine's backend,
+# a parameter — never a second code path.
 #
 # There used to be one anyway: `applyeffects!` walked `liveeffects` with two
 # scratch buffers, plus `applyeffect!` methods that re-stated what Color, Blur

@@ -21,6 +21,7 @@ import FFMPEG_jll
 import HTTP
 import JSON
 import KernelAbstractions as KA
+import Mantle
 import Mmap
 import PNGFiles
 import Scratch

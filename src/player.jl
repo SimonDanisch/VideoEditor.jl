@@ -720,6 +720,47 @@ function timecode(seq::Sequence, n::Integer)
     return @sprintf("%02d:%06.3f  %d/%d", minutes, t - 60minutes, n, max(seqlength(seq) - 1, 0))
 end
 
+# A Player has ~50 fields, and the default `show` walks every one of them. Three
+# of those are why this exists rather than being cosmetic: `frame` and
+# `composebuf` are whole decoded images, and `gpucache` maps each source to its
+# DEVICE-RESIDENT frames — so displaying a Player at the REPL pulled megabytes
+# back off the GPU to print them. These two touch scalars and observables only.
+function Base.show(io::IO, p::Player)
+    seq = p.sequence
+    n = length(seq.clips)
+    print(io, "Player(", n, " clip", n == 1 ? "" : "s", ", ", timecode(seq, p.playhead[]), ")")
+end
+
+function Base.show(io::IO, ::MIME"text/plain", p::Player)
+    seq = p.sequence
+    nclip = length(seq.clips)
+    ntr = ntracks(seq)
+    nfx = sum(c -> length(c.effects), seq.clips; init = 0)
+    names = unique(basename(c.source.path) for c in seq.clips)
+    w, h = p.lastcanvas
+    println(io, "Player")
+    if nclip == 0
+        println(io, "  timeline   empty")
+    else
+        print(io, "  timeline   ", nclip, " clip", nclip == 1 ? "" : "s",
+              " on ", ntr, " track", ntr == 1 ? "" : "s")
+        nfx == 0 || print(io, ", ", nfx, " effect", nfx == 1 ? "" : "s")
+        println(io)
+        # Sources, not clips: a split leaves two clips on one file, and naming the
+        # file twice reads as two pieces of media.
+        println(io, "  media      ", join(first(names, 3), ", "),
+                length(names) > 3 ? " (+$(length(names) - 3) more)" : "")
+    end
+    println(io, "  position   ", timecode(seq, p.playhead[]),
+            p.playing[] ? "  playing" : "  paused")
+    println(io, "  canvas     ", w, "x", h, " @ ", round(seq.framerate; digits = 3), " fps")
+    println(io, "  preview    ", p.gpupreview === nothing ? "CPU" : "GPU",
+            p.analysisbackend === nothing ? "" : "  ·  analysis on $(nameof(typeof(p.analysisbackend)))")
+    nundo, nredo = length(p.undostack), length(p.redostack)
+    print(io, "  edits      ", p.edits, " (", nundo, " undo, ", nredo, " redo)")
+    p.dockopen[] === :none || print(io, "  ·  dock: ", p.dockopen[])
+end
+
 # ---------------------------------------------------------------- presentation
 
 """
