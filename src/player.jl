@@ -50,6 +50,17 @@ mutable struct Player
     const matteinfo::Observable{String}          # matte tool status line
     const restoreinfo::Observable{String}        # restore tool status line
     const mattemarks::Dict{UInt64, Dict{Int, Matrix{UInt8}}}  # clip id -> marked frames
+    # clip id -> frames repaired by hand after propagation. Separate from the
+    # marks because they are a different KIND of statement: a mark is an input the
+    # propagator runs from, a repair is an output that overrules what it produced.
+    # `runmatte!` re-applies these after every full analysis, or rebuilding the
+    # track would throw them away without a word.
+    const matterepairs::Dict{UInt64, Dict{Int, Matrix{UInt8}}}
+    # `(clip, srcframe, mask)` while a brush stroke is in flight, else `nothing`.
+    # The mask is a COPY of the frame's alpha; the stroke paints into it and only
+    # `endmattebrush!` puts it on the undo stack, so one stroke is one step and an
+    # abandoned one costs nothing.
+    mattebrush::Any
     analysisbackend::Any  # KA backend for analysis/GPU playback; set by auto-detect
     const fig::Figure
     const previewaxis::Axis
@@ -136,15 +147,24 @@ undo steps cost a hundred dictionaries instead of a hundred megabytes.
 """
 docsnapshot(player::Player) =
     (snapshot(player.sequence),
-     Dict{UInt64, Dict{Int, Matrix{UInt8}}}(k => copy(v) for (k, v) in player.mattemarks))
+     Dict{UInt64, Dict{Int, Matrix{UInt8}}}(k => copy(v) for (k, v) in player.mattemarks),
+     Dict{UInt64, Dict{Int, Matrix{UInt8}}}(k => copy(v) for (k, v) in player.matterepairs))
 
 "Put a [`docsnapshot`](@ref) back."
 function docrestore!(player::Player, snap)
-    clips, marks = snap
+    clips, marks, repairs = snap
     restore!(player.sequence, clips)
     empty!(player.mattemarks)
     for (k, v) in marks
         player.mattemarks[k] = copy(v)
+    end
+    # `snapshot` SHARES the mattetrack rather than copying it, so restoring the
+    # clips alone would not put a repaired frame's pixels back. `repairmatteat!`
+    # installs a fresh track instead of writing through the shared one, which is
+    # what makes `restore!` above enough — see the note there.
+    empty!(player.matterepairs)
+    for (k, v) in repairs
+        player.matterepairs[k] = copy(v)
     end
     return nothing
 end
@@ -456,6 +476,8 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     Observable(true), Observable("no analysis yet"),
                     Observable("no matte"), Observable("no restoration"),
                     Dict{UInt64, Dict{Int, Matrix{UInt8}}}(),
+                    Dict{UInt64, Dict{Int, Matrix{UInt8}}}(),
+                    nothing,
                     analysisbackend,
                     fig, ax, Ref(false),
                     Observable(Point2f[]),
@@ -2077,8 +2099,24 @@ function wirecroptool(player::Player)
         end
         return Consume(false)
     end
+    # Alt+drag on the preview PAINTS the matte: left adds to the subject, right
+    # takes away. Alt rather than a tool of its own, and available whenever the
+    # clip has a matte, because the moment you want it is the moment you are
+    # looking at a bad frame — putting it behind a mode switch means noticing the
+    # problem, leaving what you were doing, and coming back.
+    brushing() = ispressed(player.fig, Keyboard.left_alt | Keyboard.right_alt)
     on(events(ax.scene).mousebutton) do event
         mine() || return Consume(false)
+        if brushing() && event.button in (Mouse.left, Mouse.right)
+            if event.action == Mouse.press && is_mouseinside(ax.scene)
+                beginmattebrush!(player, event.button == Mouse.left) || return Consume(false)
+                mattebrushto!(player, Point2f(mouseposition(ax.scene)))
+                return Consume(true)
+            elseif event.action == Mouse.release && player.mattebrush !== nothing
+                endmattebrush!(player)
+                return Consume(true)
+            end
+        end
         event.button == Mouse.left || return Consume(false)
         player.cropmode[] || return Consume(false)
         if event.action == Mouse.press && is_mouseinside(ax.scene)
@@ -2092,6 +2130,12 @@ function wirecroptool(player::Player)
     end
     on(events(ax.scene).mouseposition) do _
         mine() || return Consume(false)
+        if player.mattebrush !== nothing
+            # Direction comes from the stroke, not from the mouse right now — see
+            # `beginmattebrush!`.
+            mattebrushto!(player, Point2f(mouseposition(ax.scene)))
+            return Consume(true)
+        end
         anchor = player.cropanchor
         if anchor !== nothing && player.cropmode[]
             pos = Point2f(mouseposition(ax.scene))
@@ -2216,7 +2260,14 @@ function wirekeys(player::Player)
         elseif event.key == Keyboard.enter && ispress && mattecollect(player) !== nothing
             # Enter is the "I am done marking" gesture; it must beat every other
             # Enter binding while a selection is open, hence the guard up here.
-            finishmattecollect!(mattecollect(player))
+            #
+            # Shift+Enter writes THIS FRAME ONLY. The two are one gesture apart
+            # because they are the same decision — "the marking is finished" —
+            # answered for different scopes, and the scope is the thing a user
+            # picks per frame: propagate when the tracking drifted, repair when
+            # one frame in a good matte came out broken.
+            shift ? repairmattecollect!(mattecollect(player)) :
+                    finishmattecollect!(mattecollect(player))
         elseif event.key == Keyboard.backspace && ispress && mattecollect(player) !== nothing
             dropmattepoint!(mattecollect(player))
         elseif event.key == Keyboard.escape && ispress

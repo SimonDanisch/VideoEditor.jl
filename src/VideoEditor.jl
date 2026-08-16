@@ -75,13 +75,16 @@ export play!, pause!, step!
 export split!, deleteclip!, moveclip!, copyclip, copyclips!, pasteclips!,
        addsource!, saveproject, loadproject
 export ColorEffect, BlurEffect, SharpenEffect, MatteEffect, seteffect!
-export MatteTrack, analyzematte!, applymatte!, registermatte!, seedmask
+export MatteTrack, analyzematte!, applymatte!, registermatte!, seedmask,
+       repairframe!, repairmatteat!, matterepairs
 export sam2seed, sam2ready, defaultsegmenter
 export RestoreEffect, registerrestore!, restorewindow!, applyrestore!
 export registerplugin!, registereffect!, EffectKind, FxParam, Pointwise, Stencil
 export Overlay, registeroverlay!, addoverlay!, removeoverlay!, setoverlaykey!
 export registertool!, ToolContext, toolplot!, ontool!, tooltime, toolband
 export activatetool!, deactivatetool!
+export repairmattecollect!, brushmatte!, matteframe
+export beginmattebrush!, mattebrushto!, endmattebrush!
 export exportvideo, exportgif, analyzecolor!, analyzemotion!, analyzeobject!, findloop
 export loopsignatures, similarframes
 export contactsheet, filmstrip, framegrab, regiongrab, findchange, viewsummary

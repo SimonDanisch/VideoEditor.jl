@@ -597,6 +597,86 @@ function mattecoverage(track::MatteTrack; samples::Integer = 12)
 end
 
 """
+    repairframe!(clip, srcframe, mask) -> Bool
+
+Overwrite ONE frame of an existing matte, leaving every other frame alone.
+
+The propagator is causal, so the ordinary way to fix a bad frame — mark it and
+re-analyse — rebuilds the whole clip from its seeds and takes as long as the
+first run did. That is the right tool when the tracking went wrong and everything
+after it drifted. It is the wrong one for a single frame that came out broken in
+an otherwise good matte, which is the common case and the one with no answer
+before this.
+
+`mask` is at any resolution; it is scaled to the track's. Returns `false` when
+the clip has no matte, or when `srcframe` is outside it — a repair has nothing to
+repair in either case.
+
+**Not recorded as a seed.** A seed is an INPUT the propagator runs from; this is
+an OUTPUT written after the fact. Adding it to `track.seeds` would mean the next
+full analysis propagates from a frame the user painted, which is a different and
+much stronger claim than "this one frame should look like this". See
+[`repairedframes`](@ref) for what does remember them.
+"""
+function repairframe!(clip::Clip, srcframe::Integer, mask::AbstractMatrix)
+    t = clip.mattetrack
+    t === nothing && return false
+    k = Int(srcframe) - t.src_in + 1
+    1 <= k <= size(t.alpha, 3) || return false
+    w, h = mattesize(t)
+    view(t.alpha, :, :, k) .= mattemaskscale(mask, w, h)
+    return true
+end
+
+"""
+    brushmatte!(mask, nx, ny, foreground; radius = 0.04) -> mask
+
+Stamp one round brush dab into `mask` at normalized `(nx, ny)`, in place.
+
+`foreground` writes 0xff (keep this), otherwise 0x00 (drop this) — the two things
+a matte can say about a pixel, so an eraser is the same gesture with the other
+button rather than a second tool.
+
+`radius` is a fraction of the mask's WIDTH, so the brush is the same size on
+screen whatever resolution the matte was analysed at. Painting is the repair of
+last resort: the model gets the subject nearly right and leaves a hole, or takes a
+bite out of an edge, and no arrangement of clicks talks it out of that — at which
+point saying "this bit, here" directly is the shortest path from wrong to right.
+"""
+function brushmatte!(mask::AbstractMatrix{UInt8}, nx::Real, ny::Real, foreground::Bool;
+                     radius::Real = 0.04)
+    w, h = size(mask, 1), size(mask, 2)
+    cx, cy = nx * w, ny * h
+    r = max(1.0, radius * w)
+    r2 = r * r
+    v = foreground ? 0xff : 0x00
+    x0 = max(1, floor(Int, cx - r));  x1 = min(w, ceil(Int, cx + r))
+    y0 = max(1, floor(Int, cy - r));  y1 = min(h, ceil(Int, cy + r))
+    @inbounds for y in y0:y1, x in x0:x1
+        dx = x - cx; dy = y - cy
+        dx * dx + dy * dy <= r2 && (mask[x, y] = v)
+    end
+    return mask
+end
+
+"""
+    matteframe(clip, srcframe) -> Matrix{UInt8} | nothing
+
+A COPY of one frame of the clip's matte, at the track's own resolution.
+
+A copy because it is what a brush stroke paints into: strokes are committed
+through [`repairframe!`](@ref) on release, so the track must not change under a
+stroke the user may still abandon.
+"""
+function matteframe(clip::Clip, srcframe::Integer)
+    t = clip.mattetrack
+    t === nothing && return nothing
+    k = Int(srcframe) - t.src_in + 1
+    1 <= k <= size(t.alpha, 3) || return nothing
+    return Matrix{UInt8}(view(t.alpha, :, :, k))
+end
+
+"""
     previewmatte(clip, frame, mask; maxside = nothing) -> Matrix{UInt8}
 
 The matte for ONE frame, at matte resolution — what the current selection would

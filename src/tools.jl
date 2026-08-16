@@ -1372,6 +1372,104 @@ mattemarks(player::Player, clip::Clip) =
     get!(() -> Dict{Int, Matrix{UInt8}}(), player.mattemarks, clip.id)
 
 """
+    matterepairs(player, clip) -> Dict{Int, Matrix{UInt8}}
+
+Single frames whose matte was fixed by hand, by source frame.
+
+Kept beside the marks rather than inside the track for the reason the marks are:
+a track is the propagator's OUTPUT and gets rebuilt wholesale, so anything that
+must survive a rebuild has to live outside it. `runmatte!` re-applies these after
+every full analysis.
+"""
+matterepairs(player::Player, clip::Clip) =
+    get!(() -> Dict{Int, Matrix{UInt8}}(), player.matterepairs, clip.id)
+
+"""
+    beginmattebrush!(player, foreground) -> Bool
+    mattebrushto!(player, p) -> Bool
+    endmattebrush!(player) -> Bool
+
+Paint into a finished matte, one stroke at a time.
+
+The three exist separately because a stroke is three events and only the last one
+should reach the document. `begin` takes a copy of the frame's alpha,
+`to` dabs into that copy and shows it, and `end` commits the whole stroke through
+[`repairmatteat!`](@ref) — so one stroke is one undo step, and letting go outside
+the picture or pressing Escape leaves the matte exactly as it was.
+
+Committing per dab instead would put a hundred entries on the undo stack for one
+stroke and re-upload the track a hundred times.
+"""
+function beginmattebrush!(player::Player, foreground::Bool)
+    loc = editclip(player)
+    loc === nothing && return false
+    clip, srcframe = loc
+    m = matteframe(clip, srcframe)
+    m === nothing && (setstatus!(player, "matte: nothing to paint into — run the matte first"); return false)
+    # `foreground` is fixed for the stroke's whole length. Re-reading the mouse on
+    # every move would flip add to erase mid-stroke on a stray second button.
+    player.mattebrush = (clip, Int(srcframe), m, foreground)
+    return true
+end
+
+function mattebrushto!(player::Player, p; radius::Real = 0.04)
+    br = player.mattebrush
+    br === nothing && return false
+    clip, srcframe, mask, foreground = br
+    nx, ny = previewtomatte(player, clip, srcframe, p)
+    brushmatte!(mask, nx, ny, foreground; radius)
+    # Shown by writing the live track, not by committing: the picture has to
+    # follow the brush, and the document must not.
+    repairframe!(clip, srcframe, mask)
+    notify(player.playhead)
+    return true
+end
+
+function endmattebrush!(player::Player)
+    br = player.mattebrush
+    br === nothing && return false
+    mask = br[3]
+    player.mattebrush = nothing
+    return repairmatteat!(player, mask)
+end
+
+"""
+    repairmatteat!(player, mask) -> Bool
+
+Fix the matte on the frame under the playhead, and remember the fix.
+
+The repair a propagated matte needs is almost never "run it all again" — it is
+one frame in the middle that came out wrong while the frames either side are
+fine. Re-analysing rebuilds the clip and costs what the first run cost; this
+writes one frame and costs nothing.
+"""
+function repairmatteat!(player::Player, mask::AbstractMatrix)
+    loc = editclip(player)
+    loc === nothing && (setstatus!(player, "matte: no clip under the playhead"); return false)
+    clip, srcframe = loc
+    clip.mattetrack === nothing &&
+        (setstatus!(player, "matte: nothing to repair — run the matte first"); return false)
+    snapshot!(player)
+    # COPY the track before writing into it. `snapshot` shares `mattetrack`
+    # between the undo record and the live clip, so mutating the alpha in place
+    # would edit the snapshot too and the repair would survive its own undo.
+    # One clip's alpha, once per explicit repair — the alternative is an undo
+    # that silently does nothing.
+    old = clip.mattetrack
+    clip.mattetrack = MatteTrack(copy(old.alpha), old.src_in, copy(old.seeds))
+    if !repairframe!(clip, srcframe, mask)
+        clip.mattetrack = old
+        setstatus!(player, "matte: frame $srcframe is outside this clip's matte")
+        return false
+    end
+    matterepairs(player, clip)[Int(srcframe)] = Matrix{UInt8}(mask)
+    refreshmattepanel!(player)
+    notify(player.playhead)
+    setstatus!(player, "matte: frame $srcframe repaired — kept through the next full run")
+    return true
+end
+
+"""
 Propagate the marks across the clip, on the analysis backend, off the UI thread.
 
 The reader is the clip's own post-fx frame stream, so the model tracks the
@@ -1403,6 +1501,16 @@ function runmatte!(ctx::ToolContext; clip = nothing, seeds = nothing)
             track = analyzematte!(clip, reader, marks; progress = (d, t) -> begin
                 player.jobprogress[] = d / max(t, 1)
             end)
+            # A full run rebuilds every frame from the seeds, which would silently
+            # throw away single-frame repairs. They are put back rather than
+            # re-seeded: a repair says "this frame should look like this", not
+            # "propagate from here", and the propagator has no way to be told the
+            # first. Whoever repaired a frame did so because the propagation was
+            # wrong there, so propagation does not get to overrule it.
+            reps = matterepairs(player, clip)
+            for (sf, m) in reps
+                repairframe!(clip, sf, m)
+            end
             put!(player.uiqueue, () -> begin
                 findeffect(clip, MatteEffect) === nothing &&
                     push!(clip.effects, FxSlot(MatteEffect()))
@@ -2152,7 +2260,8 @@ function livematte!(col::MatteCollect)
                     refreshmattepanel!(player)      # the card gains the seed outline
                     setstatus!(player, "matte: $(length(points)) point$(length(points) == 1 ? "" : "s") — " *
                                "selection covers $(round(100 * count(!=(0x00), mask) / length(mask); digits = 1))%" *
-                               " · Enter to propagate")
+                               " · Enter to propagate" *
+                               (col.prevtrack === nothing ? "" : " · Shift+Enter for this frame only"))
                 end
                 player.jobprogress[] = NaN
                 col.busy = false
@@ -2246,6 +2355,42 @@ function finishmattecollect!(col::MatteCollect)
         end
     end
     return nothing
+end
+
+"""
+    repairmattecollect!(col) -> Bool
+
+End the marking session by writing THIS FRAME only, instead of propagating.
+
+The other exit from a marking session, and the one a finished matte usually
+wants. `finishmattecollect!` adds the marks as a seed and re-propagates the whole
+clip, which is right when the tracking went wrong and everything after it
+drifted, and wrong for the ordinary case: one frame in the middle came out broken
+while the frames either side are fine. Re-propagating then costs what the first
+run cost and risks changing frames that were already correct.
+
+The mask is the one the preview is already showing — the same `lastseed` the
+propagating exit uses — so what lands is what you were looking at when you
+pressed the key. No preview yet means no repair: the alternative is running the
+model on the UI thread, and that is half a second of frozen window.
+"""
+function repairmattecollect!(col::MatteCollect)
+    player = col.ctx.player
+    endmattecollect!(col)
+    restorematteeffect!(col)
+    col.clip.mattetrack = col.prevtrack          # drop the live one-frame track
+    if col.prevtrack === nothing
+        setstatus!(player, "matte: nothing to repair yet — Enter propagates the first run")
+        return false
+    end
+    mask = col.lastseed
+    if mask === nothing || col.lastseedpoints != col.points
+        setstatus!(player, "matte: wait for the selection to appear, then repair")
+        return false
+    end
+    ok = repairmatteat!(player, mask)
+    ok && notify(player.playhead)
+    return ok
 end
 
 "Discard the marking and put back what the preview showed before it."
