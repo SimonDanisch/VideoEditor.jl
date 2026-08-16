@@ -184,8 +184,24 @@ struct GPUWorker
 
     function GPUWorker()
         jobs = Channel{Function}(8)
+        # A job that throws must not take the worker with it. It used to: the
+        # exception escaped the `for`, the task died, and because the channel
+        # stayed open every later `rungpu` posted into a channel nobody read —
+        # so the next GPU request did not fail, it HUNG, forever, with no
+        # message. `record_loop_demo` sat 15 minutes at 107% CPU twice before an
+        # interrupt showed no `analyzemotion!` frame anywhere: the worker had
+        # been dead since the thumbnail probe hit a lost device.
+        #
+        # Reported, not swallowed — `@error` with the backtrace, because a GPU
+        # job failing is a bug and the whole point here is that it stops being
+        # invisible. `rungpusync` still carries its own exception back to its
+        # caller; this only catches what nobody else would ever see.
         task = Task(() -> for f in jobs
-            Base.invokelatest(f)  # jobs may be defined after the worker started
+            try
+                Base.invokelatest(f)  # jobs may be defined after the worker started
+            catch err
+                @error "GPU worker job failed; worker stays up" exception = (err, catch_backtrace())
+            end
         end)
         task.sticky = true
         ccall(:jl_set_task_tid, Cint, (Any, Cint), task, Threads.nthreads() - 1)
@@ -194,9 +210,20 @@ struct GPUWorker
     end
 end
 
-"Post `f` to a worker directly — for callers that own a [`GPUWorker`] but no `Player`
-(the test suite's GPU beats, which must reach Lava on the same pinned thread the
-editor uses, or they fix ownership on main and every later analysis asserts)."
+"""
+Post `f` to a worker directly — for callers that own a [`GPUWorker`] but no
+`Player` (the test suite's GPU beats, which must reach Lava on the same pinned
+thread the editor uses, or they fix ownership on main and every later analysis
+asserts).
+
+**Fire and forget: this tells you nothing about whether `f` ran, finished or
+threw.** If you need to know, use [`rungpusync`](@ref), which carries the
+exception back and rethrows it at the caller. Do NOT hand-roll
+`rungpu(...) do; …; flag[] = true; end` followed by `while !flag[]` — that is a
+synchronous wait written as an asynchronous one, and when the job throws the
+flag is never set and the loop spins forever. Both walkthroughs did exactly
+that, and both hung for fifteen minutes at full CPU with nothing in the log.
+"""
 function rungpu(f::Function, w::GPUWorker)
     put!(w.jobs, f)
     return nothing
@@ -2642,8 +2669,12 @@ function buildexportpanel!(player::Player, gridpos, uicolors)
             end
         end
     end
+    # All five, not three: the GIF fps and loop controls were the only ones in
+    # this panel without a handle, so a walkthrough could drive the format menu
+    # and the Export button but not the settings between them.
     merge!(player.fxwidgets, Dict{Symbol, Any}(:exportgo => gobtn, :exportpath => path,
-                                               :exportformat => fmtmenu))
+                                               :exportformat => fmtmenu,
+                                               :giffps => fpsslider, :gifloop => loopbox))
     return panel
 end
 

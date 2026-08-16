@@ -96,6 +96,11 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
         addeffect!(player, sel)
     end
 
+    # The primary way to put an effect on a clip, and until now the only panel
+    # control without a handle — so a walkthrough could drive a card's parameters
+    # but not the step that creates the card.
+    player.fxwidgets[:addeffect] = addmenu
+
     # ------------------------------------------------------------------ filter
     query = Observable("")
     player.fxwidgets[:fxquery] = query

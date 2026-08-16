@@ -72,6 +72,29 @@ function previewrobj(player::Player)
 end
 
 """
+    gpupreviewlive(player) -> Bool
+
+Whether the Vulkan images are actually IMPORTED as GL textures — i.e. whether a
+present can reach the screen through the GPU tier at all.
+
+**Not the same question as [`gpuready`](@ref)**, which says the decode and effect
+side is device-resident. The import additionally needs the GL context and the
+Vulkan device to be the same card. Under a software GL — Xvfb with `llvmpipe`,
+which is what a headless test run gets — an NVIDIA memory handle cannot be
+imported however many extensions Mesa advertises, `setupgpupreview!` throws on
+every attempt, and every present falls back to the CPU tier while `gpuready`
+stays true throughout.
+
+That combination is why three preview tests in `test_gpu.jl` read as a playback
+regression and are nothing of the kind. Anything asking "will the GPU lane put a
+picture on the screen" — a test, or a UI deciding what to label the lane — has to
+ask this and not `gpuready`.
+"""
+gpupreviewlive(player::Player) =
+    (gp = player.gpupreview;
+     gp !== nothing && !isempty(gp.gltex) && previewrobj(player) !== nothing)
+
+"""
 Run `f` on a pinned GPU worker and wait for its result — given either the worker
 itself or the `Player` that owns one.
 

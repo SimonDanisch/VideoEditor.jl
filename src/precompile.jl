@@ -198,6 +198,20 @@ end
                                   propagator = prop,
                                   progress = (d, t) -> nothing)
                 end
+
+                # …and camera stabilization, the one expensive GPU path that was
+                # NOT traced here. Its first run compiles the Lava feature and
+                # flow kernels: `record_demo.jl` warms it off-camera and puts it
+                # at "~30 s on first use", which a user pays as a dead editor on
+                # the first "Stabilize clip" — the same first-click stall the
+                # matte traces above exist to remove. `analyzemotion!` defaults
+                # to `:similarity`, which is what the Camera lock mode runs.
+                #
+                # LAST on purpose. Everything here shares one `try`, so a step
+                # that throws takes every step after it down with it — and the
+                # matte traces are worth 94 s to a user, against this one's 30.
+                stabclip = Clip(src; src_in = clip.src_in, src_out = clip.src_in + 8)
+                analyzemotion!(stabclip; backend)
                 KA.synchronize(backend)
             end
 

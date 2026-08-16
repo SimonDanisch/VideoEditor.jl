@@ -106,6 +106,11 @@ VideoIO. Feed frames with [`grayinto!`](@ref)/[`hostgray!`](@ref)/[`rgbinto!`](@
 graysource(backend::KA.CPU, source::VideoSource) = GrayReader(source)
 function graysource(backend, source::VideoSource)
     mezz = mezzaninepath(source)
+    # Keep the ORIGINAL's failure: without a mezzanine the warning below is the
+    # only thing said, and it used to say the GPU stream was declined without
+    # saying why — so "unsupported codec" and "out of VRAM" looked identical, and
+    # a walkthrough silently doing CPU optical flow looked merely slow.
+    firsterr = nothing
     for path in (source.path, mezz)   # prefer the original; fall back to a mezzanine
         (path == mezz && !isfile(mezz)) && continue
         try
@@ -118,11 +123,12 @@ function graysource(backend, source::VideoSource)
             end
             return StreamGraySource(s, backend)
         catch e
+            firsterr === nothing && (firsterr = e)
             path == mezz &&
                 @warn "GPU stream unavailable for analysis — CPU decode" source exception = e
         end
     end
-    isfile(mezz) || @warn "GPU stream unavailable for analysis — CPU decode" source = source.path
+    isfile(mezz) || @warn "GPU stream unavailable for analysis — CPU decode" source = source.path exception = firsterr
     return GrayReader(source)
 end
 

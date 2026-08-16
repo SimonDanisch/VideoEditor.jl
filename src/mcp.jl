@@ -457,8 +457,21 @@ function renderpreview(player::Player, t::Float64, width::Int)
     engine = FxEngine(player.analysisbackend)
     try
         render(engine, scratch, ec, Int(srcframe)) do out
-            warp!(preview, out, ec.crop)
-            KA.synchronize(KA.get_backend(preview))
+            # `preview` is the HOST frame the MCP encodes, and `out` lives on
+            # `player.analysisbackend`. `warp!` runs on the source's backend, so
+            # the two cannot be spanned in one call — with a GPU analysis backend
+            # this handed a host `Matrix` to a Lava kernel and failed inside
+            # GPUCompiler. Crop on the device, then bring the result down.
+            b = KA.get_backend(out)
+            if typeof(b) === typeof(KA.get_backend(preview))
+                warp!(preview, out, ec.crop)
+                KA.synchronize(b)
+            else
+                tmp = KA.allocate(b, eltype(preview), size(preview)...)
+                warp!(tmp, out, ec.crop)
+                KA.synchronize(b)
+                copyto!(preview, tmp)
+            end
         end
     finally
         emptyengine!(engine)
