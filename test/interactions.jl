@@ -555,26 +555,92 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test p.tool[] == :none
         end
 
-        @testset "plain-drag lifts a clip to a new track" begin
-            # press mid-clip (starts as a scrub), then drag UP into the marked
-            # new-track zone — the gesture converts into a clip move, no Ctrl
+        @testset "Ctrl-drag lifts a clip to a new track" begin
+            # Ctrl+press mid-clip, then drag UP into the marked new-track zone.
+            #
+            # This used to work WITHOUT Ctrl: a plain press that wandered out of
+            # the clip's lane converted into a move. That gesture is the scrub's
+            # exactly — press on the timeline and move — separated only by how far
+            # you strayed, and it kept stealing clips during ordinary scrubbing.
+            # Ctrl is now the only way to move a clip, so the two cannot collide.
             clip = p.sequence.clips[1]
             @test clip.track == 1
             sleep(0.5)
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
             press(tlx(3.0))
-            @test tl.presspick !== nothing       # button down on the ruler (not a drag yet)
+            @test tl.dragclip !== nothing        # Ctrl+press grabs it immediately
             vp = ax.scene.viewport[]
             moveto(Point2f(tlx(3.5)[1], vp.origin[2] + 0.93 * vp.widths[2]))
-            @test !tl.scrubbing[]
-            @test tl.dragclip !== nothing        # converted to a move
             @test tl.dragtrack == 2
             release()
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
             @test clip.track == 2
             @test VE.ntracks(p.sequence) == 2
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
             keypress(Keyboard.z)                 # undoable like any edit
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
             @test p.sequence.clips[1].track == 1
+        end
+
+        @testset "a plain scrub never moves a clip" begin
+            # The complaint this replaced the old gesture over: scrubbing along
+            # the timeline would sometimes carry the clip with it. Without Ctrl
+            # the playhead follows and the sequence must not change at all.
+            clip = p.sequence.clips[1]
+            tr0, st0 = clip.track, clip.start
+            sleep(0.5)
+            press(tlx(3.0))
+            vp = ax.scene.viewport[]
+            moveto(Point2f(tlx(3.5)[1], vp.origin[2] + 0.93 * vp.widths[2]))
+            @test tl.dragclip === nothing        # no move was started
+            release()
+            @test clip.track == tr0
+            @test clip.start == st0
+        end
+
+        @testset "copy/paste carries the fx graph, not references" begin
+            # Ctrl+C then Ctrl+V. The copy must be independent: same effects, own
+            # slot ids, so editing one clip's stack cannot reach the other's.
+            seq = p.sequence
+            # Every testset here shares one Player, so this one has to hand the
+            # document back exactly as it found it — it adds an effect, leaves a
+            # pasted clip behind and moves the playhead, and the testsets after it
+            # assert against the sequence it started with.
+            snap0 = VE.docsnapshot(p)
+            head0 = p.playhead[]
+            clip = seq.clips[1]
+            VE.seteffect!(clip, VE.OpacityEffect(0.5f0))
+            nfx = length(clip.effects)
+            @test nfx > 0
+            n0 = length(seq.clips)
+            tl.selected[] = 1
+            sleep(0.3)
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
+            keypress(Keyboard.c)
+            @test length(p.clipboard) == 1
+            VE.seek!(p, VE.seqlength(seq) - 1)   # paste lands at the playhead
+            sleep(0.3)
+            keypress(Keyboard.v)
+            ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
+            @test waitfor(() -> length(seq.clips) == n0 + 1)
+            pasted = seq.clips[end]
+            @test pasted !== clip
+            @test pasted.id != clip.id                       # fresh identity
+            @test length(pasted.effects) == nfx              # the stack came along
+            @test pasted.source === clip.source              # source is shared
+            @test pasted.mattetrack === clip.mattetrack      # analysis is shared
+            # …but the SLOTS are the copy's own, or the inspector would address both
+            @test all(a.id != b.id for a in pasted.effects, b in clip.effects)
+            # editing the copy's stack must not touch the original's — the slot
+            # is mutable, so this is exactly what a shared slot would leak through
+            pasted.effects[1].enabled = false
+            @test clip.effects[1].enabled
+
+            empty!(p.clipboard)
+            VE.docrestore!(p, snap0)
+            p.playhead[] = head0
+            VE.refreshedit!(p)
+            @test waitfor(() -> length(p.sequence.clips) == n0)
         end
 
         @testset "export dock panel renders the timeline" begin

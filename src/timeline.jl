@@ -7,8 +7,8 @@ the clip list on edits and feeds shared view observables — zooming or
 panning only updates `viewrange`/`pixelspersecond` and the recipes recompute
 their strips themselves.
 
-Interaction: left-drag scrubs (and selects the clip under the cursor),
-Ctrl+left-drag moves the selected clip with a translucent ghost (snap lines,
+Interaction: left-drag scrubs and selects the clip under the cursor — and does
+nothing else, ever: a scrub cannot become a move. Ctrl+left-drag moves the clip with a translucent ghost (snap lines,
 red tint when the drop would overlap; commits on release), scroll zooms
 (x only), right-drag pans, right-click calls `onrightclick(time)`. A time
 tooltip follows the cursor; hover brightens a clip's border. Clip edges are
@@ -45,19 +45,6 @@ function trackat(y::Real, ntr::Integer)
     yy < TRACKBASE && return 0
     return clamp(floor(Int, (yy - TRACKBASE) / trackspan(ntr)) + 1, 1, ntr + 1)
 end
-
-"""
-How far out of its lane a pressed clip must be dragged before the press counts as
-a MOVE rather than a scrub or a trim, as a fraction of the axis.
-
-Relative to the LANE, not absolute: the old fixed 0.18 was tuned against a single
-0.84-tall lane, and lanes get thinner with every track added. At four tracks the
-whole distance from the middle of the top lane to the new-track strip is 0.175 —
-under the threshold — so dropping onto "+ new track" did nothing at all, silently,
-and only once you had a few tracks.
-"""
-liftthreshold(ntr::Integer) = max(0.05, 0.21 * trackspan(ntr))
-laneslack(ntr::Integer) = max(0.012, 0.05 * trackspan(ntr))
 
 mutable struct Timeline
     const axis::Axis
@@ -117,8 +104,9 @@ mutable struct Timeline
     dragactive::Observable{Bool}                # a clip/bin drag is in flight → highlight the zone
     zonelabelpos::Observable{Point2f}           # left-anchored zone caption
     zonelabelposlo::Observable{Point2f}
-    presspick::Union{Nothing, Tuple{Int, Float64, Float64}}  # (clipindex, t, y) of a scrub press —
-                                                # dragging out of the lane converts it to a clip move
+    # (clipindex, t, y) of a scrub press. Only its presence is read now — Ctrl is
+    # the sole way to move a clip, so a press never becomes anything but a scrub.
+    presspick::Union{Nothing, Tuple{Int, Float64, Float64}}
     gpurun::Any   # synchronous GPU-worker runner for thumbnail decoding (nothing = CPU)
     rightpress::Any   # (t, px) of a right press — release decides menu vs pan
 
@@ -560,28 +548,20 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
         elseif timeline.presspick !== nothing   # button down on the ruler → moving = scrubbing
             mp = mouseposition(axis.scene)
             pk = timeline.presspick
-            if pk !== nothing && pk[1] != 0 && inside
-                # the press grabbed a clip and the cursor DELIBERATELY left its
-                # lane → a MOVE (e.g. lifting a cut clip into the new-track
-                # zone), not a scrub. Deliberate = well past the band AND well
-                # below/above where the press started: a few pixels of vertical
-                # wobble during a horizontal scrub or an edge trim used to
-                # convert into a surprise clip move ("it moved my clip!")
-                clip = seq.clips[pk[1]]
-                ntr0 = ntracks(seq)
-                blo, bhi = trackband(clip.track, ntr0)
-                slack, lift = laneslack(ntr0), liftthreshold(ntr0)
-                if (mp[2] > bhi + slack || mp[2] < blo - slack) && abs(mp[2] - pk[3]) > lift
-                    timeline.scrubbing[] = false
-                    timeline.presspick = nothing
-                    timeline.dragclip = (clip, timelineframe(timeline, pk[2]) - clip.start)
-                    timeline.dragstart = clip.start
-                    timeline.dragtrack = clip.track
-                    timeline.dragvalid = true
-                    dragto!(timeline, mp[1], mp[2])
-                    return Consume(false)
-                end
-            end
+            # NO implicit conversion into a clip move. A press without Ctrl is a
+            # scrub and stays one, however far the cursor wanders.
+            #
+            # It used to convert: a press that grabbed a clip and then left that
+            # clip's lane became a drag, so a clip could be lifted to another
+            # track with no modifier. That gesture overlaps the scrub exactly —
+            # both are "press on the timeline and move" — and only how far you
+            # strayed told them apart. Two thresholds were added to separate them
+            # and it still fired by accident, which is what a heuristic over an
+            # ambiguous gesture does.
+            #
+            # Ctrl is the drag modifier (see the press handler) and now the only
+            # one: without it the playhead follows the cursor and nothing in the
+            # sequence can move.
             t = mp[1]
             n = timelineframe(timeline, t)
             timeline.scrubbing[] = true    # the press became a drag
@@ -690,15 +670,21 @@ function dragto!(timeline::Timeline, t::Real, y::Real = NaN)
     # above the top lane targets a NEW track
     ntr = ntracks(seq)
     track = isnan(y) ? clip.track : trackat(y, ntr)
-    # dropping ONTO another clip rides up a lane instead of being refused: one lane
-    # holds one clip at a time, but overlapping clips is how they blend — the ghost
-    # shows the lane it will land on, so the lift is visible before the release
-    while track >= 1 && !canplace(seq, clip, snapped, track) && track <= ntr
-        track += 1
-    end
+    # A drop onto an occupied lane is REFUSED, not relocated.
+    #
+    # It used to ride upward looking for a free lane, which made moving a clip
+    # DOWN impossible in the one arrangement where you always want to: a clip
+    # stacked over another. Aiming at the lane below finds it occupied, rides back
+    # up to the lane the clip is already on — a clip never blocks itself — and
+    # reports `dragvalid = true`, so the ghost went green, the release committed,
+    # and nothing moved. With the lanes above full it walked off the top into the
+    # new-track zone, which is why that looked like the only drop target there was.
+    #
+    # The two new-track zones stay always-valid by construction: 0 is a new lane
+    # below the stack, anything past `ntr` a new lane above it.
     timeline.dragstart = snapped
     timeline.dragtrack = track
-    timeline.dragvalid = track == 0 || canplace(seq, clip, snapped, track)
+    timeline.dragvalid = track == 0 || track > ntr || canplace(seq, clip, snapped, track)
     timeline.dragactive[] = true
 
     # the ghost sits IN the zone it targets. Drawing it in the band it will occupy
