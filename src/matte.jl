@@ -370,24 +370,6 @@ the model says so by returning three proposals.
 """
 function sam2seed(frame, points; key = nothing)
     if SAM2MODEL[] === nothing
-        # `replaydecode = false`. SAM 2 captures its decode on the first click
-        # and REPLAYS the recorded command buffer on every later one, which is
-        # worth about a millisecond a click — and a garbage collection between
-        # two clicks makes the replay fault the DEVICE. Reproduced here, with no
-        # other GPU work in the session:
-        #
-        #     click 1 (captures)  ok
-        #     GC.gc(true)
-        #     click 2 (replays)   device was lost while waiting for timeline 848
-        #
-        # and with this flag the same sequence survives three clicks and two
-        # collections. A GC between two clicks is not a corner case in an editor
-        # — every frame allocates — so the default costs a dead context for a
-        # millisecond, and the trade only looks good until it fires.
-        #
-        # Turn it back on when the replay is fixed rather than worked around:
-        # `SAM2Runner`'s own docstring names this as the way around the fault,
-        # not as the intended configuration.
         model = SAM2Runner.sam2model(; backend = Lava.LavaBackend(), replaydecode = false)
         SAM2MODEL[] = SAM2Runner.sam2segmenter(model; pick = :confident)
     end
