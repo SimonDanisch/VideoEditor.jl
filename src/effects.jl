@@ -50,6 +50,24 @@ struct RestoreEffect <: Effect
 end
 RestoreEffect(; strength = 1.0) = RestoreEffect(Float32(strength))
 
+"""
+Defocus the background against estimated depth (see `depth.jl`).
+
+`focus` is the depth that stays sharp (0 = farthest, 1 = nearest) and `strength`
+how much everything else softens. Both are keyframable, which is the point of
+making this an effect rather than a bake: a rack focus is a `focus` curve.
+
+Declines with no depth track, exactly as the matte declines with no matte — the
+analysis is the expensive part and the effect is free to sit in the stack
+waiting for it.
+"""
+struct DepthBlurEffect <: Effect
+    focus::Float32
+    strength::Float32
+end
+DepthBlurEffect(; focus = 1.0, strength = 0.6) =
+    DepthBlurEffect(Float32(focus), Float32(strength))
+
 "Composite opacity: scales the frame toward black by `α` (1 = opaque). The main
 use is a keyframed fade in/out; on a single track α<1 fades to black."
 struct OpacityEffect <: Effect
@@ -154,6 +172,7 @@ isneutral(e::MatteEffect) = e.strength <= 0.001f0
 isneutral(e::FlickerEffect) = e.strength <= 0.001f0
 isneutral(::StabilizeEffect) = false   # the warp is either applied or the slot is off
 isneutral(e::RestoreEffect) = e.strength <= 0.001f0
+isneutral(e::DepthBlurEffect) = e.strength <= 0.001f0
 
 """
     liveeffects(clip)
@@ -195,6 +214,8 @@ effectdict(e::SharpenEffect) =
 effectdict(e::OpacityEffect) = Dict{String, Any}("type" => "opacity", "alpha" => e.α)
 effectdict(e::RestoreEffect) =
     Dict{String, Any}("type" => "restore", "strength" => e.strength)
+effectdict(e::DepthBlurEffect) =
+    Dict{String, Any}("type" => "depthblur", "focus" => e.focus, "strength" => e.strength)
 effectdict(e::TransformEffect) =
     Dict{String, Any}("type" => "transform", "scale" => e.scale, "x" => e.x, "y" => e.y,
                       "rotation" => e.rotation)
@@ -236,6 +257,8 @@ function effectfromdict(d::AbstractDict)
     t == "sharpen" && return SharpenEffect(Float32(d["sigma"]), Float32(d["amount"]))
     t == "opacity" && return OpacityEffect(Float32(d["alpha"]))
     t == "restore" && return RestoreEffect(Float32(d["strength"]))
+    t == "depthblur" && return DepthBlurEffect(Float32(get(d, "focus", 1.0)),
+                                               Float32(get(d, "strength", 0.6)))
     t == "matte" && return MatteEffect(Float32(d["strength"]), Float32(get(d, "feather", 0.0)))
     t == "stabilize" && return StabilizeEffect()
     t == "loopfinder" && return LoopFinderEffect()
@@ -407,6 +430,16 @@ const BUILTINPARAMS = ParamSpec[
     ParamSpec(:sharpen, "Sharpen", :sharpen, 0.0, 2.0, 0.0,
         c -> (e = findeffect(c, SharpenEffect); e === nothing ? 0.0 : Float64(e.amount)),
         (c, v) -> seteffect!(c, SharpenEffect(2.0f0, Float32(v)))),
+    ParamSpec(:depth_focus, "Focus", :depth, 0.0, 1.0, 1.0,
+        c -> (e = findeffect(c, DepthBlurEffect); e === nothing ? 1.0 : Float64(e.focus)),
+        (c, v) -> (e = findeffect(c, DepthBlurEffect);
+                   seteffect!(c, DepthBlurEffect(Float32(v),
+                                                 e === nothing ? 0.6f0 : e.strength)))),
+    ParamSpec(:depth_strength, "Defocus", :depth, 0.0, 1.0, 0.6,
+        c -> (e = findeffect(c, DepthBlurEffect); e === nothing ? 0.6 : Float64(e.strength)),
+        (c, v) -> (e = findeffect(c, DepthBlurEffect);
+                   seteffect!(c, DepthBlurEffect(e === nothing ? 1.0f0 : e.focus,
+                                                 Float32(v))))),
     ParamSpec(:restore_strength, "Restore", :restore, 0.0, 1.0, 1.0,
         c -> (e = findeffect(c, RestoreEffect); e === nothing ? 1.0 : Float64(e.strength)),
         (c, v) -> seteffect!(c, RestoreEffect(Float32(v)))),
@@ -466,18 +499,13 @@ isanimated(clip::Clip) = !isempty(clip.animations)
 "`clip` without its matte — what the matte pipeline renders through, so the seed
 is not computed from a frame the previous matte already keyed."
 withoutmatte(clip::Clip) =
-    Clip(clip.id, clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
-         filter(s -> !(s.effect isa MatteEffect), clip.effects),
-         clip.colortrack, clip.motiontrack, nothing, clip.restorecache, clip.animations,
-         clip.track, clip.blendfrom, clip.rate)
+    withfields(clip; mattetrack = nothing,
+               effects = filter(s -> !(s.effect isa MatteEffect), clip.effects))
 
 "`clip` without its opacity effects — compositing reads opacity as the LAYER
 alpha, not a per-pixel fade to black."
 withoutopacity(clip::Clip) =
-    Clip(clip.id, clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
-         filter(s -> !(s.effect isa OpacityEffect), clip.effects),
-         clip.colortrack, clip.motiontrack, clip.mattetrack, clip.restorecache,
-         clip.animations, clip.track, clip.blendfrom, clip.rate)
+    withfields(clip; effects = filter(s -> !(s.effect isa OpacityEffect), clip.effects))
 
 """
     effectiveclip(clip, srcframe) -> Clip
@@ -492,10 +520,8 @@ function effectiveclip(clip::Clip, srcframe::Integer)
     isempty(clip.animations) && return clip
     # own slots (same ids, same on/off) so a sampled value never writes into the
     # clip the user is editing
-    ec = Clip(clip.id, clip.source, clip.src_in, clip.src_out, clip.start, clip.crop,
-              [FxSlot(s.id, s.effect, s.enabled, s.links) for s in clip.effects],
-              clip.colortrack, clip.motiontrack, clip.mattetrack, clip.restorecache,
-              clip.animations, clip.track, clip.blendfrom, clip.rate)
+    ec = withfields(clip;
+                    effects = [FxSlot(s.id, s.effect, s.enabled, s.links) for s in clip.effects])
     for (key, curve) in clip.animations
         # a project can hold a curve for a parameter this session has no effect
         # registered for — skip it rather than fail the render

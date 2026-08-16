@@ -643,6 +643,75 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test waitfor(() -> length(p.sequence.clips) == n0)
         end
 
+
+        @testset "depth: normalization, effect, and declining without a track" begin
+            # `depthbytes` is the one place a monocular model's arbitrary scale is turned
+            # into something an effect can threshold, so it is worth pinning directly.
+            @test VE.depthbytes(Float32[1 2; 3 4]) == UInt8[0x00 0x55; 0xaa 0xff]
+            @test all(==(0x80), VE.depthbytes(fill(0.5f0, 3, 3)))   # no range at all
+            @test all(==(0x80), VE.depthbytes(fill(NaN32, 2, 2)))   # …and no finite range
+
+            # The effect survives a project-file roundtrip, which is what a new effect
+            # most often forgets: `effectdict`/`effectfromdict` are two lists to update.
+            e = VE.DepthBlurEffect(; focus = 0.25, strength = 0.75)
+            @test VE.effectfromdict(VE.effectdict(e)) == e
+            @test VE.isneutral(VE.DepthBlurEffect(; strength = 0.0))
+            @test !VE.isneutral(e)
+
+            # No track → no node, so the effect can sit in a stack waiting for the
+            # analysis instead of erroring or rendering something wrong.
+            src = VE.VideoSource(testvideo)
+            clip = VE.Clip(src)
+            @test clip.depthtrack === nothing
+            @test VE.planeshape(VE.DepthBlurOp(1.0f0, 1.0f0), clip) === nothing
+            @test VE.depthframe(clip, 0) === nothing
+
+            # …and with one, the plane is found and sized from the track.
+            clip.depthtrack = VE.DepthTrack(fill(0x40, 8, 6, 4), 0)
+            @test VE.planeshape(VE.DepthBlurOp(1.0f0, 1.0f0), clip) == (8, 6)
+            @test size(VE.depthframe(clip, 2)) == (8, 6)
+            @test VE.depthframe(clip, 99) === nothing        # outside the track
+
+            # A copy and a split must carry depth, exactly as they carry the matte —
+            # both are keyed by absolute source frame.
+            c2 = VE.copyclip(clip)
+            @test c2.depthtrack === clip.depthtrack
+        end
+
+        @testset "depth blur focuses at a plane, not just far away" begin
+            # The discriminating test: moving the focus plane must SWAP which half
+            # stays sharp. A kernel that merely blurred "the far stuff" passes any
+            # single-focus check and fails this one — and focusing on a mid-ground
+            # subject is the whole reason `focus` is a parameter.
+            W, H = 64, 48
+            chk(x, y) = Float32((x ÷ 4 + y ÷ 4) % 2)
+            img = [RGB{N0f8}(chk(x, y), chk(x, y), chk(x, y)) for x in 1:W, y in 1:H]
+            dw, dh = 16, 12
+            plane = [x <= dw ÷ 2 ? 0xff : 0x00 for x in 1:dw, y in 1:dh]   # left near, right far
+            # `VE.ColorTypes.red`, as line 169 and runtests.jl:210 already do: the test
+            # file does not import ColorTypes, and four loaded packages export a `red`,
+            # so an unqualified one resolves to none of them in `Main`.
+            chan(q) = Float64(VE.ColorTypes.red(q))
+            varof(v) = (m = sum(chan, v) / length(v);
+                        sum((chan(q) - m)^2 for q in v) / length(v))
+            nearside(a) = view(a, 1:(W ÷ 2 - 4), :)
+            farside(a)  = view(a, (W ÷ 2 + 4):W, :)
+
+            onnear = similar(img)
+            VE.depthblur!(onnear, img, plane, VE.DepthBlurOp(1.0f0, 1.0f0))
+            @test varof(nearside(onnear)) > varof(farside(onnear))
+            @test varof(farside(onnear)) < varof(farside(img))
+
+            onfar = similar(img)
+            VE.depthblur!(onfar, img, plane, VE.DepthBlurOp(0.0f0, 1.0f0))
+            @test varof(farside(onfar)) > varof(nearside(onfar))     # …swapped
+            @test varof(nearside(onfar)) < varof(nearside(img))
+
+            flat = similar(img)                                       # neutral is a pass-through
+            VE.depthblur!(flat, img, plane, VE.DepthBlurOp(1.0f0, 0.0f0))
+            @test flat == img
+        end
+
         @testset "export dock panel renders the timeline" begin
             outbtn = first(b for b in fig.content
                            if b isa Makie.Button && b.label[] == "Export")

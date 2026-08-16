@@ -59,6 +59,32 @@ MatteTrack(alpha::Array{UInt8, 3}, src_in::Integer, seeds::AbstractVector{<:Inte
 mattesize(t::MatteTrack) = (size(t.alpha, 1), size(t.alpha, 2))
 
 """
+Per-source-frame DEPTH, keyed absolutely like the other tracks.
+
+`depth` is `(w, h, nframes)` of `UInt8`, near = 255, far = 0, normalized per
+frame. Eight bits because nothing here measures distance — it *orders* pixels
+front to back so an effect can decide how much of one to apply, and a blur radius
+resolved to one part in 256 is finer than any edge it produces.
+
+Per frame, not per clip, and that is a real cost: a monocular depth model has no
+scale, so its output is only comparable within one frame. Two frames of the same
+shot can disagree about what "far" means, which is why an effect reading this
+must be smooth in depth — a hard threshold on it flickers, and the flicker is the
+model's, not the effect's.
+
+No `seeds` field: depth is not marked, it is estimated. There is nothing the user
+authored to keep, so the whole track is a cache and regenerating it is the only
+thing a project file ever needs to record.
+"""
+mutable struct DepthTrack
+    const depth::Array{UInt8, 3}
+    const src_in::Int
+end
+DepthTrack(depth::Array{UInt8, 3}, src_in::Integer) = DepthTrack(depth, Int(src_in))
+
+depthsize(t::DepthTrack) = (size(t.depth, 1), size(t.depth, 2))
+
+"""
 Restored frames for one clip, bounded (see `restore.jl`).
 
 Keyed by absolute source frame like the tracks above, and here for the same
@@ -143,6 +169,11 @@ mutable struct Clip
     colortrack::Union{Nothing, ColorTrack}
     motiontrack::Union{Nothing, MotionTrack}
     mattetrack::Union{Nothing, MatteTrack}
+    # Estimated depth, `nothing` until something asks for it. A field beside the
+    # other tracks rather than a global keyed by clip id — that is what made
+    # `split!` drop a clip's restoration silently, since a fresh id follows
+    # nothing (see `restorecache` below).
+    depthtrack::Union{Nothing, DepthTrack}
     # The fourth analysis result, and a field like the other three. It used to be
     # a module global keyed by clip id, which is how `split!` came to drop a
     # clip's restoration silently while taking explicit care of its matte: an id
@@ -158,8 +189,8 @@ end
 Clip(source::VideoSource, src_in, src_out, start, crop, rate::Real = 1.0,
      reframe::Union{Nothing, NTuple{<:Any, <:Real}} = nothing) =
     withreframe!(Clip(freshid(), source, src_in, src_out, start, crop, FxSlot[], nothing,
-                      nothing, nothing, nothing, Dict{Symbol, AnimCurve}(), 1, UInt64(0),
-                      Float64(rate)),
+                      nothing, nothing, nothing, nothing, Dict{Symbol, AnimCurve}(), 1,
+                      UInt64(0), Float64(rate)),
                  reframe)
 
 function Clip(source::VideoSource; src_in::Integer = 0, src_out::Integer = source.nframes,
@@ -455,6 +486,7 @@ function split!(seq::Sequence, n::Integer, track::Union{Nothing, Integer} = noth
     right.colortrack = clip.colortrack
     right.motiontrack = clip.motiontrack
     right.mattetrack = clip.mattetrack    # ditto — cutting a clip must not lose its matte
+    right.depthtrack = clip.depthtrack    # …nor its depth, which is keyed the same way
     # Shared, not copied, exactly as the tracks are: the frames are keyed by
     # absolute source frame, so one cache indexes correctly from both halves. The
     # two then share the eviction budget, which is the bargain a shared track
@@ -503,6 +535,7 @@ function copyclip(clip::Clip; start::Integer = clip.start, track::Integer = clip
     c.colortrack = clip.colortrack
     c.motiontrack = clip.motiontrack
     c.mattetrack = clip.mattetrack
+    c.depthtrack = clip.depthtrack
     c.restorecache = clip.restorecache
     for (key, curve) in clip.animations
         c.animations[key] = AnimCurve(copy(curve.keys), curve.interp)
@@ -629,14 +662,39 @@ function deleteclip!(seq::Sequence, clip::Clip; ripple::Bool = true)
     return clip
 end
 
+"""
+    withfields(clip; kw...) -> Clip
+
+`clip` with named fields replaced, everything else shared.
+
+Adding a field to [`Clip`](@ref) otherwise means finding every positional
+construction of it — there were five across two files, and the ones a test does
+not reach fail at runtime, in the render path, as a `MethodError` about argument
+counts. This is the same shape as Mantle's `DeviceCaps(c; kw...)` and exists for
+the same reason.
+
+Shares the effect vector by default. Callers that hand the copy somewhere it may
+be mutated pass their own (`snapshot` copies the slots, `effectiveclip` gives the
+copy its own so a sampled parameter cannot write back).
+"""
+withfields(clip::Clip;
+           id = clip.id, source = clip.source, src_in = clip.src_in,
+           src_out = clip.src_out, start = clip.start, crop = clip.crop,
+           effects = clip.effects, colortrack = clip.colortrack,
+           motiontrack = clip.motiontrack, mattetrack = clip.mattetrack,
+           depthtrack = clip.depthtrack, restorecache = clip.restorecache,
+           animations = clip.animations, track = clip.track,
+           blendfrom = clip.blendfrom, rate = clip.rate) =
+    Clip(id, source, src_in, src_out, start, crop, effects, colortrack, motiontrack,
+         mattetrack, depthtrack, restorecache, animations, track, blendfrom, rate)
+
 "Copy of the edit state for undo/redo. Sources and analysis tracks are shared."
 snapshot(seq::Sequence) =
-    [Clip(c.id, c.source, c.src_in, c.src_out, c.start, c.crop,
-          # links are copied, not shared: an undo that put back a slot whose
-          # link vector was the live one would not restore a removed partner
-          [FxSlot(s.id, s.effect, s.enabled, copy(s.links)) for s in c.effects],
-          c.colortrack, c.motiontrack, c.mattetrack, c.restorecache,
-          deepcopy(c.animations), c.track, c.blendfrom, c.rate)
+    # links are copied, not shared: an undo that put back a slot whose link vector
+    # was the live one would not restore a removed partner
+    [withfields(c;
+                effects = [FxSlot(s.id, s.effect, s.enabled, copy(s.links)) for s in c.effects],
+                animations = deepcopy(c.animations))
      for c in seq.clips]
 
 "Restore a [`snapshot`](@ref) (the snapshot itself stays reusable)."

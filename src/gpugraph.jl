@@ -178,6 +178,25 @@ struct RestoreOp <: PlaneOp
 end
 
 """
+Defocus by distance from a focus plane, against the clip's estimated depth.
+
+`focus` is the depth that stays sharp, on the 0..1 scale `DepthTrack` stores
+(1 = nearest); `strength` scales the blur radius reached at the far end of that
+distance. Between them is a smooth ramp — a hard threshold on a monocular depth
+estimate flickers, because the estimate's scale drifts frame to frame and the
+threshold lands somewhere different on each one.
+
+Blur, deliberately, and not a key. Depth from one camera has soft, unreliable
+edges exactly where a matte needs hard ones — and defocus is soft at its edges
+anyway, so the model's weakness lands where a lens would put one. Anything
+wanting a hard edge should mark a matte instead.
+"""
+struct DepthBlurOp <: PlaneOp
+    focus::Float32
+    strength::Float32
+end
+
+"""
 The node a [`PlaneOp`](@ref) becomes. `shape` is the plane's size, carried here
 because it is part of the PLAN SIGNATURE: the plane is a graph resource, so a
 clip whose matte was analysed at another resolution needs its own plan rather
@@ -377,6 +396,44 @@ function chainpass!(g, n::PlaneNode, pr, cur, ctx::ChainBuild, dims)
     return cur
 end
 
+"""
+The depth blur's node. A type of its own rather than a plain [`PlaneNode`](@ref)
+because it GATHERS: it reads neighbours of the pixel it writes, so it needs a
+destination buffer, and `PlaneNode`'s pass is in place.
+
+The alternative was copying the input inside `applyplane!` — a device allocation
+per frame, outside the pool, which is the exact thing the note on `PlaneNode`'s
+buffer records as already having been fixed once.
+"""
+struct DepthBlurNode <: FxNode
+    input::Int
+    op::DepthBlurOp
+    shape::Tuple{Int, Int}
+end
+planeshape(n::DepthBlurNode) = n.shape
+
+function chainpass!(g, n::DepthBlurNode, pr, cur, ctx::ChainBuild, dims)
+    key = (:plane, DepthBlurOp, n.shape)
+    sl = slot!(ctx.store, key, planeeltype(n.op), prod(n.shape))
+    b = PlaneBinding(key, Mantle.Update(g, sl.buf), pr, n.shape, Ref(false))
+    push!(ctx.planes, b)
+    dst = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
+    Mantle.custom!(g, passname(n.op)) do p
+        Mantle.use(p, cur; read = true)
+        Mantle.use(p, dst; write = true)
+        Mantle.use(p, sl.buf; read = true)
+        () -> begin
+            d, c = frameview(dst, dims), frameview(cur, dims)
+            # Inactive means this frame is outside the depth track. The picture
+            # still has to reach `dst`, or the rest of the chain reads a buffer
+            # nothing wrote — which is a black frame, not a missing effect.
+            b.active[] ? depthblur!(d, c, frameview(sl.buf, n.shape), pr[].op) :
+                         copyto!(d, c)
+        end
+    end
+    return dst
+end
+
 function chainpass!(g, ::ColorNode, pr, cur, ctx::ChainBuild, dims)
     Mantle.custom!(g, "colour") do p
         Mantle.use(p, cur; read = true, write = true)
@@ -445,6 +502,11 @@ nodefor(::StabilizeEffect, input, clip) =
 nodefor(e::FlickerEffect, input, clip) =
     clip.colortrack === nothing ? nothing : ColorTrackNode(input, e.strength)
 nodefor(e::RestoreEffect, input, clip) = planenode(RestoreOp(e.strength), input, clip)
+function nodefor(e::DepthBlurEffect, input, clip)
+    op = DepthBlurOp(e.focus, e.strength)
+    sh = planeshape(op, clip)
+    return sh === nothing ? nothing : DepthBlurNode(input, op, sh)
+end
 nodefor(e::MatteEffect, input, clip) = planenode(MatteOp(e.strength, e.feather), input, clip)
 nodefor(e::ColorEffect, input, clip) = ColorNode(input, e.adj)       # specialized kernels
 nodefor(e::BlurEffect, input, clip) = BlurNode(input, e.σ)

@@ -491,6 +491,9 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     Ref(1.0), Observable(:opacity), Observable(true),
                     Threads.Atomic{Float64}(NaN), Dict{Any, Any}(), FxEngine(analysisbackend),
                     effects, Clip[], Threads.Atomic{Bool}(false))
+    # The built-in depth model, so an editor has depth without being asked. Lazy
+    # inside — this only points `registerdepth!` at it and builds nothing.
+    installdepth!()
     player.fxwidgets[:lanechip] = lanechip
     @async for s in player.statusqueue  # main-thread consumer: threads → observable
         status[] = s

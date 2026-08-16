@@ -1372,6 +1372,57 @@ mattemarks(player::Player, clip::Clip) =
     get!(() -> Dict{Int, Matrix{UInt8}}(), player.mattemarks, clip.id)
 
 """
+    rundepth!(player) -> nothing
+
+Estimate depth for the clip under the playhead and defocus its background.
+
+One action, not two, because "estimate depth" on its own shows the user nothing —
+the track is invisible until something reads it, and a button whose effect is
+invisible reads as broken. So this adds the [`DepthBlurEffect`](@ref) as well, and
+the picture changes the moment the analysis lands. The effect's parameters are
+then the dial: focus is keyframable, so a rack focus is a curve on it.
+
+Runs on the analysis executor like the matte does, and for the same reason — it
+is one model call per frame and the UI thread must stay answerable.
+"""
+function rundepth!(player::Player)
+    loc = editclip(player)
+    loc === nothing && return setstatus!(player, "depth: no clip under the playhead")
+    clip = loc[1]
+    hasdepthmodel() || return setstatus!(player, "depth: no model installed")
+    player.matteinfo[] == "matting…" &&
+        return setstatus!(player, "depth: an analysis is already running")
+    setstatus!(player, "depth: estimating $(srclength(clip)) frames…")
+    player.jobprogress[] = 0.0
+    runanalysis(player) do
+        try
+            reader = framereader(clip, player.engine)
+            analyzedepth!(clip, reader; progress = (d, t) -> begin
+                player.jobprogress[] = d / max(t, 1)
+            end)
+            put!(player.uiqueue, () -> begin
+                # The effect too — see the docstring on why the analysis alone is
+                # not a usable result.
+                findeffect(clip, DepthBlurEffect) === nothing &&
+                    push!(clip.effects, FxSlot(DepthBlurEffect()))
+                player.jobprogress[] = NaN
+                refreshedit!(player)
+                notify(player.playhead)
+                setstatus!(player, "depth ready — Focus and Defocus are keyframable in the inspector")
+            end)
+        catch e
+            bt = catch_backtrace()
+            put!(player.uiqueue, () -> begin
+                player.jobprogress[] = NaN
+                setstatus!(player, "depth failed: $(briefly(e))")
+                @error "depth analysis failed" exception = (e, bt)
+            end)
+        end
+    end
+    return nothing
+end
+
+"""
     matterepairs(player, clip) -> Dict{Int, Matrix{UInt8}}
 
 Single frames whose matte was fixed by hand, by source frame.

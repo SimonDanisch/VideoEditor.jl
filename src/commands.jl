@@ -157,6 +157,11 @@ registercommand!(:go_end, "Go to the end"; category = :transport, shortcut = "En
     enabled = needsclips,
     run = p -> seek!(p, max(seqlength(p.sequence) - 1, 0)))
 
+registercommand!(:depth_blur, "Blur background (depth)"; category = :effect,
+    keywords = ["depth", "defocus", "bokeh", "background", "portrait"],
+    enabled = needsclip,
+    run = p -> rundepth!(p))
+
 registercommand!(:split, "Split at playhead"; category = :edit, shortcut = "S",
     keywords = ["cut", "blade", "trim"], enabled = needsclip,
     run = split!)

@@ -9,6 +9,7 @@ using Lava
 using Makie
 using Observables
 using SAM2Runner
+import DepthAnythingRunner
 using Printf
 using TOML
 using JSON
@@ -54,6 +55,7 @@ include("audiopreview.jl")
 include("audio.jl")
 include("matte.jl")
 include("restore.jl")
+include("depth.jl")     # DepthBlurOp lives in gpugraph.jl; its hooks are here
 include("colorstab.jl")
 include("motionstab.jl")
 include("bundlestab.jl")
@@ -79,6 +81,7 @@ export MatteTrack, analyzematte!, applymatte!, registermatte!, seedmask,
        repairframe!, repairmatteat!, matterepairs
 export sam2seed, sam2ready, defaultsegmenter
 export RestoreEffect, registerrestore!, restorewindow!, applyrestore!
+export DepthBlurEffect, DepthTrack, registerdepth!, installdepth!, analyzedepth!, depthframe
 export registerplugin!, registereffect!, EffectKind, FxParam, Pointwise, Stencil
 export Overlay, registeroverlay!, addoverlay!, removeoverlay!, setoverlaykey!
 export registertool!, ToolContext, toolplot!, ontool!, tooltime, toolband
