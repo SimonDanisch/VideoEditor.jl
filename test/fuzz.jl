@@ -95,6 +95,19 @@ function settleon!(player, n; seconds = 3.0)
     return false
 end
 
+"""
+    overlapframes(seq)
+
+The timeline frames where more than one clip is present. The composite path only
+runs on these, and there are few of them, so the fuzzer aims at them rather than
+hoping a uniform sample lands on one.
+"""
+function overlapframes(seq)
+    last = seqlength(seq) - 1
+    last < 0 && return Int[]
+    return [n for n in 0:last if length(clipsat(seq, n)) > 1]
+end
+
 # ---------------------------------------------------------------- the actions
 
 "Every edit the fuzzer can make, as (name, apply) — each returns a log line."
@@ -203,8 +216,14 @@ end
             VE.refreshedit!(player)
             sleep(0.05)
             isempty(seq.clips) && (VE.undo!(player); continue)
-            for _ in 1:3
-                n = rand(rng, 0:max(seqlength(seq) - 1, 0))
+            over = overlapframes(seq)
+            for k in 1:3
+                # One of the three deliberately lands on a composite whenever one
+                # exists. An overlap is a handful of frames in a long timeline, so
+                # uniform sampling renders one about never — which is precisely how
+                # the first version passed 72 checks without ever compositing.
+                n = k == 1 && !isempty(over) ? rand(rng, over) :
+                    rand(rng, 0:max(seqlength(seq) - 1, 0))
                 cs = clipsat(seq, n)
                 isempty(cs) && continue          # a gap shows black, nothing to compare
                 settleon!(player, n) || continue # decoder not there yet — not a picture bug

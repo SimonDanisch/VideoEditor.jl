@@ -59,6 +59,27 @@ end
     VE.stop!(worker)
 end
 
+# The worker's loop used to be a bare `for f in jobs; invokelatest(f); end`, so a
+# job that threw escaped the loop and killed the task — while the Channel stayed
+# open, which meant every later `rungpu` posted into a channel nobody read. The
+# next GPU request did not fail, it HUNG forever with nothing in the log.
+# `record_loop_demo` sat 15 minutes at full CPU twice before an interrupt showed
+# the worker had been dead since the thumbnail probe hit a lost device.
+#
+# No GPU needed here: the point is that a throwing job leaves the worker serving.
+@testset "a throwing GPU job does not kill the worker" begin
+    w = VE.GPUWorker()
+    VE.rungpu(() -> error("deliberate"), w)
+    ran = Ref(false)
+    VE.rungpu(() -> (ran[] = true), w)
+    t0 = time()
+    while !ran[] && time() - t0 < 20
+        sleep(0.05)
+    end
+    @test ran[]                    # the job after the failure still got served
+    @test !istaskdone(w.task)      # …because the worker itself survived
+end
+
 @testset "Sequence ops" begin
     src = VideoSource(testvideo)  # 120 frames
     seq = Sequence(src)
@@ -993,6 +1014,13 @@ end
 include("agentview.jl")   # what an AGENT sees (headless: no window needed)
 
 canui && include("interactions.jl")
+# NOT REACHED while `interactions.jl` has failing testsets: it throws at the end
+# of the file, which aborts this one — so the quoted 259|18|2 baseline is
+# "everything up to and including interactions.jl", and `fuzz.jl` has never run
+# as part of the suite. Run it with `test/fuzz_only.jl` until that is settled;
+# the moment it did run it found two real bugs (Mantle's `nothing`-as-constraint
+# and `showframe!`'s no-clip path). Moving this above `interactions.jl` would
+# make it run — and would change the baseline, so that is a deliberate call.
 canui && include("fuzz.jl")   # random edit programs vs the picture (needs a Player)
 
 @testset "Thumbnails" begin

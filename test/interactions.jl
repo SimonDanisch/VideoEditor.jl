@@ -7,6 +7,132 @@ import VideoEditor.Makie as Makie
 using Statistics: mean
 using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
 
+# Nothing in the suite runs `examples/`, so the walkthroughs track a UI that has
+# moved on and only say so when someone records a video. `record_loop_demo` asked
+# for `fxwidgets[:loop]`, which was never registered at ALL — a KeyError that sat
+# there until 2026-08-11. These are the handles the walkthroughs drive; a rename
+# that drops one should fail here, not in a recording session.
+@testset "the widgets the walkthroughs drive are registered" begin
+    p = Player(testvideo; gpupreview = false)
+    settle(pred; s = 10) = (t0 = time();
+                            while !pred() && time() - t0 < s; sleep(0.05); end; pred())
+    try
+        sleep(1.5)
+        # The export panel, which exists for every Player.
+        for k in (:exportgo, :exportpath, :exportformat, :giffps, :gifloop,
+                  :addeffect, :fxcards, :fxlistrefresh)
+            @test haskey(p.fxwidgets, k)
+        end
+        # The rest are registered by a CARD BODY, so they exist only once the
+        # clip carries that effect — which is what the walkthroughs set up first.
+        # Parameter sliders come from the body too, by parameter name.
+        clip = p.sequence.clips[1]
+        VE.seteffect!(clip, VE.ColorEffect())
+        VE.seteffect!(clip, VE.StabilizeEffect())
+        p.fxwidgets[:fxlistrefresh]()
+        @test settle(() -> haskey(p.fxsliders, :saturation))
+        for k in (:modemenu, :analyze, :compare)      # the Stabilize card's panel
+            @test settle(() -> haskey(p.fxwidgets, k))
+        end
+    finally
+        close(p)
+    end
+end
+
+# MOVED ABOVE `UI interactions` deliberately. That testset finishes with
+# failures, and a top-level @testset THROWS when it does — which aborts the
+# rest of the file. These two had therefore never run once, in the same way
+# `fuzz.jl` never ran (runtests.jl includes it after this file). Their own
+# summaries are separate, so this does not touch the 259|18|2 baseline.
+@testset "chaos: random event storm leaves the editor coherent" begin
+    using Random
+    p = Player(testvideo; gpupreview = false)
+    sleep(1.5)
+    ev = Makie.events(p.fig)
+    p.fxwidgets[:browse] = () -> nothing   # the storm clicks everywhere, and the bin's
+                                           # drop zone would open a BLOCKING native dialog
+    # dock-panel widgets live outside fig.content — include them in the storm
+    buttons = vcat([b for b in p.fig.content if b isa Makie.Button],
+                   [w for w in values(p.fxwidgets) if w isa Makie.Button])
+    rng = MersenneTwister(42)   # seeded: the event sequence is reproducible
+    randpos() = Point2f(rand(rng) * 1490 + 5, rand(rng) * 940 + 5)
+    fuzzkeys = [Keyboard.space, Keyboard.s, Keyboard.x, Keyboard.c, Keyboard.r,
+                Keyboard.left, Keyboard.right, Keyboard.escape]
+    errormsgs = String[]
+    t0 = time()
+    while time() - t0 < 10
+        try
+            r = rand(rng)
+            if r < 0.35
+                ev.mouseposition[] = Tuple(randpos())
+                rand(rng, Bool) &&
+                    (ev.mousebutton[] = MouseButtonEvent(rand(rng, (Mouse.left, Mouse.right)), Mouse.press);
+                     ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.release))
+            elseif r < 0.60
+                rand(rng) < 0.2 && (ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press))
+                k = rand(rng, fuzzkeys)
+                ev.keyboardbutton[] = KeyEvent(k, Keyboard.press)
+                ev.keyboardbutton[] = KeyEvent(k, Keyboard.release)
+                ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
+            elseif r < 0.75
+                b = rand(rng, buttons)
+                bb = b.layoutobservables.computedbbox[]
+                ev.mouseposition[] = Tuple(Point2f(bb.origin .+ rand(rng, 2) .* bb.widths))
+                ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.press)
+                ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.release)
+            elseif r < 0.90
+                ev.mouseposition[] = Tuple(Point2f(rand(rng) * 1400 + 20, 60))
+                ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.press)
+                ev.mouseposition[] = Tuple(Point2f(rand(rng) * 1400 + 20, 60))
+                ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.release)
+            elseif r < 0.97
+                ev.mouseposition[] = Tuple(Point2f(rand(rng) * 1400 + 20, 60))
+                ev.scroll[] = (0.0, rand(rng, -4:4))
+            else
+                ev.dropped_files[] = [rand(rng, (testvideo2, "/nonexistent/nope.mp4"))]
+            end
+        catch e
+            push!(errormsgs, sprint(showerror, e)[1:min(end, 300)])
+            length(errormsgs) > 3 && break
+        end
+        rand(rng) < 0.1 && sleep(0.02)
+    end
+    isempty(errormsgs) || @info "chaos exceptions" errormsgs
+    @test isempty(errormsgs)                # no listener ever threw
+    sleep(0.5)
+    VE.pause!(p)                            # the storm may leave playback running,
+    p.playhead[] = 10                       # and its presents would race this one
+    ok = VE.showframe!(p, 10)
+    t1 = time()
+    while !ok && time() - t1 < 5            # decoder settles after the seek storm
+        sleep(0.05)
+        ok = VE.showframe!(p, 10)
+    end
+    @test ok                                # still presents (empty sequence = black)
+    close(p)                                # and closes cleanly
+    sleep(0.5)
+    @test true
+end
+
+@testset "Player opens a saved project" begin
+    src = VideoSource(testvideo)
+    seq = Sequence(src)
+    split!(seq, 40)
+    seq.clips[1].crop = (0.1, 0.1, 0.8, 0.8)
+    path = joinpath(mktempdir(), "edit.videoedit.toml")
+    saveproject(path, seq)
+    p2 = Player(path; gpupreview = false)   # .toml path → the saved edit, not a video
+    try
+        sleep(1.5)
+        @test length(p2.sequence.clips) == 2
+        @test p2.sequence.clips[1].crop == (0.1, 0.1, 0.8, 0.8)
+        @test VE.seqlength(p2.sequence) == 120
+        @test size(p2.frame[]) == (320, 180)   # presents from the project's source
+    finally
+        close(p2)
+    end
+end
+
 @testset "UI interactions" begin
     GLMakie.activate!(; visible = false)
     p = Player(testvideo; gpupreview = false)  # 320×180, 120 frames @30 (from runtests.jl); CPU for determinism
@@ -1321,94 +1447,5 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
         end
     finally
         close(p)
-    end
-end
-
-@testset "chaos: random event storm leaves the editor coherent" begin
-    using Random
-    p = Player(testvideo; gpupreview = false)
-    sleep(1.5)
-    ev = Makie.events(p.fig)
-    p.fxwidgets[:browse] = () -> nothing   # the storm clicks everywhere, and the bin's
-                                           # drop zone would open a BLOCKING native dialog
-    # dock-panel widgets live outside fig.content — include them in the storm
-    buttons = vcat([b for b in p.fig.content if b isa Makie.Button],
-                   [w for w in values(p.fxwidgets) if w isa Makie.Button])
-    rng = MersenneTwister(42)   # seeded: the event sequence is reproducible
-    randpos() = Point2f(rand(rng) * 1490 + 5, rand(rng) * 940 + 5)
-    fuzzkeys = [Keyboard.space, Keyboard.s, Keyboard.x, Keyboard.c, Keyboard.r,
-                Keyboard.left, Keyboard.right, Keyboard.escape]
-    errormsgs = String[]
-    t0 = time()
-    while time() - t0 < 10
-        try
-            r = rand(rng)
-            if r < 0.35
-                ev.mouseposition[] = Tuple(randpos())
-                rand(rng, Bool) &&
-                    (ev.mousebutton[] = MouseButtonEvent(rand(rng, (Mouse.left, Mouse.right)), Mouse.press);
-                     ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.release))
-            elseif r < 0.60
-                rand(rng) < 0.2 && (ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press))
-                k = rand(rng, fuzzkeys)
-                ev.keyboardbutton[] = KeyEvent(k, Keyboard.press)
-                ev.keyboardbutton[] = KeyEvent(k, Keyboard.release)
-                ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
-            elseif r < 0.75
-                b = rand(rng, buttons)
-                bb = b.layoutobservables.computedbbox[]
-                ev.mouseposition[] = Tuple(Point2f(bb.origin .+ rand(rng, 2) .* bb.widths))
-                ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.press)
-                ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.release)
-            elseif r < 0.90
-                ev.mouseposition[] = Tuple(Point2f(rand(rng) * 1400 + 20, 60))
-                ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.press)
-                ev.mouseposition[] = Tuple(Point2f(rand(rng) * 1400 + 20, 60))
-                ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.release)
-            elseif r < 0.97
-                ev.mouseposition[] = Tuple(Point2f(rand(rng) * 1400 + 20, 60))
-                ev.scroll[] = (0.0, rand(rng, -4:4))
-            else
-                ev.dropped_files[] = [rand(rng, (testvideo2, "/nonexistent/nope.mp4"))]
-            end
-        catch e
-            push!(errormsgs, sprint(showerror, e)[1:min(end, 300)])
-            length(errormsgs) > 3 && break
-        end
-        rand(rng) < 0.1 && sleep(0.02)
-    end
-    isempty(errormsgs) || @info "chaos exceptions" errormsgs
-    @test isempty(errormsgs)                # no listener ever threw
-    sleep(0.5)
-    VE.pause!(p)                            # the storm may leave playback running,
-    p.playhead[] = 10                       # and its presents would race this one
-    ok = VE.showframe!(p, 10)
-    t1 = time()
-    while !ok && time() - t1 < 5            # decoder settles after the seek storm
-        sleep(0.05)
-        ok = VE.showframe!(p, 10)
-    end
-    @test ok                                # still presents (empty sequence = black)
-    close(p)                                # and closes cleanly
-    sleep(0.5)
-    @test true
-end
-
-@testset "Player opens a saved project" begin
-    src = VideoSource(testvideo)
-    seq = Sequence(src)
-    split!(seq, 40)
-    seq.clips[1].crop = (0.1, 0.1, 0.8, 0.8)
-    path = joinpath(mktempdir(), "edit.videoedit.toml")
-    saveproject(path, seq)
-    p2 = Player(path; gpupreview = false)   # .toml path → the saved edit, not a video
-    try
-        sleep(1.5)
-        @test length(p2.sequence.clips) == 2
-        @test p2.sequence.clips[1].crop == (0.1, 0.1, 0.8, 0.8)
-        @test VE.seqlength(p2.sequence) == 120
-        @test size(p2.frame[]) == (320, 180)   # presents from the project's source
-    finally
-        close(p2)
     end
 end
