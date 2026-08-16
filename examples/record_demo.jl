@@ -28,11 +28,12 @@
 #        as a new clip with its own thumbnails/decoder, then played
 #   [ 7] crop: C, drag a rect on the preview (Photoshop-style)
 #   [ 8] grading: temperature/saturation/contrast sliders on the live frame
-#   [ 9] camera stabilization: mode menu opened on screen, "Tripod +
-#        perspective" selected, analysis progress (running on the GPU via
+#   [ 9] camera stabilization: added via Ctrl+P (typed, Enter takes the first
+#        hit), then its card's mode menu opened on screen and
+#        "Camera lock" selected, analysis progress (running on the GPU via
 #        Lava/Vulkan — the CPU is busy rendering the recording itself),
 #        locked playback + A/B
-#   [9b] object lock: "Object lock" mode, Stabilize arms a pick, the
+#   [9b] object lock: "Object lock" mode, Stabilize starts a pick, the
 #        birdhouse is CLICKED in the preview and pinned in place
 #   [10] export: Export button, status shows progress and the output path
 #        (sources with sound get their audio muxed along the cut list)
@@ -47,7 +48,7 @@ import FFMPEG_jll
 isdefined(Main, :FakeInteraction) ||
     include(joinpath(@__DIR__, "..", "..", "Makie", "docs", "fake_interaction.jl"))
 using .FakeInteraction: Wait, MouseTo, LeftClick, LeftDown, LeftUp, RightClick,
-                        Lazy, KeyPress, KeyDown, KeyUp, Scroll, DropFiles
+                        Lazy, KeyPress, KeyDown, KeyUp, Scroll, DropFiles, TypeText
 
 # ---------------------------------------------------------------- off-camera
 
@@ -71,7 +72,24 @@ end
 # the synthetic positions.
 GLMakie.activate!(; visible = false, framerate = 30)
 
-player = Player(demosource; analysisbackend = LavaBackend())
+# NOT `analysisbackend = LavaBackend()`. Lava's context belongs to whichever
+# thread touches it FIRST, and constructing the backend here makes that MAIN —
+# after which every analysis on the pinned worker dies with "BatchQueue is
+# single-writer; cross-thread sweep forbidden". `autodetectgpu!` (spawned by the
+# constructor) gets the order right: `vk_context()` through `rungpusync` first,
+# the backend built around the worker-owned context second.
+player = Player(demosource)
+let t0 = time()
+    while !(player.analysisbackend isa LavaBackend) && time() - t0 < 90
+        sleep(0.2)
+    end
+    player.analysisbackend isa LavaBackend ||
+        @warn "GPU autodetect did not enable Lava — the walkthrough will run on the CPU tier"
+end
+# DO NOT set `player.gpupreview = nothing` here — see record_loop_demo.jl. The
+# GL shared-texture import fails on this machine and the editor says so in the
+# status bar, which is ugly; clearing the field after `autodetectgpu!` has wired
+# the preview is worse, and renders green/black stripes instead of video.
 fig = player.fig
 resize!(fig, 1440, 900)
 sleep(4.0)  # let the thumbnail strip fill before the video starts
@@ -81,14 +99,13 @@ fig.scene.events.hasfocus[] = false
 # Warm the GPU analysis (Vulkan init + kernel compile take ~30 s on first
 # use) on the player's pinned GPU worker so the on-camera stabilization
 # only pays the actual analysis time.
-gpuwarm = Ref(false)
-VE.rungpu(() -> begin
+#
+# `rungpusync`, not `rungpu` + `while !gpuwarm[]`: fire-and-forget leaves the
+# caller no way to hear that the job failed, so a worker that died on a lost
+# device turned this into a silent forever-spin. The sync form rethrows here.
+VE.rungpusync(player) do
     warmclip = VE.Clip(VideoSource(demosource2), 0, 48, 0, (0.0, 0.0, 1.0, 1.0))
     analyzemotion!(warmclip; backend = LavaBackend())  # camera-lock patch kernels
-    gpuwarm[] = true
-end, player)
-while !gpuwarm[]
-    sleep(0.5)
 end
 
 # ------------------------------------------------------------------ helpers
@@ -131,14 +148,45 @@ slider_pos(key::Symbol, frac::Real) =
 buttons = [c for c in fig.content if c isa Makie.Button]
 play_btn = first(b for b in buttons if b.label[] in ("Play", "Pause"))
 export_btn = first(b for b in buttons if b.label[] == "Export")
-# panel widgets live in the left dock (not in fig.content)
-stabilize_btn = player.fxwidgets[:analyze]
-compare_btn = player.fxwidgets[:compare]
-mode_menu = player.fxwidgets[:modemenu]
+# The dock starts on FX, but dropping a file switches it to Bin and nothing
+# switches back — so the grading and stabilization beats used to play with their
+# own panel hidden. `toggledock!` only closes the dock when the clicked tab is
+# ALREADY open, so clicking FX while Bin shows just switches to FX.
+fx_btn = first(b for b in buttons if b.label[] == "FX")
+# Panel widgets live in the left dock (not in fig.content). Stabilize is an
+# effect KIND like any other now, so the mode menu, the analyze button and the
+# A/B compare button are built by ITS CARD — they do not exist until the clip
+# carries the effect, and they are rebuilt whenever the stack is. Hence
+# accessors, read at event time, not bindings read once at script level.
+stabilize_btn() = player.fxwidgets[:analyze]
+compare_btn() = player.fxwidgets[:compare]
+mode_menu() = player.fxwidgets[:modemenu]
+
+"""
+Add an effect the way a user does: Ctrl+P, type enough of its name to filter,
+Enter takes the first hit.
+
+Rule 1 — the card that carries the sliders (and the mode menu, and the analyze
+button) only exists once the clip has the effect, and a script-side `seteffect!`
+would put it there with no visible cause.
+
+Ctrl+P rather than the "+ Add effect…" menu, which is what this first used and
+which silently added nothing here: the palette "owns the keyboard while it is
+open" (`palette.jl`), whereas plain typing into a menu that did not open reaches
+the editor as single-letter shortcuts — and the letters in "color" include `c`,
+the crop tool that the step right before this one uses. `record_keyframe_walkthrough`
+drives the palette the same way and passes.
+"""
+addeffect_events(query) = [
+    KeyDown(Makie.Keyboard.left_control), KeyPress(Makie.Keyboard.p),
+    KeyUp(Makie.Keyboard.left_control), Wait(0.9),
+    TypeText(query), Wait(0.9),
+    KeyPress(Makie.Keyboard.enter), Wait(1.3),
+]
 
 "Pixel position on the mode menu: rely=0.5 is the button, -(i-0.5) is open option i."
 function menu_pos(rely::Real)
-    bb = mode_menu.layoutobservables.computedbbox[]
+    bb = mode_menu().layoutobservables.computedbbox[]
     return Point2f(bb.origin[1] + bb.widths[1] / 2, bb.origin[2] + rely * bb.widths[2])
 end
 
@@ -258,9 +306,13 @@ events = [
     Lazy(_ -> MouseTo(preview_pos(0.8, 0.78))), Wait(0.25),
     LeftUp(), Wait(1.2),
 
-    # [8] Grading: back on the bird clip — warm temperature, more
-    # saturation, a bit of contrast; the paused frame updates live
+    # [8] Grading: back on the bird clip — add the Color effect, then warm
+    # temperature, more saturation, a bit of contrast; the frame updates live.
+    # The card is what registers `player.fxsliders[:temperature]` &c., so adding
+    # it is a step, not setup — without it the drag hits a KeyError.
+    MouseTo(block_center(fx_btn)), LeftClick(), Wait(0.6),   # back to FX — the drop left the Bin open
     Lazy(_ -> MouseTo(timeline_pos(2.0))), LeftClick(), Wait(0.6),
+    addeffect_events("color")...,
     slider_set_events(:temperature, 0.78)...,
     slider_set_events(:saturation, 0.68)...,
     slider_set_events(:contrast, 0.55)...,
@@ -275,23 +327,24 @@ events = [
     Lazy(_ -> MouseTo(timeline_pos(0.5))), LeftClick(), Wait(0.6),
     KeyPress(Makie.Keyboard.space), Wait(3.0),
     KeyPress(Makie.Keyboard.space), Wait(0.5),
+    addeffect_events("stabil")...,                               # the card, on camera
     Lazy(_ -> MouseTo(menu_pos(0.5))), LeftClick(), Wait(1.8),   # dropdown open
     Lazy(_ -> MouseTo(menu_pos(-0.5))), LeftClick(), Wait(0.8),  # Camera lock
-    MouseTo(block_center(stabilize_btn)), LeftClick(), Wait(14.0),
+    Lazy(_ -> MouseTo(block_center(stabilize_btn()))), LeftClick(), Wait(14.0),
     Lazy(_ -> MouseTo(timeline_pos(0.5))), LeftClick(), Wait(0.6),
     KeyPress(Makie.Keyboard.space), Wait(2.2),
-    MouseTo(block_center(compare_btn)), LeftDown(), Wait(1.6),  # original, shaky
+    Lazy(_ -> MouseTo(block_center(compare_btn()))), LeftDown(), Wait(1.6),  # original, shaky
     LeftUp(), Wait(1.6),                                        # stabilized again
     KeyPress(Makie.Keyboard.space), Wait(0.6),
 
-    # [9b] Object lock: keep the SUBJECT still — "Stabilize clip" arms a
+    # [9b] Object lock: keep the SUBJECT still — "Stabilize clip" starts a
     # pick, then the birdhouse BOX is clicked in the preview (the static
     # structure at source px (140, 760) — NOT the sparrows hopping on top,
     # a tracker told to pin a live bird will chase it) and the clip is
     # re-analyzed to pin it in place
     Lazy(_ -> MouseTo(menu_pos(0.5))), LeftClick(), Wait(1.4),
     Lazy(_ -> MouseTo(menu_pos(-1.5))), LeftClick(), Wait(0.8),  # Object lock
-    MouseTo(block_center(stabilize_btn)), LeftClick(), Wait(1.4),
+    Lazy(_ -> MouseTo(block_center(stabilize_btn()))), LeftClick(), Wait(1.4),
     Lazy(_ -> MouseTo(preview_data_pos(140 / 640, 760 / 1138))), LeftClick(), Wait(14.0),
     Lazy(_ -> MouseTo(timeline_pos(0.5))), LeftClick(), Wait(0.6),
     KeyPress(Makie.Keyboard.space), Wait(2.5),

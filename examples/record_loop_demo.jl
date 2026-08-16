@@ -26,7 +26,7 @@ import FFMPEG_jll
 
 isdefined(Main, :FakeInteraction) ||
     include(joinpath(@__DIR__, "..", "..", "Makie", "docs", "fake_interaction.jl"))
-using .FakeInteraction: Wait, WaitUntil, MouseTo, LeftClick, LeftDown, LeftUp, Lazy, KeyPress
+using .FakeInteraction: Wait, WaitUntil, MouseTo, LeftClick, LeftDown, LeftUp, Lazy, KeyPress, TypeText
 
 const DEMOLOOP = joinpath(@__DIR__, "..", "..", "..", "media", "demo_loop.mp4")
 const RAW_MP4  = joinpath(tempdir(), "loop_walkthrough_raw.mp4")
@@ -34,7 +34,30 @@ const OUT_MP4  = joinpath(@__DIR__, "..", "..", "..", "media", "loop_walkthrough
 const OUT_GIF  = joinpath(tempdir(), "bird_fullcycle.gif")
 
 GLMakie.activate!(; visible = false, framerate = 30)
-player = Player(DEMOLOOP; analysisbackend = LavaBackend())
+# NOT `analysisbackend = LavaBackend()`. Lava's context belongs to whichever
+# thread touches it FIRST, and constructing the backend here makes that MAIN —
+# after which every analysis on the pinned worker dies with "BatchQueue is
+# single-writer; cross-thread sweep forbidden". `autodetectgpu!` (spawned by the
+# constructor) gets the order right: it touches `vk_context()` through
+# `rungpusync` first, and only then builds the backend around the worker-owned
+# context. So let it, and wait for it rather than racing it.
+player = Player(DEMOLOOP)
+let t0 = time()
+    while !(player.analysisbackend isa LavaBackend) && time() - t0 < 90
+        sleep(0.2)
+    end
+    player.analysisbackend isa LavaBackend ||
+        @warn "GPU autodetect did not enable Lava — the walkthrough will run on the CPU tier"
+end
+# DO NOT set `player.gpupreview = nothing` here. Importing the shared Vulkan
+# texture into GL fails on this machine ("GL import of the shared texture
+# failed", glbridge.jl:175 — the same known failure test_gpu.jl:218 carries), and
+# the editor handles it correctly: it pauses and says so in the status bar. That
+# banner is ugly in a recording, but clearing the field after `autodetectgpu!`
+# has already wired the preview is worse — it leaves the preview plot pointing at
+# a torn-down path and the walkthrough renders GREEN/BLACK STRIPES instead of
+# video. Measured both ways: correct picture + banner, or broken picture.
+# Turning the tier off properly would need an inverse of `setupgpupreview!`.
 fig = player.fig
 resize!(fig, 1440, 900)
 sleep(4.0)                                   # let the thumbnail strip fill
@@ -42,11 +65,15 @@ Makie.disconnect!(player.screen, Makie.mouse_position)   # keep the real OS mous
 fig.scene.events.hasfocus[] = false
 player.fxwidgets[:exportpath][] = OUT_GIF    # off-camera: preset the export path
 
-# warm the GPU kernels off-camera (first Lava analysis compiles them)
-let done = Ref(false)
-    VE.rungpu(() -> (VE.analyzemotion!(VE.Clip(VideoSource(DEMOLOOP), 0, 48, 0, (0.,0.,1.,1.));
-                                       backend = LavaBackend()); done[] = true), player)
-    while !done[]; sleep(0.3); end
+# Warm the GPU kernels off-camera (the first Lava analysis compiles them).
+#
+# `rungpusync`, not `rungpu` + `while !done[]`: fire-and-forget gives the caller
+# no way to hear that the job failed, so when the worker died on a lost device
+# this spun forever at full CPU with nothing on screen and nothing in the log.
+# The sync form carries the exception back and rethrows it here.
+VE.rungpusync(player) do
+    VE.analyzemotion!(VE.Clip(VideoSource(DEMOLOOP), 0, 48, 0, (0., 0., 1., 1.));
+                      backend = LavaBackend())
 end
 
 # ------------------------------------------------------------------ helpers
@@ -66,9 +93,22 @@ play_btn = first(b for b in buttons if b.label[] in ("Play", "Pause"))
 fx_btn   = first(b for b in buttons if b.label[] == "FX")
 out_btn  = first(b for b in buttons if b.label[] == "Out")
 split_btn = first(b for b in buttons if b.label[] == "✂")
-mode_menu = player.fxwidgets[:modemenu]
-stabilize_btn = player.fxwidgets[:analyze]
-loop_btn = player.fxwidgets[:loop]
+# Stabilize is an effect kind now, so these are built by ITS CARD and do not
+# exist until the clip carries the effect — accessors, read at event time.
+mode_menu() = player.fxwidgets[:modemenu]
+stabilize_btn() = player.fxwidgets[:analyze]
+"""
+Add an effect the way a user does: open "+ Add effect…", type enough of its name
+to filter, Enter takes the first hit. The card is what carries the mode menu and
+the analyze button, so it has to be created on camera — a script-side
+`seteffect!` would make it appear with no visible cause.
+"""
+addeffect_events(query) = [
+    Lazy(_ -> MouseTo(block_center(player.fxwidgets[:addeffect]))), LeftClick(), Wait(0.9),
+    TypeText(query), Wait(0.7),
+    KeyPress(Makie.Keyboard.enter), Wait(1.3),
+]
+loop_btn = player.fxwidgets[:gifloop]      # the "GIF loop" checkbox
 fmt_menu = player.fxwidgets[:exportformat]
 export_go = player.fxwidgets[:exportgo]
 
@@ -120,9 +160,10 @@ events = [
     # the modes, pick "Camera lock", click "Stabilize clip". The status counts the frames; the
     # view glides into the auto-crop when it's done. (analysis wait time-lapsed in post)
     Lazy(_ -> MouseTo(timeline_pos(8.0))), LeftClick(), Wait(0.6),
-    Lazy(_ -> MouseTo(menu_pos(mode_menu, 0.5))), LeftClick(), Wait(1.6),
-    Lazy(_ -> MouseTo(menu_pos(mode_menu, -0.5))), LeftClick(), Wait(0.8),
-    Lazy(_ -> (TIMELAPSE[] = true; MouseTo(block_center(stabilize_btn)))), LeftClick(),
+    addeffect_events("stabil")...,                        # the card, on camera
+    Lazy(_ -> MouseTo(menu_pos(mode_menu(), 0.5))), LeftClick(), Wait(1.6),
+    Lazy(_ -> MouseTo(menu_pos(mode_menu(), -0.5))), LeftClick(), Wait(0.8),
+    Lazy(_ -> (TIMELAPSE[] = true; MouseTo(block_center(stabilize_btn())))), LeftClick(),
     WaitUntil(hasmotion; timeout = 500.0),          # wait for the GPU analysis to finish
 
     # [4] the auto-crop glides in (normal speed = a nice reveal), then play the stabilized

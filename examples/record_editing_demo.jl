@@ -64,13 +64,13 @@ events = [
     Lazy(_ -> (caption[] = "A plain clip"; MouseTo(block_center(play_btn)))),
     LeftClick(), Wait(1.6), KeyPress(K.space), Wait(0.5),
 
-    # blade: arm ✂, click the timeline to cut there
+    # blade: activate ✂, click the timeline to cut there
     Lazy(_ -> (caption[] = "Blade tool — click ✂"; MouseTo(block_center(blade_btn)))),
     LeftClick(), Wait(0.9),
     Lazy(_ -> (caption[] = "…then click the timeline to cut"; MouseTo(timeline_pos(2.5)))),
     LeftClick(), Wait(1.0), KeyPress(K.escape), Wait(0.6),   # Esc puts the persistent blade away
 
-    # crop: C arms crop, drag a rectangle on the preview
+    # crop: C activates crop, drag a rectangle on the preview
     Lazy(_ -> (caption[] = "Crop — press C and drag on the preview"; MouseTo(pv(0.28, 0.28)))),
     KeyPress(K.c), Wait(0.5),
     Lazy(_ -> MouseTo(pv(0.28, 0.28))), LeftDown(), Wait(0.2),

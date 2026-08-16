@@ -1,9 +1,9 @@
-# Mouse-driven walkthrough of the EFFECT-STACK + modal editing (2026-07 UI): the FX
-# panel is a stack of applied effects; clicking one opens a modal where you edit its
-# parameters on live sliders (the preview updates as you drag). All on-screen mouse.
+# Mouse-driven walkthrough of the EFFECT STACK: the FX panel is a stack of cards,
+# one per applied effect, each showing its parameters as live sliders — the
+# preview updates as you drag. All on-screen mouse.
 #
-#   a clip already carries a Color effect → click it in the stack → drag Saturation up
-#   (vivid) then down (grayscale) then to a rich look, preview updating live.
+#   a clip already carries a Color effect → click its card to select it → drag
+#   Saturation up (vivid) then down (grayscale) then to a rich look, live.
 
 ENV["DISPLAY"] = get(ENV, "DISPLAY", ":1")
 if !haskey(ENV, "XAUTHORITY")
@@ -35,7 +35,7 @@ fig.scene.events.hasfocus[] = false
 
 # off-camera: short clip + a neutral Color effect already in the stack (starts vivid-neutral)
 seq.clips[1].src_out = 180
-push!(seq.clips[1].effects, VE.ColorEffect())
+VE.seteffect!(seq.clips[1], VE.ColorEffect())   # `effects` holds FxSlots, not effects
 VE.refreshedit!(player)
 player.fxwidgets[:fxlistrefresh]()
 player.playhead[] = 0
@@ -54,8 +54,19 @@ drag(getsl, v) = [Lazy(_ -> (sl = getsl(); MouseTo(slider_x(sl, sliderfrac(sl)))
 
 buttons = [c for c in fig.content if c isa Makie.Button]
 play_btn = first(b for b in buttons if b.label[] in ("Play", "Pause"))
-colorrow() = player.fxwidgets[:effectrows][1]
-satslider() = player.fxwidgets[:pickerform][].widgets[:saturation]
+# The FX panel is a stack of `Makie.Card`s, one per applied effect, and a card
+# opens IN PLACE — there is no modal picker any more, and no `:effectrows`.
+colorcard() = first(c for c in player.fxwidgets[:fxcards] if c.title[] == "Color")
+"A point on the card's header bar: its top strip, left of the accessory cell
+(the ?/eye/× buttons live there and take their own presses)."
+function header_point(card)
+    bb = card.layoutobservables.computedbbox[]
+    h = card.headerheight[]
+    Point2f(bb.origin[1] + 0.3 * bb.widths[1], bb.origin[2] + bb.widths[2] - h / 2)
+end
+# Parameter sliders register themselves by parameter name as the card body is
+# built (`fxpanel.jl`: `player.fxsliders[kind.kfkeys[j]] = w`).
+satslider() = player.fxsliders[:saturation]
 
 caption = Observable("")
 Makie.text!(fig.scene, caption; position = Point2f(750, 928), space = :pixel,
@@ -68,7 +79,10 @@ events = [
     Lazy(_ -> (caption[] = "A clip with a Color effect in the stack"; MouseTo(block_center(play_btn)))),
     LeftClick(), Wait(1.6), KeyPress(K.space), Wait(0.5),
 
-    Lazy(_ -> (caption[] = "Click the effect to edit it in a modal"; MouseTo(block_center(colorrow())))),
+    # The card's parameters are already unfolded; what the click visibly does is
+    # SELECT it — accent outline and tinted header — which is what makes it the
+    # card the keyframe and tool actions target. Narrate that, not a fold.
+    Lazy(_ -> (caption[] = "Click the effect's card to select it"; MouseTo(header_point(colorcard())))),
     LeftClick(), Wait(1.2),
 
     Lazy(_ -> (caption[] = "Drag Saturation up — vivid, live in the preview"; MouseTo(slider_x(satslider(), sliderfrac(satslider()))))),
@@ -81,7 +95,7 @@ events = [
 ]
 
 FakeInteraction.interaction_record((i, t) -> nothing, fig, RAW_MP4, events; fps = 30, px_per_unit = 1)
-ce = seq.clips[1].effects[end]
+ce = seq.clips[1].effects[end].effect      # a slot, not the effect itself
 result = (saturation = ce isa VE.ColorEffect ? round(Float64(ce.adj.saturation), digits = 2) : nothing,)
 close(player)
 run(`$(FFMPEG_jll.ffmpeg()) -y -i $RAW_MP4 -c:v libx264 -crf 22 -pix_fmt yuv420p $OUT_MP4`)

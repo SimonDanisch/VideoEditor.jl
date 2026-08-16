@@ -129,7 +129,11 @@ function measure(source::VE.VideoSource, nframes::Integer)
     motion, bright = Float64[], Float64[]
     step = max(1, (source.width * source.height) ÷ 40_000)   # subsample; we want a shape, not a metric
     for n in 0:(nframes - 1)
-        VE.sourceinto!(frame, reader, n)
+        # `sourceinto!` takes the DECODED frame, not a frame index — decode is a
+        # separate step since `1f5332e` moved it out of the source pass, so that
+        # `served` is settled before the graph runs. Passing `n` here copied the
+        # integer into an RGB buffer ("(2, 2, 2) are integers in the range 0-255").
+        VE.sourceinto!(frame, reader, VE.decodesource(reader, n))
         px = @view frame[1:step:end]
         y = [0.299 * Float64(p.r) + 0.587 * Float64(p.g) + 0.114 * Float64(p.b) for p in px]
         push!(bright, sum(y) / length(y))

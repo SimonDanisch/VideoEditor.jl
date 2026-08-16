@@ -4,7 +4,7 @@
 # mouse/keyboard event (FakeInteraction draws a live cursor); only the caption
 # and the off-camera trim-to-a-short-clip are script-side.
 #
-#   play a plain clip → Ctrl+P adds a Color effect → ◆ arms Brightness
+#   play a plain clip → Ctrl+P adds a Color effect → ◆ activates Brightness
 #   → scrub + slider writes a second key → drag a ◆ (readout + playhead snap)
 #   → right-click a ◆ → Ease curve → scrub the ramp → play it back
 
@@ -92,8 +92,8 @@ events = [
     KeyDown(K.left_control), KeyPress(K.p), KeyUp(K.left_control), Wait(0.8),
     TypeText("col"), Wait(0.9), KeyPress(K.enter), Wait(1.2),
 
-    # ◆ arms Brightness — first key at the playhead, curve lands on the clip
-    Lazy(_ -> (caption[] = "◆ arms Brightness — its curve lands on the clip";
+    # ◆ activates Brightness — first key at the playhead, curve lands on the clip
+    Lazy(_ -> (caption[] = "◆ activates Brightness — its curve lands on the clip";
                armframe[] = srcframe(); MouseTo(trio_pos()))),
     LeftClick(), Wait(1.3),
 
