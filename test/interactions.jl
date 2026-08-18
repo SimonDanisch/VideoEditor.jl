@@ -274,7 +274,16 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             # scrubbing onto the new clip switches the preview buffers
             press(tlx((45 + 15) / 30)); release()
             sleep(0.6)
-            @test size(p.frame[]) == (480, 270)
+            # NOT `== (480, 270)`. The preview is CANVAS-sized on purpose —
+            # `ensureframesize!(player, canvassize(seq))`, "the SEQUENCE's format,
+            # not the top layer's" — so a second source of a different shape is
+            # letterboxed into the project's format rather than resizing it. This
+            # assertion predated the canvas and was checking the old behaviour: it
+            # read (320, 180), the FIRST clip's size, long before an explicit
+            # canvas existed to blame. What scrubbing across the cut actually
+            # changes is which source is being decoded.
+            @test size(p.frame[]) == VE.canvassize(p.sequence)
+            @test VE.locate(p.sequence, p.playhead[])[1].source.width == 480
 
             # near the cross-source cut the other source's worker pre-warms;
             # the current clip's worker stays on its own tail (separate rings)
@@ -555,6 +564,195 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test p.tool[] == :none
         end
 
+        @testset "one refiner at a time, and it targets the CURRENT frame" begin
+            # The scrub/fx desync: `retrypresent` used to spawn a task PER playhead
+            # change, each closing over ITS frame — so a slow one published behind a
+            # newer one and the matte mask lagged the picture. The fix is structural
+            # and cheap to state: at most one refiner exists, and it re-reads
+            # `playhead[]` every pass rather than a captured `n`.
+            @test p.refining isa Threads.Atomic{Bool}
+            @test p.refining[] == false                  # nothing in flight at rest
+
+            # A second call while one is running must NOT start another — that is
+            # the whole invariant, and `atomic_cas!` is what enforces it.
+            Threads.atomic_cas!(p.refining, false, true)
+            @test p.refining[] == true
+            @test VE.retrypresent(p) === nothing         # declines rather than piling on
+            p.refining[] = false
+
+            # …and a burst of playhead moves settles on the LAST one, not on
+            # whichever render happened to finish last.
+            head0 = p.playhead[]
+            clip = p.sequence.clips[1]
+            for n in (clip.start + 2, clip.start + 5, clip.start + 9)
+                p.playhead[] = n
+            end
+            target = p.playhead[]
+            @test waitfor(() -> p.refining[] == false; s = 20)
+            @test p.playhead[] == target
+            p.playhead[] = head0
+            VE.refreshedit!(p)
+        end
+
+        @testset "the pill row is tall enough for its pills" begin
+            # TODO #7's other half. The row height was `Fixed(28 * n)` — a hardcoded
+            # guess at one pill plus a gap — while the grid's real gap was Makie's
+            # default. Every added object pushed the pills further past the bottom
+            # of their row and over the control beneath.
+            @test VE.pillrowsize(1) == Makie.Fixed(VE.PILLHEIGHT)
+            for n in 2:6
+                want = (VE.PILLHEIGHT + VE.PILLGAP) * n - VE.PILLGAP
+                @test VE.pillrowsize(n) == Makie.Fixed(want)
+                # …i.e. n pills and the n-1 gaps BETWEEN them, never n gaps
+                @test want == n * VE.PILLHEIGHT + (n - 1) * VE.PILLGAP
+            end
+            # and the radius is the "not a stadium" one the complaint was about
+            @test VE.PILLRADIUS < VE.PILLHEIGHT / 2
+        end
+
+        @testset "painting into the mask actually paints" begin
+            # The second half of the repair TODO — "or directly paint into the
+            # mask" — and it had NO coverage at all: not one test called
+            # `beginmattebrush!`. The GUI for it was verified by screenshot; that
+            # says the hint and the sizing are on screen, not that a stroke moves a
+            # pixel.
+            clip = p.sequence.clips[1]
+            snap0 = VE.docsnapshot(p)
+            p.timeline.selected[] = 1
+            p.playhead[] = clip.start
+            clip.mattetrack = VE.MatteTrack(fill(0x00, 32, 24, 20), clip.src_in)
+            empty!(VE.matterepairs(p, clip))
+            sf = VE.sourceframe(clip, p.playhead[])
+            @test all(==(0x00), VE.matteframe(clip, sf))       # nothing painted yet
+
+            @test VE.beginmattebrush!(p, true)                  # left drag = add
+            vp = p.previewaxis.scene.viewport[]
+            mid = Point2f(vp.origin[1] + 0.5 * vp.widths[1],
+                          vp.origin[2] + 0.5 * vp.widths[2])
+            @test VE.mattebrushto!(p, mid; radius = 0.25)
+            @test any(==(0xff), VE.matteframe(clip, sf))        # …the stroke landed
+
+            # …and letting go RECORDS it, so a later full re-run cannot silently
+            # discard the fix — that is what `matterepairs` is for.
+            @test VE.endmattebrush!(p)
+            @test haskey(VE.matterepairs(p, clip), Int(sf))
+            @test p.mattebrush === nothing                      # the stroke is over
+
+            empty!(VE.matterepairs(p, clip))
+            clip.mattetrack = nothing
+            VE.docrestore!(p, snap0)
+            VE.refreshedit!(p)
+        end
+
+        @testset "the DNN kernels actually compile on the GPU" begin
+            # Both of these shipped with `RGB{N0f8}(::Float32, …)`, which VALIDATES
+            # and calls `throw_colorerror` — string building on an error path no
+            # input reaches, which Lava rejects, taking the whole kernel with it.
+            # They passed every CPU test and could never have run on the GPU they
+            # were written for. `unitn0f8` (matte.jl) exists precisely for this and
+            # documents it; I wrote both kernels without using it.
+            be = p.analysisbackend
+            KA = VE.KA
+            W, H = 32, 24
+            img = KA.allocate(be, VE.RGB{VE.N0f8}, W, H)
+            fill!(img, VE.RGB{VE.N0f8}(0.5, 0.4, 0.3))
+            out = KA.allocate(be, VE.RGB{VE.N0f8}, W, H)
+            fill!(out, VE.RGB{VE.N0f8}(0.1, 0.2, 0.3))
+            VE.lookmix_kernel!(be)(out, img, 0.5f0; ndrange = (W, H))
+            KA.synchronize(be)
+            @test Array(out)[1, 1] isa VE.RGB{VE.N0f8}
+
+            dep = KA.allocate(be, UInt8, W, H); fill!(dep, 0x80)
+            dst = KA.allocate(be, VE.RGB{VE.N0f8}, W, H)
+            VE.depthblur_kernel!(be)(dst, img, dep, Int32(W), Int32(H), 0.5f0, Int32(3);
+                                     ndrange = (W, H))
+            KA.synchronize(be)
+            @test Array(dst)[1, 1] isa VE.RGB{VE.N0f8}
+        end
+
+        @testset "resizing a depth map keeps its values" begin
+            # `analyzedepth!` resized through `mattemaskscale`, which ends
+            # `v > 0 ? 0xff : 0x00` — right for a binary seed mask, catastrophic
+            # for depth: every non-zero depth became 0xff, so the track was a flat
+            # "everything is nearest" plane. Depth blur still CHANGED the picture
+            # (it defocused everything equally), so every does-it-do-something
+            # check passed. The card's thumbnail — solid white — is what showed it.
+            grad = UInt8[round(UInt8, 255 * (i - 1) / 15) for i in 1:16, j in 1:12]
+            @test length(unique(grad)) > 2                    # a real gradient in
+            small = VE.depthscale(grad, 8, 6)
+            @test size(small) == (8, 6)
+            @test length(unique(small)) > 2                   # …and a gradient out
+            @test minimum(small) < 0x40 && maximum(small) > 0xc0
+
+            # the mask scaler, by contrast, is SUPPOSED to flatten — that is what
+            # makes it wrong here and right where it belongs
+            flat = VE.mattemaskscale(grad, 8, 6)
+            @test Set(unique(flat)) ⊆ Set([0x00, 0xff])
+
+            # …and it interpolates rather than picking nearest: depth drives a
+            # PER-PIXEL blur radius, so a stepped map bands the defocus into rings.
+            ramp = UInt8[round(UInt8, 255 * (i - 1) / 63) for i in 1:64, j in 1:8]
+            down = VE.depthscale(ramp, 16, 4)
+            steps = diff(Int.(down[:, 1]))
+            @test all(>=(0), steps)                    # monotone in, monotone out
+            @test maximum(steps) - minimum(steps) <= 1 # …and evenly spaced, not chunked
+        end
+
+        @testset "the depth model's output is a matrix, not a tensor" begin
+            # `depthbytes` takes a MATRIX; the runner returns the model's raw
+            # tensor with a batch and a channel axis. Pressing "Estimate depth"
+            # threw `MethodError: no method matching depthbytes(::Array{Float16,4})`
+            # every time — the whole feature was unreachable, and every test around
+            # it fed `depthbytes` a synthetic matrix so nothing noticed.
+            @test VE.dropsingletons(zeros(Float16, 8, 6, 1, 1)) |> size == (8, 6)
+            @test VE.dropsingletons(zeros(Float16, 1, 1, 8, 6)) |> size == (8, 6)
+            @test VE.dropsingletons(zeros(Float16, 8, 6)) |> size == (8, 6)
+            @test VE.depthbytes(VE.dropsingletons(rand(Float16, 8, 6, 1, 1))) isa Matrix{UInt8}
+        end
+
+        @testset "paste selects what it pasted" begin
+            # Paste lands a clip at the playhead on whichever lane is free, which
+            # is rarely where it belongs — so the next act is always to move it.
+            # Without a selection the act BEFORE that was hunting for the thing you
+            # had just made.
+            seq = p.sequence
+            snap0 = VE.docsnapshot(p)
+            head0 = p.playhead[]
+            p.timeline.selected[] = 1
+            VE.copyclips!(p)
+            @test !isempty(p.clipboard)
+            p.playhead[] = VE.clipend(seq.clips[1])
+            n = VE.pasteclips!(p)
+            @test n == 1
+            @test length(seq.clips) == 2
+            i = p.timeline.selected[]
+            @test 1 <= i <= length(seq.clips)
+            # …and it is the NEW one, found by identity after the sort reorders
+            @test seq.clips[i].start == head0 + VE.cliplength(seq.clips[1]) ||
+                  seq.clips[i] !== seq.clips[1]
+            @test i in p.timeline.selection[]
+
+            empty!(p.clipboard)
+            VE.docrestore!(p, snap0)
+            p.playhead[] = head0
+            VE.refreshedit!(p)
+            @test waitfor(() -> length(p.sequence.clips) == 1)
+        end
+
+        @testset "a refused lane says WHY, not just no" begin
+            # "seems like only new track is a drop target" was a reading of silence:
+            # the ghost went red and nothing said what WOULD work, so an occupied
+            # lane looked like a lane that refuses clips rather than one that
+            # refuses this clip here. The label sits on the lane, where the eye is.
+            tl0 = p.timeline
+            # a VECTOR: `text!` type-locks the attribute at creation, so both the
+            # hint and its replacement have to be assigned in that form
+            @test first(tl0.newtrackplot.text[]) isa AbstractString
+            # the hint is STROKED, because it also has to read on top of a
+            # filmstrip — unstroked it was invisible over the clip it covers
+            @test tl0.newtrackplot.strokewidth[] > 0
+        end
+
         @testset "Ctrl-drag lifts a clip to a new track" begin
             # Ctrl+press mid-clip, then drag UP into the marked new-track zone.
             #
@@ -710,6 +908,837 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             flat = similar(img)                                       # neutral is a pass-through
             VE.depthblur!(flat, img, plane, VE.DepthBlurOp(1.0f0, 0.0f0))
             @test flat == img
+        end
+
+        @testset "look: per-clip LUT, uploaded once, declines without one" begin
+            src = VE.VideoSource(testvideo)
+            clip = VE.Clip(src)
+            @test clip.look === nothing
+            @test VE.lookdim(clip) === nothing
+            @test VE.nodefor(VE.LookEffect(), 1, clip) === nothing   # no LUT, no node
+
+            # An identity table: out == in, so a grade that changes nothing proves
+            # the sampling is right rather than that the kernel ran.
+            D = 8
+            lut = Array{Float32,4}(undef, D, D, D, 3)
+            for k in 1:D, j in 1:D, i in 1:D
+                lut[i, j, k, 1] = (i - 1) / (D - 1)
+                lut[i, j, k, 2] = (j - 1) / (D - 1)
+                lut[i, j, k, 3] = (k - 1) / (D - 1)
+            end
+            clip.look = lut
+            @test VE.lookdim(clip) == D
+            n = VE.nodefor(VE.LookEffect(), 1, clip)
+            @test n isa VE.LookNode && n.dim == D
+
+            W, H = 16, 12
+            img = [RGB{N0f8}((x - 1) / (W - 1), (y - 1) / (H - 1), 0.5f0) for x in 1:W, y in 1:H]
+            out = similar(img)
+            VE.applylook!(out, img, lut, 1.0)
+            chan(q) = Float64(VE.ColorTypes.red(q))
+            @test maximum(abs(chan(a) - chan(b)) for (a, b) in zip(out, img)) < 0.02
+
+            # strength mixes back toward the original; at 0 it IS the original
+            VE.applylook!(out, img, lut, 0.0)
+            @test out == img
+
+            # split and copy carry the shot's grade — it is keyed to the clip,
+            # not to a frame range
+            r = VE.copyclip(clip)
+            @test r.look === clip.look
+
+            # …and it survives save/reopen. Re-learning is NOT the same operation:
+            # `runlook!` fits from whatever frame the playhead is on, so a look
+            # dropped by the project file comes back as a DIFFERENT grade — which
+            # is worse than coming back missing, because nothing tells you.
+            dir = mktempdir()
+            proj = joinpath(dir, "look.vproj")
+            VE.saveproject(proj, VE.Sequence([clip], 30.0))
+            back = VE.loadproject(proj)
+            @test back.clips[1].look !== nothing
+            @test size(back.clips[1].look) == size(lut)
+            @test maximum(abs.(back.clips[1].look .- lut)) < 1.0f-6
+        end
+
+        @testset "captions live on the sequence, save and undo" begin
+            seq = p.sequence
+            @test isempty(seq.captions)          # a fresh sequence has none
+
+            caps = [VE.Caption(0.0, 1.0, "hello"), VE.Caption(0.9, 2.0, "world")]
+            @test VE.captionat(caps, 0.5) == "hello"
+            @test VE.captionat(caps, 1.5) == "world"
+            @test VE.captionat(caps, 0.95) == "world"   # overlap: the later line wins
+            @test VE.captionat(caps, 9.0) == ""         # outside every line
+
+            # Linear resample, exact on a 2:1 decimation
+            @test VE.resampleaudio(Float32[0, 1, 2, 3], 4, 2) == Float32[0, 2]
+            @test VE.resampleaudio(Float32[1, 2], 8, 8) == Float32[1, 2]
+
+            # A transcript is an EDIT: it survives a project roundtrip…
+            snap0 = VE.docsnapshot(p)
+            append!(seq.captions, caps)
+            path = joinpath(mktempdir(), "cap.vedit")
+            VE.saveproject(path, p.sequence)
+            back = VE.loadproject(path)
+            @test length(back.captions) == 2
+            @test back.captions[2].text == "world"
+            @test back.captions[1].stop == 1.0
+
+            # …and undo reaches it, because re-transcribing replaces corrections
+            VE.docrestore!(p, snap0)
+            @test isempty(p.sequence.captions)
+
+            @test haskey(VE.OVERLAYBYNAME, :captions)
+
+            # …and a transcript is a GUESS, so it must be correctable without
+            # re-running the model. `captionindexat` is what the editor asks with
+            # a playhead; the caption stores seconds.
+            empty!(seq.captions); append!(seq.captions, caps)
+            fps = seq.framerate
+            @test VE.captionindexat(seq, round(Int, 0.5 * fps)) == 1
+            @test VE.captionindexat(seq, round(Int, 1.5 * fps)) == 2
+            @test VE.captionindexat(seq, round(Int, 9.0 * fps)) == 0
+            p.playhead[] = round(Int, 1.5 * fps)
+            @test VE.editcaption!(p, "corrected")
+            @test seq.captions[2].text == "corrected"
+            @test seq.captions[2].start == caps[2].start   # only the words change
+            p.playhead[] = round(Int, 9.0 * fps)
+            @test !VE.editcaption!(p, "nowhere")           # nothing under the playhead
+            empty!(seq.captions)
+        end
+
+        @testset "time interpolation: the phase is what floor() throws away" begin
+            src = VE.VideoSource(testvideo)
+            c = VE.Clip(src); c.start = 0
+            @test c.timeinterp === :sample              # every editor's default
+            c.rate = 1.0
+            @test VE.sourcephase(c, 7) == 0.0           # unconformed: never between frames
+
+            c.rate = 0.5                                # half speed
+            @test [VE.sourcephase(c, n) for n in 0:5] == [0.0, 0.5, 0.0, 0.5, 0.0, 0.5]
+            @test [VE.sourceframe(c, n) - c.src_in for n in 0:5] == [0, 0, 1, 1, 2, 2]
+
+            # …which is exactly the judder: two timeline frames show source frame
+            # 0, and the phase says the second one wants a frame that is not there.
+            @test VE.settimeinterp!(c, :flow) === :flow
+            @test_throws ArgumentError VE.settimeinterp!(c, :bogus)
+            @test c.timeinterp === :flow
+            @test VE.copyclip(c).timeinterp === :flow    # a copy keeps the mode
+        end
+
+        @testset "narration mixes over the clips and saves its words" begin
+            seq = p.sequence
+            @test isempty(seq.narration)
+
+            nar = VE.Narration("hello there", 0.5, "af_heart")
+            @test isempty(nar.samples)                   # not rendered yet
+            push!(seq.narration, nar)
+
+            # An unrendered narration must not change the mix — the words are the
+            # edit, the samples are a cache, and a missing cache is silence.
+            blk = fill(Int16(100), 2, 64)
+            VE.mixnarration!(blk, seq, 0; rate = 48_000)
+            @test all(==(Int16(100)), blk)
+
+            # …and a rendered one ADDS, because a voiceover plays OVER the timeline
+            append!(nar.samples, fill(0.5f0, 48_000)); nar.rate = 48_000
+            VE.mixnarration!(blk, seq, 24_000; rate = 48_000)   # inside its span
+            @test all(>(Int16(100)), blk)
+
+            # the WORDS round-trip through a project file; the samples do not
+            snap0 = VE.docsnapshot(p)
+            path = joinpath(mktempdir(), "nar.vedit")
+            VE.saveproject(path, seq)
+            back = VE.loadproject(path)
+            @test length(back.narration) == 1
+            @test back.narration[1].text == "hello there"
+            @test back.narration[1].at == 0.5
+            @test isempty(back.narration[1].samples)
+            # RESTORE first, then clear: `docrestore!` now puts the narration back
+            # (that is the undo fix), so clearing before it restored the very line
+            # this testset added and leaked it into the next one.
+            VE.docrestore!(p, snap0)
+            empty!(seq.narration)
+        end
+
+        @testset "the canvas is the sequence's, not whichever clip is first" begin
+            seq = p.sequence
+            head0 = p.playhead[]
+            # Normalise BEFORE snapshotting: the testsets share one Player and an
+            # earlier crop legitimately leaves a canvas behind, which a snapshot
+            # taken first would faithfully restore — and then the "undo unsets it"
+            # assertion below would be checking the leak, not the fix.
+            seq.canvas = nothing
+            snap0 = VE.docsnapshot(p)
+            @test VE.canvassize(seq) != (640, 360)   # unset: derived from clip 1
+
+            # Setting it explicitly makes the resolution stop depending on which
+            # clip happens to be first — the trap this replaced: deleting clip 1
+            # silently changed the project's output size.
+            seq.canvas = (640, 360)
+            @test VE.canvassize(seq) == (640, 360)
+            base = seq.clips[1]
+            c2 = VE.copyclip(base; start = VE.clipend(base))
+            c2.crop = (0.0, 0.0, 0.5, 0.5)            # a differently-cropped clip
+            push!(seq.clips, c2)
+            @test VE.canvassize(seq) == (640, 360)    # …and it does not move
+            deleteat!(seq.clips, 1)
+            @test VE.canvassize(seq) == (640, 360)    # …not even when clip 1 goes
+
+            # Unset, the old behaviour is intact so existing projects open the same
+            seq.canvas = nothing
+            @test VE.canvassize(seq) == (round(Int, 0.5 * c2.source.width) ÷ 2 * 2,
+                                         round(Int, 0.5 * c2.source.height) ÷ 2 * 2)
+
+            # The canvas is a SEQUENCE field and `snapshot(seq)` returns the clip
+            # vector alone, so this is what caught that cropping outward survived
+            # a Ctrl+Z: the picture went back to its old framing and the output
+            # size stayed changed.
+            seq.canvas = (1920, 1080)
+            VE.docrestore!(p, snap0)
+            @test seq.canvas === nothing
+
+            p.playhead[] = head0
+            VE.refreshedit!(p)
+            @test waitfor(() -> length(p.sequence.clips) == 1)
+        end
+
+        @testset "crop scope: this clip, or the whole project" begin
+            seq = p.sequence
+            snap0 = VE.docsnapshot(p)
+            head0 = p.playhead[]
+            seq.canvas = nothing
+            clip = seq.clips[1]
+            p.playhead[] = clip.start
+            VE.refreshedit!(p)
+            W, H = size(p.frame[])
+            @test W > 0 && H > 0
+
+            @test VE.cropscope(p)[] === :canvas      # resizing the project is the default
+
+            # THIS CLIP: the drag reframes the clip and the project keeps its size.
+            # The bug this closes: every crop rewrote `sequence.canvas`, so "show
+            # less of this one shot" silently resized the finished video.
+            VE.setcropscope!(p, :clip)
+            before = VE.canvassize(seq)
+            p.cropanchor = Point2f(0.1W, 0.1H)
+            VE.finishcrop!(p, Point2f(0.6W, 0.6H))
+            @test VE.canvassize(seq) == before       # the project did not move…
+            @test clip.crop[3] < 0.9                 # …but the clip did
+            # …and it holds because the derived canvas got PINNED. Without that,
+            # `canvassize` re-derives from clip one's crop and a "this clip only"
+            # crop of clip one silently resized the project anyway — which is what
+            # this assertion caught the first time it ran.
+            @test seq.canvas == before
+
+            # WHOLE PROJECT: the same drag now sets the canvas.
+            VE.setcropscope!(p, :canvas)
+            p.cropanchor = Point2f(0.0, 0.0)
+            VE.finishcrop!(p, Point2f(0.5W, 0.5H))
+            @test seq.canvas !== nothing
+            @test VE.canvassize(seq) == seq.canvas
+
+            # …and dragging PAST the edge grows it, which is the whole point of an
+            # unclamped crop rectangle — a canvas that could only ever shrink had
+            # no gesture for "make this taller".
+            grown = VE.canvassize(seq)
+            p.cropanchor = Point2f(-0.5W, -0.5H)
+            VE.finishcrop!(p, Point2f(1.5W, 1.5H))
+            @test VE.canvassize(seq)[1] > grown[1]
+            @test VE.canvassize(seq)[2] > grown[2]
+
+            # Reset drops back to deriving it, and is itself undoable
+            VE.resetcanvas!(p)
+            @test seq.canvas === nothing
+
+            VE.setcropscope!(p, :canvas)
+            VE.usetool!(p, :none)
+            VE.docrestore!(p, snap0)
+            p.playhead[] = head0
+            VE.refreshedit!(p)
+            @test waitfor(() -> length(p.sequence.clips) == 1)
+        end
+
+        @testset "crop ratio lock: a fraction is not a pixel" begin
+            seq = p.sequence
+            snap0 = VE.docsnapshot(p)
+            head0 = p.playhead[]
+            clip = seq.clips[1]
+            src = clip.source
+
+            # The bug this guards: a crop is a fraction OF THE SOURCE, so locking
+            # the fraction ratio to 16/9 gives a 16:9 output only on a square
+            # source. The ratio has to be converted through the source's pixels.
+            for a in (16 / 9, 9 / 16, 1.0)
+                x, y, w, h = VE.lockaspect((0.0, 0.0, 1.0, 1.0), src, a)
+                @test isapprox((w * src.width) / (h * src.height), a; rtol = 1e-6)
+                @test (x, y, w) == (0.0, 0.0, 1.0)   # anchor and width kept…
+            end
+            @test src.width != src.height            # …and the source is NOT square,
+                                                      # so the conversion is doing work
+
+            # End to end: picking a ratio reshapes the framing NOW, and the canvas
+            # follows in :canvas scope. Even-pixel rounding is why this is rtol and
+            # not equality.
+            p.timeline.selected[] = 1
+            p.playhead[] = clip.start
+            VE.setcropscope!(p, :canvas)
+            VE.setcropaspect!(p, 9 / 16)
+            cw, ch = VE.canvassize(seq)
+            @test isapprox(cw / ch, 9 / 16; rtol = 0.05)
+
+            # …and in :clip scope the shape changes without resizing the project
+            VE.setcropscope!(p, :clip)
+            seq.canvas = (640, 360)
+            VE.setcropaspect!(p, 1.0)
+            @test seq.canvas == (640, 360)
+            @test isapprox((clip.crop[3] * src.width) / (clip.crop[4] * src.height),
+                           1.0; rtol = 1e-6)
+
+            VE.setcropaspect!(p, nothing)
+            @test VE.cropaspect(p)[] === nothing
+            VE.setcropscope!(p, :canvas)
+            VE.usetool!(p, :none)
+            VE.docrestore!(p, snap0)
+            p.playhead[] = head0
+            VE.refreshedit!(p)
+            @test waitfor(() -> length(p.sequence.clips) == 1)
+        end
+
+        @testset "the panel rebuilds when the SEQUENCE changes, not just the clip" begin
+            # `effsig` reads the CLIP and only the clip, which was right while the
+            # panel showed clip effects and nothing else. It now hosts Narration,
+            # Transcript, Crop and Time interpolation, which read the SEQUENCE — so
+            # the signature never changed when they did, `rebuildstack` returned
+            # early, and a narration line you had just typed did not appear on the
+            # card that added it. A screenshot found this; no assertion did.
+            seq = p.sequence
+            clip = seq.clips[1]
+            empty!(seq.captions); empty!(seq.narration)
+            before = VE.docsig(seq, clip)
+
+            push!(seq.captions, VE.Caption(0.0, 1.0, "hello"))
+            @test VE.docsig(seq, clip) != before        # a caption is a change…
+            empty!(seq.captions)
+            @test VE.docsig(seq, clip) == before
+
+            push!(seq.narration, VE.Narration("hi", 0.0))
+            @test VE.docsig(seq, clip) != before        # …so is a narration line
+            empty!(seq.narration)
+
+            seq.canvas = (640, 360)
+            @test VE.docsig(seq, clip) != before        # …and so is the canvas
+            seq.canvas = nothing
+            @test VE.docsig(seq, clip) == before
+
+            # …while the clip-only signature is blind to every one of them, which
+            # is precisely why it could not be the whole answer.
+            e = VE.effsig(clip)
+            push!(seq.captions, VE.Caption(0.0, 1.0, "hello"))
+            push!(seq.narration, VE.Narration("hi", 0.0))
+            seq.canvas = (640, 360)
+            @test VE.effsig(clip) == e
+            empty!(seq.captions); empty!(seq.narration); seq.canvas = nothing
+        end
+
+        @testset "a hidden panel skips rebuilds but is never stale" begin
+            # `rebuildstack` runs on EVERY playhead change and tears the stack
+            # down on every clip boundary — during playback, that is every cut,
+            # paid for cards behind a closed dock. Skipping while hidden is only
+            # safe if coming back rebuilds, which is the failure this guards.
+            seq = p.sequence
+            snap0 = VE.docsnapshot(p)
+            head0 = p.playhead[]
+            base = seq.clips[1]
+            c2 = VE.copyclip(base; start = VE.clipend(base))
+            VE.seteffect!(c2, VE.BlurEffect(3.0f0))       # …so its stack DIFFERS
+            push!(seq.clips, c2)
+            VE.refreshedit!(p)
+
+            VE.opendock!(p, :effects)
+            p.timeline.selected[] = 1
+            p.playhead[] = base.start
+            @test waitfor(() -> !("Blur" in [c.title[] for c in p.fxwidgets[:fxcards]]))
+
+            # close, move onto the OTHER clip while nothing is watching, reopen
+            VE.opendock!(p, :none)
+            p.timeline.selected[] = 2
+            p.playhead[] = c2.start + 1
+            VE.opendock!(p, :effects)
+            @test waitfor(() -> "Blur" in [c.title[] for c in p.fxwidgets[:fxcards]])
+
+            deleteat!(seq.clips, findfirst(c -> c === c2, seq.clips))
+            VE.docrestore!(p, snap0)
+            p.playhead[] = head0
+            VE.refreshedit!(p)
+            @test waitfor(() -> length(p.sequence.clips) == 1)
+        end
+
+        @testset "the tool-only cards actually render" begin
+            # What the four `registertool!` tools needed and did not have. The
+            # panel builds cards from `clip.effects`; a kind with no `make` has no
+            # effect to hang one on, so Crop, Transcript, Narration and Time
+            # interpolation were dead UI — while four tests passed by asserting
+            # only that the KIND was registered. A registered kind nobody can see
+            # is not a feature, so this asserts on the card titles instead.
+            VE.opendock!(p, :effects)
+            p.timeline.selected[] = 1
+            p.playhead[] = p.sequence.clips[1].start
+            VE.refreshedit!(p)
+            p.fxwidgets[:fxlistrefresh]()
+            titles() = [c.title[] for c in p.fxwidgets[:fxcards]]
+            for want in ("Crop", "Transcript", "Narration", "Time interpolation")
+                @test waitfor(() -> want in titles())
+            end
+            # …and each is a kind with a body and no `make`, which is the shape
+            # `toolonlykinds` selects on — if one grows a `make` it becomes a
+            # normal effect card and belongs in the loop above instead.
+            names = [k.name for k in VE.toolonlykinds()]
+            @test Set(names) == Set([:crop, :transcript, :narration, :timeinterp])
+        end
+
+        @testset "an outward crop survives all the way to the exported file" begin
+            # The end of every job, and the place TODO #8 would matter most: a
+            # crop that reaches OUTSIDE the picture has to grow the delivered
+            # file, not just the preview, and the new area has to come out empty
+            # rather than as stretched picture. Nothing tested the export against
+            # an unclamped crop.
+            src = p.sequence.clips[1].source
+            clip = VE.Clip(src, 0, 12, 0, (-0.25, -0.25, 1.5, 1.5), 1.0)
+            seq = VE.Sequence([clip], 30.0)
+            cw, ch = VE.canvassize(seq)
+            @test cw > src.width && ch > src.height        # it GREW
+
+            out = joinpath(mktempdir(), "outward.mp4")
+            VE.exportvideo(out, seq)
+            rd = VE.VideoIO.openvideo(out); f = VE.VideoIO.read(rd); close(rd)
+            # `size` is (h, w); `canvassize` is (w, h). Not a transposition bug —
+            # checking the wrong way round is how it first looked like one.
+            @test size(f) == (ch, cw)
+            @test VE.ColorTypes.red(f[1, 1]) == 0          # the new area is empty…
+            @test VE.ColorTypes.green(f[1, 1]) == 0        # …letterbox, not picture
+
+            # …and an explicit canvas beats whatever clip 1 would have implied
+            seq.canvas = (640, 360)
+            out2 = joinpath(mktempdir(), "explicit.mp4")
+            VE.exportvideo(out2, seq)
+            rd2 = VE.VideoIO.openvideo(out2); f2 = VE.VideoIO.read(rd2); close(rd2)
+            @test size(f2) == (360, 640)
+        end
+
+        @testset "a long matte is file-backed, not resident" begin
+            # The alpha is width*height*length bytes and grows with the SHOT —
+            # measured 3.5 GB a minute at 1080p, 17 GB for five. Holding all of it
+            # resident was a STORAGE choice, not a requirement: the propagator
+            # writes forward once and the renderer reads a single frame. Refusing
+            # big mattes with a guard treated the symptom; backing them with a file
+            # removes the reason for one.
+            src = p.sequence.clips[1].source
+            short = VE.Clip(src, 0, 60, 0, (0.0, 0.0, 1.0, 1.0), 1.0)
+            @test VE.mattebytes(short) == src.width * src.height * 60
+
+            # Small stays a plain heap array — the mapping is not worth its own cost
+            small = VE.mattebuffer(64, 64, 10)
+            @test small isa Array{UInt8, 3}
+            @test 64 * 64 * 10 <= VE.MATTEINRAM
+
+            # …and past the threshold it is file-backed while staying the SAME
+            # type, which is what lets `MatteTrack` and every reader be unchanged.
+            dims = (256, 256, 4608)                     # 288 MB: PAST it, not exactly on it
+            @test prod(dims) > VE.MATTEINRAM
+            big = VE.mattebuffer(dims...)
+            @test big isa Array{UInt8, 3}
+            @test size(big) == dims
+            big[1, 1, 1] = 0x7f; big[end, end, end] = 0x2a
+            @test big[1, 1, 1] == 0x7f && big[end, end, end] == 0x2a
+
+            # NOT on a tmpfs: /tmp here is RAM with a path, so backing an
+            # "avoid holding it resident" buffer there defeats the whole point.
+            @test !startswith(VE.mattescratch(), "/tmp")
+            @test isdir(VE.mattescratch())
+            @test VE.clearmattescratch!() isa Integer   # sweeps dead processes' files
+        end
+
+        @testset "a ripple delete carries the captions and the narration" begin
+            # Cutting anything is mostly ripple deletes, and these two are pinned
+            # to the PICTURE. Leaving them at absolute seconds while the clips
+            # after the cut moved earlier desynced the whole back half of the edit
+            # on the first trim.
+            seq = p.sequence
+            snap0 = VE.docsnapshot(p)
+            head0 = p.playhead[]
+            fps = seq.framerate
+            base = VE.copyclip(seq.clips[1]; start = VE.clipend(seq.clips[1]))
+            push!(seq.clips, base)
+            first_len = VE.cliplength(seq.clips[1]) / fps
+
+            empty!(seq.captions); empty!(seq.narration)
+            push!(seq.captions, VE.Caption(0.1, 0.4, "before the cut"))
+            push!(seq.captions, VE.Caption(first_len + 0.5, first_len + 0.9, "after it"))
+            push!(seq.narration, VE.Narration("spoken after", first_len + 0.5))
+            append!(seq.narration[1].samples, fill(0.5f0, 64))
+            seq.narration[1].rate = 24_000
+
+            VE.deleteclip!(seq, seq.clips[1])          # ripple: everything after moves up
+            @test seq.captions[1].text == "before the cut"
+            @test seq.captions[1].start == 0.1          # …ahead of the cut: untouched
+            @test seq.captions[2].text == "after it"
+            @test seq.captions[2].start ≈ 0.5           # …behind it: moved with the picture
+            @test seq.captions[2].stop ≈ 0.9
+            @test seq.narration[1].at ≈ 0.5
+            @test length(seq.narration[1].samples) == 64  # the words did not change
+
+            empty!(seq.captions); empty!(seq.narration)
+            VE.docrestore!(p, snap0)
+            p.playhead[] = head0
+            VE.refreshedit!(p)
+            @test waitfor(() -> length(p.sequence.clips) == 1)
+        end
+
+        @testset "a split carries the matte marks to both halves" begin
+            # Both stores are keyed by CLIP ID and every way of making a second
+            # clip from one hands it a fresh id. The alpha comes along, so the
+            # picture stays right and only re-running breaks — the split half met
+            # an empty mark store and refused to propagate.
+            seq = p.sequence
+            snap0 = VE.docsnapshot(p)
+            head0 = p.playhead[]
+            left = seq.clips[1]
+            VE.mattemarks(p, left)[left.src_in] = fill(0x22, 8, 6)
+            VE.matterepairs(p, left)[left.src_in + 1] = fill(0x33, 8, 6)
+
+            p.timeline.selected[] = 1
+            p.playhead[] = left.start + VE.cliplength(left) ÷ 2
+            VE.split!(p)
+            @test length(seq.clips) == 2
+            right = seq.clips[2]
+            @test right.id != left.id                     # a fresh id, as always…
+            @test haskey(VE.mattemarks(p, right), left.src_in)     # …but the marks followed
+            @test haskey(VE.matterepairs(p, right), left.src_in + 1)
+            @test all(==(0x22), VE.mattemarks(p, right)[left.src_in])
+
+            empty!(VE.mattemarks(p, left)); empty!(VE.matterepairs(p, left))
+            VE.docrestore!(p, snap0)
+            p.playhead[] = head0
+            VE.refreshedit!(p)
+            @test waitfor(() -> length(p.sequence.clips) == 1)
+        end
+
+        @testset "matte repairs survive save and reopen" begin
+            # Invisible without this: the repaired PIXELS live in the alpha
+            # sidecar, so a reopened project looked right. What was lost was the
+            # RECORD — so the repair cards were gone, and the next `runmatte!`
+            # rebuilt from the seeds and silently discarded every fix.
+            clip = p.sequence.clips[1]
+            snap0 = VE.docsnapshot(p)
+            p.timeline.selected[] = 1
+            p.playhead[] = clip.start
+            clip.mattetrack = VE.MatteTrack(fill(0x00, 8, 6, 40), clip.src_in)
+            empty!(VE.matterepairs(p, clip))
+            VE.matterepairs(p, clip)[3] = fill(0xff, 8, 6)
+            VE.matterepairs(p, clip)[7] = fill(0x40, 8, 6)
+
+            dir = mktempdir()
+            proj = joinpath(dir, "reps.vproj")
+            VE.saveproject(proj, p)                    # the PLAYER method, not the sequence one
+            @test isfile(VE.repairfile(proj, clip.id))
+
+            # Clear them as a reopen would, then read them back off the sidecar
+            empty!(VE.matterepairs(p, clip))
+            @test isempty(VE.matterepairs(p, clip))
+            VE.loadrepairs!(p, proj)
+            reps = VE.matterepairs(p, clip)
+            @test Set(keys(reps)) == Set([3, 7])
+            @test all(==(0xff), reps[3])
+            @test all(==(0x40), reps[7])
+            @test size(reps[3]) == (8, 6)
+
+            # The MARKS ride the same sidecar, and losing them was worse:
+            # `runmatte!` propagates from them, so a reopened matte could not be
+            # re-run at all — "Apply matte to clip" met an empty store and refused.
+            VE.mattemarks(p, clip)[2] = fill(0x11, 8, 6)
+            VE.saveproject(proj, p)
+            empty!(VE.mattemarks(p, clip))
+            VE.loadrepairs!(p, proj)
+            @test haskey(VE.mattemarks(p, clip), 2)
+            @test all(==(0x11), VE.mattemarks(p, clip)[2])
+
+            # A checkpoint carries the JSON and NOT the `.mattes` directory, so
+            # restoring one must leave the session's marks alone rather than clear
+            # them and put nothing back.
+            @test !isdir(VE.mattedir(joinpath(dir, "no-such-checkpoint.vproj")))
+
+            empty!(VE.matterepairs(p, clip)); empty!(VE.mattemarks(p, clip))
+            clip.mattetrack = nothing
+            VE.docrestore!(p, snap0)
+        end
+
+        @testset "a finished matte can still be marked again" begin
+            # The door that locked behind you: "Mark subject" is gated on there
+            # being NO matte, and "Fix this frame only" needs a marking session to
+            # already exist — so once a matte was applied, nothing on the card, no
+            # shortcut and no palette entry started marking again. That is exactly
+            # the case the repair flow was built for.
+            clip = p.sequence.clips[1]
+            snap0 = VE.docsnapshot(p)
+            p.timeline.selected[] = 1
+            p.playhead[] = clip.start
+            clip.mattetrack = VE.MatteTrack(fill(0x00, 8, 6, 40), clip.src_in)
+            VE.showkind!(p, :matte)
+            @test waitfor(() -> haskey(p.fxwidgets[:toolpanels], :matte))
+            pctx = p.fxwidgets[:toolpanels][:matte]
+            # an action that starts marking, with a matte already on the clip
+            @test !isempty(pctx.callbacks)
+            clip.mattetrack = nothing
+            VE.docrestore!(p, snap0)
+            VE.refreshedit!(p)
+        end
+
+        @testset "the new actions are reachable from the keyboard" begin
+            # The palette IS this editor's keyboard route — that is why every edit
+            # operation registers one. Everything added this session was
+            # mouse-only, so walking a transcript, resetting the project canvas or
+            # picking a focus point could not be done without hunting for a card.
+            seq = p.sequence
+            cmds = Dict(c.name => c for c in VE.commands(p))
+            for name in (:next_caption, :prev_caption, :reset_canvas, :pick_focus)
+                @test haskey(cmds, name)
+            end
+            # …and each says WHY it is unavailable rather than failing silently
+            empty!(seq.captions)
+            @test cmds[:next_caption].enabled(p) isa String
+            push!(seq.captions, VE.Caption(0.0, 1.0, "hello"))
+            @test cmds[:next_caption].enabled(p) === true
+            empty!(seq.captions)
+
+            seq.canvas = nothing
+            @test cmds[:reset_canvas].enabled(p) isa String   # nothing to reset
+            seq.canvas = (640, 360)
+            @test cmds[:reset_canvas].enabled(p) === true
+            seq.canvas = nothing
+        end
+
+        @testset "every edit operation is in the palette" begin
+            # Copy/paste were Ctrl+C/Ctrl+V and nothing else — the only edit
+            # operations with no palette entry. That hides them from a mouse user
+            # entirely, and hides the SHORTCUT from everyone, since the palette is
+            # where a key is learned.
+            names = [c.name for c in VE.commands(p)]
+            @test :copy_clips in names
+            @test :paste_clips in names
+            cmds = Dict(c.name => c for c in VE.commands(p))
+            @test cmds[:copy_clips].shortcut == "Ctrl+C"
+            @test cmds[:paste_clips].shortcut == "Ctrl+V"
+            # Paste says WHY it is off rather than being silently dead
+            empty!(p.clipboard)
+            @test cmds[:paste_clips].enabled(p) isa String
+        end
+
+        @testset "a narration line can be reworded and re-timed" begin
+            seq = p.sequence
+            snap0 = VE.docsnapshot(p)
+            head0 = p.playhead[]
+            empty!(seq.narration)
+            push!(seq.narration, VE.Narration("frist post", 0.0, "af_heart"))
+            append!(seq.narration[1].samples, fill(0.25f0, 100))
+            seq.narration[1].rate = 24_000
+
+            # Rewording REPLACES and un-renders: the samples are a cache of the
+            # words, and audio that says the old line is worse than none.
+            VE.setnarrationtext!(p, 1, "first post")
+            @test seq.narration[1].text == "first post"
+            @test isempty(seq.narration[1].samples)
+            @test seq.narration[1].at == 0.0             # …and the timing survives
+
+            # Moving KEEPS the audio — the words did not change, so re-synthesizing
+            # would cost seconds to produce the same sound.
+            append!(seq.narration[1].samples, fill(0.25f0, 100))
+            p.playhead[] = 30
+            VE.movenarration!(p, 1)
+            @test seq.narration[1].at ≈ 30 / seq.framerate
+            @test length(seq.narration[1].samples) == 100
+            @test seq.narration[1].text == "first post"
+
+            # Changing the VOICE un-renders too: the samples cache the words AND
+            # who says them, so keeping them would leave a card claiming one voice
+            # over audio in another.
+            append!(seq.narration[1].samples, fill(0.25f0, 100))
+            VE.setnarrationvoice!(p, 1, "am_michael")
+            @test seq.narration[1].voice == "am_michael"
+            @test isempty(seq.narration[1].samples)
+            @test seq.narration[1].text == "first post"     # …and the words survive
+            VE.setnarrationvoice!(p, 1, "am_michael")       # same voice: a no-op
+            @test seq.narration[1].voice == "am_michael"
+
+            # With no synthesizer installed there are no voices to offer, and the
+            # panel draws no menu rather than an empty one.
+            @test VE.speakvoices() isa Vector{String}
+
+            empty!(seq.narration)
+            VE.docrestore!(p, snap0)
+            p.playhead[] = head0
+        end
+
+        @testset "the transcript can be walked line by line" begin
+            seq = p.sequence
+            snap0 = VE.docsnapshot(p)
+            head0 = p.playhead[]
+            empty!(seq.captions)
+            append!(seq.captions, [VE.Caption(0.0, 1.0, "one"),
+                                   VE.Caption(1.0, 2.0, "two"),
+                                   VE.Caption(2.0, 3.0, "three")])
+            # From a gap, forward goes to the FIRST line and back to the LAST, so
+            # the buttons do something useful wherever the playhead happens to be.
+            p.playhead[] = round(Int, 9.0 * seq.framerate)
+            VE.gotocaption!(p, 1)
+            @test VE.captionindexat(seq, p.playhead[]) == 1
+            VE.gotocaption!(p, 1)
+            @test VE.captionindexat(seq, p.playhead[]) == 2
+            VE.gotocaption!(p, -1)
+            @test VE.captionindexat(seq, p.playhead[]) == 1
+            VE.gotocaption!(p, -1)                       # clamps, does not wrap
+            @test VE.captionindexat(seq, p.playhead[]) == 1
+
+            empty!(seq.captions)
+            VE.docrestore!(p, snap0)
+            p.playhead[] = head0
+        end
+
+        @testset "undo puts a narration back" begin
+            seq = p.sequence
+            snap0 = VE.docsnapshot(p)
+            push!(seq.narration, VE.Narration("undo me", 0.0, "af_heart"))
+            @test length(seq.narration) == 1
+            VE.docrestore!(p, snap0)
+            @test isempty(seq.narration)              # …and not a line of it left
+        end
+
+        @testset "a matte repair is visible and droppable" begin
+            clip = p.sequence.clips[1]
+            reps = VE.matterepairs(p, clip)
+            @test isempty(reps)
+
+            # A repair with no matte to repair must decline, not half-apply
+            clip.mattetrack === nothing &&
+                @test !VE.repairmatteat!(p, fill(0xff, 4, 4))
+            @test isempty(VE.matterepairs(p, clip))
+
+            # With a track, the repair is recorded so the panel can show it — the
+            # point of the record: a fixed frame you cannot see or undo is not a
+            # feature, and a full re-run would silently discard it.
+            clip.mattetrack = VE.MatteTrack(fill(0x00, 8, 6, 40), clip.src_in)
+            snap0 = VE.docsnapshot(p)
+            # `repairmatteat!` repairs the clip being EDITED, and `editclip` wants
+            # it selected with the playhead inside it — the same precondition every
+            # other clip operation has.
+            p.timeline.selected[] = 1
+            p.playhead[] = clip.start; sleep(0.2)
+            @test VE.repairmatteat!(p, fill(0xff, 8, 6))
+            reps = VE.matterepairs(p, clip)
+            @test length(reps) == 1
+            sf = first(keys(reps))
+            @test all(==(0xff), VE.matteframe(clip, sf))     # the pixels changed
+
+            VE.dropmatterepair!(p, clip, sf)                 # …and the record drops
+            @test isempty(VE.matterepairs(p, clip))
+
+            clip.mattetrack = nothing
+            VE.docrestore!(p, snap0)
+            empty!(VE.matterepairs(p, clip))
+        end
+
+        @testset "narration and focus-pick are reachable, not just callable" begin
+            # The gap these close: `narrate!` and the focus parameter existed with
+            # NO way for a user to reach them — plumbing with no door.
+            names = [k.name for k in VE.toolkinds()]
+            @test :narration in names
+            @test :transcript in names
+            @test :timeinterp in names        # flow was command-only and invisible
+
+            # Focus-picking is NOT its own tool: it is an action on the Depth blur
+            # card, next to the sliders it sets. Two cards for one feature made the
+            # user work out that they were related.
+            kinds = [k.name for k in VE.effectkinds()]
+            @test :depthblur in kinds
+            @test :look in kinds              # …and both are addable from the menu
+            @test :depthblur in [k.name for k in VE.addablekinds()]
+            @test :look in [k.name for k in VE.addablekinds()]
+            @test !(:depthfocus in names)
+
+            seq = p.sequence
+            snap0 = VE.docsnapshot(p)
+            @test isempty(seq.narration)
+            # Dropping a line by index, and refusing an index that is not there
+            push!(seq.narration, VE.Narration("one", 0.0))
+            push!(seq.narration, VE.Narration("two", 1.0))
+            VE.dropnarration!(p, 1)
+            @test length(seq.narration) == 1 && seq.narration[1].text == "two"
+            VE.dropnarration!(p, 99)                       # out of range: a no-op
+            @test length(seq.narration) == 1
+            empty!(seq.narration)
+
+            # Focus-pick declines cleanly with no depth rather than arming a
+            # click that would then fail on the preview.
+            clip = seq.clips[1]
+            clip.depthtrack = nothing
+            # `pickfocus!` acts on the clip being EDITED, so select it — otherwise
+            # it declines for the wrong reason ("no clip under the playhead") and
+            # the test passes or fails on the wrong branch.
+            p.timeline.selected[] = 1
+            p.playhead[] = clip.start
+            VE.pickfocus!(p)
+            @test p.onpick === nothing
+            # `setstatus!` PUTS ON A QUEUE — reading `p.status[]` on the next line
+            # reads whatever the previous testset left there.
+            @test waitfor(() -> occursin("depth", p.status[]))
+
+            clip.depthtrack = VE.DepthTrack(fill(0x80, 8, 6, 40), clip.src_in)
+            VE.pickfocus!(p)
+            @test p.onpick !== nothing                     # armed
+            p.onpick = nothing
+            # setinterp! is undoable and a no-op when nothing changes — the card
+            # is redrawn constantly, so a toggle that always snapshotted would
+            # fill the undo stack with edits that changed nothing.
+            @test clip.timeinterp === :sample
+            n0 = length(p.undostack)
+            VE.setinterp!(p, clip, :sample)
+            @test length(p.undostack) == n0
+            VE.setinterp!(p, clip, :flow)
+            @test clip.timeinterp === :flow
+            @test length(p.undostack) == n0 + 1
+            VE.setinterp!(p, clip, :sample)
+
+            clip.depthtrack = nothing
+            VE.docrestore!(p, snap0)
+        end
+
+        @testset "the matte brush has a size you can see and change" begin
+            # Painting with a fixed, invisible radius is guesswork — the gesture
+            # exists but you cannot tell where the brush is or how big.
+            @test p.brushradius ≈ 0.04
+            r0 = p.brushradius
+            keypress(Keyboard.right_bracket); sleep(0.1)
+            @test p.brushradius > r0
+            keypress(Keyboard.left_bracket); sleep(0.1)
+            @test p.brushradius ≈ r0                    # ] then [ returns
+            # Geometric, so one key is the same PROPORTION at any size: a fixed
+            # step is half the brush at 1% and nothing at 20%.
+            p.brushradius = 0.004
+            keypress(Keyboard.left_bracket); sleep(0.1)
+            @test p.brushradius ≈ 0.004                 # clamped, not below
+            p.brushradius = 0.4
+            keypress(Keyboard.right_bracket); sleep(0.1)
+            @test p.brushradius ≈ 0.4                   # …and not above
+            p.brushradius = 0.04
+
+            # The kernel honours the radius it is given, so the cursor and the
+            # stroke cannot disagree about size.
+            m = zeros(UInt8, 200, 200)
+            VE.brushmatte!(m, 0.5, 0.5, true; radius = 0.05)
+            small = count(==(0xff), m)
+            fill!(m, 0x00)
+            VE.brushmatte!(m, 0.5, 0.5, true; radius = 0.10)
+            @test count(==(0xff), m) > 3 * small        # ~4x the area
         end
 
         @testset "export dock panel renders the timeline" begin
@@ -1450,7 +2479,11 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
                                  c !== nothing && !isempty(c[3])); s = 15)
             cards = get(p.fxwidgets, :toolcards, nothing)
             for c in cards[3]
-                c[5] === nothing || c[5](c[1])           # onclick(id)
+                # BY FIELD, not by position. This read `c[5](c[1])`, so appending a
+                # field to the entry silently turned `onclick` into a `Label` and
+                # the loop called it — the entry is named precisely so this cannot
+                # happen, and reading it positionally gave that up.
+                c.onclick === nothing || c.onclick(c.id)
             end
             @test true                                    # got here without throwing
         end
