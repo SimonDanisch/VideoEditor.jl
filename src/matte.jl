@@ -541,7 +541,7 @@ seed, running backwards in time — and the two halves are stitched at the seed.
 function propagateboth(prop, frames::AbstractVector, seeds::Dict{Int, <:AbstractMatrix},
                        mw::Integer, mh::Integer, n::Integer, progress)
     k = minimum(keys(seeds))
-    alpha = Array{UInt8}(undef, mw, mh, n)
+    alpha = mattebuffer(mw, mh, n)
     # total work: the tail plus the prefix, once each. That is `n + 1`, not `n`
     # — the seed frame is propagated by both halves — and reporting it against
     # `n` used to walk the bar slightly past its own end on a mid-clip seed.
@@ -871,6 +871,106 @@ mattereadsize(clip::Clip, maxside::Union{Nothing,Integer}) =
     mattereadsize(mattelayersize(clip), maxside)
 mattereadsize(frame::AbstractMatrix, maxside::Union{Nothing,Integer}) =
     mattereadsize(size(frame), maxside)
+
+"""
+    mattebytes(clip, maxside = nothing) -> Int
+
+How big this clip's alpha will be — `width * height * srclength` bytes.
+
+Reported rather than enforced. It grows with the SHOT: 3.5 GB a minute at 1080p,
+17 GB for five. Worth showing on the button that spends it, which is why the
+matte card prints it past a gigabyte.
+"""
+mattebytes(clip::Clip, maxside::Union{Nothing,Integer} = nothing) =
+    (sz = mattereadsize(clip, maxside); sz[1] * sz[2] * max(srclength(clip), 0))
+
+"""
+Above this, a matte's alpha is FILE-BACKED rather than resident.
+
+256 MB: below it the mapping's own cost is not worth paying, above it the
+resident footprint is what stops a long shot being mattable at all.
+"""
+const MATTEINRAM = 256 * 2^20
+
+"""
+Where this process keeps its file-backed matte buffers.
+
+**Not `mktempdir()`.** That follows `TMPDIR`, and `/tmp` here is a tmpfs — RAM
+with a path. Backing an "avoid holding gigabytes resident" buffer with RAM is
+exactly backwards, and writing a 4 GB alpha into it filled the filesystem and
+took the shell down with it. The Julia depot's scratch space is on real disk,
+which is the only property this needs.
+
+A per-process subdirectory, and NOT one `prunecache!` manages: that one deletes
+least-recently-used files to stay under a budget, and pulling the file out from
+under a LIVE mapping is not a risk worth taking. `atexit` removes it; a crash
+leaves one behind, which `clearmattescratch!` sweeps on the next start.
+"""
+const MATTESCRATCH = Ref{String}("")
+
+function mattescratch()
+    if isempty(MATTESCRATCH[])
+        dir = joinpath(cachedir("matte_alpha"), string(getpid()))
+        isdir(dir) || mkpath(dir)
+        MATTESCRATCH[] = dir
+        atexit(() -> rm(dir; recursive = true, force = true))
+    end
+    return MATTESCRATCH[]
+end
+
+"""
+    clearmattescratch!() -> Int
+
+Delete matte buffers left by processes that are no longer running, returning how
+many bytes went.
+
+A mapping's backing file is only garbage once its process is gone, so the sweep
+is keyed on the PID in the directory name rather than on age — an
+age-based prune would eventually delete the file under a long-running session's
+own live matte.
+"""
+function clearmattescratch!()
+    root = cachedir("matte_alpha")
+    freed = 0
+    for name in readdir(root; join = true)
+        isdir(name) || continue
+        pid = tryparse(Int, basename(name))
+        (pid === nothing || pid == getpid()) && continue
+        # `/proc/<pid>` rather than a signal probe: a plain directory test, so
+        # there is nothing to throw and nothing to swallow.
+        isdir("/proc/$pid") && continue
+        for f in readdir(name; join = true)
+            freed += filesize(f)
+        end
+        rm(name; recursive = true, force = true)
+    end
+    return freed
+end
+
+"""
+    mattebuffer(mw, mh, n) -> Array{UInt8, 3}
+
+Storage for an alpha: a plain array when it is small, a file-backed one when it
+is not.
+
+Holding the whole clip resident was a STORAGE decision, never a requirement. The
+propagator writes forward, once; the renderer reads one frame. Nothing needs all
+of it at the same time, and pretending otherwise is what made a five-minute 1080p
+shot (17 GB) unmattable on a 31 GB machine.
+
+`Mmap.mmap` hands back an `Array{UInt8, 3}` — precisely the type `MatteTrack`
+already declares — so no reader, no kernel and no save path changes. What changes
+is that the resident set becomes the pages actually touched, and the kernel
+reclaims them under pressure instead of the process dying.
+"""
+function mattebuffer(mw::Integer, mh::Integer, n::Integer)
+    dims = (Int(mw), Int(mh), Int(n))
+    prod(dims) <= MATTEINRAM && return Array{UInt8}(undef, dims)
+    io = open(joinpath(mattescratch(), string(hash(dims), "-", time_ns(), ".alpha")), "w+")
+    a = Mmap.mmap(io, Array{UInt8, 3}, dims)
+    close(io)          # the mapping outlives the handle
+    return a
+end
 
 function mattereadsize(layer::Tuple{Integer,Integer}, maxside::Union{Nothing,Integer})
     w, h = layer

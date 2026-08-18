@@ -71,11 +71,17 @@ into; by the time any body runs it holds the frame the source really delivered.
 mutable struct FxState
     source::Any
     decoded::Any                      # what `decodesource` handed back
+    # The frame AFTER `decoded`, and how far between them this timeline frame
+    # sits. Both are only set for a clip whose time interpolation is `:flow`;
+    # `phase == 0` means this frame lands exactly on a source frame and nothing
+    # has to be synthesized.
+    decoded2::Any
+    phase::Float64
     clip::Any
     frame::Int
     served::Base.RefValue{Int}
 end
-FxState() = FxState(nothing, nothing, nothing, 0, Ref(0))
+FxState() = FxState(nothing, nothing, nothing, 0.0, nothing, 0, Ref(0))
 
 """
 The 2-D view a kernel gets over a resource's 1-D storage — a transient's arena
@@ -133,6 +139,16 @@ fxkind(e::OpacityEffect) = (a = e.α; Pointwise((c, uv) -> c * a))
 abstract type FxNode end
 
 struct SourceNode <: FxNode end                                      # the decoded frame
+
+"""
+The source pass for a clip whose time interpolation is `:flow`: the frame is
+SYNTHESIZED between the two the decoder produced, at [`sourcephase`](@ref).
+
+A node rather than an effect because it changes what the source IS, before any
+effect runs — the same category as `rate`, and for the same reason it cannot be
+one: an effect sees one frame and this needs two.
+""" 
+struct SmoothSourceNode <: FxNode end
 struct MotionNode <: FxNode; input::Int; end                         # stabilization warp
 struct ColorTrackNode <: FxNode                                      # per-frame color stabilization
     input::Int
@@ -353,6 +369,39 @@ function chainpass!(g, ::SourceNode, ::Nothing, ctx::ChainBuild, dims)
     return cur
 end
 
+"""
+The optical-flow source pass. Two decoded frames in, one synthesized frame out.
+
+Falls back to the plain conversion whenever there is nothing to synthesize — the
+phase is zero (this timeline frame lands exactly on a source frame), the next
+frame could not be decoded (the clip's last), or no interpolator is installed.
+That fallback is not an error path: half of a slowed clip's frames land exactly
+on a source frame and must be shown as they are.
+"""
+function chainpass!(g, ::SmoothSourceNode, ::Nothing, ctx::ChainBuild, dims)
+    cur = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
+    fa  = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
+    fb  = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
+    st = ctx.state
+    Mantle.custom!(g, "source-flow") do p
+        Mantle.use(p, cur; write = true)
+        Mantle.use(p, fa; read = true, write = true)
+        Mantle.use(p, fb; read = true, write = true)
+        () -> begin
+            d = frameview(cur, dims)
+            if st.phase <= 0.0 || st.decoded2 === nothing || !hasinterpolator()
+                sourceinto!(d, st.source, st.decoded)
+            else
+                a, b = frameview(fa, dims), frameview(fb, dims)
+                sourceinto!(a, st.source, st.decoded)
+                sourceinto!(b, st.source, st.decoded2)
+                INTERPOLATOR[](d, a, b, st.phase)
+            end
+        end
+    end
+    return cur
+end
+
 function chainpass!(g, ::MotionNode, pr, cur, ctx::ChainBuild, dims)
     tmp = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
     st = ctx.state
@@ -434,6 +483,45 @@ function chainpass!(g, n::DepthBlurNode, pr, cur, ctx::ChainBuild, dims)
     return dst
 end
 
+"""
+The learned grade's node. `dim` is the LUT's edge length and is part of the plan
+signature, because the graph reserves a buffer of exactly `dim^3 * 3` floats — a
+clip graded at another table size needs its own plan, not one holding a buffer of
+the wrong size.
+"""
+struct LookNode <: FxNode
+    input::Int
+    strength::Float32
+    dim::Int
+end
+planeshape(n::LookNode) = (n.dim, n.dim)
+
+function chainpass!(g, n::LookNode, pr, cur, ctx::ChainBuild, dims)
+    key = (:lut, n.dim)
+    sl = slot!(ctx.store, key, Float32, n.dim^3 * 3)
+    dst = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
+    st = ctx.state
+    Mantle.custom!(g, "look") do p
+        Mantle.use(p, cur; read = true)
+        Mantle.use(p, dst; write = true)
+        Mantle.use(p, sl.buf; read = true)
+        () -> begin
+            d, c = frameview(dst, dims), frameview(cur, dims)
+            lut = st.clip.look
+            # No look on the clip is not an error — the effect may sit in the
+            # stack while the analysis has not run, exactly as the matte's does.
+            # The picture still has to reach `dst` or the rest of the chain reads
+            # a buffer nothing wrote.
+            if lut === nothing || size(lut, 1) != n.dim
+                copyto!(d, c)
+            else
+                applylook!(d, c, loadlut!(ctx.store, key, lut), pr[].strength)
+            end
+        end
+    end
+    return dst
+end
+
 function chainpass!(g, ::ColorNode, pr, cur, ctx::ChainBuild, dims)
     Mantle.custom!(g, "colour") do p
         Mantle.use(p, cur; read = true, write = true)
@@ -502,6 +590,11 @@ nodefor(::StabilizeEffect, input, clip) =
 nodefor(e::FlickerEffect, input, clip) =
     clip.colortrack === nothing ? nothing : ColorTrackNode(input, e.strength)
 nodefor(e::RestoreEffect, input, clip) = planenode(RestoreOp(e.strength), input, clip)
+function nodefor(e::LookEffect, input, clip)
+    d = lookdim(clip)
+    return d === nothing ? nothing : LookNode(input, e.strength, d)
+end
+
 function nodefor(e::DepthBlurEffect, input, clip)
     op = DepthBlurOp(e.focus, e.strength)
     sh = planeshape(op, clip)
@@ -541,7 +634,11 @@ Neutral effects are dropped. `applytracks = false` is the hold-to-compare bypass
 it shows the ORIGINAL frame, so it skips the effect stack too, not just the tracks.
 """
 function graphof(clip::Clip; applytracks::Bool = true)
-    nodes = FxNode[SourceNode()]
+    # Frame sampling repeats a source frame when the clip is slowed; optical flow
+    # synthesizes the frame in between. The choice belongs to the CLIP, like
+    # `rate`, and is read here so the plan signature carries it — the two produce
+    # different graphs and must not share a compiled chain.
+    nodes = FxNode[clip.timeinterp === :flow ? SmoothSourceNode() : SourceNode()]
     cur = 1
     if applytracks
         for e in liveeffects(clip)          # enabled, non-neutral entries in stack order
@@ -654,7 +751,8 @@ streaming source really serves decides which frame every per-frame result is
 sampled at — see [`decodesource`](@ref).
 """
 function runchain!(engine::FxEngine, source, clip::Clip, frame::Integer;
-                   applytracks::Bool = true, playing::Bool = false, exact::Bool = false)
+                   applytracks::Bool = true, playing::Bool = false, exact::Bool = false,
+                   phase::Real = 0.0)
     nodes = graphof(clip; applytracks).nodes
     dims = framesize(source)
     cp = get!(engine.plans, plansignature(nodes, dims, applytracks)) do
@@ -668,7 +766,21 @@ function runchain!(engine::FxEngine, source, clip::Clip, frame::Integer;
     for i in eachindex(cp.params)            # the store a changed parameter costs
         cp.params[i][] = nodes[i + 1]
     end
+    st.phase = clip.timeinterp === :flow ? Float64(phase) : 0.0
     st.decoded = decodesource(source, st.frame; playing, served = st.served, exact)
+    # The frame after it, only when one will actually be synthesized. `served` is
+    # deliberately NOT passed: this decode must not move the frame the rest of the
+    # chain was told it is rendering, and a streaming source is free to refuse.
+    # …and the frame after it, only when one will be synthesized AND one exists.
+    # The bound is checked rather than discovered: `src_out` is exclusive, so
+    # `frame + 1 < src_out` is exactly "there is a next frame in this clip". A
+    # decoder that then fails is a real fault and must surface — catching around
+    # this would turn a broken source into silently juddering playback.
+    #
+    # `served` is deliberately not passed: this decode must not move the frame the
+    # rest of the chain was told it is rendering.
+    st.decoded2 = (st.phase > 0.0 && st.frame + 1 < clip.src_out) ?
+        decodesource(source, st.frame + 1; playing, exact) : nothing
     for b in cp.planes                       # `served` is settled: the planes can be written
         loadplane!(engine.store, b, clip, st.served[])
     end
@@ -802,8 +914,9 @@ returned rather than the image because the compositor needs its matte plane too;
 both are valid until the same plan runs again, so compose before then.
 """
 function renderlayer!(engine::FxEngine, lclip::Clip, srcframe::Integer, source;
-                      applytracks::Bool = true, playing::Bool = false, exact::Bool = false)
-    cp = runchain!(engine, source, lclip, srcframe; applytracks, playing, exact)
+                      applytracks::Bool = true, playing::Bool = false, exact::Bool = false,
+                      phase::Real = 0.0)
+    cp = runchain!(engine, source, lclip, srcframe; applytracks, playing, exact, phase)
     cropaway!(chainimage(cp), lclip.crop)
     return cp
 end
@@ -843,7 +956,8 @@ function composite(f, engine::FxEngine, clips, n::Integer, sourcefor;
         source = sourcefor(clip, srcframe)
         source === nothing && return false
         lclip = withoutopacity(effectiveclip(clip, srcframe))
-        cp = renderlayer!(engine, lclip, srcframe, source; applytracks, playing, exact)
+        cp = renderlayer!(engine, lclip, srcframe, source; applytracks, playing, exact,
+                          phase = sourcephase(clip, n))
         layer = chainimage(cp)
         α = Float32(clamp(paramvalue(clip, :opacity, srcframe), 0.0, 1.0))
         # COVERAGE, per pixel: white where this layer is opaque, black where

@@ -321,6 +321,34 @@ registereffect!(EffectKind(:sharpen, "Sharpen";
     matches = e -> e isa SharpenEffect,
     read = e -> (sharpen = Float64(e.amount),)))
 
+# ONE card, not two. The sliders and the "click what should be sharp" action are
+# the same feature — `EffectKind` carries `params` AND `activate`, so splitting
+# them into an effect plus a tool would put two cards on the clip for one thing
+# and leave the user to work out that they are related.
+registereffect!(EffectKind(:depthblur, "Depth blur";
+    description = "Defocus by distance from a focus plane, against estimated depth. " *
+                  "Focus is a DEPTH and nothing on screen is labelled with one, so " *
+                  "click the picture to set it to whatever you clicked.",
+    params = [FxParam(:focus, "Focus"; min = 0.0, max = 1.0, default = 1.0),
+              FxParam(:defocus, "Defocus"; min = 0.0, max = 1.0, default = 0.6)],
+    make = nt -> DepthBlurEffect(Float32(nt.focus), Float32(nt.defocus)),
+    matches = e -> e isa DepthBlurEffect,
+    read = e -> (focus = Float64(e.focus), defocus = Float64(e.strength)),
+    # `body` only — NOT `activate` too. The panel draws the generic action button
+    # only for a kind with no body (see `fxpanel.jl`), so an `activate` here would
+    # never be reachable from the card and would only fire via `activatetool!`.
+    body = ctx -> depthbody!(ctx)))
+
+registereffect!(EffectKind(:look, "Look";
+    description = "A colour grade learned from one frame of this shot. " *
+                  "Strength dials it back — the look is the same, the amount is " *
+                  "what changes, so a fade-in is a curve on it and never a re-run.",
+    params = [FxParam(:look, "Look"; min = 0.0, max = 1.0, default = 1.0)],
+    make = nt -> LookEffect(Float32(nt.look)),
+    matches = e -> e isa LookEffect,
+    read = e -> (look = Float64(e.strength),),
+    body = ctx -> lookbody!(ctx)))
+
 registereffect!(EffectKind(:transform, "Transform";
     description = "Where the picture sits in the canvas — scale, position, rotation. " *
                   "Drag the handles in the preview.",

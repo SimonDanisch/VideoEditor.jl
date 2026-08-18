@@ -29,6 +29,46 @@ Two conventions make an overlay mean the same thing everywhere:
 # ---------------------------------------------------------------- registry
 
 """
+A line of synthesized narration: what to say, WHEN to say it (seconds from the
+sequence's start), and which voice.
+
+`samples` is a cache of `text`, not an edit — a project file carries the words
+and re-renders, which is what keeps a minute of speech out of the JSON. `rate` is
+the synthesizer's, kept because resampling on the way into the mixer needs it and
+because a model that changes rate must not silently pitch-shift what is stored.
+
+Here rather than in `narration.jl` for the reason [`Caption`](@ref) is: `Sequence`
+has a field of it and `clips.jl` is included next.
+"""
+mutable struct Narration
+    text::String
+    at::Float64
+    voice::String
+    const samples::Vector{Float32}
+    rate::Int
+end
+Narration(text::AbstractString, at::Real = 0.0, voice::AbstractString = "af_heart") =
+    Narration(String(text), Float64(at), String(voice), Float32[], 0)
+
+"""
+One spoken line: `start` and `stop` in SECONDS from the sequence's beginning, and
+what was said.
+
+Here rather than in `captions.jl` for the same reason [`Overlay`](@ref) is here
+and not in the file that draws it: `Sequence` has a field of it, and `clips.jl`
+is included next. A caption is document data — the transcript is what a user
+corrects when the model mishears — not a detail of the model that produced it.
+
+Seconds, not frames, because that is what a speech model reports and what
+survives the sequence's frame rate changing under it.
+"""
+struct Caption
+    start::Float64
+    stop::Float64
+    text::String
+end
+
+"""
 A registered overlay kind: a name, display label, keyframable scalar `params`,
 and `draw(scene, canvas, state)` which builds its plots ONCE.
 
@@ -133,14 +173,20 @@ Two keys are RESERVED and always present: `frame` (the timeline frame) and
 playhead without anyone keyframing a cursor — the overlay reads where the video
 is instead of being told twice.
 """
-function overlaystate(ov::Overlay, n::Integer; framerate::Real = 0.0)
+function overlaystate(ov::Overlay, n::Integer; framerate::Real = 0.0,
+                      captions::Vector{Caption} = Caption[])
     p = ov.params
     for (key, curve) in ov.animations
         haskey(p, key) || continue
         v = valueat(curve, n)
         v === nothing || (p = merge(p, NamedTuple{(key,)}((Float64(v),))))
     end
-    return merge(ov.settings, p, (frame = Int(n), framerate = Float64(framerate)))
+    # `captions` travels with `frame` and `framerate` for the same reason those do:
+    # it is what the sequence is, not what this overlay was configured with, and an
+    # overlay that needs it should read it rather than be handed a copy per frame
+    # through a keyframed parameter.
+    return merge(ov.settings, p,
+                 (frame = Int(n), framerate = Float64(framerate), captions = captions))
 end
 
 "Value of `ov`'s parameter `key` at timeline frame `n` (its curve, or the static value)."
@@ -314,7 +360,8 @@ plots for one that appeared, drop the scenes of one that went, and hand every
 live overlay its sampled [`overlaystate`](@ref). Overlays outside their span are
 hidden rather than rebuilt, so a title entering and leaving costs a boolean.
 """
-function syncoverlays!(cs::CanvasScene, overlays, n::Integer; framerate::Real = 0.0)
+function syncoverlays!(cs::CanvasScene, overlays, n::Integer; framerate::Real = 0.0,
+                       captions::Vector{Caption} = Caption[])
     # a kind was (re)registered since these plots were built: they belong to the
     # previous `draw` closure and will not run against the new one, so drop them
     # all and let the loop below rebuild. This is what makes live authoring —
@@ -331,7 +378,7 @@ function syncoverlays!(cs::CanvasScene, overlays, n::Integer; framerate::Real = 
             child = isempty(cs.spare) ?
                 Makie.Scene(cs.scene; camera = Makie.campixel!, clear = false) :
                 pop!(cs.spare)
-            state = Observables.Observable{NamedTuple}(overlaystate(ov, n; framerate))
+            state = Observables.Observable{NamedTuple}(overlaystate(ov, n; framerate, captions))
             overlaykind(ov.kind).draw(child, cs.canvas, state)
             entry = (child, state)
             cs.entries[ov.id] = entry
@@ -343,7 +390,7 @@ function syncoverlays!(cs::CanvasScene, overlays, n::Integer; framerate::Real = 
         # there is nothing to compare against. What keeps a static overlay from
         # re-computing anything is `olift`'s `ignore_equal_values` on each
         # derived attribute, one level down.
-        visible && (state[] = overlaystate(ov, n; framerate))
+        visible && (state[] = overlaystate(ov, n; framerate, captions))
     end
     recycle!(cs, [id for id in keys(cs.entries) if !(id in live)])   # deleted since last frame
     return cs
@@ -377,13 +424,14 @@ and a 1080p pass costs ~5.5 ms.
 `dest` may live on a device; it is staged through the canvas's host buffers. The
 lock is the GL context's: one export job and one preview can ask at once.
 """
-function drawoverlays!(dest::AnyRGBFrame, overlays, n::Integer; framerate::Real = 0.0)
+function drawoverlays!(dest::AnyRGBFrame, overlays, n::Integer; framerate::Real = 0.0,
+                       captions::Vector{Caption} = Caption[])
     (isempty(overlays) || !any(ov -> showsat(ov, n), overlays)) && return dest
     return lock(CANVASLOCK) do
         cs = canvasscenefor(Base.size(dest))
         copyto!(cs.frame[], dest)                # device→host when dest is a LavaArray
         Observables.notify(cs.frame)             # same array object: notify explicitly
-        syncoverlays!(cs, overlays, n; framerate)
+        syncoverlays!(cs, overlays, n; framerate, captions)
         gl = rastercanvas(cs)                    # (W, H), column 1 = the scene's BOTTOM
         stageback!(dest, cs.host, gl)
         return dest

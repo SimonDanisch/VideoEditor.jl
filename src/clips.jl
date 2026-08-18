@@ -174,6 +174,18 @@ mutable struct Clip
     # `split!` drop a clip's restoration silently, since a fresh id follows
     # nothing (see `restorecache` below).
     depthtrack::Union{Nothing, DepthTrack}
+    # A learned colour grade as a (D,D,D,3) table, host-side. Per CLIP, not per
+    # frame: a look that drifted within a shot would be a fault, not a feature
+    # (see `look.jl`). Host-side because it is project-file data and because a
+    # device array would be on the wrong device after `autodetectgpu!`.
+    look::Union{Nothing, Array{Float32, 4}}
+    # How this clip fills timeline frames its source has no frame for — i.e. what
+    # a slowed clip does between source frames. `:sample` repeats the nearest
+    # (the default, and what every editor does with no model); `:flow`
+    # synthesizes the in-between frame (see `flow.jl`). A property of the clip
+    # like `rate`, not an effect: it decides what the SOURCE is, before any
+    # effect runs, and an effect only ever sees one frame.
+    timeinterp::Symbol
     # The fourth analysis result, and a field like the other three. It used to be
     # a module global keyed by clip id, which is how `split!` came to drop a
     # clip's restoration silently while taking explicit care of its matte: an id
@@ -188,9 +200,12 @@ end
 
 Clip(source::VideoSource, src_in, src_out, start, crop, rate::Real = 1.0,
      reframe::Union{Nothing, NTuple{<:Any, <:Real}} = nothing) =
-    withreframe!(Clip(freshid(), source, src_in, src_out, start, crop, FxSlot[], nothing,
-                      nothing, nothing, nothing, nothing, Dict{Symbol, AnimCurve}(), 1,
-                      UInt64(0), Float64(rate)),
+    withreframe!(Clip(freshid(), source, src_in, src_out, start, crop, FxSlot[],
+                      # colortrack, motiontrack, mattetrack, depthtrack, look
+                      nothing, nothing, nothing, nothing, nothing,
+                      :sample,          # timeinterp
+                      nothing,          # restorecache
+                      Dict{Symbol, AnimCurve}(), 1, UInt64(0), Float64(rate)),
                  reframe)
 
 function Clip(source::VideoSource; src_in::Integer = 0, src_out::Integer = source.nframes,
@@ -261,6 +276,22 @@ sourceframe(clip::Clip, n::Integer) =
     clip.rate == 1.0 ? clip.src_in + (Int(n) - clip.start) :
     clip.src_in + floor(Int, (Int(n) - clip.start) * clip.rate)
 
+"""
+    sourcephase(clip, n) -> Float64
+
+How far timeline frame `n` sits BETWEEN [`sourceframe`](@ref)`(clip, n)` and the
+one after it, in `0..1`.
+
+Exactly the fraction `sourceframe` throws away with its `floor`. It is zero for
+an unconformed clip, and for a slowed one it is the position a frame
+interpolator would synthesize at: `rate = 0.5` gives 0, 0.5, 0, 0.5… — the
+alternating half-steps that are shown as repeated frames without one, which is
+what makes slow motion judder.
+"""
+sourcephase(clip::Clip, n::Integer) =
+    clip.rate == 1.0 ? 0.0 :
+    (x = (Int(n) - clip.start) * clip.rate; Float64(x - floor(x)))
+
 "Timeline frames that `nsrc` source frames of this clip's media occupy."
 timelineframes(clip::Clip, nsrc::Integer) = floor(Int, Int(nsrc) / clip.rate)
 
@@ -308,12 +339,31 @@ mutable struct Sequence
     # SEQUENCE, not to a clip: an overlay sits above the composite, so a cut
     # underneath it changes nothing about where or when it is drawn.
     const overlays::Vector{Overlay}
+    # What is spoken, and when. An EDIT like the overlays above — the transcript
+    # is what a user fixes when the model mishears a word, so it is saved with the
+    # project and restored by undo. Regenerating it is minutes of Whisper, which
+    # is the other half of why it is not a cache.
+    const captions::Vector{Caption}
+    # Spoken narration mixed OVER the clips, on both the preview and the export.
+    # An edit like the captions: the words are saved, the samples are a cache.
+    const narration::Vector{Narration}
+    # The output resolution, once something has set it — the crop tool does.
+    #
+    # `nothing` means "derive it from the first clip", which is what this did
+    # ALWAYS and is a trap: deleting or reordering clips then silently changes the
+    # project's resolution, and cropping clip 2 resized nothing while cropping
+    # clip 1 resized everything. Kept as the fallback so projects written before
+    # this open unchanged.
+    canvas::Union{Nothing, Tuple{Int, Int}}
 end
 
 Sequence(clips::Vector{Clip}, framerate::Real) =
-    Sequence(clips, framerate, Transition[], Overlay[])
+    Sequence(clips, framerate, Transition[], Overlay[], Caption[], Narration[], nothing)
 Sequence(clips::Vector{Clip}, framerate::Real, transitions::Vector{Transition}) =
-    Sequence(clips, framerate, transitions, Overlay[])
+    Sequence(clips, framerate, transitions, Overlay[], Caption[], Narration[], nothing)
+Sequence(clips::Vector{Clip}, framerate::Real, transitions::Vector{Transition},
+         overlays::Vector{Overlay}) =
+    Sequence(clips, framerate, transitions, overlays, Caption[], Narration[], nothing)
 Sequence(source::VideoSource) = Sequence([Clip(source)], source.framerate)
 
 "The clip with `id`, or `nothing` — how anything refers to a clip across sorting,
@@ -487,6 +537,8 @@ function split!(seq::Sequence, n::Integer, track::Union{Nothing, Integer} = noth
     right.motiontrack = clip.motiontrack
     right.mattetrack = clip.mattetrack    # ditto — cutting a clip must not lose its matte
     right.depthtrack = clip.depthtrack    # …nor its depth, which is keyed the same way
+    right.look = clip.look                # both halves of a cut keep the shot's grade
+    right.timeinterp = clip.timeinterp    # …and how it fills in between frames
     # Shared, not copied, exactly as the tracks are: the frames are keyed by
     # absolute source frame, so one cache indexes correctly from both halves. The
     # two then share the eviction budget, which is the bargain a shared track
@@ -527,21 +579,16 @@ duplicate.
   partner. `split!` keeps it because its left half genuinely continues the same
   blend; a copy does not.
 """
-function copyclip(clip::Clip; start::Integer = clip.start, track::Integer = clip.track)
-    c = Clip(clip.source, clip.src_in, clip.src_out, start, clip.crop, clip.rate)
-    c.track = track
-    append!(c.effects, [FxSlot(freshid(), s.effect, s.enabled, copy(s.links))
-                        for s in clip.effects])
-    c.colortrack = clip.colortrack
-    c.motiontrack = clip.motiontrack
-    c.mattetrack = clip.mattetrack
-    c.depthtrack = clip.depthtrack
-    c.restorecache = clip.restorecache
-    for (key, curve) in clip.animations
-        c.animations[key] = AnimCurve(copy(curve.keys), curve.interp)
-    end
-    return c
-end
+copyclip(clip::Clip; start::Integer = clip.start, track::Integer = clip.track) =
+    withfields(clip; id = freshid(), start = Int(start), track = Int(track),
+               # Fresh slot ids and copied link vectors: the copy's stack is its
+               # own, so unlinking on one must not reach into the other.
+               effects = [FxSlot(freshid(), s.effect, s.enabled, copy(s.links))
+                          for s in clip.effects],
+               animations = Dict{Symbol, AnimCurve}(
+                   k => AnimCurve(copy(c.keys), c.interp) for (k, c) in clip.animations),
+               # NOT the original's blend partner — a copy is not in that transition.
+               blendfrom = UInt64(0))
 
 """
     trimclip!(seq, clip, i, side, n) -> clip
@@ -647,6 +694,36 @@ function deleteclip!(seq::Sequence, n::Integer; ripple::Bool = true)
     return deleteclip!(seq, seq.clips[i]; ripple)
 end
 
+"""
+    rippledoc!(seq, from, by) -> seq
+
+Shift the document-level timings at or after `from` seconds earlier by `by`.
+
+The captions and the narration are pinned to the PICTURE, not to the wall clock.
+`deleteclip!` rippled the clips and left these exactly where they were, so the
+first ripple delete slid every subtitle and every voiceover after the cut out of
+sync with the shot it belonged to — and cutting anything is mostly ripple
+deletes, so this went wrong on essentially the first real edit.
+
+Both are REPLACED rather than mutated. `docsnapshot` shares these objects with
+every undo step holding them, so shifting one in place would rewrite the history
+that is supposed to put it back. The narration's samples come along: the words
+have not changed, only when they are said.
+"""
+function rippledoc!(seq::Sequence, from::Real, by::Real)
+    for (i, c) in enumerate(seq.captions)
+        c.start >= from && (seq.captions[i] = Caption(c.start - by, c.stop - by, c.text))
+    end
+    for (i, nar) in enumerate(seq.narration)
+        nar.at >= from || continue
+        fresh = Narration(nar.text, nar.at - by, nar.voice)
+        append!(fresh.samples, nar.samples)
+        fresh.rate = nar.rate
+        seq.narration[i] = fresh
+    end
+    return seq
+end
+
 "Delete `clip` ITSELF (by identity — track-safe where a frame is ambiguous)
 with the same ripple semantics."
 function deleteclip!(seq::Sequence, clip::Clip; ripple::Bool = true)
@@ -658,6 +735,9 @@ function deleteclip!(seq::Sequence, clip::Clip; ripple::Bool = true)
         for other in seq.clips
             other.start >= clip.start && (other.start -= len)
         end
+        # …and the timings that are NOT on a clip. See `rippledoc!`.
+        seq.framerate > 0 &&
+            rippledoc!(seq, clip.start / seq.framerate, len / seq.framerate)
     end
     return clip
 end
@@ -682,11 +762,13 @@ withfields(clip::Clip;
            src_out = clip.src_out, start = clip.start, crop = clip.crop,
            effects = clip.effects, colortrack = clip.colortrack,
            motiontrack = clip.motiontrack, mattetrack = clip.mattetrack,
-           depthtrack = clip.depthtrack, restorecache = clip.restorecache,
+           depthtrack = clip.depthtrack, look = clip.look,
+           timeinterp = clip.timeinterp, restorecache = clip.restorecache,
            animations = clip.animations, track = clip.track,
            blendfrom = clip.blendfrom, rate = clip.rate) =
     Clip(id, source, src_in, src_out, start, crop, effects, colortrack, motiontrack,
-         mattetrack, depthtrack, restorecache, animations, track, blendfrom, rate)
+         mattetrack, depthtrack, look, timeinterp, restorecache, animations, track,
+         blendfrom, rate)
 
 "Copy of the edit state for undo/redo. Sources and analysis tracks are shared."
 snapshot(seq::Sequence) =

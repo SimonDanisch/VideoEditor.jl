@@ -183,9 +183,18 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     lastsig = Ref{Any}(:init)
     function rebuildstack(; force::Bool = false)
         force && (lastsig[] = :force)
+        # NOBODY IS LOOKING: skip the whole teardown and rebuild. The stack is
+        # rebuilt on every clip boundary, which during playback is every cut — and
+        # paying ~30 ms for cards behind a hidden dock is a stutter bought for
+        # nothing. `opendock!` forces a rebuild when the panel comes back, so this
+        # cannot leave stale cards on screen; `lastsig` is deliberately NOT updated
+        # here, so the catch-up rebuild still sees a changed signature.
+        if player.dockopen[] !== :effects && !force
+            return
+        end
         loc = editclip(player)
         clip = loc === nothing ? nothing : loc[1]
-        sig = effsig(clip)
+        sig = (effsig(clip), docsig(player.sequence, clip))
         sig == lastsig[] && return
         lastsig[] = sig
 
@@ -215,12 +224,16 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
         empty!(cards); empty!(cardkinds); empty!(strays); empty!(player.fxsliders)
         Makie.trim!(stackgl)
 
+        # rows the empty state consumed, so the tool cards below start clear of it
+        skip = 0
         if clip === nothing
-            append!(strays, emptystate!(stackgl, "No clip at the playhead.",
+            append!(strays, emptystate!(stackgl, 1, "No clip at the playhead.",
                         "Move the playhead onto a clip to give it effects.", uicolors))
+            skip = 1
         elseif isempty(clip.effects)
-            append!(strays, emptystate!(stackgl, "No effects on this clip.",
+            append!(strays, emptystate!(stackgl, 1, "No effects on this clip.",
                         "Add one above, or press Ctrl+P.", uicolors))
+            skip = 1
         else
             for slot in clip.effects
                 card, ctx = fxcard!(player, stackgl, length(cards) + 1, clip, slot,
@@ -228,9 +241,23 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
                 push!(cards, card)
                 push!(cardkinds, effectkindfor(slot.effect))
                 if ctx !== nothing
-            push!(bodyctxs, ctx)
-            get!(() -> Dict{Symbol, Any}(), player.fxwidgets, :toolpanels)[ctx.tool] = ctx
+                    push!(bodyctxs, ctx)
+                    get!(() -> Dict{Symbol, Any}(), player.fxwidgets, :toolpanels)[ctx.tool] = ctx
+                end
+            end
         end
+        # …and UNDER them, the tools that are not clip effects at all — see
+        # `toolonlycard!`. Outside the `isempty(clip.effects)` branch on purpose:
+        # the crop and the transcript are reachable on a clip with no effects on
+        # it, which is exactly when somebody is most likely to want the crop.
+        if clip !== nothing
+            for kind in toolonlykinds()
+                card, ctx = toolonlycard!(player, stackgl, length(cards) + 1 + skip,
+                                          kind, uicolors)
+                push!(cards, card)
+                push!(cardkinds, kind)
+                push!(bodyctxs, ctx)
+                get!(() -> Dict{Symbol, Any}(), player.fxwidgets, :toolpanels)[ctx.tool] = ctx
             end
         end
         colsize!(stackgl, 1, Makie.Relative(1.0))
@@ -310,18 +337,48 @@ function withtoolslots!(build::Function, player::Player, ctx::EffectContext, gri
     # matte to clip" printed above the list of marked frames read as a control for
     # something further up; an action goes under what it consumes.
     slots[3][ctx.tool] = measurable!(GridLayout(gl[4, 1]))
+    # The four slots sit flush. GridLayout's default rowgap is 16, and three gaps
+    # between four slots is ~48 px of empty band under every tool card's header —
+    # paid whether or not the slot below it holds anything, which for most tools
+    # is three times out of four. The CONTENT provides its own separation (a card
+    # has padding, stacked actions have their own gap), so the slots do not need
+    # to. Not zero: a few pixels still reads as "these are different areas".
+    rowgap!(gl, 4)
     build()
     return gl
 end
 
 "The panel's resting state: what is here, and what to do about it."
-function emptystate!(gl, title::AbstractString, hint::AbstractString, uicolors)
-    box = GridLayout(gl[1, 1]; alignmode = Makie.Outside(4, 4, 10, 10))
+function emptystate!(gl, row::Integer, title::AbstractString, hint::AbstractString, uicolors)
+    # a ROW, not a hardcoded 1: the tool-only cards share this stack, and an empty
+    # state pinned to row 1 sat underneath the first of them
+    box = GridLayout(gl[row, 1]; alignmode = Makie.Outside(4, 4, 10, 10))
     return [Label(box[1, 1], title; halign = :left, fontsize = 12, color = uicolors.text,
                   tellwidth = false),
             Label(box[2, 1], hint; halign = :left, fontsize = 11, color = uicolors.text_muted,
                   tellwidth = false)]
 end
+
+"""
+    docsig(seq, clip) -> Tuple
+
+The part of the rebuild signature that is NOT on the clip's effect stack.
+
+`effsig` reads the clip and only the clip, which was right while the panel showed
+clip effects and nothing else. It now also hosts the tool-only cards — Narration,
+Transcript, Crop, Time interpolation — and those read the SEQUENCE. Without this
+the signature never changed when they did, `rebuildstack` returned early, and a
+narration line you had just typed did not appear on the card that added it.
+
+Deliberately cheap: this runs on every playhead move. Captions hash by value
+(small immutable structs), narration by its fields rather than by `hash(nar)` —
+a `Narration` carries its rendered SAMPLES, and hashing a minute of audio on
+every frame change would be a real cost for a summary that never needed it.
+"""
+docsig(seq, clip) =
+    (length(seq.captions), hash(seq.captions), seq.canvas,
+     Tuple((n.text, n.at, n.voice, isempty(n.samples)) for n in seq.narration),
+     clip === nothing ? nothing : (clip.timeinterp, clip.rate, clip.crop))
 
 """
 The signature that decides whether the card stack still describes the clip: which
@@ -393,6 +450,85 @@ function showkind!(player::Player, name::Symbol)
     i === nothing || (player.fxwidgets[:fxcards][i].open = true)
     return true
 end
+
+"""
+    toolcardopen(kind, player) -> Bool
+
+Whether a tool-only card starts unfolded.
+
+Open when the tool HAS something to show — narration lines, a transcript, a clip
+that is actually retimed — and folded otherwise. Making these four render at all
+was the fix for them being invisible; leaving all four permanently expanded on
+every clip was the over-correction, and turned the panel into a scroll of things
+you are mostly not using. Folded still shows the header, so nothing is hidden.
+
+Crop is never open by default: it is a tool you reach for, not a thing you read.
+"""
+function toolcardopen(kind, player::Player)
+    seq = player.sequence
+    kind.name === :narration  && return !isempty(seq.narration)
+    kind.name === :transcript && return !isempty(seq.captions)
+    if kind.name === :timeinterp
+        loc = editclip(player)
+        return loc !== nothing && loc[1].rate != 1.0
+    end
+    return false
+end
+
+"""
+    toolonlycard!(player, stackgl, row, kind, uicolors) -> (card, ctx)
+
+A card for a kind that is NOT a clip effect — it has a body and no `make`.
+
+`rebuildstack` builds its cards from `clip.effects`, which is right for
+everything that IS one: Blur, Matte, Stabilize all reach the panel because their
+effect sits on the clip. A kind with no `make` can never get there, so
+`registertool!` — whose whole job is registering exactly that shape — produced
+panels that could not appear. It went unused after the Tools dock was removed,
+which is why nothing noticed until four of them were written against it.
+
+These are the project- and sequence-level tools (the crop scope, the transcript,
+the narration, the retime mode). They belong under the clip's effects, not
+inside them, and they have no slot, no bypass eye and no keyframes — which is
+why this is its own builder rather than another branch through `fxcard!`.
+"""
+function toolonlycard!(player::Player, stackgl, row::Integer, kind, uicolors)
+    card = Card(stackgl[row, 1]; title = kind.label,
+                selected = false,
+                open = toolcardopen(kind, player),
+                backgroundcolor = Makie.lerp_oklab(RGBf(Makie.to_color(uicolors.background)),
+                                                   RGBf(1, 1, 1), 0.045),
+                headercolor = uicolors.surface,
+                headercolor_selected = uicolors.select_subtle,
+                strokecolor = uicolors.border,
+                selectioncolor = uicolors.select,
+                titlecolor = uicolors.text)
+    if !isempty(kind.description)
+        acc = GridLayout(card_accessory(card))
+        help = Button(acc[1, 1]; label = "?", width = 18, fontsize = 11,
+                      labelcolor = uicolors.text_muted, buttoncolor = (:transparent, 0.0),
+                      strokewidth = 0, cornerradius = 3, height = 20,
+                      buttoncolor_hover = uicolors.accent_subtle)
+        tips = get(player.fxwidgets, :tips, nothing)
+        tips === nothing || (tips[help] = wraptext(kind.description, 46))
+        push!(get!(() -> Any[], player.fxwidgets, :fxtips), help)
+    end
+    ctx = EffectContext(player, kind.name)
+    ctx.state = nothing
+    withtoolslots!(player, ctx, card[1, 1]) do
+        # guarded exactly as `fxcard!` guards a body: one tool that throws must
+        # not take the rest of the stack with it
+        try
+            kind.body(ctx)
+        catch e
+            @error "tool card body failed" kind = kind.name exception = (e, catch_backtrace())
+        end
+    end
+    return card, ctx
+end
+
+"Kinds the Effects panel must render on their own — a body, but no effect to hang it on."
+toolonlykinds() = filter(k -> k.body !== nothing && k.make === nothing, effectkinds())
 
 """
 One card: the effect's name in the header, its enable toggle and remove ×

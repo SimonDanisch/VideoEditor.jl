@@ -53,7 +53,19 @@ function muxaudio(rendered::AbstractString, seq::Sequence, outpath::AbstractStri
     end
 
     pads = join(("[s$i]" for i in eachindex(branches)))
-    graph = join(branches, ";") * ";$(pads)concat=n=$(length(branches)):v=0:a=1[aout]"
+    graph = join(branches, ";") * ";$(pads)concat=n=$(length(branches)):v=0:a=1[acat]"
+    # Narration is mixed OVER the cut list, not concatenated into it — the same
+    # relationship the preview's `mixnarration!` has, and the reason it is a
+    # separate input rather than another branch. `duration=first` keeps the
+    # timeline's length authoritative when the speech runs past the end.
+    nar = narrationwav(seq, mktempdir())
+    if nar === nothing
+        graph *= ";[acat]anull[aout]"
+    else
+        inputs = `$inputs -i $nar`
+        graph *= ";[$(length(inputidx) + 1):a]$norm[nar];[acat][nar]amix=inputs=2:" *
+                 "duration=first:dropout_transition=0,volume=2[aout]"
+    end
     run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y $inputs -filter_complex $graph
                   -map 0:v -map "[aout]" -c:v copy -c:a aac -shortest $outpath`,
                  stdout = devnull, stderr = devnull))

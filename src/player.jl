@@ -61,6 +61,10 @@ mutable struct Player
     # `endmattebrush!` puts it on the undo stack, so one stroke is one step and an
     # abandoned one costs nothing.
     mattebrush::Any
+    # The matte brush's radius, as a fraction of the matte's width. A field
+    # because it is per-editor state a user adjusts constantly ([ and ]), and
+    # because painting with a size you cannot see or change is guesswork.
+    brushradius::Float64
     analysisbackend::Any  # KA backend for analysis/GPU playback; set by auto-detect
     const fig::Figure
     const previewaxis::Axis
@@ -134,7 +138,7 @@ mutable struct Player
 end
 
 """
-    docsnapshot(player) -> (clips, mattemarks)
+    docsnapshot(player) -> (clips, mattemarks, repairs, captions, canvas, narration)
 
 Everything an undo has to put back: the timeline AND the inputs that produced
 what is rendered on it. The matte's seed marks live next to the player rather
@@ -148,11 +152,25 @@ undo steps cost a hundred dictionaries instead of a hundred megabytes.
 docsnapshot(player::Player) =
     (snapshot(player.sequence),
      Dict{UInt64, Dict{Int, Matrix{UInt8}}}(k => copy(v) for (k, v) in player.mattemarks),
-     Dict{UInt64, Dict{Int, Matrix{UInt8}}}(k => copy(v) for (k, v) in player.matterepairs))
+     Dict{UInt64, Dict{Int, Matrix{UInt8}}}(k => copy(v) for (k, v) in player.matterepairs),
+     # The transcript: `restore!` keeps the same Sequence object, so captions would
+     # otherwise survive an undo by accident. Re-transcribing REPLACES a transcript
+     # the user may have corrected by hand, and that has to be undoable.
+     copy(player.sequence.captions),
+     # The canvas and the narration are the two things that live on the SEQUENCE
+     # rather than on a clip, and `snapshot(seq)` returns the clip vector alone —
+     # so without these, cropping the canvas outward or adding a voiceover was not
+     # undoable. Both are edits the user makes with a gesture and expects Ctrl+Z
+     # to take back.
+     player.sequence.canvas,
+     # The vector is copied so add/remove is undoable; the `Narration`s in it are
+     # SHARED, on the same terms as the matte marks above — safe only because a
+     # re-render REPLACES the element rather than writing through it.
+     copy(player.sequence.narration))
 
 "Put a [`docsnapshot`](@ref) back."
 function docrestore!(player::Player, snap)
-    clips, marks, repairs = snap
+    clips, marks, repairs, caps, canvas, narration = snap
     restore!(player.sequence, clips)
     empty!(player.mattemarks)
     for (k, v) in marks
@@ -166,6 +184,11 @@ function docrestore!(player::Player, snap)
     for (k, v) in repairs
         player.matterepairs[k] = copy(v)
     end
+    empty!(player.sequence.captions)
+    append!(player.sequence.captions, caps)
+    player.sequence.canvas = canvas
+    empty!(player.sequence.narration)
+    append!(player.sequence.narration, narration)
     return nothing
 end
 
@@ -178,19 +201,58 @@ function snapshot!(player::Player)
     return nothing
 end
 
+"""
+    changesummary(from, to) -> String
+
+What differs between two [`docsnapshot`](@ref)s, in the user's terms.
+
+Undo used to say NOTHING: the picture changed and you were left to work out what
+had come back — which on a long timeline, where the change may be off screen, is
+the difference between confidence and pressing Ctrl+Z twice to see.
+
+DERIVED rather than labelled. A description per edit would mean touching all 62
+`snapshot!` sites and going stale at the 63rd; comparing the states reports what
+actually changed no matter which one produced it, including edits added later.
+"""
+function changesummary(from, to)
+    fc, fm, fr, fcap, fcv, fn = from
+    tc, tm, tr, tcap, tcv, tn = to
+    parts = String[]
+    length(fc) == length(tc) || push!(parts, "$(length(tc)) clip(s)")
+    if length(fc) == length(tc) &&
+       any(((a, b),) -> length(a.effects) != length(b.effects) || a.crop != b.crop ||
+                        a.start != b.start || a.track != b.track, zip(fc, tc))
+        push!(parts, "a clip's edit")
+    end
+    fcv == tcv   || push!(parts, "the canvas")
+    fcap == tcap || push!(parts, "the transcript")
+    length(fn) == length(tn) || push!(parts, "the narration")
+    (sum(length, values(fm); init = 0) == sum(length, values(tm); init = 0) &&
+     sum(length, values(fr); init = 0) == sum(length, values(tr); init = 0)) ||
+        push!(parts, "the matte")
+    isempty(parts) && return "the last edit"
+    return join(parts, " · ")
+end
+
 function undo!(player::Player)
-    isempty(player.undostack) && return nothing
-    push!(player.redostack, docsnapshot(player))
-    docrestore!(player, pop!(player.undostack))
+    isempty(player.undostack) && return setstatus!(player, "nothing left to undo")
+    now = docsnapshot(player)
+    push!(player.redostack, now)
+    back = pop!(player.undostack)
+    docrestore!(player, back)
     postrestore!(player)
+    setstatus!(player, "undid $(changesummary(now, back)) — Ctrl+Shift+Z redoes it")
     return nothing
 end
 
 function redo!(player::Player)
-    isempty(player.redostack) && return nothing
-    push!(player.undostack, docsnapshot(player))
-    docrestore!(player, pop!(player.redostack))
+    isempty(player.redostack) && return setstatus!(player, "nothing to redo")
+    now = docsnapshot(player)
+    push!(player.undostack, now)
+    fwd = pop!(player.redostack)
+    docrestore!(player, fwd)
     postrestore!(player)
+    setstatus!(player, "redid $(changesummary(now, fwd))")
     return nothing
 end
 
@@ -362,6 +424,10 @@ function Player(path::AbstractString; capacity::Integer = 64,
         # runs purely on the GPU (background; CPU decode until the stream is ready)
         wantgpu && Threads.@spawn preloadgpu!(player, src)
     end
+    # The repairs come back with the project. They live here rather than on the
+    # sequence, so `loadproject` cannot restore them — see `loadrepairs!` for what
+    # losing them silently cost.
+    isproject && loadrepairs!(player, path)
     autodetect && Threads.@spawn autodetectgpu!(player)  # enable GPU playback if capable
     Threads.@spawn begin  # keep the regenerable proxy/PCM caches bounded
         pruned = prunecache!()
@@ -477,7 +543,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     Observable("no matte"), Observable("no restoration"),
                     Dict{UInt64, Dict{Int, Matrix{UInt8}}}(),
                     Dict{UInt64, Dict{Int, Matrix{UInt8}}}(),
-                    nothing,
+                    nothing, 0.04,
                     analysisbackend,
                     fig, ax, Ref(false),
                     Observable(Point2f[]),
@@ -494,6 +560,10 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     # The built-in depth model, so an editor has depth without being asked. Lazy
     # inside — this only points `registerdepth!` at it and builds nothing.
     installdepth!()
+    installlook!()
+    installtranscribe!()
+    installinterpolate!()
+    installspeak!()
     player.fxwidgets[:lanechip] = lanechip
     @async for s in player.statusqueue  # main-thread consumer: threads → observable
         status[] = s
@@ -540,6 +610,52 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     end
 
     lines!(ax, player.croprect; color = :orangered, linewidth = 2)
+    # The matte brush's footprint, so painting is not done blind. Alt is the
+    # gesture (see the preview's mouse handlers), so the circle appears exactly
+    # when the click would paint — a cursor that lied about whether the next
+    # click paints would be worse than none.
+    brushpos = Observable(Point2f(NaN, NaN))
+    brushsize = Observable(0.0f0)
+    brushcursor = scatter!(ax, brushpos; marker = Makie.Circle, markersize = brushsize,
+                           markerspace = :pixel, color = (:white, 0.0),
+                           strokecolor = (:white, 0.9), strokewidth = 1.5)
+    translate!(brushcursor, 0, 0, 9)
+    player.fxwidgets[:brushpos] = brushpos
+    player.fxwidgets[:brushsize] = brushsize
+    # What the drag is ABOUT to produce, next to the rectangle.
+    #
+    # Derived from `croprect` alone, so there is no second piece of state that can
+    # disagree with the rectangle on screen. Before this the size only appeared in
+    # the status bar AFTER releasing, which is the wrong moment: the number is what
+    # you are aiming at, and a crop that grows the canvas looks exactly like the
+    # letterbox bars a differently-shaped clip already gets.
+    cropreadoutpos = Makie.lift(player.croprect) do r
+        isempty(r) ? Point2f(0, 0) :
+            Point2f(minimum(q[1] for q in r), minimum(q[2] for q in r))
+    end
+    cropreadouttext = Makie.lift(player.croprect) do r
+        isempty(r) && return ""
+        loc = editclip(player)
+        loc === nothing && return ""
+        clip = loc[1]
+        W, H = size(player.frame[])
+        (W == 0 || H == 0) && return ""
+        x0, x1 = extrema(q[1] for q in r)
+        y0, y1 = extrema(q[2] for q in r)
+        # Preview pixels → the SOURCE fraction the crop stores → canvas pixels,
+        # the same chain `finishcrop!` and `canvassize` walk. The preview may be a
+        # proxy, so its own size is never the answer.
+        cw = max(2 * (round(Int, (x1 - x0) / W * clip.source.width) ÷ 2), 2)
+        ch = max(2 * (round(Int, (y1 - y0) / H * clip.source.height) ÷ 2), 2)
+        now = canvassize(player.sequence)
+        grew = cw > now[1] || ch > now[2]
+        return "$(cw)×$(ch)" * (grew ? "  ↑ canvas grows" : "")
+    end
+    cropreadout = text!(ax, cropreadoutpos; text = cropreadouttext,
+                        fontsize = 13, font = :bold, color = :orangered,
+                        strokecolor = (:black, 0.85), strokewidth = 2,
+                        offset = (6, -18), align = (:left, :top))
+    translate!(cropreadout, 0, 0, 9)
 
     fxdock = dockpanel!(player, :effects; width = 360)
     buildfxpanel!(player, fxdock[1, 1], uicolors)
@@ -634,7 +750,14 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
         mp = Point2f(events(fig).mouseposition[])
         t = player.tool[]
         shape = :arrow
-        if t === :split
+        # A PENDING PICK first: it claims the next click on the preview whatever
+        # the toolbar tool is, and it was the one mode with no cursor at all —
+        # "focus: click what should be sharp" in the status bar, then nothing on
+        # screen to say the click was still owed. Covers the object-lock pick too,
+        # which had the same silence.
+        if player.onpick !== nothing
+            shape = mp in ax.scene.viewport[] ? :crosshair : :arrow
+        elseif t === :split
             tlscene = timeline.axis.scene
             if mp in tlscene.viewport[]
                 tt = Makie.mouseposition(tlscene)[1]
@@ -643,6 +766,17 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
             end
         elseif t === :crop
             shape = mp in ax.scene.viewport[] ? :crosshair : :arrow
+        elseif ispressed(fig, Keyboard.left_control | Keyboard.right_control) &&
+               mp in timeline.axis.scene.viewport[] &&
+               clipat(sequence, timelineframe(timeline,
+                      Makie.mouseposition(timeline.axis.scene)[1])) !== nothing
+            # Ctrl ADVERTISES itself. Ctrl is the only way to drag a clip — a plain
+            # press scrubs — and nothing said so, which is the other half of "one
+            # accidentally drags the clip": once it stopped happening by accident
+            # there was no way to learn it happens on purpose. Holding Ctrl over a
+            # clip now shows the move cursor, so the gesture is discovered by
+            # reaching for it rather than by being told.
+            shape = :move
         elseif !isempty(timeline.edgeline[])
             shape = :hresize   # trim handle under the cursor reads as "drag to trim"
         end
@@ -677,7 +811,15 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
         splitbtn.buttoncolor[] = t === :split ? uicolors.accent : uicolors.surface
         cropbtn.buttoncolor[] = t === :crop ? uicolors.accent : uicolors.surface
         t === :split && setstatus!(player, "blade tool — click the timeline to cut (stays active; Esc or ✂ to put it away)")
-        t === :crop && setstatus!(player, "crop tool — drag a rectangle on the preview (Esc to put it away)")
+        if t === :crop
+            # SHOW the framing you are about to change. Without this every crop is
+            # a blind redo: the rectangle you drag has no relationship on screen to
+            # the one already in force, so refining a crop means guessing where it
+            # currently is and starting over.
+            showcurrentcrop!(player)
+            setstatus!(player, "crop tool — drag a rectangle on the preview " *
+                               "(it may reach outside the picture; Esc to put it away)")
+        end
     end
     # split tool: the next timeline click cuts THERE (not at the playhead)
     on(events(fig).mousebutton; priority = 95) do event
@@ -1225,6 +1367,30 @@ n_of(::Player, clip::Clip, srcframe::Integer) =
     clip.start + timelineframes(clip, Int(srcframe) - clip.src_in)
 
 """
+    showcurrentcrop!(player) -> nothing
+
+Draw the framing currently in force, so the crop tool has something to refine
+rather than replace.
+
+Uses the same rectangle the drag does (`croprect`), so there is one outline on
+screen and no second one to disagree with it. Cleared by the first press of a new
+drag, which is exactly when it has served its purpose.
+"""
+function showcurrentcrop!(player::Player)
+    loc = editclip(player)
+    loc === nothing && return nothing
+    x, y, w, h = loc[1].crop
+    W, H = size(player.frame[])
+    (W == 0 || H == 0) && return nothing
+    # In PREVIEW pixels, like the drag's own rectangle — the preview may be a
+    # proxy, so the crop's source fractions have to come through its size.
+    x0, y0 = x * W, y * H
+    x1, y1 = (x + w) * W, (y + h) * H
+    player.croprect[] = Point2f[(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+    return nothing
+end
+
+"""
 Frame the preview on the CANVAS — the whole of it, every time.
 
 There is nothing left for the limits to express: the crop, the reframe and the
@@ -1240,6 +1406,36 @@ function applycrop!(player::Player)
     return nothing
 end
 applycrop!(player::Player, ::Clip) = applycrop!(player)
+
+"""
+    inheritmasks!(player, from::Clip, to::Clip) -> nothing
+
+Give `to` the matte marks and repairs of `from`.
+
+Both stores are keyed by CLIP ID, and every way of making a second clip out of one
+— splitting it, copying it, pasting it — hands the new clip a fresh id. The
+tracks themselves survive that, because they are keyed by absolute SOURCE frame
+and both clips share the source; the player-side stores do not, and silently did
+not follow.
+
+What that cost is worst exactly where it is least visible: the alpha comes along,
+so the picture is right, and only re-running is broken — a split half met an empty
+mark store and refused to propagate, with the repair cards gone too. Splitting is
+the single most common act in cutting anything, so this is the corner case most
+likely to be hit and least likely to be noticed.
+
+Copied whole rather than filtered to `to`'s range: a mark outside it is harmless
+(every lookup is by source frame) and trimming the halves back out later would
+otherwise have to put it back.
+"""
+function inheritmasks!(player::Player, from::Clip, to::Clip)
+    from.id == to.id && return nothing
+    for store in (player.mattemarks, player.matterepairs)
+        src = get(store, from.id, nothing)
+        src === nothing || isempty(src) || (store[to.id] = copy(src))
+    end
+    return nothing
+end
 
 """
 Make a framing change visible: glide the preview zoom from crop `from` to
@@ -1396,10 +1592,12 @@ function split!(player::Player)
     loc = editclip(player)          # the SELECTED clip, else the one under the playhead
     loc === nothing && return setstatus!(player, "nothing to split at the playhead")
     snapshot!(player)
-    if split!(player.sequence, player.playhead[], loc[1].track) === nothing
+    right = split!(player.sequence, player.playhead[], loc[1].track)
+    if right === nothing
         pop!(player.undostack)
         return setstatus!(player, "cannot split here — the playhead is at the clip's start")
     end
+    inheritmasks!(player, loc[1], right)
     refreshedit!(player)
     return nothing
 end
@@ -1427,7 +1625,12 @@ function copyclips!(player::Player)
     base = minimum(c.start for c in clips)
     empty!(player.clipboard)
     for c in clips
-        push!(player.clipboard, copyclip(c; start = c.start - base))
+        dup = copyclip(c; start = c.start - base)
+        # the clipboard entry carries the marks too, so a paste can be re-run —
+        # see `inheritmasks!`. The chain is original -> clipboard -> pasted, and
+        # every link is a fresh id.
+        inheritmasks!(player, c, dup)
+        push!(player.clipboard, dup)
     end
     setstatus!(player, "copied $(length(clips)) clip$(length(clips) == 1 ? "" : "s")")
     return length(clips)
@@ -1450,18 +1653,31 @@ function pasteclips!(player::Player)
     at = player.playhead[]
     snapshot!(player)
     n = 0
+    fresh = Clip[]
     for c in player.clipboard
         start = at + c.start                    # relative offsets, restored around the playhead
         track = c.track
         while track <= ntracks(seq) && !canplace(seq, c, start, track)
             track += 1
         end
-        push!(seq.clips, copyclip(c; start, track))
+        pasted = copyclip(c; start, track)
+        inheritmasks!(player, c, pasted)
+        push!(seq.clips, pasted)
+        push!(fresh, pasted)
         n += 1
     end
     sort!(seq.clips, by = c -> (c.track, c.start))
+    # SELECT what was just pasted. Paste puts a clip at the playhead on whichever
+    # lane was free, which is rarely where it belongs — so the next act is always
+    # to move it, and without this the act before THAT is hunting for it. By
+    # identity, not by index: the sort above has just moved everything.
+    idx = filter(!isnothing, [findfirst(c -> c === f, seq.clips) for f in fresh])
+    if !isempty(idx)
+        player.timeline.selected[] = first(idx)
+        player.timeline.selection[] = Int[i for i in idx]
+    end
     refreshedit!(player)
-    setstatus!(player, "pasted $n clip$(n == 1 ? "" : "s")")
+    setstatus!(player, "pasted $n clip$(n == 1 ? "" : "s") — selected, Ctrl-drag to place")
     return n
 end
 
@@ -1655,9 +1871,18 @@ function restoreproject!(player::Player, file::AbstractString)
         return nothing
     end
     snapshot!(player)
+    # ONLY when the checkpoint brought its own. `checkpointproject` copies the
+    # JSON and not the `.mattes` directory beside it, so most checkpoints have no
+    # masks at all — clearing unconditionally would throw away the session's marks
+    # and put nothing back, which is strictly worse than the stale-but-present
+    # marks the restore used to leave alone.
+    if isdir(mattedir(file))
+        empty!(player.matterepairs); empty!(player.mattemarks)
+    end
     empty!(player.sequence.clips); append!(player.sequence.clips, seq.clips)
     empty!(player.sequence.transitions); append!(player.sequence.transitions, seq.transitions)
     empty!(player.sequence.overlays); append!(player.sequence.overlays, seq.overlays)
+    loadrepairs!(player, file)               # …and the repairs saved beside it
     postrestore!(player)
     r = get(player.fxwidgets, :projectrefresh, nothing); r === nothing || r()
     setstatus!(player, "restored $(basename(file)) — Ctrl+Z puts the edit back")
@@ -1688,7 +1913,7 @@ function autosave!(player::Player; force::Bool = false)
     (force || player.edits != player.autosaved) || return nothing
     path = autosavepath(player)
     try
-        saveproject(path, player.sequence; checkpoint = false)
+        saveproject(path, player; checkpoint = false)
         player.autosaved = player.edits
         return path
     catch e
@@ -1730,6 +1955,22 @@ function recoverable(player::Player)
 end
 
 """
+    saveproject(path, player; checkpoint = true)
+
+Save the project AND the edit state that lives on the player rather than on the
+sequence — currently the matte repairs.
+
+A `Sequence` is not the whole edit. The repairs are on the player because they
+must outlive the panel that shows them, so the sequence-only method cannot see
+them and quietly wrote a project that was missing work. See `saverepairs`.
+"""
+function saveproject(path::AbstractString, player::Player; checkpoint::Bool = true)
+    saveproject(path, player.sequence; checkpoint)
+    saverepairs(path, player)
+    return path
+end
+
+"""
     saveproject!(player) -> path
 
 Save the edit (Ctrl+S) to [`projectfile`](@ref) — reopen it later with
@@ -1741,7 +1982,7 @@ function saveproject!(player::Player)
         return nothing
     end
     path = projectfile(player)
-    saveproject(path, player.sequence)
+    saveproject(path, player)
     player.autosaved = player.edits
     rm(autosavepath(player); force = true)   # the project IS the newest copy again
     n = length(projectcheckpoints(path))
@@ -2113,7 +2354,8 @@ function wirecroptool(player::Player)
         if brushing() && event.button in (Mouse.left, Mouse.right)
             if event.action == Mouse.press && is_mouseinside(ax.scene)
                 beginmattebrush!(player, event.button == Mouse.left) || return Consume(false)
-                mattebrushto!(player, Point2f(mouseposition(ax.scene)))
+                mattebrushto!(player, Point2f(mouseposition(ax.scene));
+                              radius = player.brushradius)
                 return Consume(true)
             elseif event.action == Mouse.release && player.mattebrush !== nothing
                 endmattebrush!(player)
@@ -2133,10 +2375,24 @@ function wirecroptool(player::Player)
     end
     on(events(ax.scene).mouseposition) do _
         mine() || return Consume(false)
+        # Show (or hide) the brush footprint. Diameter in SCREEN pixels, from the
+        # radius' fraction of the matte width and the preview's width — so the
+        # circle is the size the stroke will actually be, at any zoom.
+        bp = get(player.fxwidgets, :brushpos, nothing)
+        if bp !== nothing
+            vp = ax.scene.viewport[]
+            if brushing() && editclip(player) !== nothing
+                bp[] = Point2f(mouseposition(ax.scene))
+                player.fxwidgets[:brushsize][] =
+                    Float32(2 * player.brushradius * vp.widths[1])
+            else
+                bp[] = Point2f(NaN, NaN)
+            end
+        end
         if player.mattebrush !== nothing
             # Direction comes from the stroke, not from the mouse right now — see
             # `beginmattebrush!`.
-            mattebrushto!(player, Point2f(mouseposition(ax.scene)))
+            mattebrushto!(player, Point2f(mouseposition(ax.scene)); radius = player.brushradius)
             return Consume(true)
         end
         anchor = player.cropanchor
@@ -2149,6 +2405,88 @@ function wirecroptool(player::Player)
     end
     return nothing
 end
+
+"""
+    setbrushradius!(player, r) -> Float64
+
+Resize the matte brush, clamped, and make the change visible where the brush is.
+
+One function because there are two ways to ask — `[`/`]` and the panel's ± — and
+they must agree: the cursor ring on the preview and the percentage in the panel
+are both derived from this field, so a caller that set it directly would move the
+brush and leave one of the two showing the old size.
+
+Steps are the CALLER's, and geometric by convention: at 1% a fixed step is half
+the brush and at 20% it is nothing, so the same gesture has to mean the same
+proportion.
+"""
+function setbrushradius!(player::Player, r::Real)
+    player.brushradius = clamp(Float64(r), 0.004, 0.4)
+    bp = get(player.fxwidgets, :brushsize, nothing)
+    bp === nothing ||
+        (bp[] = Float32(2 * player.brushradius *
+                        player.previewaxis.scene.viewport[].widths[1]))
+    setstatus!(player, "matte brush $(round(100 * player.brushradius; digits = 1))% " *
+                       "of the frame width")
+    # the panel prints the number too, and only rebuilds when asked
+    refreshmattepanel!(player)
+    return player.brushradius
+end
+
+"""
+    cropscope(player) -> Ref{Symbol}
+
+What the crop tool changes: `:canvas`, the whole project, or `:clip`, only the
+clip you dragged on.
+
+Both are real requests and they used to be the same gesture. Every drag rewrote
+`sequence.canvas`, so "show less of this one shot" could not be said at all —
+reframing one clip silently resized the finished video. Photoshop draws the same
+line between cropping the canvas and moving a layer inside it; this is the same
+distinction with the same default, because resizing the project is the reason the
+tool exists.
+
+On `fxwidgets` rather than in a field, like [`mattecardview`](@ref): the dock
+rebuilds every panel from scratch on each refresh, so a toggle holding its state
+in the context would have it discarded by the rebuild it triggered.
+"""
+cropscope(player::Player) = get!(() -> Ref(:canvas), player.fxwidgets, :cropscope)
+
+"""
+    cropaspect(player) -> Ref{Union{Nothing, Float64}}
+
+The shape the next crop is locked to — width over height of the OUTPUT — or
+`nothing` for whatever you drag.
+
+A ratio lock is not a convenience here, it is the only way to hit one. "Make this
+vertical for phones" means exactly 9:16, and a rectangle dragged by hand is never
+exactly anything; the alternative is typing pixel counts into a project-settings
+dialog, which is the thing this tool exists to avoid.
+"""
+cropaspect(player::Player) =
+    get!(() -> Ref{Union{Nothing, Float64}}(nothing), player.fxwidgets, :cropaspect)
+
+"""
+    lockaspect(crop, source, a) -> NTuple{4, Float64}
+
+Reshape a dragged crop so the exported picture is `a` wide for every 1 tall.
+
+The crop is in fractions **of the source**, and a fraction is not a pixel: the
+output ratio is `w·source.width / h·source.height`, so the fraction ratio that
+lands on `a` is `a · height/width`. Getting this wrong gives a 16:9 lock that is
+16:9 only on a square source.
+
+The dragged WIDTH is kept and the height derived. One of the two has to give, and
+width is the one a framing is judged by — a locked crop that quietly narrowed
+would move the subject out of the frame you just drew around it.
+"""
+function lockaspect(crop::NTuple{4, Float64}, source, a::Real)
+    x0, y0, w, h = crop
+    want = Float64(a) * source.height / source.width
+    return (x0, y0, w, w / want)
+end
+
+
 
 function finishcrop!(player::Player, corner::Point2f)
     anchor = player.cropanchor
@@ -2178,8 +2516,30 @@ function finishcrop!(player::Player, corner::Point2f)
     # A degenerate drag is still degenerate, but the floor is on the SIZE, not on
     # where it sits: a 5%-wide crop hanging off the left edge is a real request.
     (x1 - x0 < 0.01 || y1 - y0 < 0.01) && return nothing
+    a = cropaspect(player)[]
+    a === nothing || ((x0, y0, w, h) = lockaspect((x0, y0, x1 - x0, y1 - y0), clip.source, a);
+                      x1 = x0 + w; y1 = y0 + h)
     before = canvassize(player.sequence)
     clip.crop = (x0, y0, x1 - x0, y1 - y0)
+    # In `:canvas` scope the crop tool is how the CANVAS is set — that is the
+    # whole gesture, and recording it here is what makes it survive deleting or
+    # reordering clips. In `:clip` scope the project keeps its size and only this
+    # clip's framing moves, which is what letterboxing and re-framing one shot
+    # inside a finished timeline needs.
+    wholeproject = cropscope(player)[] === :canvas
+    if wholeproject
+        player.sequence.canvas =
+            (max(2 * (round(Int, (x1 - x0) * clip.source.width) ÷ 2), 2),
+             max(2 * (round(Int, (y1 - y0) * clip.source.height) ÷ 2), 2))
+    elseif player.sequence.canvas === nothing
+        # PIN it. Without an explicit canvas `canvassize` derives one from CLIP
+        # ONE's crop — so "crop this clip only", performed on clip one, still
+        # resized the project, which is the exact thing the scope exists to
+        # prevent. Freezing the size it already has is the only way the promise
+        # can hold, and it is invisible: the number does not change, it just
+        # stops being a function of a clip the user is now editing.
+        player.sequence.canvas = before
+    end
     applycrop!(player, clip)
     # Say what the canvas became, and say so LOUDLY when it grew. A crop that only
     # ever removed picture needed no readout — the result was on screen. One that
@@ -2188,11 +2548,38 @@ function finishcrop!(player::Player, corner::Point2f)
     # letterbox this clip?" is a real question the status bar can answer.
     after = canvassize(player.sequence)
     grew = after[1] > before[1] || after[2] > before[2]
-    setstatus!(player, grew ?
+    setstatus!(player, !wholeproject ?
+        "cropped this clip — the project stays $(after[1])×$(after[2])" :
+        grew ?
         "canvas $(before[1])×$(before[2]) → $(after[1])×$(after[2]) — cropped outward, the new area is empty" :
         "canvas $(after[1])×$(after[2])")
+    refreshcroppanel!(player)
     return nothing
 end
+
+"""
+    resetcanvas!(player) -> nothing
+
+Drop the explicit canvas and go back to deriving it from the first clip.
+
+The escape hatch for a canvas you no longer want. Without it the only way out of
+a project size was Ctrl+Z, which also takes back the crop that set it — and once
+any later edit is on the stack, not even that.
+"""
+function resetcanvas!(player::Player)
+    player.sequence.canvas === nothing && return setstatus!(player, "canvas: already derived from the first clip")
+    snapshot!(player)
+    player.sequence.canvas = nothing
+    applycrop!(player)
+    refreshedit!(player)
+    refreshcroppanel!(player)
+    sz = canvassize(player.sequence)
+    setstatus!(player, "canvas back to $(sz[1])×$(sz[2]), derived from the first clip")
+    return nothing
+end
+
+"Rebuild the crop card, so its scope toggle and size readout follow the edit."
+refreshcroppanel!(player::Player) = (EFFECTS.version[] += 1; nothing)
 
 function wirekeys(player::Player)
     on(events(player.fig).keyboardbutton) do event
@@ -2230,6 +2617,13 @@ function wirekeys(player::Player)
             split!(player)
         elseif (event.key == Keyboard.x || event.key == Keyboard.delete) && ispress
             deleteat!(player)
+        elseif (event.key == Keyboard.left_bracket ||
+                event.key == Keyboard.right_bracket) && ispress
+            # [ and ] resize the matte brush, as every paint tool does. Geometric
+            # steps, not linear: at 1% a fixed step is half the brush and at 20%
+            # it is nothing, so the same key has to mean the same PROPORTION.
+            f = event.key == Keyboard.right_bracket ? 1.25 : 0.8
+            setbrushradius!(player, player.brushradius * f)
         elseif event.key == Keyboard.c && ispress &&
                ispressed(player.fig, Keyboard.left_control | Keyboard.right_control)
             copyclips!(player)          # BEFORE bare `c`, which is the crop tool
@@ -2336,6 +2730,13 @@ function opendock!(player::Player, key::Symbol)
     colsize!(layout, 2, Makie.Fixed(entry === nothing ? 0.0 : entry.width))
     colgap!(layout, 2, entry === nothing ? 0.0 : 8.0)
     player.dockopen[] = key
+    # The effects panel skips its rebuilds while hidden (see `rebuildstack`), so
+    # it has to catch up on the way back — otherwise it shows the clip that was
+    # under the playhead when it was closed.
+    if key === :effects
+        r = get(player.fxwidgets, :fxlistrefresh, nothing)
+        r === nothing || r(force = true)
+    end
     return nothing
 end
 

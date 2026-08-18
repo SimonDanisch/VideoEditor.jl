@@ -378,7 +378,9 @@ function calltool(srv::MCPServer, name::String, args)
             "object lock analysis started — poll get_state"
         elseif name == "save_project"
             isempty(seq.clips) && return "nothing to save — the timeline is empty"
-            saveproject(String(args["path"]), seq)
+            # the PLAYER method: the matte marks and repairs live there, not on the
+            # sequence, and the sequence-only method drops them without a word
+            saveproject(String(args["path"]), player)
         elseif name == "add_source"
             clip = addsource!(player, String(args["path"]))  # snapshots itself
             statedict(player)

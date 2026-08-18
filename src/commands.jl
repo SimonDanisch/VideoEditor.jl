@@ -157,10 +157,37 @@ registercommand!(:go_end, "Go to the end"; category = :transport, shortcut = "En
     enabled = needsclips,
     run = p -> seek!(p, max(seqlength(p.sequence) - 1, 0)))
 
+registercommand!(:smooth_slowmo, "Smooth slow motion (optical flow)"; category = :effect,
+    keywords = ["slow", "motion", "interpolate", "rife", "flow", "retime", "fps"],
+    enabled = needsclip,
+    run = p -> smoothslowmo!(p))
+
+registercommand!(:transcribe, "Transcribe (captions)"; category = :effect,
+    keywords = ["subtitle", "caption", "speech", "whisper", "text", "srt"],
+    enabled = needsclips,
+    run = p -> runtranscribe!(p))
+
+registercommand!(:auto_look, "Grade from this frame (look)"; category = :effect,
+    keywords = ["colour", "color", "grade", "lut", "look", "neural"],
+    enabled = needsclip,
+    run = p -> runlook!(p))
+
 registercommand!(:depth_blur, "Blur background (depth)"; category = :effect,
     keywords = ["depth", "defocus", "bokeh", "background", "portrait"],
     enabled = needsclip,
     run = p -> rundepth!(p))
+
+# Copy/paste were Ctrl+C/Ctrl+V and nothing else — the only edit operations with
+# no palette entry, while split, delete, undo, redo, crop and blade all have one.
+# The palette is also where a shortcut is LEARNED: it prints the key beside the
+# name, so a command that is missing from it hides its own keystroke.
+registercommand!(:copy_clips, "Copy the selected clip(s)"; category = :edit,
+    shortcut = "Ctrl+C", keywords = ["duplicate", "clipboard", "copy"],
+    enabled = needsclip, run = copyclips!)
+registercommand!(:paste_clips, "Paste clip(s) at the playhead"; category = :edit,
+    shortcut = "Ctrl+V", keywords = ["duplicate", "clipboard", "paste"],
+    enabled = p -> isempty(p.clipboard) ? "nothing copied yet" : true,
+    run = pasteclips!)
 
 registercommand!(:split, "Split at playhead"; category = :edit, shortcut = "S",
     keywords = ["cut", "blade", "trim"], enabled = needsclip,
@@ -210,6 +237,29 @@ registercommand!(:blade, "Blade — cut where you click"; category = :edit,
 registercommand!(:transition, "Add / remove a cross-dissolve"; category = :edit,
     shortcut = "T", keywords = ["fade", "dissolve", "blend"], enabled = needsclip,
     run = toggletransition!)
+# Walking a transcript is keyboard work — you read, fix a word, move on — and the
+# panel's ◀/▶ were the only way to do it. Alongside the edit-point jumps because
+# they are the same gesture on a different set of marks.
+registercommand!(:next_caption, "Go to the next caption"; category = :transport,
+    keywords = ["subtitle", "transcript", "line"],
+    enabled = p -> isempty(p.sequence.captions) ? "no transcript yet" : true,
+    run = p -> gotocaption!(p, 1))
+registercommand!(:prev_caption, "Go to the previous caption"; category = :transport,
+    keywords = ["subtitle", "transcript", "line"],
+    enabled = p -> isempty(p.sequence.captions) ? "no transcript yet" : true,
+    run = p -> gotocaption!(p, -1))
+
+# The canvas escape hatch. Reachable only from the crop card before this, which
+# is a bad place for "undo a decision about the whole project".
+registercommand!(:reset_canvas, "Reset the project canvas"; category = :edit,
+    keywords = ["size", "resolution", "canvas", "uncrop", "project"],
+    enabled = p -> p.sequence.canvas === nothing ? "the canvas is already derived" : true,
+    run = p -> resetcanvas!(p))
+
+registercommand!(:pick_focus, "Pick the focus point (depth blur)"; category = :effect,
+    keywords = ["depth", "focus", "sharp", "bokeh"], enabled = needsclip,
+    run = p -> pickfocus!(p))
+
 registercommand!(:next_edit, "Go to the next edit point"; category = :transport,
     shortcut = "↓", enabled = needsclips, run = p -> jumpedit!(p, 1))
 registercommand!(:prev_edit, "Go to the previous edit point"; category = :transport,

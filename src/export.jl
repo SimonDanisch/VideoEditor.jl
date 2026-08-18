@@ -120,6 +120,12 @@ Default export canvas: the first clip's crop region in source pixels
 (even multiples, as encoders require), or the source size when uncropped.
 """
 function canvassize(seq::Sequence)
+    # An explicit canvas wins. Without one this falls back to the first clip's
+    # crop, which is what it always did and why deleting that clip used to change
+    # the project's resolution — the crop tool now records the size it produced
+    # instead of leaving it to be re-derived from whichever clip is first.
+    seq.canvas === nothing || return seq.canvas
+    isempty(seq.clips) && return (2, 2)
     clip = seq.clips[1]
     w = round(Int, clip.crop[3] * clip.source.width)
     h = round(Int, clip.crop[4] * clip.source.height)
@@ -266,7 +272,7 @@ function renderframe!(dest::AnyRGBFrame, seq::Sequence, n::Integer,
     # Plots go on LAST, over the finished canvas — including over a gap, so a
     # title can carry a black hold. Unconditional: on a sequence without
     # overlays it returns without touching a pixel.
-    drawoverlays!(dest, seq.overlays, n; framerate = seq.framerate)
+    drawoverlays!(dest, seq.overlays, n; framerate = seq.framerate, captions = seq.captions)
     return dest
 end
 

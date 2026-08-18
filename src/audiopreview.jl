@@ -109,6 +109,9 @@ function fillaudio!(out::AbstractMatrix{Int16}, seq::Sequence,
         end
         pos += span
     end
+    # Narration plays OVER the cut list, so it is a second pass that ADDS rather
+    # than another branch in the loop above, which writes.
+    mixnarration!(out, seq, startsample; rate = AUDIORATE)
     return out
 end
 

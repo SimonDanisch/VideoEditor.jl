@@ -105,7 +105,9 @@ registertool!(name::Symbol, label::AbstractString, description::AbstractString;
     registereffect!(EffectKind(name, label; description, body = panel,
                                activate, deactivate, analysis = true))
 
-"Every kind that has a card body or an action of its own — what the Tools dock lists."
+"Every kind that has a card body or an action of its own. NOT a list of what is on
+ screen — the Tools dock it once described is gone, and the Effects panel renders
+ a kind's body inside its effect's card, or via `toolonlykinds` when it has none."
 toolkinds(registry::EffectRegistry = EFFECTS) =
     filter(k -> k.activate !== nothing || k.body !== nothing, registry.kinds)
 
@@ -205,6 +207,23 @@ function toolslot(ctx::ToolContext, which::Symbol)
     d = which === :rows ? slots[2] : which === :footer ? slots[3] : slots[1]
     return get(d, ctx.tool, nothing)
 end
+
+"""
+    ghostbutton(colors) -> NamedTuple
+
+The look of a SECONDARY action: outlined, transparent fill, full-strength label.
+
+Splat it into a `Button`. It exists because `labelcolor = colors.text_muted` on a
+transparent fill reads as DISABLED, and that combination was written four
+separate times in this panel — "+ object", the brush's ±, a narration's render,
+a repair's "go to frame" — and was wrong all four times. Outlined-not-filled is
+what makes an action secondary; dimming its TEXT just makes it look broken.
+"""
+ghostbutton(colors) = (fontsize = 11, height = 24, tellwidth = false,
+                       width = Makie.Relative(1.0), cornerradius = PILLRADIUS,
+                       buttoncolor = (:transparent, 0.0), strokewidth = 1,
+                       strokecolor = (colors.text, 0.45), labelcolor = colors.text,
+                       buttoncolor_hover = colors.surface)
 
 """
     toolaction!(ctx, label, callback; footer = false)
@@ -355,8 +374,15 @@ function toolcard!(build::Function, ctx::ToolContext; caption::AbstractString = 
     cardrows === nothing && return 0
     colors = ctx.player.timeline.colors
     cardbg = Makie.lerp_oklab(RGBf(Makie.to_color(colors.background)), RGBf(1, 1, 1), 0.075)
+    # `id` is GLOBAL (it addresses `cards`, which every tool shares) but the ROW
+    # is per-tool, and the two are not the same number. They coincided only while
+    # a single tool body rendered at a time; with the tool-only cards the panel now
+    # builds four at once, so the second tool's first card landed in row 2 of its
+    # own grid and left row 1 empty — and one empty row makes a nested layout
+    # indeterminate, which collapses the card that should have held it.
     id = length(cards) + 1
-    cell = cardrows[id, 1]
+    row = count(c -> c.tool === ctx.tool, cards) + 1
+    cell = cardrows[row, 1]
     frame = Box(cell; color = cardbg, strokecolor = colors.border, strokewidth = 1,
                 cornerradius = 6, tellwidth = false, tellheight = false)
     # The header spans the card EDGE TO EDGE — the outer layout carries no padding
@@ -380,7 +406,12 @@ function toolcard!(build::Function, ctx::ToolContext; caption::AbstractString = 
     # preview lands) then still leaves everything it made in the teardown list.
     # Orphaned scene plots do not just leak — they keep drawing, stacked over the
     # card that replaced them.
-    entry = (; id, frame, im = nothing, lbl, onclick = nothing, rm, box = nothing, blocks)
+    # `tool` LAST. The note above says this list is read by field — and it mostly
+    # is, but not everywhere: the suite indexes it positionally (`c[5](c[1])`), so
+    # inserting a field in the middle turned `onclick` into a `Label` and every
+    # click on a tool card threw. Appending is the only safe place to grow it.
+    entry = (; id, frame, im = nothing, lbl, onclick = nothing, rm, box = nothing,
+             blocks, tool = ctx.tool)
     push!(cards, entry)
     build(GridLayout(g[2, 1]; alignmode = Makie.Outside(8, 8, 6, 8)), blocks)
     return entry
@@ -405,7 +436,9 @@ function tooladdcard!(ctx::ToolContext, img::AbstractMatrix{RGB{N0f8}};
     cardrows === nothing && return 0
     colors = ctx.player.timeline.colors
     id = length(cards) + 1
-    k = 2id - 1
+    # PER TOOL, like `toolcard!` — `id` addresses the shared `cards` list, not a
+    # row in this tool's grid. Two cards per entry here (header + picture).
+    k = 2 * count(c -> c.tool === ctx.tool, cards) + 1
     # A CARD, visibly: one framed container holding a header row [caption … ×] and
     # the picture under it — the same section look the tool cards themselves use, so
     # a reference reads as one object instead of a loose label next to an image.
@@ -443,7 +476,7 @@ function tooladdcard!(ctx::ToolContext, img::AbstractMatrix{RGB{N0f8}};
     # card made (frame, box, lbl, im, rm) — but the field has to BE there: the
     # list is read by field, so a positional tuple made every click on the tools
     # panel throw a `FieldError` instead of selecting a card.
-    push!(cards, (; id, frame, im, lbl, onclick, rm, box, blocks = Any[]))
+    push!(cards, (; id, frame, im, lbl, onclick, rm, box, blocks = Any[], tool = ctx.tool))
     return id
 end
 
@@ -1282,22 +1315,561 @@ function mattepanel!(ctx::ToolContext)
         return nothing
     end
     matteviewrow!(ctx)
+    # Painting is Alt+drag and always has been; what was missing was anything on
+    # screen saying so, and any way to size the brush without knowing about `[`
+    # and `]`. Next to the view toggle because both are "how am I looking at and
+    # touching this matte", as opposed to the cards below, which are the matte.
+    clip.mattetrack === nothing || brushrow!(ctx)
     # one card per marked frame, plus the frame being marked — its points are not
     # a mark yet, they become one when the session is committed
     frames = collect(keys(marks))
     marking && !(col.srcframe in frames) && push!(frames, col.srcframe)
     sort!(frames)
+    # ONE CARD for the frame being marked — it holds the object pills and the live
+    # preview — and one thin ROW for each of the others. A full card per marked
+    # frame turned ten marks into a screen and a half of scrolling, when all a
+    # non-live mark needs is its number, a way back to it, and a way to drop it.
+    # `toolrows!` is the codebase's own "list of items, not buttons" shape.
     live = nothing
+    others = Any[]
     for f in frames
-        w = matteseedcard!(ctx, clip, f, marking && col.srcframe == f)
-        w.live && (live = w)
+        if marking && col.srcframe == f
+            w = matteseedcard!(ctx, clip, f, true)
+            w.live && (live = w)
+        else
+            push!(others, ("frame $f",
+                           [("go", () -> gotomatteseed!(ctx, clip, f)),
+                            ("×",  () -> removematteseed!(player, clip, f))],
+                           false))
+        end
     end
+    # …and one per REPAIRED frame. Without these a repair is invisible: you can
+    # fix a frame and have no way to see which frames you fixed, no way to get
+    # back to one, and no way to drop a single repair short of undoing every edit
+    # since. A repair is an edit and needs the same handle a mark has.
+    # …and the repairs join the same list, marked as such: they are the same kind
+    # of thing (a frame you can return to and undo), so two separate lists of
+    # near-identical rows would only ask the reader which is which.
+    for (f, _) in sort!(collect(matterepairs(player, clip)); by = first)
+        push!(others, ("frame $f · repaired",
+                       [("go", () -> gotomatteseed!(ctx, clip, f)),
+                        ("×",  () -> dropmatterepair!(player, clip, f))],
+                       false))
+    end
+    isempty(others) || toolrows!(ctx, others)
     # published so a click during marking can repaint the live card's pills in
     # place — a full rebuild per click loses the one arriving mid-rebuild
     live === nothing ? delete!(player.fxwidgets, :mattecard) :
                        (player.fxwidgets[:mattecard] = live)
-    toolaction!(ctx, "Apply matte to clip", () -> applymattenow!(ctx, clip); footer = true)
+    # The two ways to finish a marking session, as two buttons, because they were
+    # two keystrokes one Shift apart and the difference is the whole decision:
+    # propagate through the shot, or fix the one frame that came out broken.
+    # Shift+Enter still does this — but a repair gesture that exists only as a
+    # modifier on a key, hinted in a status line that the next status overwrites,
+    # is a feature nobody finds.
+    if marking && col.prevtrack !== nothing
+        toolaction!(ctx, "Fix this frame only", () -> repairmattecollect!(col); footer = true)
+    elseif !marking
+        # THE WAY BACK IN. "Mark subject" is gated on there being no matte yet, so
+        # once one was applied there was no button, no shortcut and no palette
+        # entry that started marking again — and "Fix this frame only" above needs
+        # a marking session to exist before it appears. The whole repair flow was
+        # a door that locked behind you: the one case it was built for, a bad
+        # frame in a finished matte, was the one case you could not reach.
+        toolaction!(ctx, "Mark this frame", () -> startmattepick!(ctx); footer = true)
+    end
+    # Say what it will COST when that is worth knowing. The alpha is linear in the
+    # shot's length — 3.5 GB a minute at 1080p — so on a long clip this is the
+    # number that decides whether to matte the whole thing or trim it first. Shown
+    # only past a gigabyte: on the short clips that are most of them it is noise.
+    need = mattebytes(clip)
+    toolaction!(ctx, need > 2^30 ?
+                     "Apply matte to clip (≈$(round(need / 2^30; digits = 1)) GB)" :
+                     "Apply matte to clip",
+                () -> applymattenow!(ctx, clip); footer = true)
     warmmattepanel!(ctx)
+    return nothing
+end
+
+"""
+    gotocaption!(player, step) -> nothing
+
+Move the playhead to the caption `step` lines away from the one under it.
+
+Correcting a transcript is a walk through it, line by line — and the panel only
+ever shows the line under the playhead, so without this you scrub blindly hunting
+for the next one. From nowhere (`i == 0`) it goes to the first line forward and
+the last line back, so the buttons do something useful from a gap too.
+"""
+function gotocaption!(player::Player, step::Integer)
+    seq = player.sequence
+    isempty(seq.captions) && return nothing
+    i = captionindexat(seq, player.playhead[])
+    j = i == 0 ? (step > 0 ? 1 : length(seq.captions)) :
+        clamp(i + Int(step), 1, length(seq.captions))
+    c = seq.captions[j]
+    seek!(player, clamp(round(Int, c.start * seq.framerate), 0,
+                        max(seqlength(seq) - 1, 0)))
+    setstatus!(player, "line $j of $(length(seq.captions)): $(c.text)")
+    return nothing
+end
+
+"""
+The transcript panel: how many lines there are, and the one under the playhead —
+editable.
+
+A transcript is a GUESS, and the one thing anybody reliably wants to do with a
+guess is correct it. Without this the speech integration is read-only: you can
+generate captions, see them, move them and restyle them, and the moment the model
+mishears a name your only recourse is to run it again and get the same answer.
+
+Shows the line under the playhead rather than a list of every line, because the
+playhead is already how you navigate to the one you disagree with — you hear it,
+you stop, you fix it. A scrolling list would be a second way to move through the
+timeline that does not move the timeline.
+"""
+function transcriptpanel!(ctx::ToolContext)
+    player = ctx.player
+    seq = player.sequence
+    if isempty(seq.captions)
+        toolaction!(ctx, "Transcribe", () -> runtranscribe!(player))
+        return nothing
+    end
+    i = captionindexat(seq, player.playhead[])
+    toolcard!(ctx; caption = "$(length(seq.captions)) line(s)") do g, blocks
+        if i == 0
+            lab = Label(g[1, 1], "no line under the playhead"; fontsize = 11,
+                        halign = :left, tellwidth = false)
+            push!(blocks, lab)
+        else
+            c = seq.captions[i]
+            box = Textbox(g[1, 1]; stored_string = c.text, width = Makie.Relative(1.0),
+                          tellwidth = false, reset_on_defocus = false, fontsize = 11)
+            # `stored_string` fires on ENTER, not per keystroke, so one correction
+            # is one undo step rather than one per letter.
+            on(box.stored_string) do str
+                str === nothing && return
+                str == seq.captions[i].text && return      # focus loss, not an edit
+                editcaption!(player, str)
+            end
+            push!(blocks, box)
+            t = Label(g[2, 1], "line $i of $(length(seq.captions))  ·  " *
+                                "$(round(c.start; digits = 2))s – $(round(c.stop; digits = 2))s";
+                      fontsize = 10, halign = :left, tellwidth = false)
+            push!(blocks, t)
+        end
+        nothing
+    end
+    # Walk the transcript. The panel shows ONE line — the one under the playhead —
+    # so without a way to step between them, fixing what the model misheard means
+    # scrubbing at random until a line appears.
+    slot = toolslot(ctx, :controls)
+    if slot !== nothing
+        colors = player.fxwidgets[:uicolors]
+        nav = GridLayout(slot[length(ctx.controls) + 1, 1])
+        prev = Button(nav[1, 1]; label = "◀ line", fontsize = 11, height = 22,
+                      tellwidth = false, width = Makie.Relative(1.0),
+                      buttoncolor = colors.surface)
+        nxt = Button(nav[1, 2]; label = "line ▶", fontsize = 11, height = 22,
+                     tellwidth = false, width = Makie.Relative(1.0),
+                     buttoncolor = colors.surface)
+        on(_ -> gotocaption!(player, -1), prev.clicks)
+        on(_ -> gotocaption!(player, 1), nxt.clicks)
+        push!(ctx.controls, nav)          # ONE entry — see `matteviewrow!`
+    end
+    toolaction!(ctx, "Re-transcribe", () -> runtranscribe!(player); footer = true)
+    return nothing
+end
+
+"""
+The narration panel: what has been said, and a box to say something new.
+
+Placed at the PLAYHEAD, because that is where you are when you decide a line
+belongs — the alternative is a time field to type into, which means reading the
+timecode off the screen and copying it by hand.
+
+Each existing line is a card with its own × so one can go without touching the
+others, and re-rendering is per line: a voice or wording change should not cost
+the whole track.
+"""
+function narrationpanel!(ctx::ToolContext)
+    player = ctx.player
+    seq = player.sequence
+    colors = player.fxwidgets[:uicolors]
+    toolcard!(ctx; caption = "new line") do g, blocks
+        box = Textbox(g[1, 1]; placeholder = "what should be said…",
+                      width = Makie.Relative(1.0), tellwidth = false,
+                      reset_on_defocus = false, fontsize = 11)
+        # ENTER commits, so a line is one edit rather than one per keystroke.
+        on(box.stored_string) do str
+            (str === nothing || isempty(strip(str))) && return
+            addnarration!(player, str)
+            box.stored_string[] = nothing
+        end
+        push!(blocks, box)
+        nothing
+    end
+    for (i, nar) in enumerate(seq.narration)
+        toolcard!(ctx; caption = "at $(round(nar.at; digits = 2))s",
+                  onremove = _ -> dropnarration!(player, i)) do g, blocks
+            # A Textbox, not a Label: the words are the EDIT, and a line you can
+            # only delete and retype is not an editable line.
+            box = Textbox(g[1, 1]; stored_string = nar.text, fontsize = 11,
+                          width = Makie.Relative(1.0), tellwidth = false,
+                          reset_on_defocus = false)
+            on(str -> str === nothing || setnarrationtext!(player, i, str), box.stored_string)
+            push!(blocks, box)
+            # Side by side, not stacked. Each line is a card in a scrolling panel
+            # and a documentary has dozens of them — three full-width controls
+            # apiece made thirty lines a scroll nobody would use.
+            brow = GridLayout(g[2, 1])
+            flat = ghostbutton(colors)
+            b  = Button(brow[1, 1]; label = isempty(nar.samples) ? "render" : "re-render", flat...)
+            mv = Button(brow[1, 2]; label = "move here", flat...)
+            on(_ -> rendernarration!(player, i), b.clicks)
+            on(_ -> movenarration!(player, i), mv.clicks)
+            push!(blocks, brow)
+            # The voice, once the synthesizer can say what it has. No menu at all
+            # rather than an empty one: a control listing nothing is worse than a
+            # control that is not there yet.
+            vs = speakvoices()
+            if !isempty(vs)
+                menu = Menu(g[3, 1]; options = vs, fontsize = 11,
+                            default = nar.voice in vs ? nar.voice : nothing,
+                            prompt = "voice: $(nar.voice)",
+                            width = Makie.Relative(1.0), tellwidth = false)
+                on(v -> v === nothing || setnarrationvoice!(player, i, v), menu.selection)
+                push!(blocks, menu)
+            end
+            nothing
+        end
+    end
+    return nothing
+end
+
+"""
+    addnarration!(player, text) -> nothing
+
+Add a spoken line at the playhead and synthesize it.
+
+On the analysis executor: Kokoro is ~0.5 s of model time for a sentence warm and
+far more cold, and the UI thread must stay answerable — the same reason the matte
+and the depth run there.
+"""
+function addnarration!(player::Player, text::AbstractString)
+    hasspeakmodel() || return setstatus!(player, "narration: no synthesizer installed")
+    seq = player.sequence
+    at = player.playhead[] / (seq.framerate > 0 ? seq.framerate : 25.0)
+    snapshot!(player)
+    nar = Narration(String(text), at)
+    push!(seq.narration, nar)
+    refreshedit!(player)
+    setstatus!(player, "narration: speaking…")
+    runanalysis(player) do
+        try
+            render!(nar)
+            put!(player.uiqueue, () -> begin
+                refreshedit!(player)
+                setstatus!(player, "narration added at $(round(at; digits = 2))s")
+            end)
+        catch e
+            bt = catch_backtrace()
+            put!(player.uiqueue, () -> begin
+                setstatus!(player, "narration failed: $(briefly(e))")
+                @error "narration failed" exception = (e, bt)
+            end)
+        end
+    end
+    return nothing
+end
+
+"""
+    setnarrationtext!(player, i, text) -> nothing
+
+Reword line `i`, which un-renders it.
+
+The samples are a cache OF THE WORDS. Keeping them after an edit would leave a
+line whose card says one thing and whose audio says another — so the replacement
+starts unrendered and the button goes back to saying "render". REPLACE rather
+than mutate: the undo stack shares these objects.
+"""
+function setnarrationtext!(player::Player, i::Integer, text::AbstractString)
+    seq = player.sequence
+    1 <= i <= length(seq.narration) || return nothing
+    old = seq.narration[i]
+    strip(String(text)) == strip(old.text) && return nothing
+    snapshot!(player)
+    seq.narration[i] = Narration(String(text), old.at, old.voice)
+    refreshedit!(player)
+    setstatus!(player, "narration reworded — press render to speak it")
+    return nothing
+end
+
+"""
+    setnarrationvoice!(player, i, voice) -> nothing
+
+Speak line `i` in a different voice, which un-renders it.
+
+Same rule as [`setnarrationtext!`](@ref) and for the same reason: the samples are
+a cache of the words AND the voice, so keeping them would leave a card claiming
+one voice over audio in another. Replaces rather than mutates — the undo stack
+shares these objects.
+"""
+function setnarrationvoice!(player::Player, i::Integer, voice::AbstractString)
+    seq = player.sequence
+    1 <= i <= length(seq.narration) || return nothing
+    old = seq.narration[i]
+    String(voice) == old.voice && return nothing
+    snapshot!(player)
+    seq.narration[i] = Narration(old.text, old.at, String(voice))
+    refreshedit!(player)
+    setstatus!(player, "narration voice $(voice) — press render to hear it")
+    return nothing
+end
+
+"""
+    movenarration!(player, i) -> nothing
+
+Move line `i` to the playhead, keeping its audio.
+
+WHEN a voiceover lands is the thing you adjust most, and it was the one property
+with no control at all: a line added a second early had to be deleted and typed
+again with the playhead moved. The words have not changed, so the samples are
+still valid and come along — re-synthesizing to move a line would cost seconds
+and produce the same sound.
+"""
+function movenarration!(player::Player, i::Integer)
+    seq = player.sequence
+    1 <= i <= length(seq.narration) || return nothing
+    old = seq.narration[i]
+    at = player.playhead[] / (seq.framerate > 0 ? seq.framerate : 25.0)
+    snapshot!(player)
+    fresh = Narration(old.text, at, old.voice)
+    append!(fresh.samples, old.samples)
+    fresh.rate = old.rate
+    seq.narration[i] = fresh
+    refreshedit!(player)
+    setstatus!(player, "narration moved to $(round(at; digits = 2))s")
+    return nothing
+end
+
+"Re-synthesize one line — after editing its words or changing its voice."
+function rendernarration!(player::Player, i::Integer)
+    seq = player.sequence
+    1 <= i <= length(seq.narration) || return nothing
+    nar = seq.narration[i]
+    setstatus!(player, "narration: speaking…")
+    runanalysis(player) do
+        try
+            # REPLACE, never `render!` in place — see `render`. The undo stack
+            # shares this object.
+            fresh = render(nar)
+            put!(player.uiqueue, () -> (i <= length(seq.narration) &&
+                                        (seq.narration[i] = fresh)))
+            put!(player.uiqueue, () -> (refreshedit!(player);
+                                        setstatus!(player, "narration rendered")))
+        catch e
+            bt = catch_backtrace()
+            put!(player.uiqueue, () -> begin
+                setstatus!(player, "narration failed: $(briefly(e))")
+                @error "narration render failed" exception = (e, bt)
+            end)
+        end
+    end
+    return nothing
+end
+
+"Drop one spoken line."
+function dropnarration!(player::Player, i::Integer)
+    seq = player.sequence
+    1 <= i <= length(seq.narration) || return nothing
+    snapshot!(player)
+    deleteat!(seq.narration, i)
+    refreshedit!(player)
+    setstatus!(player, "narration line removed")
+    return nothing
+end
+
+"""
+    lookbody!(ctx)
+
+The look card's body: learn the grade, or learn it again somewhere else.
+
+Re-learning matters more than it sounds. The LUT is fitted from ONE frame, so
+which frame you were parked on when you pressed it is the whole result — and the
+only way to find that out is to try another one. Offering "Learn from this frame"
+again on a clip that already has a look is the difference between a dial you can
+work with and a one-shot you have to undo.
+"""
+function lookbody!(ctx)
+    player = ctx.player
+    loc = editclip(player)
+    loc === nothing && return nothing
+    label = loc[1].look === nothing ? "Learn look from this frame" : "Re-learn from this frame"
+    toolaction!(ctx, label, () -> runlook!(player))
+    return nothing
+end
+
+"""
+    depthbody!(ctx)
+
+The depth-blur card's body: estimate the depth, or pick the focus point.
+
+The card's sliders come from its `EffectKind` params; this adds the two ACTIONS,
+so one card answers "make the background soft" end to end instead of sending the
+user to a second card for the analysis and a third for the picker.
+"""
+function depthbody!(ctx)
+    player = ctx.player
+    loc = editclip(player)
+    loc === nothing && return nothing
+    clip, srcframe = loc
+    if clip.depthtrack === nothing
+        toolaction!(ctx, "Estimate depth", () -> rundepth!(player))
+        return nothing
+    end
+    toolaction!(ctx, "Pick focus point", () -> pickfocus!(player))
+    toolaction!(ctx, "Re-estimate depth", () -> rundepth!(player))
+    # The map itself, under the actions. A card in the tool list rather than an
+    # overlay on the preview: an overlay has to be mapped through the clip's crop
+    # and the canvas letterbox to line up, and a depth map that is subtly
+    # misaligned is worse than none — it would be read as the model being wrong.
+    d = depthframe(clip, srcframe)
+    d === nothing ||
+        tooladdcard!(ctx, depthimage(d); caption = "depth here — bright is near")
+    return nothing
+end
+
+"""
+    pickfocus!(player) -> nothing
+
+Arm a one-shot preview click that sets the depth-blur focus to whatever you click
+ON.
+
+The parameter is a depth in `0..1` and nothing on screen is labelled with one, so
+setting it by slider is guesswork — you drag until the thing you care about looks
+sharp, which is a search, not an adjustment. Clicking the subject is the question
+the user actually has: *make this sharp*.
+
+Reads the clip's own depth track at the clicked pixel, so it agrees with what the
+effect will do by construction rather than by a second estimate.
+"""
+function pickfocus!(player::Player)
+    loc = editclip(player)
+    loc === nothing && return setstatus!(player, "focus: no clip under the playhead")
+    clip, srcframe = loc
+    clip.depthtrack === nothing &&
+        return setstatus!(player, "focus: estimate depth first")
+    setstatus!(player, "focus: click what should be sharp")
+    player.onpick = function (pt)
+        d = depthframe(clip, srcframe)
+        if d === nothing
+            setstatus!(player, "focus: this frame has no depth")
+            return nothing
+        end
+        # Preview point → matte-space fraction: `previewtomatte` is the same
+        # conversion the matte's clicks use, so a click means the same pixel in
+        # both tools rather than two nearly-identical mappings.
+        nx, ny = previewtomatte(player, clip, srcframe, pt)
+        w, h = size(d)
+        ix = clamp(floor(Int, nx * w) + 1, 1, w)
+        iy = clamp(floor(Int, ny * h) + 1, 1, h)
+        z = Float32(d[ix, iy]) / 255.0f0
+        snapshot!(player)
+        e = findeffect(clip, DepthBlurEffect)
+        seteffect!(clip, DepthBlurEffect(z, e === nothing ? 0.6f0 : e.strength))
+        refreshedit!(player)
+        notify(player.playhead)
+        setstatus!(player, "focus set to $(round(z; digits = 2)) — what you clicked is sharp")
+        return nothing
+    end
+    return nothing
+end
+
+"""
+The time-interpolation panel: which mode this clip uses, and what its rate is.
+
+A card for the same reason `StabilizeEffect` is one — its docstring records what
+the alternative cost: "there was no card to fold, no toggle to compare with".
+Optical flow was reachable only from the command palette, so a clip either
+juddered or did not and nothing on screen said which, or why.
+
+Shows the RATE too, because the mode does nothing at all above 1× and a control
+that is correctly idle looks broken. A user who turns it on and sees no change
+needs to be told the clip is not slowed, not left to conclude the feature is.
+"""
+function timeinterppanel!(ctx::ToolContext)
+    player = ctx.player
+    loc = editclip(player)
+    loc === nothing && return nothing
+    clip = loc[1]
+    colors = player.fxwidgets[:uicolors]
+    flow = clip.timeinterp === :flow
+    toolcard!(ctx; caption = "$(round(clip.rate; digits = 2))× source rate") do g, blocks
+        off = Makie.RGBf(0.22, 0.23, 0.26)
+        row = GridLayout(g[1, 1])
+        b1 = Button(row[1, 1]; label = "Frame sampling", fontsize = 11, height = 22,
+                    tellwidth = false, width = Makie.Relative(1.0),
+                    cornerradius = PILLRADIUS, buttoncolor = flow ? off : colors.accent)
+        b2 = Button(row[1, 2]; label = "Optical flow", fontsize = 11, height = 22,
+                    tellwidth = false, width = Makie.Relative(1.0),
+                    cornerradius = PILLRADIUS, buttoncolor = flow ? colors.accent : off)
+        on(_ -> setinterp!(player, clip, :sample), b1.clicks)
+        on(_ -> setinterp!(player, clip, :flow), b2.clicks)
+        push!(blocks, b1, b2)
+        if clip.rate >= 1.0
+            lab = Label(g[2, 1], wraptext("This clip is not slowed, so no frame " *
+                                          "falls between two source frames yet.", 34);
+                        fontsize = 10, halign = :left, tellwidth = false,
+                        color = colors.text_muted)
+            push!(blocks, lab)
+        end
+        nothing
+    end
+    return nothing
+end
+
+"Set a clip's time interpolation from the card, undoably."
+function setinterp!(player::Player, clip::Clip, mode::Symbol)
+    clip.timeinterp === mode && return nothing
+    snapshot!(player)
+    settimeinterp!(clip, mode)
+    refreshedit!(player)
+    notify(player.playhead)
+    setstatus!(player, mode === :flow ?
+        "optical flow on — in-between frames are synthesized" :
+        "frame sampling — the nearest source frame repeats")
+    return nothing
+end
+
+registertool!(:timeinterp, "Time interpolation",
+    "How a SLOWED clip fills the frames its source does not have: repeat the " *
+    "nearest (frame sampling) or synthesize it with RIFE (optical flow).";
+    activate = ctx -> smoothslowmo!(ctx.player),
+    panel = timeinterppanel!)
+
+registertool!(:narration, "Narration",
+    "Type a line, press Enter, and Kokoro speaks it at the playhead. Mixed over " *
+    "the timeline in the preview AND in the export.";
+    activate = ctx -> setstatus!(ctx.player, "narration: type a line in the card and press Enter"),
+    panel = narrationpanel!)
+
+registertool!(:transcript, "Transcript",
+    "Speech to captions with Whisper. The line under the playhead is editable — " *
+    "a transcript is a guess, and correcting it must not mean running it again.";
+    activate = ctx -> runtranscribe!(ctx.player),
+    panel = transcriptpanel!)
+
+"""
+Forget one frame's repair. The pixels stay until the matte is re-run — see
+[`repairmatteat!`](@ref) for why they cannot simply be put back.
+"""
+function dropmatterepair!(player::Player, clip::Clip, srcframe::Integer)
+    snapshot!(player)
+    delete!(matterepairs(player, clip), Int(srcframe))
+    refreshmattepanel!(player; structure = true)
+    setstatus!(player, "matte: repair on frame $srcframe forgotten — re-run the " *
+                       "matte to put the propagated frame back")
     return nothing
 end
 
@@ -1328,6 +1900,45 @@ function matteviewrow!(ctx::ToolContext)
     # recurses into its content, so the buttons still get cleaned up with it.
     push!(ctx.controls, row)
     return (b1, b2)
+end
+
+"""
+    brushrow!(ctx) -> (minus, plus)
+
+The paint gesture, said out loud, with a brush size you can set by clicking.
+
+Alt+drag has painted into the mask for as long as the brush has existed, and
+right-drag has erased — but neither appeared anywhere on screen, so the repair
+half of the matte tool was reachable only by already knowing it was there. The
+size readout doubles as the label: it is the one brush property you change often
+enough to want a number for, and `[`/`]` still move it.
+"""
+function brushrow!(ctx::ToolContext)
+    slot = toolslot(ctx, :controls)
+    slot === nothing && return nothing
+    player = ctx.player
+    row = GridLayout(slot[length(ctx.controls) + 1, 1])
+    # the FULL palette, for `text_muted` — see `matteseedcard!`
+    colors = player.fxwidgets[:uicolors]
+    Label(row[1, 1], "Alt+drag paints · right erases"; fontsize = 10,
+          color = colors.text_muted, halign = :left, tellwidth = false)
+    pct = round(Int, 100 * player.brushradius)
+    # The HINT stays muted — it is a sentence you read once. The ± are controls
+    # and are drawn as controls: at `text_muted` on a transparent fill they were
+    # as quiet as the sentence next to them and read as decoration, the same way
+    # `+ object` did before it got its contrast back.
+    minus = Button(row[1, 2]; label = "−", fontsize = 12, width = 22, height = 22,
+                   buttoncolor = (:transparent, 0.0), strokewidth = 1,
+                   strokecolor = (colors.text, 0.45), labelcolor = colors.text)
+    Label(row[1, 3], "$(pct)%"; fontsize = 10, color = colors.text, tellwidth = true)
+    plus = Button(row[1, 4]; label = "+", fontsize = 12, width = 22, height = 22,
+                  buttoncolor = (:transparent, 0.0), strokewidth = 1,
+                  strokecolor = (colors.text, 0.45), labelcolor = colors.text)
+    on(_ -> setbrushradius!(player, player.brushradius / 1.25), minus.clicks)
+    on(_ -> setbrushradius!(player, player.brushradius * 1.25), plus.clicks)
+    # ONE entry, like `matteviewrow!` — see the note there about empty rows.
+    push!(ctx.controls, row)
+    return (minus, plus)
 end
 
 """
@@ -1416,6 +2027,91 @@ function rundepth!(player::Player)
                 player.jobprogress[] = NaN
                 setstatus!(player, "depth failed: $(briefly(e))")
                 @error "depth analysis failed" exception = (e, bt)
+            end)
+        end
+    end
+    return nothing
+end
+
+"""
+    runlook!(player) -> nothing
+
+Grade the clip under the playhead from the frame under the playhead.
+
+**From the frame you are looking at**, not the clip's first: a shot often opens
+on black or mid-whip, and a look predicted from that is a look for a frame nobody
+sees. Choosing the frame is the entire user input to this feature, which is why
+it is the playhead's and not a hidden default.
+
+One model call, so it runs inline rather than through the analysis executor —
+~1.8 ms against the ~0.6 s a segmenter takes. The frame read costs more than the
+prediction.
+"""
+function runlook!(player::Player)
+    loc = editclip(player)
+    loc === nothing && return setstatus!(player, "look: no clip under the playhead")
+    clip, srcframe = loc
+    haslookmodel() || return setstatus!(player, "look: no model installed")
+    setstatus!(player, "look: grading from frame $srcframe…")
+    runanalysis(player) do
+        try
+            img = framereader(clip, player.engine)(srcframe)
+            analyzelook!(clip, img)
+            put!(player.uiqueue, () -> begin
+                findeffect(clip, LookEffect) === nothing &&
+                    push!(clip.effects, FxSlot(LookEffect()))
+                refreshedit!(player)
+                notify(player.playhead)
+                setstatus!(player, "look applied — Look is keyframable in the inspector")
+            end)
+        catch e
+            bt = catch_backtrace()
+            put!(player.uiqueue, () -> begin
+                setstatus!(player, "look failed: $(briefly(e))")
+                @error "look analysis failed" exception = (e, bt)
+            end)
+        end
+    end
+    return nothing
+end
+
+"""
+    runtranscribe!(player) -> nothing
+
+Transcribe the timeline and put a caption overlay on it.
+
+The overlay is added too, for the reason `rundepth!` adds its effect: a
+transcript nothing draws is invisible, and an invisible result reads as a broken
+button. If one is already there the transcript simply replaces what it shows.
+
+Whisper decodes the whole timeline, so this is minutes rather than milliseconds —
+it runs on the analysis executor with the progress bar, like the matte.
+"""
+function runtranscribe!(player::Player)
+    seq = player.sequence
+    isempty(seq.clips) && return setstatus!(player, "captions: the timeline is empty")
+    hasspeechmodel() || return setstatus!(player, "captions: no speech model installed")
+    setstatus!(player, "captions: transcribing…")
+    snapshot!(player)      # a re-run replaces corrections; undo has to reach them
+    player.jobprogress[] = 0.0
+    runanalysis(player) do
+        try
+            caps = transcribe!(seq)
+            put!(player.uiqueue, () -> begin
+                player.jobprogress[] = NaN
+                any(o -> o.kind === :captions, seq.overlays) ||
+                    addoverlay!(seq, :captions)
+                refreshedit!(player)
+                notify(player.playhead)
+                setstatus!(player, "captions: $(length(caps)) line(s) — the overlay's " *
+                                   "Y/Size/Opacity are in the inspector")
+            end)
+        catch e
+            bt = catch_backtrace()
+            put!(player.uiqueue, () -> begin
+                player.jobprogress[] = NaN
+                setstatus!(player, "captions failed: $(briefly(e))")
+                @error "transcription failed" exception = (e, bt)
             end)
         end
     end
@@ -1659,6 +2355,23 @@ lumpy where the curves join.
 const PILLRADIUS = 5
 
 """
+A pill's height, and the gap between two of them.
+
+They are constants together because the row that holds the pills is a NESTED
+grid, and a nested grid reports one row's height however many it holds — so the
+outer row has to be sized by hand, from exactly these two numbers. When that
+arithmetic assumed a gap the grid did not actually have, each extra object
+pushed the pills further past the bottom of their row and over the control
+below: the "+ object" button drifting out of line with the pills above it is
+what that looks like on screen.
+"""
+const PILLHEIGHT = 24
+const PILLGAP = 4
+
+"The exact height of a nested pill grid holding `n` rows of [`PILLHEIGHT`](@ref)."
+pillrowsize(n::Integer) = Makie.Fixed((PILLHEIGHT + PILLGAP) * n - PILLGAP)
+
+"""
 ONE card for ONE marked frame: which objects were marked there, and the × that
 un-marks that frame.
 
@@ -1675,6 +2388,7 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
     col    = live ? mattecollect(player) : nothing
     ids    = col === nothing ? Int[] : mattecardobjects(col)
     pillwidgets = Any[]
+    newobjbtn = Ref{Any}(nothing)
 
     card = toolcard!(ctx; caption = "frame $seedframe",
                      onremove = _ -> removematteseed!(player, clip, seedframe)) do g, blocks
@@ -1698,7 +2412,7 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
                 fill = Makie.lerp_oklab(RGBf(Makie.to_color(colors.background)), base,
                                         sel ? 0.55 : 0.16)
                 pill = Button(pills[k, 1]; label = "$n point$(n == 1 ? "" : "s")",
-                              fontsize = 11, height = 24, tellwidth = false,
+                              fontsize = 11, height = PILLHEIGHT, tellwidth = false,
                               width = Makie.Relative(1.0), cornerradius = PILLRADIUS,
                               buttoncolor = fill,
                               buttoncolor_hover = Makie.lerp_oklab(RGBf(Makie.to_color(colors.background)),
@@ -1708,7 +2422,8 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
                               strokewidth = sel ? 2 : 1,
                               strokecolor = sel ? base : (base, 0.4))
                 on(_ -> selectmatteobject!(player, id), pill.clicks)
-                bx = Button(pills[k, 2]; label = "×", fontsize = 11, width = 22, height = 24,
+                bx = Button(pills[k, 2]; label = "×", fontsize = 11, width = 22,
+                            height = PILLHEIGHT,
                             buttoncolor = (:transparent, 0.0), strokewidth = 0,
                             labelcolor = colors.text_muted,
                             buttoncolor_hover = Makie.lerp_oklab(RGBf(Makie.to_color(colors.background)),
@@ -1718,6 +2433,9 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
                 push!(pillwidgets, (; object = id, pill, remove = bx))
             end
             colsize!(pills, 1, Makie.Auto(false, 1.0))
+            # SET the gap rather than assume one: `rowsize!` below computes the
+            # outer row from it, and the default is not 4.
+            rowgap!(pills, PILLGAP)
 
             # UNDER the pills, because that is where the thing it makes appears.
             # Further clicks on a subject REFINE it — that is what SAM 2 does with
@@ -1728,16 +2446,21 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
             # it, the button stretched the full card width while every pill above
             # stopped short by the `×` column, so the one control that makes a new
             # pill was the one control that did not line up with them.
-            newobj = Button(pills[length(ids) + 1, 1]; label = "+ object", fontsize = 11,
-                            height = 24, tellwidth = false, width = Makie.Relative(1.0),
+            newobj = newobjbtn[] = Button(pills[length(ids) + 1, 1]; label = "+ object", fontsize = 11,
+                            height = PILLHEIGHT, tellwidth = false, width = Makie.Relative(1.0),
                             cornerradius = PILLRADIUS, buttoncolor = (:transparent, 0.0),
-                            strokewidth = 1, strokecolor = (colors.text, 0.28),
-                            labelcolor = colors.text_muted,
+                            # Outlined, to read as "makes a new one" rather than as
+                            # another object — but the LABEL is full-strength text.
+                            # At `text_muted` on a transparent fill it looked
+                            # switched off, which is a bad way to draw the one
+                            # control on this card that creates a pill.
+                            strokewidth = 1, strokecolor = (colors.text, 0.45),
+                            labelcolor = colors.text,
                             buttoncolor_hover = colors.surface)
             # …which makes the row one taller than the object count. Without an
             # explicit height the nested layout reported one row's worth however
             # many it held, and everything below was laid over what did not fit.
-            rowsize!(g, r, Makie.Fixed(28 * (length(ids) + 1)))
+            rowsize!(g, r, pillrowsize(length(ids) + 1))
             on(newobj.clicks) do _
                 c = mattecollect(player)
                 c === nothing && return setstatus!(player, "matte: mark a subject first")
@@ -1760,6 +2483,12 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
     end
     return (; clip, srcframe = Int(seedframe), live,
             nobj = length(ids), pills = pillwidgets,
+            # `newobj` is published for the same reason `pills` is — everything on
+            # this card should be addressable by a test, a walkthrough or MCP. It
+            # was the one control that MAKES a pill and the one that could not be
+            # pressed except by a human with a mouse, which is precisely the
+            # control a rendering check of the pills needs.
+            newobj = newobjbtn[],
             removebtn = card === 0 ? nothing : card.rm)
 end
 
@@ -2504,6 +3233,152 @@ function refreshmattepanel!(player::Player; structure::Bool = false)
     (structure || !repaintmattecard!(player)) && (EFFECTS.version[] += 1)
     return nothing
 end
+
+"""
+The crop card: what the next drag will change, and how big the project is now.
+
+The crop tool had no card at all — it was a toolbar button and a status line, and
+the status line is where its one irreversible act (resizing the project) was
+reported and then overwritten by the next message. Two things needed a home on
+screen: the SCOPE, because "crop this clip" and "resize the project" are
+different intents that were one gesture, and the CANVAS SIZE, because a project
+size you cannot see is one you cannot check before exporting.
+
+The scope is a two-button toggle rather than a modifier on the drag, for the
+reason the matte brush needed a row of its own: a gesture nobody can see is a
+gesture only its author knows about.
+"""
+function croppanel!(ctx::ToolContext)
+    player = ctx.player
+    seq = player.sequence
+    colors = player.fxwidgets[:uicolors]
+    scope = cropscope(player)
+    w, h = canvassize(seq)
+    toollabel!(ctx, "project canvas $(w)×$(h)" *
+                    (seq.canvas === nothing ? " (from the first clip)" : ""))
+
+    slot = toolslot(ctx, :controls)
+    if slot !== nothing
+        row = GridLayout(slot[length(ctx.controls) + 1, 1])
+        off = Makie.RGBf(0.22, 0.23, 0.26)
+        b1 = Button(row[1, 1]; label = "Whole project", fontsize = 11, height = 22,
+                    tellwidth = false, width = Makie.Relative(1.0),
+                    buttoncolor = scope[] === :canvas ? colors.accent : off)
+        b2 = Button(row[1, 2]; label = "This clip", fontsize = 11, height = 22,
+                    tellwidth = false, width = Makie.Relative(1.0),
+                    buttoncolor = scope[] === :clip ? colors.accent : off)
+        on(_ -> setcropscope!(player, :canvas), b1.clicks)
+        on(_ -> setcropscope!(player, :clip), b2.clicks)
+        # ONE entry — see `matteviewrow!` on what an empty row does to the layout.
+        push!(ctx.controls, row)
+    end
+
+    # The ratio row, under the scope row: first WHAT the drag changes, then WHAT
+    # SHAPE it comes out — the order the two decisions are actually made in.
+    slot2 = toolslot(ctx, :controls)
+    if slot2 !== nothing
+        arow = GridLayout(slot2[length(ctx.controls) + 1, 1])
+        off = Makie.RGBf(0.22, 0.23, 0.26)
+        lock = cropaspect(player)
+        for (j, (lbl, val)) in enumerate(CROPRATIOS)
+            on_ = val === nothing ? lock[] === nothing :
+                  lock[] !== nothing && isapprox(lock[], val; rtol = 1e-3)
+            b = Button(arow[1, j]; label = lbl, fontsize = 10, height = 22,
+                       tellwidth = false, width = Makie.Relative(1.0),
+                       buttoncolor = on_ ? colors.accent : off)
+            on(_ -> setcropaspect!(player, val), b.clicks)
+        end
+        push!(ctx.controls, arow)
+    end
+
+    toolaction!(ctx, player.tool[] === :crop ? "Crop tool (active)" : "Crop tool",
+                () -> usetool!(player, :crop))
+    seq.canvas === nothing ||
+        toolaction!(ctx, "Reset canvas to the first clip", () -> resetcanvas!(player);
+                    footer = true)
+    return nothing
+end
+
+"""
+The shapes the crop tool can be locked to, and what they are for.
+
+`nothing` is free-drag. The other three are the deliveries a shot actually gets
+cut for — a wide timeline, a phone, and a square post — rather than a list of
+every ratio that exists, which is a menu nobody reads.
+"""
+const CROPRATIOS = (("Free", nothing), ("16:9", 16 / 9), ("9:16", 9 / 16), ("1:1", 1.0))
+
+"Name a locked ratio — one of [`CROPRATIOS`](@ref) if it is one, else the number.
+ `first` over a filtered generator would throw on a ratio nobody listed, which is
+ a status line taking down the click that produced it."
+ratiolabel(a::Real) =
+    (i = findfirst(r -> r[2] !== nothing && isapprox(r[2], a; rtol = 1e-3), CROPRATIOS);
+     i === nothing ? string(round(Float64(a); digits = 3), ":1") : CROPRATIOS[i][1])
+
+"""
+    setcropaspect!(player, a) -> nothing
+
+Lock the crop tool to a shape (or to `nothing`, for free-drag).
+
+Locking RESHAPES the framing already in force rather than waiting for the next
+drag. Choosing 9:16 and seeing nothing happen reads as a control that did not
+work — and the whole reason to pick a ratio is to see the shot in it.
+"""
+function setcropaspect!(player::Player, a)
+    cropaspect(player)[] = a === nothing ? nothing : Float64(a)
+    player.tool[] === :crop || usetool!(player, :crop)
+    loc = editclip(player)
+    if a !== nothing && loc !== nothing
+        clip = loc[1]
+        snapshot!(player)
+        clip.crop = lockaspect(clip.crop, clip.source, a)
+        cropscope(player)[] === :canvas && (player.sequence.canvas =
+            (max(2 * (round(Int, clip.crop[3] * clip.source.width) ÷ 2), 2),
+             max(2 * (round(Int, clip.crop[4] * clip.source.height) ÷ 2), 2)))
+        applycrop!(player, clip)
+        refreshedit!(player)
+    end
+    showcurrentcrop!(player)
+    sz = canvassize(player.sequence)
+    setstatus!(player, a === nothing ? "crop: drag any shape" :
+                       "crop locked to $(ratiolabel(a)) — $(sz[1])×$(sz[2])")
+    refreshcroppanel!(player)
+    return nothing
+end
+
+"""
+    setcropscope!(player, s) -> Symbol
+
+Point the crop tool at the project or at one clip, and say which on the preview.
+
+Switching scope also brings the tool up: choosing what a crop will change is
+something you do because you are about to crop, and making that a second click
+was one click of ceremony on every use.
+"""
+function setcropscope!(player::Player, s::Symbol)
+    cropscope(player)[] = s
+    # NOT `usetool!`, which TOGGLES: changing scope while the crop tool is already
+    # up would have put it away, i.e. the control would cancel the thing it
+    # configures.
+    player.tool[] === :crop || usetool!(player, :crop)
+    showcurrentcrop!(player)
+    setstatus!(player, s === :canvas ?
+        "crop resizes the WHOLE PROJECT — drag past the edge to make it bigger" :
+        "crop reframes THIS CLIP only — the project keeps its size")
+    refreshcroppanel!(player)
+    return s
+end
+
+registereffect!(EffectKind(:crop, "Crop";
+    description = "Drag a rectangle on the preview. The rectangle may reach OUTSIDE the " *
+        "picture — that is how the canvas grows, and the new area comes in empty, " *
+        "exactly as it exports. Choose whether the drag resizes the whole project " *
+        "or reframes only the clip you dragged on.",
+    body = croppanel!,
+    # No `make`/`matches`: crop is not an effect in the stack. `clip.crop` is a
+    # field, and the canvas is the sequence's — so this kind is a card and a
+    # gesture, and `addablekinds` correctly leaves it out of the Add-effect menu.
+    activate = ctx -> usetool!(ctx.player, :crop)))
 
 # ONE kind: the parameters that tune the matte AND the card that produces it.
 # Split across two registries these were two entries with the same name — a

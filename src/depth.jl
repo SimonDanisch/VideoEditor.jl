@@ -41,11 +41,27 @@ travels to the host anyway.
 """
 const DEPTHANYTHING = Ref{Any}(nothing)
 
+"""
+    dropsingletons(a) -> AbstractArray
+
+`a` without its size-1 axes.
+
+The runner hands back the model's raw tensor — a depth map with a batch axis and
+a channel axis, neither of which a depth map has. Dropping them HERE, in the
+adapter, keeps the editor's contract as "a depth map is a matrix" rather than
+widening every consumer to accept a 4-D array that only ever has two real axes.
+"""
+dropsingletons(a::AbstractArray) = dropdims(a; dims = Tuple(findall(==(1), size(a))))
+
 function depthanythingdepth(img)
     if DEPTHANYTHING[] === nothing
         DEPTHANYTHING[] = DepthAnythingRunner.depthanything(; backend = Lava.LavaBackend())
     end
-    return Array(DepthAnythingRunner.depthmap!(DEPTHANYTHING[], img))
+    d = dropsingletons(Array(DepthAnythingRunner.depthmap!(DEPTHANYTHING[], img)))
+    # Loud, not silent: a model whose output stops being one plane is a change the
+    # editor must not paper over by guessing which axis to keep.
+    ndims(d) == 2 || error("depth model returned $(ndims(d)) non-singleton axes, expected 2")
+    return d
 end
 
 """
@@ -111,7 +127,7 @@ function analyzedepth!(clip::Clip, readframe; maxside::Integer = 384, progress =
     for k in 1:n
         img = k == 1 ? f0 : readframe(clip.src_in + k - 1)
         d = depthbytes(DEPTHMODEL[](img))
-        view(track.depth, :, :, k) .= mattemaskscale(d, dw, dh)
+        view(track.depth, :, :, k) .= depthscale(d, dw, dh)
         progress === nothing || progress(k, n)
     end
     clip.depthtrack = track
@@ -132,6 +148,63 @@ function depthframe(clip::Clip, srcframe::Integer)
     1 <= k <= size(t.depth, 3) || return nothing
     return view(t.depth, :, :, k)
 end
+
+"""
+    depthscale(src, w, h) -> Matrix{UInt8}
+
+Resize a depth map to `w`×`h`, KEEPING its values.
+
+Not [`mattemaskscale`](@ref), which this used and which ends
+`v > 0 ? 0xff : 0x00` — correct for a binary seed mask, catastrophic for a depth
+map: every non-zero depth became 0xff, so the track was a uniform "everything is
+nearest" plane. Depth blur still changed the picture (it defocused everything
+equally), so it passed a does-the-effect-do-something check; it had simply never
+done anything DEPTH-related. The card's thumbnail, which is solid white when this
+is wrong, is what showed it.
+
+BILINEAR, unlike the mask version's nearest neighbour. A mask has two values and
+nearest is the only honest choice; a depth map is continuous and drives a
+PER-PIXEL BLUR RADIUS, so a stepped depth map becomes visible banding in the
+defocus — concentric rings where the radius jumps. Interpolating costs three
+extra lerps per pixel, once per frame, at analysis time.
+"""
+function depthscale(src::AbstractMatrix{UInt8}, w::Int, h::Int)
+    sw, sh = size(src)
+    out = Matrix{UInt8}(undef, w, h)
+    @inbounds for j in 1:h, i in 1:w
+        # sample at pixel CENTRES, so the map is not shifted half a pixel
+        x = clamp((i - 0.5) * sw / w + 0.5, 1.0, Float64(sw))
+        y = clamp((j - 0.5) * sh / h + 0.5, 1.0, Float64(sh))
+        x0 = floor(Int, x); y0 = floor(Int, y)
+        x1 = min(x0 + 1, sw); y1 = min(y0 + 1, sh)
+        fx = x - x0; fy = y - y0
+        a = Float32(src[x0, y0]); b = Float32(src[x1, y0])
+        c = Float32(src[x0, y1]); d = Float32(src[x1, y1])
+        top = a + (b - a) * fx
+        bot = c + (d - c) * fx
+        out[i, j] = round(UInt8, clamp(top + (bot - top) * fy, 0.0f0, 255.0f0))
+    end
+    return out
+end
+
+"""
+    depthimage(d) -> Matrix{RGB{N0f8}}
+
+One depth plane as a grayscale picture, bright = near.
+
+The card shows this because a monocular depth estimate is a GUESS, and the effect
+built on it hides how good a guess it was: defocus turns a wrong depth into a
+soft halo rather than a visible error, so a shot the model misread looks merely
+mediocre instead of wrong. The map shows whether it separated subject from
+background at all — which is the one question worth asking before touching
+either slider.
+
+It is also what makes `Focus` legible. That slider is a number in depth units
+with nothing on screen carrying units, so without the map the only way to find a
+value is to drag until it looks right.
+"""
+depthimage(d::AbstractMatrix{UInt8}) =
+    map(v -> (g = reinterpret(N0f8, v); RGB{N0f8}(g, g, g)), d)
 
 # ---------------------------------------------------------------- the plane
 
@@ -215,8 +288,11 @@ and a radius is an integer by the time anything uses it.
             r += Float32(red(c)); g += Float32(green(c)); b += Float32(blue(c))
             n += 1.0f0
         end
-        out[x, y] = RGB{N0f8}(clamp(r / n, 0.0f0, 1.0f0),
-                              clamp(g / n, 0.0f0, 1.0f0),
-                              clamp(b / n, 0.0f0, 1.0f0))
+        # `unitn0f8`, NOT `RGB{N0f8}(::Float32, …)` — the latter validates and calls
+        # `throw_colorerror`, which drags string building into the kernel's IR and
+        # makes Lava reject the whole thing. See the note on `unitn0f8`: the clamp
+        # IS the check. This kernel had the validating form and so never compiled,
+        # which is why depth blur could not render even once depth existed.
+        out[x, y] = RGB{N0f8}(unitn0f8(r / n), unitn0f8(g / n), unitn0f8(b / n))
     end
 end

@@ -68,6 +68,19 @@ end
 DepthBlurEffect(; focus = 1.0, strength = 0.6) =
     DepthBlurEffect(Float32(focus), Float32(strength))
 
+"""
+Applies the clip's learned colour grade (see `look.jl`).
+
+Holds only `strength`, like `MatteEffect` and `RestoreEffect`: the table lives on
+the clip, so this stays a scalar the keyframe registry can animate. Dialling a
+grade in over a few frames is a real edit, and re-predicting to do it would be
+absurd — the look is the same, the amount of it is what changes.
+"""
+struct LookEffect <: Effect
+    strength::Float32
+end
+LookEffect(; strength = 1.0) = LookEffect(Float32(strength))
+
 "Composite opacity: scales the frame toward black by `α` (1 = opaque). The main
 use is a keyframed fade in/out; on a single track α<1 fades to black."
 struct OpacityEffect <: Effect
@@ -173,6 +186,7 @@ isneutral(e::FlickerEffect) = e.strength <= 0.001f0
 isneutral(::StabilizeEffect) = false   # the warp is either applied or the slot is off
 isneutral(e::RestoreEffect) = e.strength <= 0.001f0
 isneutral(e::DepthBlurEffect) = e.strength <= 0.001f0
+isneutral(e::LookEffect) = e.strength <= 0.001f0
 
 """
     liveeffects(clip)
@@ -216,6 +230,7 @@ effectdict(e::RestoreEffect) =
     Dict{String, Any}("type" => "restore", "strength" => e.strength)
 effectdict(e::DepthBlurEffect) =
     Dict{String, Any}("type" => "depthblur", "focus" => e.focus, "strength" => e.strength)
+effectdict(e::LookEffect) = Dict{String, Any}("type" => "look", "strength" => e.strength)
 effectdict(e::TransformEffect) =
     Dict{String, Any}("type" => "transform", "scale" => e.scale, "x" => e.x, "y" => e.y,
                       "rotation" => e.rotation)
@@ -259,6 +274,7 @@ function effectfromdict(d::AbstractDict)
     t == "restore" && return RestoreEffect(Float32(d["strength"]))
     t == "depthblur" && return DepthBlurEffect(Float32(get(d, "focus", 1.0)),
                                                Float32(get(d, "strength", 0.6)))
+    t == "look" && return LookEffect(Float32(get(d, "strength", 1.0)))
     t == "matte" && return MatteEffect(Float32(d["strength"]), Float32(get(d, "feather", 0.0)))
     t == "stabilize" && return StabilizeEffect()
     t == "loopfinder" && return LoopFinderEffect()
@@ -440,6 +456,9 @@ const BUILTINPARAMS = ParamSpec[
         (c, v) -> (e = findeffect(c, DepthBlurEffect);
                    seteffect!(c, DepthBlurEffect(e === nothing ? 1.0f0 : e.focus,
                                                  Float32(v))))),
+    ParamSpec(:look_strength, "Look", :look, 0.0, 1.0, 1.0,
+        c -> (e = findeffect(c, LookEffect); e === nothing ? 1.0 : Float64(e.strength)),
+        (c, v) -> seteffect!(c, LookEffect(Float32(v)))),
     ParamSpec(:restore_strength, "Restore", :restore, 0.0, 1.0, 1.0,
         c -> (e = findeffect(c, RestoreEffect); e === nothing ? 1.0 : Float64(e.strength)),
         (c, v) -> seteffect!(c, RestoreEffect(Float32(v)))),

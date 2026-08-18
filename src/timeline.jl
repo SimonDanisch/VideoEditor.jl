@@ -171,9 +171,14 @@ mutable struct Timeline
         timeline.tracklabelpos = Observable{Point2f}[]
         timeline.tracklabelplots = Any[]
         timeline.newtrackpos = Observable(Point2f(0, 0))
+        # STROKED. "+ new track" sits on a plain empty band and reads fine bare,
+        # but the same label also carries the "lane taken" message — and that one
+        # lands on top of a clip's filmstrip, where unstroked text is unreadable.
+        # One outline makes both legible on whatever they happen to cover.
         timeline.newtrackplot = text!(axis, timeline.newtrackpos; text = "+ new track",
                                       color = colors.accent, fontsize = 12, font = :bold,
-                                      align = (:center, :center), visible = false)
+                                      align = (:center, :center), visible = false,
+                                      strokecolor = RGBAf(0, 0, 0, 0.85), strokewidth = 2.5)
         translate!(timeline.newtrackplot, 0, 0, 11)
         timeline.newtrackzone = Observable(Rect2f(0, 0.875, 1, 0.115))
         timeline.newtrackzonelo = Observable(Rect2f(0, 0.005, 1, TRACKBASE - 0.01))
@@ -699,8 +704,25 @@ function dragto!(timeline::Timeline, t::Real, y::Real = NaN)
                              (RGBf(0.75, 0.2, 0.2), 0.4)
     timeline.ghost_plot.visible = true
     timeline.snapline[] = didsnap && timeline.dragvalid ? [snapped / fps] : Float64[]
+    # SAY WHY, where the eye already is. The red ghost says "no" and nothing said
+    # what would work — which is exactly the confusion that produced "seems like
+    # only new track is a drop target": aiming at an occupied lane looked like the
+    # lane simply refused clips, rather than refusing THIS one HERE. One label
+    # carries both messages, so there is never more than one hint on screen.
+    if !timeline.dragvalid
+        lo2, hi2 = trackband(track, n2)
+        timeline.newtrackpos[] = Point2f(snapped / fps + cliplength(clip) / fps / 2,
+                                         (lo2 + hi2) / 2)
+        # a VECTOR, matching how the plot was created: Makie type-locks an
+        # attribute scalar-vs-vector at creation, and assigning a bare String to
+        # one that started as `["+ new track"]` is the trap that costs an hour.
+        timeline.newtrackplot.text[] = ["lane taken here — slide along, or drop on a new track"]
+        timeline.newtrackplot.color[] = RGBf(1.0, 0.72, 0.68)
+        timeline.newtrackplot.visible = true
     # say it, don't imply it: dropping above the top lane creates a NEW track
-    if track > ntr || track == 0
+    elseif track > ntr || track == 0
+        timeline.newtrackplot.text[] = ["+ new track"]
+        timeline.newtrackplot.color[] = timeline.colors.accent
         timeline.newtrackpos[] = Point2f(snapped / fps + cliplength(clip) / fps / 2,
                                          (lo + hi) / 2)
         timeline.newtrackplot.visible = true
