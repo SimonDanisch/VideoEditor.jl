@@ -135,6 +135,11 @@ mutable struct Player
     # thing presents and it always targets the current playhead — see there for
     # what many of them did to a scrub.
     const refining::Threads.Atomic{Bool}
+    # One trim refiner at a time, and the frame it is chasing. `trimtarget` is
+    # overwritten by every trim event so an older loop abandons its frame rather
+    # than publishing it late over a newer one.
+    const trimming::Threads.Atomic{Bool}
+    trimtarget::Any
 end
 
 """
@@ -556,7 +561,8 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     Observable(VideoSource[]), Any[], nothing, Observable(:none),
                     Ref(1.0), Observable(:opacity), Observable(true),
                     Threads.Atomic{Float64}(NaN), Dict{Any, Any}(), FxEngine(analysisbackend),
-                    effects, Clip[], Threads.Atomic{Bool}(false))
+                    effects, Clip[], Threads.Atomic{Bool}(false),
+                    Threads.Atomic{Bool}(false), nothing)
     # The built-in depth model, so an editor has depth without being asked. Lazy
     # inside — this only points `registerdepth!` at it and builds nothing.
     installdepth!()
@@ -906,10 +912,16 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     # trimming shows the frame the cut would land on — exact when it is decoded,
     # the decoder's nearest otherwise so the picture still follows the drag
     timeline.ontrimpreview = (clip, sf) -> begin
-        presentclipframe!(player, clip, sf; standin = false) ||
+        if !presentclipframe!(player, clip, sf; standin = false)
             presentclipframe!(player, clip, sf; standin = true)
+            retrytrim!(player, clip, sf)      # …and land the exact frame when it decodes
+        end
         return nothing
     end
+    # …and when the drag ends, stop chasing the edge frame. Without this the
+    # retry outlives the release and republishes the edge over the playhead —
+    # the same bug as before, pointing the other way.
+    timeline.ontrimend = () -> (player.trimtarget = nothing; nothing)
     # trim-handle hover changes the cursor too (refreshcursor! reads edgeline)
     on(_ -> refreshcursor!(), timeline.edgeline)
     wirecroptool(player)
@@ -1276,6 +1288,40 @@ function present!(player::Player)
     end
     player.dropped += 1
     return false
+end
+
+"""
+    retrytrim!(player, clip, srcframe; budget = 5.0)
+
+Keep trying to put `srcframe` on screen while a trim drag settles there.
+
+`ontrimpreview` is best-effort: if the decoder has not reached the frame yet it
+shows the nearest one instead. Nothing then corrected it, because the next
+attempt only arrived with the next mouse move — so a trim that ENDED on an
+undecoded frame left the picture on whatever was there, which is the playhead's
+frame. That is the whole of "trimming shows the playhead instead of the cut".
+
+Single-flight and self-cancelling, like [`retrypresent`](@ref): a newer trim
+event overwrites the target and the older loop sees that and stops, so dragging
+never accumulates refiners racing to publish different frames.
+"""
+function retrytrim!(player::Player, clip::Clip, srcframe::Integer; budget::Real = 5.0)
+    target = (clip, Int(srcframe))
+    player.trimtarget = target
+    Threads.atomic_cas!(player.trimming, false, true) === false || return nothing
+    @async try
+        deadline = time() + budget
+        while time() < deadline
+            t = player.trimtarget
+            t === nothing && break
+            c, sf = t
+            presentclipframe!(player, c, sf; standin = false) && break
+            sleep(0.01)
+        end
+    finally
+        player.trimming[] = false
+    end
+    return nothing
 end
 
 """

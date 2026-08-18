@@ -89,6 +89,9 @@ mutable struct Timeline
     onedit::Function                            # called before a gesture mutates
     ontrimpreview::Function                     # (clip, srcframe) while trimming:
                                                 # show the EDGE frame, playhead untouched
+    ontrimend::Function                         # …and the drag is over: stop chasing it,
+                                                # or the retry publishes the edge frame
+                                                # back over the playhead on release
     refreshtask::Task
     transbox::Observable{Vector{Rect2f}}        # cross-dissolve span boxes
     transx::Observable{Vector{Point2f}}         # the bowtie X inside each box
@@ -133,7 +136,7 @@ mutable struct Timeline
                        Observable(""), Observable(Point2f(0, 0)),
                        Threads.Atomic{Bool}(true),
                        nothing, nothing, nothing, 0, 1, false, nothing, identity, identity,
-                       (_, _) -> nothing)
+                       (_, _) -> nothing, () -> nothing)
         timeline.gpurun = nothing
         timeline.rightpress = nothing
 
@@ -527,6 +530,10 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
             finishdrag!(timeline)
             if timeline.trimclip !== nothing
                 timeline.trimclip = nothing
+                # BEFORE the notify: the trim preview retries in the background
+                # until the exact frame decodes, and a retry that outlives the drag
+                # lands the edge frame on top of the playhead one.
+                timeline.ontrimend()
                 relayout!(timeline)
                 notify(timeline.playhead)   # the preview returns to the playhead frame
             end
