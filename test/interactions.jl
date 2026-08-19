@@ -316,8 +316,11 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test !menu.is_open[]                # picking closes it — an open dropdown
                                                  # eats the next press anywhere
 
-            stabbtn = p.fxwidgets[:analyze]
-            stabcenter() = (sc = stabbtn.layoutobservables.computedbbox[]; Point2f(sc.origin .+ sc.widths ./ 2))
+            # read the CURRENT button every time: a panel rebuild recreates it, so a
+            # captured reference points at a deleted widget whose bbox is stale —
+            # and the click then lands nowhere
+            stabcenter() = (sc = p.fxwidgets[:analyze].layoutobservables.computedbbox[];
+                            Point2f(sc.origin .+ sc.widths ./ 2))
             press(stabcenter()); release()       # starts the pick AND closes the modal
             @test p.onpick !== nothing
 

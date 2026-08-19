@@ -1131,6 +1131,23 @@ const STABMODES = [("Camera lock", :similarity),
                    ("Smooth", :smooth)]
 
 """
+    stabmode(player) -> Ref{Symbol}
+
+The stabilization mode the user picked, surviving a panel rebuild.
+
+It lived in `ctx.state`, which is a FRESH Dict on every rebuild, and the menu's
+default was hardcoded to the first entry. So choosing "Object lock" and then
+doing anything that rebuilds the panel — Esc, which also deactivates the tool —
+silently put you back on Camera lock, and the next press of "Stabilize clip" ran
+plain stabilization instead of starting the object pick. Nothing said so.
+
+On `fxwidgets` for the same reason [`mattecardview`](@ref) is: the dock rebuilds
+every panel from scratch, so a control that keeps its state in the context has it
+discarded by the very rebuild it triggers.
+"""
+stabmode(player::Player) = get!(() -> Ref(:similarity), player.fxwidgets, :stabmode)
+
+"""
 Fill the Stabilize card: the mode, the action that runs the analysis, what the
 selected clip currently carries, and a way to take it off again. Stabilizing is
 an ANALYSIS of a clip — like the loop finder's search — so it lives with the
@@ -1139,9 +1156,13 @@ track) still renders as part of the clip like any other effect.
 """
 function stabilizepanel!(ctx::ToolContext)
     player = ctx.player
-    ctx.state = Dict{Symbol, Any}(:mode => :similarity)
-    menu = toolmenu!(ctx, "Mode", STABMODES, v -> (v === nothing || (ctx.state[:mode] = v));
-                     default = STABMODES[1][1])
+    mode = stabmode(player)
+    ctx.state = Dict{Symbol, Any}(:mode => mode[])
+    # the menu opens on the mode that is actually in force, not on the first entry
+    i = something(findfirst(m -> m[2] === mode[], STABMODES), 1)
+    menu = toolmenu!(ctx, "Mode", STABMODES,
+                     v -> (v === nothing || (ctx.state[:mode] = v; mode[] = v));
+                     default = STABMODES[i][1])
     analyze = toolaction!(ctx, "Stabilize clip", () -> runstabilize!(ctx))
     toollabel!(ctx, player.stabinfo)
     remove = toolaction!(ctx, "Remove stabilization", () -> begin
