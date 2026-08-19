@@ -2620,15 +2620,25 @@ function warmmattepanel!(ctx::ToolContext)
     MATTEWARMED[] && return nothing
     loc0 = editclip(player)
     mw, mh = loc0 === nothing ? (480, 270) : mattereadsize(loc0[1], nothing)
-    player.matteinfo[] = "warming up the model…"
+    # The longest wait in the editor — MEASURED 67 s for the first matte of a
+    # session (~49 s building the model, ~18 s compiling kernels for this clip's
+    # shape) and ~18 s again for each new resolution. It showed only a line of
+    # text in the card, which for a minute of silence reads as a hang. The footer
+    # spinner is what the segmenting and propagation steps already use.
+    player.matteinfo[] = "warming up the model… (up to a minute, first time)"
+    player.jobprogress[] = 0.0
+    setstatus!(player, "matte: warming up the model — the first one takes a minute")
     runanalysis(player) do
         try
             warmmatte!(mw, mh)
-            put!(player.uiqueue, () -> (player.matteinfo[] = "ready — mark the subject"))
+            put!(player.uiqueue, () -> (player.matteinfo[] = "ready — mark the subject";
+                                        player.jobprogress[] = NaN;
+                                        setstatus!(player, "matte: ready — mark the subject")))
         catch e
             bt = catch_backtrace()
             put!(player.uiqueue, () -> begin
                 player.matteinfo[] = "model warm-up failed: $(briefly(e))"
+                player.jobprogress[] = NaN      # …or the spinner runs for ever
                 @error "matte warm-up failed" exception = (e, bt)
             end)
         end
