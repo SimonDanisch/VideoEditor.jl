@@ -2184,7 +2184,11 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             ctx = VE.activetool(p)[2]
             @test waitfor(() -> ctx.state !== nothing && !isempty(ctx.state[:refs]); s = 25)
             sleep(0.4)                               # uiqueue draws card + hints
-            @test length(p.fxwidgets[:toolcards][3]) == 1   # reference card added
+            # PER TOOL, not the global count: `toolcards[3]` is shared by every
+            # tool body, and the panel now renders several at once (Crop,
+            # Transcript, Narration, Time interpolation all have card bodies).
+            # Counting the whole list measured the panel, not the loop finder.
+            @test count(c -> c.tool === :loopfinder, p.fxwidgets[:toolcards][3]) == 1
             pts = ctx.state[:hintpts][]
             @test !isempty(pts)
             # ▼ click CUTS there — the timeline keeps its length, the tool stays on
@@ -2198,18 +2202,21 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             # the clip under t=1.0 may be an UNCACHED split half (the ▼ cut position
             # is content-driven) — the Find then runs a fresh async analysis; wait
             # for the card like the first Find did instead of a fixed sleep
-            @test waitfor(() -> length(p.fxwidgets[:toolcards][3]) == 2; s = 25)
-            cards = p.fxwidgets[:toolcards][3]
+            lfcards() = filter(c -> c.tool === :loopfinder, p.fxwidgets[:toolcards][3])
+            @test waitfor(() -> length(lfcards()) == 2; s = 25)
+            cards = lfcards()
             @test ctx.state[:active][] == 2
             # clicking the FIRST card highlights its markers again
-            bb = cards[1][2].layoutobservables.computedbbox[]
+            bb = cards[1].frame.layoutobservables.computedbbox[]
             press(Point2f(bb.origin .+ bb.widths ./ 2)); release(); sleep(0.2)
             @test ctx.state[:active][] == 1
             # × on the first card removes THAT reference; the second remains
-            @test cards[1][6] !== nothing
-            notify(cards[1][6].clicks); sleep(0.3)
+            # BY FIELD: the entry is a NamedTuple precisely so a new field cannot
+            # shift what `[6]` means — which is exactly what appending `tool` did.
+            @test cards[1].rm !== nothing
+            notify(cards[1].rm.clicks); sleep(0.3)
             @test length(ctx.state[:refs]) == 1
-            @test length(p.fxwidgets[:toolcards][3]) == 1
+            @test length(lfcards()) == 1
             @test ctx.state[:active][] == 1              # selection follows the survivor
             @test !isempty(ctx.state[:hintpts][])        # its hints still shown
             VE.undo!(p); sleep(0.2)                  # undo the hint cut
