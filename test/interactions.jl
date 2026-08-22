@@ -1277,25 +1277,39 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test waitfor(() -> length(p.sequence.clips) == 1)
         end
 
-        @testset "the tool-only cards actually render" begin
-            # What the four `registertool!` tools needed and did not have. The
-            # panel builds cards from `clip.effects`; a kind with no `make` has no
-            # effect to hang one on, so Crop, Transcript, Narration and Time
-            # interpolation were dead UI — while four tests passed by asserting
-            # only that the KIND was registered. A registered kind nobody can see
-            # is not a feature, so this asserts on the card titles instead.
+        @testset "tool-only cards are opened from the menu, not always on" begin
+            # These four (Crop, Transcript, Narration, Time interpolation) have a
+            # body and no `make`, so there is no effect to hang a card on. They
+            # used to render on EVERY clip to make them reachable at all, which
+            # put four cards in front of someone who asked for none — Simon: "for
+            # a clip without effects that should be empty, discover works via the
+            # searchable menu." So the panel shows what was put there, and the
+            # menu is how a tool that is not a clip effect gets found.
             VE.opendock!(p, :effects)
             p.timeline.selected[] = 1
-            p.playhead[] = p.sequence.clips[1].start
+            clip = p.sequence.clips[1]
+            p.playhead[] = clip.start
             VE.refreshedit!(p)
             p.fxwidgets[:fxlistrefresh]()
             titles() = [c.title[] for c in p.fxwidgets[:fxcards]]
-            for want in ("Crop", "Transcript", "Narration", "Time interpolation")
-                @test waitfor(() -> want in titles())
+            @test isempty(VE.opentools(p))
+            for gone in ("Crop", "Transcript", "Narration", "Time interpolation")
+                @test !(gone in titles())
             end
+            # The menu offers them beside the real effects, and picking one opens
+            # its card WITHOUT putting anything on the clip — that is the whole
+            # distinction between a tool and an effect.
+            @test :crop in [name for (_, name) in p.fxwidgets[:fxmenuopts]()]
+            before = length(clip.effects)
+            VE.opentool!(p, :crop)
+            @test waitfor(() -> "Crop" in titles())
+            @test length(clip.effects) == before
+            # …and the card's × closes it again, so it is not a one-way door.
+            VE.closetool!(p, :crop)
+            @test waitfor(() -> !("Crop" in titles()))
             # …and each is a kind with a body and no `make`, which is the shape
             # `toolonlykinds` selects on — if one grows a `make` it becomes a
-            # normal effect card and belongs in the loop above instead.
+            # normal effect card and belongs on the stack above instead.
             names = [k.name for k in VE.toolonlykinds()]
             @test Set(names) == Set([:crop, :transcript, :narration, :timeinterp])
         end
@@ -2485,17 +2499,29 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             # `deactivatetool!` runs `cleartoolcards!`, and `rebuild()` fires only
             # on `TOOLSVERSION`, the fold button, or activating a *folded* tool,
             # so nothing puts them back. That is what made this unreachable.
-            @test waitfor(() -> (c = get(p.fxwidgets, :toolcards, nothing);
-                                 c !== nothing && !isempty(c[3])); s = 15)
-            cards = get(p.fxwidgets, :toolcards, nothing)
-            for c in cards[3]
-                # BY FIELD, not by position. This read `c[5](c[1])`, so appending a
-                # field to the entry silently turned `onclick` into a `Label` and
-                # the loop called it — the entry is named precisely so this cannot
-                # happen, and reading it positionally gave that up.
-                c.onclick === nothing || c.onclick(c.id)
-            end
-            @test true                                    # got here without throwing
+            #
+            # ON THE MATTE'S OWN ROWS, not the shared `:toolcards` list. Enter
+            # propagates through `finishmattecollect!`, which calls
+            # `endmattecollect!` — so the marking session is OVER by the time this
+            # runs, there is no live seed card, and each marked frame is a ROW
+            # ("frame N" with `go` and `×`) put there by `toolrows!`. The matte
+            # therefore contributes NOTHING to `:toolcards[3]`, which every tool
+            # shares. That assertion passed only because the four always-on
+            # tool-only cards were sitting in that list — it never looked at the
+            # matte at all, and it went red the moment those cards stopped
+            # rendering on every clip. Measured: 5 shared cards before, 0 after.
+            matterows() = (c = get(get(p.fxwidgets, :toolpanels, Dict{Symbol, Any}()),
+                                   :matte, nothing);
+                           c === nothing ? 0 : length(c.rows))
+            @test waitfor(() -> matterows() > 0; s = 15)
+            seeds = VE.mattemarks(p, clip)
+            @test !isempty(seeds)
+            @test matterows() >= length(seeds)         # one row per marked frame
+            # …and the way back to a mark still works, which is what a row is FOR.
+            p.playhead[] = VE.clipend(clip) - 1
+            ctx = p.fxwidgets[:toolpanels][:matte]
+            VE.gotomatteseed!(ctx, clip, first(sort!(collect(keys(seeds)))))
+            @test p.playhead[] != VE.clipend(clip) - 1
         end
     finally
         close(p)

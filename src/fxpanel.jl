@@ -83,7 +83,15 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     # ---------------------------------------------------------------- add menu
     # Directly under the title: adding and finding an effect are what the panel
     # is FOR, so they come before anything describing what is already there.
-    menuopts() = [(k.label, k.name) for k in addablekinds()]
+    # Effects AND the tool-only kinds. The panel shows what the user PUT there and
+    # nothing else, so a clip with no effects has an empty stack; a tool that is
+    # not a clip effect still has to be findable, and this searchable menu is
+    # where you look. Selecting one opens its card instead of adding an effect.
+    menuopts() = vcat([(k.label, k.name) for k in addablekinds()],
+                      [(k.label, k.name) for k in toolonlykinds()])
+    # The menu is the ONLY way to reach a tool-only kind now, so what it offers is
+    # a fact worth asserting on rather than reading off the widget's internals.
+    player.fxwidgets[:fxmenuopts] = menuopts
     addmenu = Menu(panel[2, 1]; prompt = "+  Add effect…", default = nothing,
                    searchable = true, search_placeholder = "type to filter…",
                    options = menuopts(), tellwidth = false)
@@ -95,7 +103,12 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     on(addmenu.selection) do sel
         sel === nothing && return
         addmenu.i_selected[] = 0     # back to the prompt; re-fires with nothing
-        addeffect!(player, sel)
+        k = kindbyname(sel)
+        if k !== nothing && k.make === nothing
+            opentool!(player, sel)   # a tool: open its card, do not touch the clip
+        else
+            addeffect!(player, sel)
+        end
     end
 
     # The primary way to put an effect on a clip, and until now the only panel
@@ -251,7 +264,7 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
         # the crop and the transcript are reachable on a clip with no effects on
         # it, which is exactly when somebody is most likely to want the crop.
         if clip !== nothing
-            for kind in toolonlykinds()
+            for kind in opentools(player)
                 card, ctx = toolonlycard!(player, stackgl, length(cards) + 1 + skip,
                                           kind, uicolors)
                 push!(cards, card)
@@ -452,6 +465,46 @@ function showkind!(player::Player, name::Symbol)
 end
 
 """
+    opentools(player) -> Vector{EffectKind}
+
+The tool-only cards the user has actually opened, in registration order.
+
+They used to ALL render, always. That put four cards on every clip whether or
+not anyone wanted them — Simon: "for a clip without effects that should be
+empty, discovery works via the searchable menu." So the panel now shows what was
+put there and nothing else, and the menu is how a tool that is not a clip effect
+gets found.
+"""
+function opentools(player::Player)
+    open = get!(() -> Set{Symbol}(), player.fxwidgets, :opentools)
+    return filter(k -> k.name in open, toolonlykinds())
+end
+
+"""
+    opentool!(player, name) -> nothing
+
+Put a tool-only card on the panel (the menu's answer to "add" for a kind that is
+not a clip effect), and select it so it is where the eye already is.
+"""
+function opentool!(player::Player, name::Symbol)
+    push!(get!(() -> Set{Symbol}(), player.fxwidgets, :opentools), name)
+    k = kindbyname(name)
+    setstatus!(player, k === nothing ? "opened $(name)" :
+                       "$(k.label) — its × closes it again")
+    r = get(player.fxwidgets, :fxlistrefresh, nothing)
+    r === nothing || r(force = true)
+    return nothing
+end
+
+"Take a tool-only card off the panel again."
+function closetool!(player::Player, name::Symbol)
+    delete!(get!(() -> Set{Symbol}(), player.fxwidgets, :opentools), name)
+    r = get(player.fxwidgets, :fxlistrefresh, nothing)
+    r === nothing || r(force = true)
+    return nothing
+end
+
+"""
     toolcardopen(kind, player) -> Bool
 
 Whether a tool-only card starts unfolded.
@@ -503,16 +556,21 @@ function toolonlycard!(player::Player, stackgl, row::Integer, kind, uicolors)
                 strokecolor = uicolors.border,
                 selectioncolor = uicolors.select,
                 titlecolor = uicolors.text)
+    acc = GridLayout(card_accessory(card))
+    flat = (buttoncolor = (:transparent, 0.0), strokewidth = 0, cornerradius = 3,
+            height = 20, buttoncolor_hover = uicolors.accent_subtle)
     if !isempty(kind.description)
-        acc = GridLayout(card_accessory(card))
         help = Button(acc[1, 1]; label = "?", width = 18, fontsize = 11,
-                      labelcolor = uicolors.text_muted, buttoncolor = (:transparent, 0.0),
-                      strokewidth = 0, cornerradius = 3, height = 20,
-                      buttoncolor_hover = uicolors.accent_subtle)
+                      labelcolor = uicolors.text_muted, flat...)
         tips = get(player.fxwidgets, :tips, nothing)
         tips === nothing || (tips[help] = wraptext(kind.description, 46))
         push!(get!(() -> Any[], player.fxwidgets, :fxtips), help)
     end
+    # …and a × like every other card has. A card the menu can open has to be
+    # closable from the card, not only by finding the menu entry again.
+    rm = Button(acc[1, 2]; label = "×", width = 20, fontsize = 13,
+                labelcolor = uicolors.text_muted, flat...)
+    on(_ -> closetool!(player, kind.name), rm.clicks)
     ctx = EffectContext(player, kind.name)
     ctx.state = nothing
     withtoolslots!(player, ctx, card[1, 1]) do
