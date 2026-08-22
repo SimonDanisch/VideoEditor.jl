@@ -34,7 +34,9 @@ show black. Crop is non-destructive per clip, applied via axis limits.
 """
 mutable struct Player
     const sequence::Sequence
-    const pools::Dict{VideoSource, SourcePool}
+    # keyed by `readerkey`: a VideoSource when clips of it can share one read
+    # head, a clip id when they are too far apart to (see there)
+    const pools::Dict{Any, SourcePool}
     const capacity::Int
     const proxyheight::Int     # preview proxy resolution (see startproxy!)
     const proxythreshold::Int  # source pixel count above which a proxy is auto-generated
@@ -391,7 +393,7 @@ function Player(path::AbstractString; capacity::Integer = 64,
     sequence = isproject ? loadproject(path) : Sequence(VideoSource(path))
     isempty(sequence.clips) && error("project has no clips: $path")
     source = sequence.clips[1].source
-    pools = Dict{VideoSource, SourcePool}(source => SourcePool(source; capacity))
+    pools = Dict{Any, SourcePool}(source => SourcePool(source; capacity))
 
     frame = Observable(zeros(RGB{N0f8}, source.width, source.height))
     playhead = Observable(0)
@@ -441,14 +443,61 @@ function Player(path::AbstractString; capacity::Integer = 64,
     return player
 end
 
-"The decode pool for `source`, created on first use. One reader per source is
-enough even when two clips of it overlap in a blend: the ring and the GPU
-stream index by GOP, and serving two positions from one reader measured 0
-stand-ins and 5.4 ms/frame vs 8.2 ms for a reader per layer (2026-07-28)."
+"""
+    readerkey(seq, clip) -> Any
+
+Which decode reader `clip` should use: its SOURCE when sharing one is fine, or
+the clip itself when it is not.
+
+Sharing a reader per source is measured FASTER for a BLEND — 0 stand-ins and
+5.4 ms/frame against 8.2 for a reader per layer (2026-07-28) — because the two
+layers sit a few frames apart and one ring holds both positions.
+
+It is much slower for a CLONE. Two clips of one file overlapping at an offset
+LARGER than the ring make that single reader seek twice for every frame drawn,
+which is the one thing a long-GOP codec is worst at: each seek walks from a
+keyframe. Measured on the bird clip, a clone pasted at the playhead (150 frames
+of offset, against a 120-frame ring) costs 55.7 -> 46.5 fps, and it hits
+scrubbing as hard as playback.
+
+So the rule is the DISTANCE, not the count. Clips that overlap within a ring's
+worth of each other share a reader and keep the blend result; clips further apart
+than that get their own and stop fighting over one read head.
+"""
+function readerkey(seq::Sequence, clip::Clip)
+    for other in seq.clips
+        other === clip && continue
+        other.source === clip.source && overlapping(clip, other) &&
+            farapart(clip, other) && return clip.id
+    end
+    return clip.source
+end
+
+"Do these two clips occupy any timeline frame in common?"
+overlapping(a::Clip, b::Clip) = a.start < clipend(b) && b.start < clipend(a)
+
+"""
+Are `a` and `b` showing source frames further apart than one reader's ring?
+
+Compared at a frame they SHARE, so a retimed clip is handled by `sourceframe`
+rather than by assuming `src_in - start`.
+"""
+function farapart(a::Clip, b::Clip)
+    n = max(a.start, b.start)
+    return abs(sourceframe(a, n) - sourceframe(b, n)) > GPU_STREAM_CAPACITY
+end
+
+"The decode pool for a clip, created on first use — see [`readerkey`](@ref) for
+ when two clips of one file share one and when they must not."
 pool(player::Player, source::VideoSource) =
     get!(() -> SourcePool(source; capacity = player.capacity), player.pools, source)
 
-pool(player::Player, clip::Clip) = pool(player, clip.source)
+function pool(player::Player, clip::Clip)
+    key = readerkey(player.sequence, clip)
+    key === clip.source && return pool(player, clip.source)
+    return get!(() -> SourcePool(clip.source; capacity = player.capacity),
+                player.pools, key)
+end
 
 """
     startproxy!(player, source; height=player.proxyheight)
@@ -1111,7 +1160,8 @@ function showframe!(player::Player, n::Integer; standin::Bool = !atrest(player))
         clips = clipsat(player.sequence, n)
         if length(clips) > 1
             shown = false
-            if gpuready(player) && all(haskey(player.gpucache, c.source) for c in clips)
+            if gpuready(player) &&
+               all(haskey(player.gpucache, readerkey(player.sequence, c)) for c in clips)
                 # composites mix layers: one stand-in among them dates the whole frame
                 standin || primecomposite!(player, clips, n) || return false
                 shown = presentgpucomposite!(player, clips, n)
@@ -1166,8 +1216,8 @@ function presentclipframe!(player::Player, clip::Clip, srcframe::Integer;
                            protect::UnitRange{Int} = 1:0)
     # PURE-GPU path: a streaming GPU decoder feeds this source — Vulkan-Video decode
     # into a bounded VRAM ring + effects on device, no CPU decode, no upload.
-    if gpuready(player) && haskey(player.gpucache, clip.source)
-        stream = player.gpucache[clip.source]
+    if gpuready(player) && haskey(player.gpucache, readerkey(player.sequence, clip))
+        stream = player.gpucache[readerkey(player.sequence, clip)]
         if 0 <= srcframe < nframes(stream)
             # parked on an undecoded frame: advance the feed but leave the last
             # exact image up — the retry loop calls back until this frame lands
@@ -2236,8 +2286,11 @@ decode forever. Cheap: one `haskey` per source, the open runs off the UI thread.
 """
 function ensurestreams!(player::Player)
     player.gpupreview isa GPUPreview || return nothing
-    for source in unique(c.source for c in player.sequence.clips)
-        haskey(player.gpucache, source) || Threads.@spawn preloadgpu!(player, source)
+    # per READER, not per source: a clone overlapping its original further apart
+    # than the ring needs its own stream or the two fight over one read head
+    for clip in player.sequence.clips
+        haskey(player.gpucache, readerkey(player.sequence, clip)) ||
+            Threads.@spawn preloadgpu!(player, clip)
     end
     return nothing
 end

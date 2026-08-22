@@ -267,7 +267,7 @@ falls back to the CPU composite. The composited canvas is blitted to the shared 
 """
 function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
     gp = player.gpupreview
-    all(haskey(player.gpucache, c.source) for c in clips) || return false
+    all(haskey(player.gpucache, readerkey(player.sequence, c)) for c in clips) || return false
     try
         W, H = canvassize(player.sequence)   # the SEQUENCE's format, not the top layer's
         if (gp.width, gp.height) != (W, H)
@@ -278,7 +278,8 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
         # the GPU tier of ONE composite (see `composite`): its only job is to
         # name each layer's stream and to blit the finished canvas
         ok = runowned(player) do
-            composite(player.engine, clips, n, (clip, _) -> player.gpucache[clip.source];
+            composite(player.engine, clips, n,
+                      (clip, _) -> player.gpucache[readerkey(player.sequence, clip)];
                       canvas = (W, H), applytracks = player.applytracks[],
                       playing = player.playing[]) do canvas
                 gp.packed .= packrgba.(reshape(canvas, W * H))
@@ -326,7 +327,7 @@ so a single stand-in among them dates the whole frame.
 function primecomposite!(player::Player, clips::Vector{Clip}, n::Integer)
     ready = true
     for clip in clips
-        stream = player.gpucache[clip.source]
+        stream = player.gpucache[readerkey(player.sequence, clip)]
         srcframe = sourceframe(clip, n)
         hasframe(stream, srcframe) && continue
         # a failed decode is loud and hands the frame to the CPU composite —
@@ -358,6 +359,14 @@ end
 const GPU_STREAM_CAPACITY = 120
 
 """
+Open a stream for one CLIP under its [`readerkey`](@ref) — its source when clips
+can share a read head, its own id when they cannot. Two clips of one file that
+overlap further apart than the ring each get a stream, so neither has to seek.
+"""
+preloadgpu!(player::Player, clip::Clip) =
+    preloadgpu!(player, clip.source; key = readerkey(player.sequence, clip))
+
+"""
 Open a streaming GPU decoder ([`GpuVideoStream`]) over `source` so its clips play
 back purely on the GPU — Vulkan-Video decode into a bounded VRAM ring, no CPU
 decode or per-frame upload. A no-op (playback stays on the CPU decode path) unless
@@ -365,10 +374,10 @@ the GPU preview is live and the stream is hardware-decodable at the display size
 Cheap — demux + `mmap` + GOP index only; frames decode on demand. Call it off the
 UI thread; playback uses the CPU path until the stream is ready.
 """
-function preloadgpu!(player::Player, source::VideoSource)
+function preloadgpu!(player::Player, source::VideoSource; key = source)
     gp = player.gpupreview
     gp isa GPUPreview || return nothing
-    haskey(player.gpucache, source) && return nothing
+    haskey(player.gpucache, key) && return nothing
     # One probe per source, not one per present. `ensurestreams!` runs on every
     # frame that is shown, so a source that is not directly streamable used to be
     # re-probed forever: each attempt failed, logged, and overwrote the
@@ -401,7 +410,7 @@ function preloadgpu!(player::Player, source::VideoSource)
             size(f.y) == (source.width, source.height)
         end
         if ok
-            player.gpucache[source] = stream
+            player.gpucache[key] = stream
             delete!(probed, source.path)
             setstatus!(player, "$(basename(source.path)) — streaming decode on the GPU")
         else
@@ -487,8 +496,8 @@ function autodetectgpu!(player::Player)
     player.gpupreview = GPUPreview()
     haskey(player.fxwidgets, :lanechip) && (player.fxwidgets[:lanechip][] = "GPU")
     setgpurun!(player.timeline, f -> rungpusync(f, player))   # GPU thumbnails from here on
-    for src in unique(c.source for c in player.sequence.clips)
-        Threads.@spawn preloadgpu!(player, src)
+    for clip in player.sequence.clips
+        Threads.@spawn preloadgpu!(player, clip)
     end
     setstatus!(player, "GPU playback on — hardware decode + effects on the GPU")
     # re-present on the MAIN thread (GL context is main-thread-owned; this runs off it)
