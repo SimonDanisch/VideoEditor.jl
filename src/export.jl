@@ -158,7 +158,7 @@ framesize(sr::SequentialReader) = (sr.source.width, sr.source.height)
 # `served` to settle here — a sequential decode is exact by construction — but
 # one shape for every source is what keeps the source pass a single method.
 decodesource(sr::SequentialReader, frame::Integer; playing::Bool = false,
-             served = nothing, exact::Bool = false) =
+             served = nothing, exact::Bool = false, chunks::Integer = 5) =
     readframe!(sr.host, sr, frame)
 
 sourceinto!(out, sr::SequentialReader, f) = (out === f || copyto!(out, f); out)

@@ -52,10 +52,11 @@ written at the position the graph reserved for them.
 cannot serve anything else, so it leaves `served` alone.
 """
 decodesource(s::GpuVideoStream, frame::Integer; playing::Bool = false,
-             served = nothing, exact::Bool = false) =
-    exact ? exactframeat!(s, frame) : frameat!(s, frame; prefetch = playing, served)
+             served = nothing, exact::Bool = false, chunks::Integer = 5) =
+    exact ? exactframeat!(s, frame) :
+            frameat!(s, frame; prefetch = playing, served, chunks)
 decodesource(s, frame::Integer; playing::Bool = false, served = nothing,
-             exact::Bool = false) = s
+             exact::Bool = false, chunks::Integer = 5) = s
 
 "Fill `out` with the frame `decodesource` handed back: a colour convert off the
 decoder's NV12 planes, or one upload of a CPU frame."
@@ -752,7 +753,7 @@ sampled at — see [`decodesource`](@ref).
 """
 function runchain!(engine::FxEngine, source, clip::Clip, frame::Integer;
                    applytracks::Bool = true, playing::Bool = false, exact::Bool = false,
-                   phase::Real = 0.0)
+                   chunks::Integer = 5, phase::Real = 0.0)
     nodes = graphof(clip; applytracks).nodes
     dims = framesize(source)
     cp = get!(engine.plans, plansignature(nodes, dims, applytracks)) do
@@ -767,7 +768,7 @@ function runchain!(engine::FxEngine, source, clip::Clip, frame::Integer;
         cp.params[i][] = nodes[i + 1]
     end
     st.phase = clip.timeinterp === :flow ? Float64(phase) : 0.0
-    st.decoded = decodesource(source, st.frame; playing, served = st.served, exact)
+    st.decoded = decodesource(source, st.frame; playing, served = st.served, exact, chunks)
     # The frame after it, only when one will actually be synthesized. `served` is
     # deliberately NOT passed: this decode must not move the frame the rest of the
     # chain was told it is rendering, and a streaming source is free to refuse.
@@ -780,7 +781,7 @@ function runchain!(engine::FxEngine, source, clip::Clip, frame::Integer;
     # `served` is deliberately not passed: this decode must not move the frame the
     # rest of the chain was told it is rendering.
     st.decoded2 = (st.phase > 0.0 && st.frame + 1 < clip.src_out) ?
-        decodesource(source, st.frame + 1; playing, exact) : nothing
+        decodesource(source, st.frame + 1; playing, exact, chunks) : nothing
     for b in cp.planes                       # `served` is settled: the planes can be written
         loadplane!(engine.store, b, clip, st.served[])
     end
@@ -798,8 +799,9 @@ All buffer management is internal. `playing` marks sequential playback — a
 streaming source then prefetches its next GOP (see [`frameat!`](@ref)).
 """
 function render(f, engine::FxEngine, source, clip::Clip, frame::Integer;
-                applytracks::Bool = true, playing::Bool = false, exact::Bool = false)
-    out = chainimage(runchain!(engine, source, clip, frame; applytracks, playing, exact))
+                applytracks::Bool = true, playing::Bool = false, exact::Bool = false,
+                chunks::Integer = 5)
+    out = chainimage(runchain!(engine, source, clip, frame; applytracks, playing, exact, chunks))
     # The crop REMOVES picture. Doing it here — once, for every caller — is
     # what makes that true: the preview blits this buffer straight to the
     # screen, so a crop that only told the canvas placement where to sample
@@ -915,8 +917,9 @@ both are valid until the same plan runs again, so compose before then.
 """
 function renderlayer!(engine::FxEngine, lclip::Clip, srcframe::Integer, source;
                       applytracks::Bool = true, playing::Bool = false, exact::Bool = false,
-                      phase::Real = 0.0)
-    cp = runchain!(engine, source, lclip, srcframe; applytracks, playing, exact, phase)
+                      chunks::Integer = 5, phase::Real = 0.0)
+    cp = runchain!(engine, source, lclip, srcframe; applytracks, playing, exact, chunks,
+                   phase)
     cropaway!(chainimage(cp), lclip.crop)
     return cp
 end
@@ -948,7 +951,8 @@ the length of a blend).
 """
 function composite(f, engine::FxEngine, clips, n::Integer, sourcefor;
                    canvas::Tuple{Integer, Integer},
-                   applytracks::Bool = true, playing::Bool = false, exact::Bool = false)
+                   applytracks::Bool = true, playing::Bool = false, exact::Bool = false,
+                   chunks::Integer = 5)
     W, H = Int(canvas[1]), Int(canvas[2])
     accum = scratch!(engine.store, :accum, RGB{N0f8}, (W, H))
     for (k, clip) in enumerate(clips)
@@ -957,7 +961,7 @@ function composite(f, engine::FxEngine, clips, n::Integer, sourcefor;
         source === nothing && return false
         lclip = withoutopacity(effectiveclip(clip, srcframe))
         cp = renderlayer!(engine, lclip, srcframe, source; applytracks, playing, exact,
-                          phase = sourcephase(clip, n))
+                          chunks, phase = sourcephase(clip, n))
         layer = chainimage(cp)
         α = Float32(clamp(paramvalue(clip, :opacity, srcframe), 0.0, 1.0))
         # COVERAGE, per pixel: white where this layer is opaque, black where

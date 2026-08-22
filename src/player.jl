@@ -1164,7 +1164,8 @@ function showframe!(player::Player, n::Integer; standin::Bool = !atrest(player))
                all(haskey(player.gpucache, readerkey(player.sequence, c)) for c in clips)
                 # composites mix layers: one stand-in among them dates the whole frame
                 standin || primecomposite!(player, clips, n) || return false
-                shown = presentgpucomposite!(player, clips, n)
+                shown = presentgpucomposite!(player, clips, n;
+                                             chunks = standin && !player.playing[] ? 0 : 5)
             end
             shown || (shown = compositeframe!(player, n, clips))
             if shown
@@ -1226,7 +1227,14 @@ function presentclipframe!(player::Player, clip::Clip, srcframe::Integer;
             end
             ensureframesize!(player, canvassize(player.sequence))
             eclip = effectiveclip(clip, srcframe)
-            if presentgpu!(player, clip, srcframe; stream = stream)
+            # A STAND-IN MUST NOT DECODE. `frameat!` spends up to 5 decode chunks
+            # reaching `srcframe` before it settles for the nearest decoded frame,
+            # and on a seek that is ~62 ms of exactly the work this call exists to
+            # skip: the point is to put a picture up NOW and let the retry loop
+            # fetch the real frame. Measured, this is the difference between a
+            # seek answering in ~1 ms and in ~62.
+            if presentgpu!(player, clip, srcframe; stream = stream,
+                           chunks = standin && !player.playing[] ? 0 : 5)
                 applycrop!(player)
                 # a scrub into an undecoded region shows the nearest decoded frame
                 # NOW; returning "not presented yet" keeps the paused retry loop
@@ -1401,14 +1409,38 @@ function retrypresent(player::Player; budget::Real = 20.0)
     Threads.atomic_cas!(player.refining, false, true) === false || return nothing
     @async try
         deadline = time() + budget
+        drawn = -1                       # the frame a stand-in is already up for
         while !player.playing[]
             n = player.playhead[]        # the CURRENT frame, never a captured one
+            # THE PICTURE MOVES FIRST, then sharpens. A full-quality seek lands
+            # mid-GOP and has to decode forward from the preceding keyframe:
+            # measured at ~2.1 ms per frame on a 250-frame GOP, so 90 ms to 455 ms
+            # depending only on where in the GOP it falls — and for all of it the
+            # screen still showed the frame the user had just left. That is the
+            # whole of "seeking is slow"; the compositor and the panel are not in
+            # it (playback renders a stand-in in 0.9 ms).
+            #
+            # `standin = true` draws the nearest decoded frame in about a
+            # millisecond AND returns whether it happened to be the exact one, so
+            # one call both answers immediately and says whether there is anything
+            # left to refine. A miss leaves a picture on screen while the loop
+            # below fetches the real frame — which is what every other NLE does,
+            # and why nobody notices a GOP walk in them.
+            if n != drawn
+                drawn = n
+                if showframe!(player, n; standin = true)
+                    player.presented += 1
+                    player.playhead[] == n && break
+                    deadline = time() + budget
+                    continue
+                end
+            end
             if showframe!(player, n)
                 player.presented += 1
                 player.playhead[] == n && break   # …unless it moved while we rendered
                 deadline = time() + budget
             elseif time() > deadline
-                showframe!(player, n; standin = true)
+                # the stand-in is already up — say why it is staying
                 setstatus!(player, "frame $n never finished decoding — showing the nearest decoded frame")
                 break
             else

@@ -330,13 +330,21 @@ nearest already-decoded frame is served. Callers that need exactness poll
 [`hasframe`](@ref) and re-present (the player's retry loop refines a scrub to the
 exact frame across a few calls instead of stalling one call for a whole GOP).
 
+`chunks` is how many ~10 ms decode chunks this call may spend reaching `n` before
+it settles for the nearest decoded frame. `chunks = 0` never decodes: it returns
+whatever the ring already holds, which is what a SEEK wants for its first draw —
+put a picture up now, let the retry loop fetch the real one. The default 5 is the
+scrub budget; measured, a miss that spends it costs ~62 ms, and that was the
+whole difference between a seek answering in 1 ms and in 62.
+
 With `prefetch` (pass it during sequential playback) the NEXT GOP starts feeding
 once `n` is half-way into the current one, and every present advances the feed by a
 ~10 ms chunk — a 250-frame GOP decodes spread invisibly across ~2 s of playback
 instead of as one ~600 ms stall at the boundary. Runs on the caller's GPU thread.
 """
 function frameat!(s::GpuVideoStream, n::Integer; prefetch::Bool = false,
-                  served::Union{Nothing, Base.RefValue{Int}} = nothing)
+                  served::Union{Nothing, Base.RefValue{Int}} = nothing,
+                  chunks::Integer = 5)
     g = gopof(s, n)
     gop = s.gops[g]
     if haskey(s.ring, n)
@@ -347,7 +355,7 @@ function frameat!(s::GpuVideoStream, n::Integer; prefetch::Bool = false,
             startfeed!(s, g)
         end
         spent = 0
-        while !haskey(s.ring, n) && s.feedgop == g && spent < 5
+        while !haskey(s.ring, n) && s.feedgop == g && spent < chunks
             decodechunk!(s) == 0 && break
             spent += 1
         end

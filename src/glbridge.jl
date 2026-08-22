@@ -221,7 +221,7 @@ CPU frame `player.frame[]` is uploaded once. Returns `true` when on screen; `fal
 (after flagging `failed`) hands the job back to the CPU path.
 """
 function presentgpu!(player::Player, clip::Clip, srcframe::Integer;
-                     stream = nothing, source = nothing)
+                     stream = nothing, source = nothing, chunks::Integer = 5)
     gp = player.gpupreview
     try
         # source = the streaming decoder (disk→VRAM) or a decoded CPU frame (one upload)
@@ -237,7 +237,7 @@ function presentgpu!(player::Player, clip::Clip, srcframe::Integer;
         ok = runowned(player) do
             composite(player.engine, [clip], n_of(player, clip, srcframe), (_, _) -> src;
                       canvas = (W, H), applytracks = player.applytracks[],
-                      playing = player.playing[]) do canvas
+                      playing = player.playing[], chunks = chunks) do canvas
                 gp.packed .= packrgba.(reshape(canvas, W * H))
                 copyto!(gp.eimages[nxt], gp.packed)        # device blit + wait
                 nothing
@@ -265,7 +265,8 @@ alpha-blended by opacity — the multi-track analogue of [`presentgpu!`]. Every 
 source must have a live `GpuVideoStream`; returns `false` otherwise so the caller
 falls back to the CPU composite. The composited canvas is blitted to the shared image.
 """
-function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
+function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer;
+                              chunks::Integer = 5)
     gp = player.gpupreview
     all(haskey(player.gpucache, readerkey(player.sequence, c)) for c in clips) || return false
     try
@@ -281,7 +282,7 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer)
             composite(player.engine, clips, n,
                       (clip, _) -> player.gpucache[readerkey(player.sequence, clip)];
                       canvas = (W, H), applytracks = player.applytracks[],
-                      playing = player.playing[]) do canvas
+                      playing = player.playing[], chunks = chunks) do canvas
                 gp.packed .= packrgba.(reshape(canvas, W * H))
                 copyto!(gp.eimages[nxt], gp.packed)
             end
