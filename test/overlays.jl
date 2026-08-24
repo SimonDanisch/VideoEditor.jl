@@ -24,6 +24,31 @@
     @test !removeoverlay!(seq, o2.id)
 end
 
+@testset "overlays: anything in the state is keyframable, not only declared params" begin
+    # A kind's `FxParam` list used to BE the set of animatable things — a curve on
+    # any other key was silently dropped. That cannot work for a generic Makie
+    # scene, where what is animatable is every attribute of every plot in it and
+    # no list can be written down in advance. Such attributes arrive as settings.
+    ov = Overlay(:text; text = "HELLO", color = "cyan", start = 0, stop = 100)
+    @test haskey(ov.settings, :color) && !haskey(ov.params, :color)
+
+    VE.setoverlaykey!(ov, :color, 0, 0.0)
+    VE.setoverlaykey!(ov, :color, 10, 1.0)
+    @test VE.overlaystate(ov, 5).color ≈ 0.5        # the curve beats the setting
+    @test VE.overlaystate(ov, 0).color ≈ 0.0
+
+    # …and a key that is neither a param nor a setting still lands, which is what
+    # a path into a plot spec will be.
+    VE.setoverlaykey!(ov, Symbol("plots[1].markersize"), 0, 4.0)
+    VE.setoverlaykey!(ov, Symbol("plots[1].markersize"), 20, 24.0)
+    @test VE.overlaystate(ov, 10)[Symbol("plots[1].markersize")] ≈ 14.0
+
+    # An unanimated setting is untouched, and the reserved keys still arrive.
+    ov2 = Overlay(:text; text = "X", color = "red", start = 0, stop = 10)
+    @test VE.overlaystate(ov2, 3; framerate = 25).color == "red"
+    @test VE.overlaystate(ov2, 3; framerate = 25).frame == 3
+end
+
 @testset "overlays: the reserved frame/framerate keys" begin
     @test VE.timecodestring(0, 60) == "00:00:00:00"
     @test VE.timecodestring(150, 60) == "00:00:02:30"

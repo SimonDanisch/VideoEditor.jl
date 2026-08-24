@@ -177,7 +177,13 @@ function overlaystate(ov::Overlay, n::Integer; framerate::Real = 0.0,
                       captions::Vector{Caption} = Caption[])
     p = ov.params
     for (key, curve) in ov.animations
-        haskey(p, key) || continue
+        # ANY key, not only a declared parameter. This used to skip everything
+        # that was not in `params`, which made the kind's `FxParam` list the
+        # complete set of animatable things — so a kind had to declare, up front,
+        # every number anyone might ever want to keyframe. For a generic Makie
+        # scene that list cannot be written down: what is animatable is every
+        # attribute of every plot in it. `settings` carries those, and merging
+        # `p` over `settings` below is what lets a curve win against one.
         v = valueat(curve, n)
         v === nothing || (p = merge(p, NamedTuple{(key,)}((Float64(v),))))
     end
