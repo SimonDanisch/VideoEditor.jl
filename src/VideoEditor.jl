@@ -72,6 +72,7 @@ include("export.jl")   # sourceinto! dispatches on GpuVideoStream — needs the 
 include("campath.jl")  # GrayReader wraps export's SequentialReader; grayinto! needs GpuVideoStream
 include("tools.jl")    # GUI tools: timeline-overlay hints + premade operations
 include("scenespec.jl") # a Makie scene AS DATA: plots, backend, theme, paths
+include("scenerender.jl") # …and rendering it, with the backend as a parameter
 include("commands.jl") # everything the editor can do, as data
 include("links.jl")    # effects that reference other effects (a blend is two halves)
 include("fxpanel.jl")  # THE effects panel: one card list for the selected clip
