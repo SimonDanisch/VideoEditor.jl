@@ -1680,5 +1680,17 @@ include("overlays.jl")
 # The cost of this order is that the reported totals now cover the whole file
 # rather than "everything up to interactions.jl", so the old 259|18|2 and
 # 548|6|1 baselines are not comparable to what comes out now.
-canui && include("interactions.jl")
-canui && include("fuzz.jl")   # random edit programs vs the picture (needs a Player)
+# BOTH INSIDE ONE OUTER TESTSET, and that is the whole trick. Each of these
+# files ends with failing testsets, and a TOP-LEVEL `@testset` throws at its end
+# — which aborts the file that included it. Ordering them cannot fix that: with
+# two throwers, whichever runs first takes the other with it, which is exactly
+# what happened when `fuzz.jl` was moved in front (it ran, found a `MethodError`
+# on iteration one, threw, and `interactions.jl` never started).
+#
+# A NESTED testset reports to its parent instead of throwing, so wrapping both
+# makes them run to completion and lets this one throw once, at the end, with
+# everything counted.
+canui && @testset "GUI" begin
+    include("fuzz.jl")            # random edit programs vs the picture (needs a Player)
+    include("interactions.jl")
+end
