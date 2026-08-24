@@ -1662,6 +1662,7 @@ end
     @test VE.transformof(VE.loadproject(path).clips[end]) == VE.NEUTRALFRAME
 end
 
+include("scenespec.jl")   # a Makie scene as data: paths, animation, round trip
 include("overlays.jl")
 
 # LAST, and that is the whole point. `interactions.jl` throws at the end of the
