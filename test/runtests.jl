@@ -1013,15 +1013,6 @@ catch e
 end
 include("agentview.jl")   # what an AGENT sees (headless: no window needed)
 
-canui && include("interactions.jl")
-# NOT REACHED while `interactions.jl` has failing testsets: it throws at the end
-# of the file, which aborts this one — so the quoted 259|18|2 baseline is
-# "everything up to and including interactions.jl", and `fuzz.jl` has never run
-# as part of the suite. Run it with `test/fuzz_only.jl` until that is settled;
-# the moment it did run it found two real bugs (Mantle's `nothing`-as-constraint
-# and `showframe!`'s no-clip path). Moving this above `interactions.jl` would
-# make it run — and would change the baseline, so that is a deliberate call.
-canui && include("fuzz.jl")   # random edit programs vs the picture (needs a Player)
 
 @testset "Thumbnails" begin
     src = VideoSource(testvideo)
@@ -1524,8 +1515,17 @@ end
         @test [(c.rate, c.src_in, c.src_out, c.start) for c in back.clips] ==
               [(0.5, 4, 50, 7)]
         @test VE.cliplength(back.clips[1]) == VE.cliplength(s.clips[1])
-        # a project written before conforming existed holds native clips only
-        write(path, replace(read(path, String), r"\nrate = [0-9.]+" => ""))
+        # a project written before conforming existed holds native clips only.
+        # Edited through the PARSER, not with a regex over the text: a project
+        # file is JSON (`saveproject` uses `JSON.print`; the docstring on
+        # project.jl says why), and this dropped `\nrate = [0-9.]+` — TOML
+        # syntax, which has not been written since. It matched nothing, `rate`
+        # stayed 0.5, and the assertion below was simply false. Nobody saw it
+        # because `interactions.jl` is included at the top of this file and its
+        # testset throws on its known failures, so execution never reached here.
+        d = VE.JSON.parse(read(path, String))
+        delete!(d["clips"][1], "rate")
+        open(io -> VE.JSON.print(io, d, 2), path, "w")
         @test VE.loadproject(path).clips[1].rate == 1.0
     end
 end
@@ -1605,18 +1605,18 @@ end
     @test bars == 2 * ((canvas[1] - round(Int, 180 * (180 / 320))) ÷ 2)
 
     # the manual reframe scales about the centre: more picture, fewer bars
-    c2.reframe = (1.9, 0.0, 0.0)
+    VE.withreframe!(c2, (1.9, 0.0, 0.0))
     zoomed = VE.RGBFrame(undef, canvas...)
     VE.renderframe!(zoomed, seq, 40, readers, engine)
     @test count(x -> zoomed[x, mid] == black, 1:canvas[1]) < bars
     @test !VE.neutralframe(c2)
     # …and shifting moves it: pushed right, the LEFT bar grows
-    c2.reframe = (1.9, 0.15, 0.0)
+    VE.settransform(c2; scale = 1.9, x = 0.15, y = 0.0)
     shifted = VE.RGBFrame(undef, canvas...)
     VE.renderframe!(shifted, seq, 40, readers, engine)
     leftbar(f) = something(findfirst(x -> f[x, mid] != black, 1:canvas[1]), canvas[1])
     @test leftbar(shifted) > leftbar(zoomed)
-    c2.reframe = VE.NEUTRALFRAME
+    VE.settransform(c2; scale = 1.0, x = 0.0, y = 0.0, rotation = 0.0)
 
     # a letterboxed layer STACKED over another shows the track below through its
     # bars — painting them black would black out the picture underneath
@@ -1632,19 +1632,53 @@ end
     # scale/position are ordinary animatable params: keyframes, project, undo
     @test VE.paramspec(:scale).group === :geometry
     VE.paramspec(:scale).set(c2, 1.4)
-    @test c2.reframe[1] == 1.4 && VE.paramspec(:scale).get(c2) == 1.4
+    @test VE.transformof(c2)[1] == 1.4 && VE.paramspec(:scale).get(c2) == 1.4
     VE.paramspec(:pos_x).set(c2, -0.2)
-    @test c2.reframe[2] == -0.2
+    @test VE.transformof(c2)[2] == -0.2
     cur = VE.AnimCurve(); VE.setkey!(cur, 0, 1.0); VE.setkey!(cur, 20, 2.0)
     c2.animations[:scale] = cur
-    @test VE.effectiveclip(c2, 10).reframe[1] ≈ 1.5      # baked at the frame
+    @test VE.transformof(VE.effectiveclip(c2, 10))[1] ≈ 1.5   # baked at the frame
     path = joinpath(mktempdir(), "reframe.videoedit.toml")
     VE.saveproject(path, seq)
     back = VE.loadproject(path)
-    @test back.clips[end].reframe == c2.reframe
-    @test VE.snapshot(seq)[end].reframe == c2.reframe
-    write(path, replace(read(path, String), r"\nreframe = \[[^\]]*\]" => ""))
-    @test VE.loadproject(path).clips[end].reframe == VE.NEUTRALFRAME   # older projects
+    @test VE.transformof(back.clips[end]) == VE.transformof(c2)
+    @test VE.transformof(VE.snapshot(seq)[end]) == VE.transformof(c2)
+    # A project written BEFORE the transform became an effect holds a `reframe`
+    # tuple on the clip instead — `withreframe!` is what turns it back into one,
+    # so feed it exactly that and check it arrives. (This used to strip a TOML
+    # `reframe = [...]` line with a regex; project files are JSON, so it matched
+    # nothing and the assertion below was reading a field that no longer exists.)
+    d = VE.JSON.parse(read(path, String))
+    d["clips"][end]["reframe"] = [1.25, 0.1, 0.0]
+    open(io -> VE.JSON.print(io, d, 2), path, "w")
+    @test VE.transformof(VE.loadproject(path).clips[end])[1] ≈ 1.25
+    # …and with NEITHER a `reframe` tuple nor a transform effect, the clip is
+    # placed by the plain fit. Both have to go: this clip carries a serialised
+    # `TransformEffect` from the `settransform` above, and dropping only the
+    # legacy tuple leaves that one answering `transformof`.
+    delete!(d["clips"][end], "reframe")
+    filter!(e -> get(e, "type", "") != "transform", d["clips"][end]["effects"])
+    open(io -> VE.JSON.print(io, d, 2), path, "w")
+    @test VE.transformof(VE.loadproject(path).clips[end]) == VE.NEUTRALFRAME
 end
 
 include("overlays.jl")
+
+# LAST, and that is the whole point. `interactions.jl` throws at the end of the
+# file on its known failures, which aborts this one — so for as long as it was
+# included in the middle, everything after it only ran when GL happened to be
+# unavailable and it was skipped. That is not hypothetical: on 2026-08-24 a run
+# without a GL context reached this half for the first time and found `conform`
+# asserting against TOML syntax in a JSON file, and `letterbox` writing to
+# `Clip.reframe`, a field removed when the transform became an effect. Both had
+# been dead for as long as they had been passed over.
+#
+# `fuzz.jl` had NEVER run as part of the suite for the same reason, and the one
+# time it did it found two real bugs (Mantle's `nothing`-as-constraint and
+# `showframe!`'s no-clip path).
+#
+# The cost of this order is that the reported totals now cover the whole file
+# rather than "everything up to interactions.jl", so the old 259|18|2 and
+# 548|6|1 baselines are not comparable to what comes out now.
+canui && include("interactions.jl")
+canui && include("fuzz.jl")   # random edit programs vs the picture (needs a Player)
