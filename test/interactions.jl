@@ -2639,7 +2639,12 @@ end
         @test length(p2.sequence.clips) == 2
         @test p2.sequence.clips[1].crop == (0.1, 0.1, 0.8, 0.8)
         @test VE.seqlength(p2.sequence) == 120
-        @test size(p2.frame[]) == (320, 180)   # presents from the project's source
+        # The CANVAS, which the crop above defines: 320*0.8 x 180*0.8. This
+        # asserted the source's own (320, 180) — true before a crop started
+        # deriving the canvas, and unnoticed since, because this file throws on
+        # its known failures and nothing after it in the suite ever ran.
+        @test size(p2.frame[]) == (256, 144)
+        @test size(p2.frame[]) == VE.canvassize(p2.sequence)
     finally
         close(p2)
     end

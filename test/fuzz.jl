@@ -14,10 +14,11 @@
 #
 #   PIXELS  — the preview buffer is EXACTLY what the export writes for that
 #             frame (same graph, same layers; both exact on the CPU tier).
-#   FRAMING — the visible region (axis limits over the buffer) is EXACTLY the
-#             framing the export bakes: a clip's crop when one clip is on
-#             screen, the whole canvas when layers are composited (their crops
-#             are already baked into it).
+#   FRAMING — the visible region (axis limits over the buffer) is the WHOLE
+#             canvas. A crop defines the canvas rather than being hidden by the
+#             axis, so once it is baked there is nothing left for the axis to
+#             cut away — measured: a 320x180 clip cropped to (0.1,0.1,0.8,0.8)
+#             previews at (256,144) with the axis showing (0,0,1,1).
 #
 # A failure prints the seed and the program, so it replays exactly.
 
@@ -59,27 +60,6 @@ function exportframe(seq, n, engine, readers)
         copyto!(out, canvas)
     end
     return ok ? out : nothing
-end
-
-"The single-clip reference: the clip's graph at `n`, crop NOT baked (the preview
-leaves that to the axis limits — see the framing check)."
-function uncropped(clip::Clip, n::Integer, engine, readers)
-    sf = VE.sourceframe(clip, n)
-    ec = effectiveclip(clip, sf)
-    # `withfields`, NOT the positional constructor. This listed `Clip`'s fields by
-    # hand and so went stale every time one moved: `reframe` left when framing
-    # became a `TransformEffect`, `restorecache` arrived when the restore cache
-    # stopped being a module global, and by the time this file was finally run as
-    # part of the suite it was three fields short (`depthtrack`, `look`,
-    # `timeinterp`) and threw `MethodError` on the first iteration. Naming only
-    # what changes means the next field costs nothing here.
-    flat = VE.withfields(ec; crop = (0.0, 0.0, 1.0, 1.0))
-    dec = get!(() -> VE.opendecoder(clip.source, engine.backend), readers, clip.source.path)
-    out = RGBFrame(undef, clip.source.width, clip.source.height)
-    VE.render(engine, dec, flat, sf; exact = true) do layer
-        copyto!(out, layer)
-    end
-    return out
 end
 
 maxdiff(a, b) = maximum(max.(abs.(Float32.(getfield.(a, :r)) .- Float32.(getfield.(b, :r))),
@@ -233,10 +213,18 @@ end
                 checked += 1
                 length(cs) > 1 && (composites += 1)
                 length(cs) == 1 && cs[1].crop != (0.0, 0.0, 1.0, 1.0) && (croppedsingles += 1)
-                # PIXELS: the preview buffer IS what the export renders. A
-                # single-clip present leaves the crop to the axis limits, so its
-                # reference is the same graph WITHOUT the crop baked in.
-                ref = length(cs) == 1 ? uncropped(cs[1], n, engine, readers) : expect
+                # PIXELS: the preview buffer IS what the export renders — for one
+                # clip and for a stack alike, so there is one reference.
+                #
+                # This used to special-case a single clip and compare against the
+                # graph WITHOUT its crop, because a single-clip present left the
+                # crop to the axis limits. That stopped being true when a crop
+                # started defining the CANVAS: measured on a 320x180 clip cropped
+                # to (0.1, 0.1, 0.8, 0.8), preview, canvas and export are all
+                # (256, 144) = 320*0.8 x 180*0.8, and the axis shows (0,0,1,1).
+                # The old reference was built at the clip's SOURCE size and could
+                # only ever mismatch.
+                ref = expect
                 if size(player.frame[]) == size(ref)
                     d = maxdiff(player.frame[], ref)
                     d > 1.0f-3 && push!(mismatches, "frame $n: pixels differ by $d")
@@ -248,8 +236,13 @@ end
                 # `applycrop!`), so this asserts the wiring — that the present put
                 # that framing on the axis, once — rather than re-deriving the
                 # geometry and agreeing with itself about the formula.
-                want = length(cs) > 1 ? (0.0, 0.0, 1.0, 1.0) :
-                       VE.canvasrect(cs[1], size(player.frame[]), VE.canvassize(seq))
+                # ALWAYS the whole canvas, one clip or many: the crop is baked
+                # into the canvas, so there is nothing left for the axis to hide.
+                # `canvasrect` still answers with the region in the SOURCE image
+                # ((0.1, 0.1, 0.8, 0.8) in the measurement above), which is no
+                # longer what the axis shows — asserting it here compared the two
+                # different things that happen to have the same shape.
+                want = (0.0, 0.0, 1.0, 1.0)
                 vis = visiblerect(player)
                 all(abs.(vis .- want) .< 5.0e-3) ||
                     push!(mismatches, "frame $n: shows $(round.(vis; digits = 3)), " *
