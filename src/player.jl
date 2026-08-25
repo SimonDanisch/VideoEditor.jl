@@ -933,8 +933,12 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     if thumb !== nothing
                         ensureframesize!(player, pool(player, clip).source)
                         blitthumb!(frame[], thumb)
-                        showcpuframe!(player)
-                        notify(frame)
+                        # overlays HERE too, approximate stand-in or not: an
+                        # overlay blinking out for the length of a scrub drag and
+                        # back reads as the overlay being broken, which is worse
+                        # than the pass costing a few ms on a frame that is
+                        # already known to be a stand-in.
+                        publishframe!(player, n)
                     end
                 end
             end
@@ -1034,8 +1038,12 @@ their rings, run each clip's tracks + effects, and blend `(1-p)·A + p·B`.
 Best-effort — returns `false` (caller falls back to the plain single-clip path)
 if either frame isn't buffered yet, or the two sources differ in size (mismatched
 dissolves preview as the outgoing clip; export still blends them via warp).
+
+`n` is carried in rather than derived from the sample: the blend is addressed by
+the two SOURCE frames, which say nothing about where on the timeline this is, and
+[`publishframe!`](@ref) needs the timeline frame to know which overlays are up.
 """
-function showtransition!(player::Player, sample)
+function showtransition!(player::Player, sample, n::Integer)
     left, srcA, right, srcB, p = sample
     spA = pool(player, left)
     spB = pool(player, right)
@@ -1061,8 +1069,7 @@ function showtransition!(player::Player, sample)
     end
     blend!(bufA, bufA, bufB, p)
     copyto!(player.frame[], bufA)   # publish the finished blend in one copy
-    showcpuframe!(player)
-    notify(player.frame)
+    publishframe!(player, n)
     applycrop!(player, lclip)  # both sides share framing in the common (split) case
     return true
 end
@@ -1098,8 +1105,7 @@ function compositeframe!(player::Player, n::Integer, clips::Vector{Clip})
         end
     end
     ok || return false
-    showcpuframe!(player)
-    notify(player.frame)
+    publishframe!(player, n)
     return true
 end
 
@@ -1137,6 +1143,38 @@ function editclip(player::Player)
 end
 
 """
+    publishframe!(player, n) -> nothing
+
+Put what is in `player.frame[]` on screen as timeline frame `n` — overlays drawn,
+texture re-pointed, observable notified.
+
+THE ONE DOOR. Every preview path ends here, because the overlay pass is the last
+stage of a rendered frame and a call site that skips it is a call site that shows
+the user a different picture than the export produces. Four of them published by
+hand — a straight `showcpuframe!` + `notify` — so `drawoverlays!` ran only from
+`export.jl`, and every overlay kind was invisible in the editor while being
+correct in the file it wrote. That is the failure `drawoverlays!` documents
+itself against ("no call site can accidentally be the one that renders WITHOUT
+overlays") and it was true of the whole preview.
+
+Costs nothing when nothing is drawn at `n`: `drawoverlays!` returns before it
+touches a pixel, and the round trip is bit-exact when it does not.
+
+Main thread ONLY. Rasterising an overlay needs the GL context, so this must not
+be called from inside `runowned` — a `composite` callback runs on the engine's
+owning thread and GLFW aborts there (`ThreadAssertionError`, measured). All four
+callers reach it after the callback has returned.
+"""
+function publishframe!(player::Player, n::Integer)
+    seq = player.sequence
+    drawoverlays!(player.frame[], seq.overlays, n;
+                  framerate = seq.framerate, captions = seq.captions)
+    showcpuframe!(player)
+    notify(player.frame)
+    return nothing
+end
+
+"""
 Resolve and show timeline frame `n` if possible (gaps show black). Returns success.
 
 `standin` decides what a still-decoding GPU stream may put on screen. While the
@@ -1152,7 +1190,7 @@ function showframe!(player::Player, n::Integer; standin::Bool = !atrest(player))
     tr = transitionat(player.sequence, n)
     if tr !== nothing
         s = transitionsample(player.sequence, tr, n)
-        s !== nothing && showtransition!(player, s) && return true
+        s !== nothing && showtransition!(player, s, n) && return true
     end
     # multiple stacked tracks → composite the stack (on the GPU if every layer has a
     # stream, else on the CPU)
@@ -1192,8 +1230,9 @@ function showframe!(player::Player, n::Integer; standin::Bool = !atrest(player))
         # there is no clip to make it so, and a 320x180 decode buffer went into a
         # 214x108 frame.
         fill!(player.frame[], RGB{N0f8}(0, 0, 0))
-        showcpuframe!(player)
-        notify(player.frame)
+        # black, but NOT bare: an overlay is a property of the sequence, not of a
+        # clip, so one standing over a gap is still up. Titles live in gaps.
+        publishframe!(player, n)
         return true
     end
     clip, srcframe = loc
@@ -1270,8 +1309,10 @@ function presentclipframe!(player::Player, clip::Clip, srcframe::Integer;
             end
         end
         ok === true || return false
-        showcpuframe!(player)
-        notify(player.frame)
+        # this path is addressed by SOURCE frame (it is reached from a trim drag
+        # as well as from the playhead), so the timeline frame has to be resolved
+        # back — the same `n_of` the composite above is given.
+        publishframe!(player, n_of(player, clip, srcframe))
         applycrop!(player)
         return true
     end
@@ -3785,8 +3826,53 @@ function wireclipmenu!(player::Player)
     return nothing
 end
 
+# --------------------------------------------------- what a keyframe acts ON
+#
+# A `Clip` was the only thing with keyframes, so the trio (`togglekey!`,
+# `gotokey!`, `clearkeyframes!`) each began by resolving `editclip(player)` and
+# went on to read `clip.animations`, map the playhead through `sourceframe`, and
+# clamp to `src_in..src_out`. An OVERLAY has keyframes too — a scene's
+# `"arm_left.angle"` is a curve like any other — and it answers those same four
+# questions differently: its own store, the timeline frame UNMAPPED, its own
+# `start..stop`, and a parameter description that comes from the scene's paths
+# rather than from the fixed `PARAMS` registry.
+#
+# So the four questions dispatch and the trio is written once. Copying the trio
+# for overlays would have been the second implementation of keyframing, and this
+# session already cost a day to one of those (`renderspec` had its own scene
+# builder, which disagreed with the preview's and tore the figure apart).
+
+"The curves `t` carries, by parameter key."
+kfstore(clip::Clip) = clip.animations
+kfstore(ov::Overlay) = ov.animations
+
+"Whether param `key` is keyframed on `t` (has at least one key)."
+kfanimated(t, key::Symbol) = haskey(kfstore(t), key) && !isempty(kfstore(t)[key])
+
+"The frame the playhead means TO `t` — a clip's own source frame, an overlay's timeline frame."
+kfframe(player::Player, clip::Clip) = sourceframe(clip, player.playhead[])
+kfframe(player::Player, ov::Overlay) = Int(player.playhead[])
+
+"…and back: where on the TIMELINE one of `t`'s frames sits."
+kftimeline(clip::Clip, f::Integer) = timelineframe(clip, f)
+kftimeline(::Overlay, f::Integer) = Int(f)
+
+"The frames of `t` a keyframe may sit on — outside it a key is unreachable."
+kfrange(clip::Clip) = clip.src_in:clip.src_out
+kfrange(ov::Overlay) = ov.start:(ov.stop - 1)
+
+"""
+How `key` reads and writes on `t`: its label, its bounds and its accessors.
+
+A clip's keys are a fixed registry (`PARAMS`). An overlay's are not — a scene's
+animatable paths depend on the scene, so its method BUILDS a spec per path (see
+scenerender.jl). `ParamSpec` already fits both: it is a label, a range and a
+`get`/`set` pair over an object, and it never said that object had to be a clip.
+"""
+kfspec(::Clip, key::Symbol) = paramspec(key)
+
 "Whether param `key` is keyframed on `clip` (has at least one key)."
-clipanimated(clip::Clip, key::Symbol) = haskey(clip.animations, key) && !isempty(clip.animations[key])
+clipanimated(clip::Clip, key::Symbol) = kfanimated(clip, key)
 
 "Absolute source frame the playhead currently maps to within `clip`."
 playheadframe(player::Player, clip::Clip) = sourceframe(clip, player.playhead[])
@@ -3852,11 +3938,15 @@ a stray click can't wipe your work.
 function startanimating!(player::Player, key::Symbol)
     loc = editclip(player)
     loc === nothing && return nothing
-    clip = loc[1]
-    p = paramspec(key)
-    if !clipanimated(clip, key)
+    return startanimating!(player, loc[1], key)
+end
+
+function startanimating!(player::Player, t, key::Symbol)
+    p = kfspec(t, key)
+    p === nothing && return nothing
+    if !kfanimated(t, key)
         snapshot!(player)
-        setkey!(get!(() -> AnimCurve(), clip.animations, key), playheadframe(player, clip), p.get(clip))
+        setkey!(get!(() -> AnimCurve(), kfstore(t), key), kfframe(player, t), p.get(t))
         setstatus!(player, "$(p.label): keyframing on — scrub + move the slider to add keys (curve on the clip)")
     else
         setstatus!(player, "$(p.label): its ◆ keys are on the clip — drag moves · Alt-click adds · Ctrl-click deletes · right-click eases")
@@ -3901,46 +3991,83 @@ parameter static again).
 function togglekey!(player::Player, key::Symbol)
     loc = editclip(player)
     loc === nothing && return nothing
-    clip = loc[1]
-    clipanimated(clip, key) || return startanimating!(player, key)
-    p = paramspec(key)
-    c = clip.animations[key]
-    sf = playheadframe(player, clip)
+    return togglekey!(player, loc[1], key)
+end
+
+function togglekey!(player::Player, t, key::Symbol)
+    kfanimated(t, key) || return startanimating!(player, t, key)
+    p = kfspec(t, key)
+    p === nothing && return nothing
+    c = kfstore(t)[key]
+    sf = kfframe(player, t)
     snapshot!(player)
     if any(k -> k.frame == sf, c.keys)
         removekey!(c, sf)
         if isempty(c)
-            delete!(clip.animations, key)
-            syncsliders!(player, clip)
+            delete!(kfstore(t), key)
+            kfstatic!(player, t)
             setstatus!(player, "$(p.label): last keyframe removed — back to a static value")
         else
             setstatus!(player, "$(p.label): keyframe removed")
         end
     else
-        setkey!(c, sf, paramvalue(clip, key, sf))
+        setkey!(c, sf, kfvalue(t, key, sf))
         setstatus!(player, "$(p.label): keyframe added at the playhead")
     end
     player.kffocus[] = key
+    kfchanged!(t)
     notify(player.playhead)
     return nothing
 end
+
+"""
+The parameter went static: put the UI back on its static value.
+
+A clip re-syncs its sliders. An overlay has no slider registry of its own yet, so
+nothing to do — its card reads the value on the next rebuild.
+"""
+kfstatic!(player::Player, clip::Clip) = syncsliders!(player, clip)
+kfstatic!(::Player, ::Any) = nothing
+
+"""
+`key`'s effective value on `t` at `t`'s own frame `sf` — its curve where it has
+one, its static value otherwise.
+"""
+function kfvalue(t, key::Symbol, sf::Integer)
+    p = kfspec(t, key)
+    p === nothing && return 0.0
+    kfanimated(t, key) || return p.get(t)
+    return something(valueat(kfstore(t)[key], sf), p.get(t))
+end
+
+"""
+A curve on `t` changed. For an overlay carrying a BAKE this matters: a baked
+frame wins over a live one, so the edit you just made would be invisible until
+the bake was thrown away. The clip case has nothing derived to drop.
+"""
+kfchanged!(::Clip) = nothing
 
 "Jump the playhead to the previous (`dir < 0`) or next keyframe of `key` on the
 clip under it — the ◀ ▶ of the inspector trio."
 function gotokey!(player::Player, key::Symbol, dir::Integer)
     loc = editclip(player)
     loc === nothing && return nothing
-    clip = loc[1]
-    p = paramspec(key)
-    clipanimated(clip, key) || return setstatus!(player, "$(p.label): no keyframes yet — ◆ adds one")
-    sf = playheadframe(player, clip)
-    ks = filter(k -> clip.src_in <= k.frame <= clip.src_out, clip.animations[key].keys)
+    return gotokey!(player, loc[1], key, dir)
+end
+
+function gotokey!(player::Player, t, key::Symbol, dir::Integer)
+    p = kfspec(t, key)
+    p === nothing && return nothing
+    kfanimated(t, key) || return setstatus!(player, "$(p.label): no keyframes yet — ◆ adds one")
+    sf = kfframe(player, t)
+    rng = kfrange(t)
+    ks = filter(k -> first(rng) <= k.frame <= last(rng), kfstore(t)[key].keys)
     cand = dir < 0 ? filter(k -> k.frame < sf, ks) : filter(k -> k.frame > sf, ks)
     isempty(cand) && return setstatus!(player,
         "$(p.label): no keyframe $(dir < 0 ? "before" : "after") the playhead")
     k = dir < 0 ? last(cand) : first(cand)
     player.kffocus[] = key
-    seek!(player, clamp(timelineframe(clip, k.frame), 0, seqlength(player.sequence) - 1))
+    seek!(player, clamp(kftimeline(t, k.frame), 0, seqlength(player.sequence) - 1))
     return nothing
 end
 
@@ -3949,14 +4076,19 @@ end
 function clearkeyframes!(player::Player)
     loc = editclip(player)
     loc === nothing && return nothing
-    clip = loc[1]
+    return clearkeyframes!(player, loc[1])
+end
+
+function clearkeyframes!(player::Player, t)
     key = player.kffocus[]
-    p = paramspec(key)
-    clipanimated(clip, key) || return setstatus!(player, "$(p.label): no keyframes to clear")
+    p = kfspec(t, key)
+    p === nothing && return nothing
+    kfanimated(t, key) || return setstatus!(player, "$(p.label): no keyframes to clear")
     snapshot!(player)
-    n = length(clip.animations[key].keys)
-    delete!(clip.animations, key)
-    syncsliders!(player, clip)   # slider drops back to the static value
+    n = length(kfstore(t)[key].keys)
+    delete!(kfstore(t), key)
+    kfstatic!(player, t)         # slider drops back to the static value
+    kfchanged!(t)
     notify(player.playhead)
     setstatus!(player, "$(p.label): cleared $n keyframe$(n == 1 ? "" : "s") (Ctrl+Z to restore)")
     return nothing

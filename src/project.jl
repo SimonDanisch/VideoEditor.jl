@@ -46,6 +46,10 @@ function saveproject(path::AbstractString, seq::Sequence; checkpoint::Bool = tru
     open(io -> JSON.print(io, dict, 2), tmp, "w")
     mv(tmp, path; force = true)          # atomic: a half-written file never replaces the good one
     savemattes(path, seq)
+    # …and the baked scene frames, for the same reason: minutes of raytracing is
+    # an edit's output, not something to recompute on every open. Defined in
+    # scenerender.jl, which loads after this file — resolved at call time.
+    savebakes(path, seq)
     return path
 end
 
@@ -248,6 +252,9 @@ function loadproject(path::AbstractString)
         push!(seq.captions, Caption(Float64(cd["start"]), Float64(cd["stop"]),
                                     String(cd["text"])))
     end
+    # baked scene frames, when the sidecar still matches what would be rendered.
+    # AFTER the overlays are in: it is keyed on their ids and fingerprints them.
+    loadbakes!(path, seq)
     return seq
 end
 

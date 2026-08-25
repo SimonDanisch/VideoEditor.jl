@@ -446,11 +446,25 @@ end
 
 # ---------------------------------------------------------------- serialization
 
+"""
+Settings that are a CACHE and must never reach the project file.
+
+`bake!` parks its rendered frames in `settings` — for the lego walk, 180 RGBA
+images of 640x1138. `tomlvalue`'s fallback is `string(v)`, so saving would have
+written the `show` form of a `Dict{Int, Matrix{RGBA{N0f8}}}` into the JSON: tens
+of megabytes of pixel repr in place of an edit, and unreadable on the way back.
+A bake is derived from the spec and the curves, both of which DO get saved, so
+dropping it loses nothing but the time to redo it.
+"""
+const CACHEDSETTINGS = (:baked, :bakedcanvas, :bakedprint)
+
 overlaydict(ov::Overlay) = Dict{String, Any}(
     "id" => string(ov.id), "kind" => String(ov.kind),
     "start" => ov.start, "stop" => ov.stop,
     "params" => Dict{String, Any}(String(k) => Float64(v) for (k, v) in pairs(ov.params)),
-    "settings" => Dict{String, Any}(String(k) => tomlvalue(v) for (k, v) in pairs(ov.settings)),
+    "settings" => Dict{String, Any}(String(k) => tomlvalue(v)
+                                    for (k, v) in pairs(ov.settings)
+                                    if !(k in CACHEDSETTINGS)),
     "animations" => Dict{String, Any}(
         String(key) => Dict{String, Any}(
             "interp" => String(curve.interp),
@@ -467,10 +481,27 @@ tomlvalue(v::Symbol) = String(v)
 tomlvalue(v::AbstractVector) = [tomlvalue(x) for x in v]
 tomlvalue(v) = string(v)
 
+"""
+    richsetting(v) -> v
+
+A settings value on its way out of / back into the project file, for the values
+that are STRUCTURE rather than a scalar.
+
+The identity here is the whole of it; the interesting methods live next to the
+types they belong to (`tomlvalue(::SceneSpec)` and the scene's reader are in
+scenespec.jl). They have to: this file is included 28 files before that one, so a
+`::SceneSpec` annotation written here does not parse — `UndefVarError: SceneSpec
+not defined`, at precompile time.
+
+Settings are deliberately a bag of plain values, so anything without a method is
+handed back untouched: a kind this editor does not know must survive a load.
+"""
+richsetting(v) = v
+
 function overlayfromdict(d::AbstractDict)
     kind = Symbol(d["kind"])
     params = NamedTuple(Symbol(k) => Float64(v) for (k, v) in get(d, "params", Dict()))
-    settings = NamedTuple(Symbol(k) => v for (k, v) in get(d, "settings", Dict()))
+    settings = NamedTuple(Symbol(k) => richsetting(v) for (k, v) in get(d, "settings", Dict()))
     ov = Overlay(freshid(), kind, params, settings, Int(d["start"]), Int(d["stop"]),
                  Dict{Symbol, AnimCurve}())
     haskey(d, "id") && (ov.id = parse(UInt64, d["id"]))

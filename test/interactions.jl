@@ -2626,6 +2626,46 @@ end
     @test length(VE.EFFECTS.version.listeners) == n0
 end
 
+# THE GAP THIS CLOSES. `drawoverlays!` was called from `export.jl` and nowhere
+# else, so every overlay kind was correct in the exported file and INVISIBLE in
+# the editor — and the suite was fully green throughout, because every overlay
+# test asserted on an exported frame or on `drawoverlays!` directly. What was
+# missing was an assertion that the PREVIEW shows what the export writes.
+@testset "overlays are drawn in the preview, not only in the export" begin
+    p = Player(testvideo; gpupreview = false)
+    try
+        sleep(1.5)
+        seq = p.sequence
+        n = 35
+        VE.seek!(p, n); sleep(0.6)
+        bare = copy(p.frame[])
+
+        # a plain filled bar: no 3D, no GPU, nothing that can be unavailable
+        # headless, and opaque enough that "did it draw" is not a judgement call
+        VE.addoverlay!(seq, :bar; start = 0, stop = 120, opacity = 1.0)
+        VE.seek!(p, n); sleep(0.6)
+        drawn = copy(p.frame[])
+        # SAME timeline frame on both sides — comparing two different frames of a
+        # moving test pattern "confirmed" this while the overlay drew nothing at
+        # all, which is how it stayed broken.
+        @test count(bare .!= drawn) > 0
+
+        # and it must match what the export produces for that frame, bit for bit:
+        # one door, one picture (see `publishframe!`)
+        expect = copy(bare)
+        VE.drawoverlays!(expect, seq.overlays, n;
+                         framerate = seq.framerate, captions = seq.captions)
+        @test drawn == expect
+
+        # removing it puts the frame back exactly — the pass is not cumulative
+        empty!(seq.overlays)
+        VE.seek!(p, n); sleep(0.6)
+        @test copy(p.frame[]) == bare
+    finally
+        close(p)
+    end
+end
+
 @testset "Player opens a saved project" begin
     src = VideoSource(testvideo)
     seq = Sequence(src)
