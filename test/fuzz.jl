@@ -143,7 +143,11 @@ function fuzzactions(player, rng)
         ("keyframe", () -> begin
             c = randclip(); c === nothing && return "keyframe (no clip)"
             VE.findslot(c, VE.ColorEffect) === nothing && VE.seteffect!(c, VE.ColorEffect())
-            curve = get!(VE.AnimCurve, c.animations, :brightness)
+            fxc = VE.findslot(c, VE.ColorEffect)
+            fxc === nothing && (VE.seteffect!(c, VE.ColorEffect()); fxc = VE.findslot(c, VE.ColorEffect))
+            prm = VE.param(fxc, :brightness)
+            prm.curve === nothing && (prm.curve = VE.AnimCurve())
+            curve = prm.curve
             VE.setkey!(curve, c.src_in, -0.3)
             VE.setkey!(curve, max(c.src_out - 1, c.src_in), 0.3)
             "keyframe brightness on clip@$(c.start)"

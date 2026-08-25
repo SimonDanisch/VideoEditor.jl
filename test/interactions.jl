@@ -7,6 +7,32 @@ import VideoEditor.Makie as Makie
 using Statistics: mean
 using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
 
+# A parameter BY NAME on whatever effect of `clip` declares it — the test-side
+# stand-in for the global index that used to answer this. Adds the effect when
+# the clip has none, because these tests animate a parameter to see what happens
+# and used to get the effect for free from `setparam!`.
+const OWNER = Dict(:brightness => VE.ColorEffect, :contrast => VE.ColorEffect,
+                   :saturation => VE.ColorEffect, :temperature => VE.ColorEffect,
+                   :sharpen => VE.SharpenEffect, :opacity => VE.OpacityEffect,
+                   :blur => VE.BlurEffect)
+function tparam(clip, name::Symbol)
+    for fx in clip.effects
+        pr = VE.param(fx, name)
+        pr === nothing || return pr
+    end
+    T = OWNER[name]
+    VE.seteffect!(clip, T === VE.ColorEffect ? VE.ColorEffect() :
+                        T === VE.SharpenEffect ? VE.SharpenEffect(2.0f0, 0.0f0) :
+                        T === VE.OpacityEffect ? VE.OpacityEffect(1.0f0) : VE.BlurEffect(0.0f0))
+    return VE.param(VE.findslot(clip, T), name)
+end
+function tcurve!(clip, name::Symbol)
+    pr = tparam(clip, name)
+    pr.curve === nothing && (pr.curve = VE.AnimCurve())
+    return pr.curve
+end
+tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing : pr.curve)
+
 @testset "UI interactions" begin
     GLMakie.activate!(; visible = false)
     p = Player(testvideo; gpupreview = false)  # 320×180, 120 frames @30 (from runtests.jl); CPU for determinism
@@ -1806,7 +1832,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             keypress(Keyboard.enter)                # ⏎ applies the top hit
             @test !p.fxwidgets[:palettemodal].open[]
             @test length(clip.effects) == nfx + 1
-            @test clip.effects[end].effect isa VE.SharpenEffect
+            @test VE.op(clip.effects[end]) isa VE.SharpenEffect
             # Stabilization is findable the same way and behaves the same way:
             # it is an effect kind like any other, so the palette ADDS it and its
             # card carries the mode menu and the analyze button.
@@ -1815,7 +1841,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             p.fxwidgets[:palettequery][] = "stabil"
             keypress(Keyboard.enter)
             @test waitfor(() -> length(clip.effects) == nstab + 1)
-            @test clip.effects[end].effect isa VE.StabilizeEffect
+            @test VE.op(clip.effects[end]) isa VE.StabilizeEffect
             @test waitfor(() -> haskey(p.fxwidgets, :modemenu) && haskey(p.fxwidgets, :analyze))
             # PARAMETER labels hit too: "bright" finds the Color kind (Premiere-style)
             nfx2 = length(clip.effects)
@@ -1823,7 +1849,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             p.fxwidgets[:palettequery][] = "bright"
             keypress(Keyboard.enter)
             @test length(clip.effects) == nfx2 + 1
-            @test clip.effects[end].effect isa VE.ColorEffect
+            @test VE.op(clip.effects[end]) isa VE.ColorEffect
         end
 
         @testset "the Add effect menu survives a search that matches nothing" begin
@@ -1847,7 +1873,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             keypress(Keyboard.enter)                       # ⏎ takes the first hit
             @test !menu.is_open[]
             @test length(clip.effects) == nfx + 1
-            @test clip.effects[end].effect isa VE.ColorEffect
+            @test VE.op(clip.effects[end]) isa VE.ColorEffect
         end
 
         @testset "the FIRST row of a dropdown is clickable" begin
@@ -1878,7 +1904,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             press(row1); release(); sleep(0.3)
             @test !menu.is_open[]
             @test length(clip.effects) == nfx + 1
-            @test clip.effects[end].effect isa VE.ColorEffect
+            @test VE.op(clip.effects[end]) isa VE.ColorEffect
             @test p.applytracks[]        # …and the compare bypass never fired
         end
 
@@ -1892,18 +1918,18 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             len = clip.src_out - clip.src_in         # frames survive earlier trim tests
             fkey = clip.src_in + (3 * len) ÷ 4       # keyed frame (both params)
             ffree = clip.src_in + (2 * len) ÷ 5      # key-free frame for the Alt-add
-            VE.startanimating!(p, :brightness)
-            VE.startanimating!(p, :sharpen)
-            VE.setkey!(clip.animations[:brightness], fkey, VE.paramspec(:brightness).hi)
-            VE.setkey!(clip.animations[:sharpen], fkey, VE.paramspec(:sharpen).lo)
-            VE.startanimating!(p, :brightness)          # focus = brightness
+            VE.togglekey!(p, VE.editclip(p)[1], tparam(VE.editclip(p)[1], :brightness))
+            VE.togglekey!(p, VE.editclip(p)[1], tparam(VE.editclip(p)[1], :sharpen))
+            VE.setkey!(tcurve!(clip, :brightness), fkey, tparam(clip, :brightness).range[2])
+            VE.setkey!(tcurve!(clip, :sharpen), fkey, tparam(clip, :sharpen).range[1])
+            VE.togglekey!(p, VE.editclip(p)[1], tparam(VE.editclip(p)[1], :brightness))          # focus = brightness
             notify(p.playhead); sleep(0.3)
             curvepos(key, sf) = begin                # figure pixel on `key`'s curve at SOURCE frame sf
                 ntr = VE.ntracks(p.sequence)
                 lo, hi = VE.trackband(clip.track, ntr)
                 g = min(0.02, VE.trackspan(ntr) * 0.15); lo += g; hi -= g
                 inset = 0.12 * (hi - lo); lo += inset; hi -= inset
-                c = clip.animations[key]; pr = VE.paramspec(key)
+                c = clip.effects[key]; pr = tparam(clip, key)
                 v = something(VE.valueat(c, sf), pr.get(clip))
                 y = lo + (hi - lo) * clamp(VE.paramnorm(pr, v), 0.0, 1.0)
                 t = (clip.start + (sf - clip.src_in)) / p.sequence.framerate
@@ -1915,21 +1941,21 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             end
             # Alt-click near the SHARPEN curve while BRIGHTNESS holds the focus:
             # the key must land on what was clicked, and the focus must follow
-            nb = length(clip.animations[:brightness].keys)
-            ns = length(clip.animations[:sharpen].keys)
+            nb = length(tcurve!(clip, :brightness).keys)
+            ns = length(tcurve!(clip, :sharpen).keys)
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.press)
             press(curvepos(:sharpen, ffree)); release()
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.release)
             sleep(0.2)
-            @test length(clip.animations[:sharpen].keys) == ns + 1
-            @test length(clip.animations[:brightness].keys) == nb
+            @test length(tcurve!(clip, :sharpen).keys) == ns + 1
+            @test length(tcurve!(clip, :brightness).keys) == nb
             @test p.kffocus[] === :sharpen
             # grabbing a brightness ◆ refocuses it
             press(curvepos(:brightness, fkey)); release(); sleep(0.2)
             @test p.kffocus[] === :brightness
             # right-click opens the keyframe menu on the clicked ◆; Delete removes
             # exactly that key (and only it) — the clip context menu stays closed
-            ns2 = length(clip.animations[:sharpen].keys)
+            ns2 = length(tcurve!(clip, :sharpen).keys)
             moveto(curvepos(:sharpen, ffree))
             ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.press)
             ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.release)
@@ -1938,8 +1964,8 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test p.clipmodal === nothing || !p.clipmodal.open[]
             notify(p.fxwidgets[:kfmenubtn1].clicks); sleep(0.2)
             @test !p.fxwidgets[:kfmenu].open[]
-            @test length(clip.animations[:sharpen].keys) == ns2 - 1
-            @test length(clip.animations[:brightness].keys) == nb
+            @test length(tcurve!(clip, :sharpen).keys) == ns2 - 1
+            @test length(tcurve!(clip, :brightness).keys) == nb
         end
 
         @testset "keyframe trio, snap, ease & guards (Premiere parity)" begin
@@ -1952,7 +1978,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
                 lo, hi = VE.trackband(clip.track, ntr)
                 g = min(0.02, VE.trackspan(ntr) * 0.15); lo += g; hi -= g
                 inset = 0.12 * (hi - lo); lo += inset; hi -= inset
-                c = clip.animations[key]; pr = VE.paramspec(key)
+                c = clip.effects[key]; pr = tparam(clip, key)
                 v = something(VE.valueat(c, sf), pr.get(clip))
                 y = lo + (hi - lo) * clamp(VE.paramnorm(pr, v), 0.0, 1.0)
                 t = (clip.start + (sf - clip.src_in)) / fps
@@ -1962,26 +1988,30 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
                         vp.origin[2] + (y - minimum(lims)[2]) /
                             (maximum(lims)[2] - minimum(lims)[2]) * vp.widths[2])
             end
-            trio() = p.fxwidgets[:kfacc_contrast]    # re-fetch: keying rebuilds the stack
+            function trio()   # re-fetch: keying rebuilds the stack
+                cl = VE.editclip(p)[1]
+                fx = VE.findslot(cl, VE.ColorEffect)
+                return p.fxwidgets[Symbol(:kfacc_, fx.id, :_, :contrast)]
+            end
 
             # --- ◆ starts animating: first key at the playhead, label flips ◇ → ◆ ---
-            @test !VE.clipanimated(clip, :contrast)
+            @test !VE.isanimated(tparam(clip, :contrast))
             @test Makie.to_value(trio()[2].label) == "◇"
             notify(trio()[2].clicks); sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             f1 = VE.playheadframe(p, clip)
-            @test [k.frame for k in clip.animations[:contrast].keys] == [f1]
+            @test [k.frame for k in tcurve!(clip, :contrast).keys] == [f1]
             @test Makie.to_value(trio()[2].label) == "◆"
             # --- scrub off the key (◇), slider writes a second key (◆ again) ---
             press(tlx(2.8)); release(); sleep(0.3)
             @test Makie.to_value(trio()[2].label) == "◇"
-            ghost0 = sum(length(c.keys) for (k, c) in clip.animations if k !== :contrast; init = 0)
+            ghost0 = sum(length(c.keys) for (k, c) in clip.effects if k !== :contrast; init = 0)
             Makie.set_close_to!(p.fxsliders[:contrast], 1.6); sleep(0.4)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             f2 = VE.playheadframe(p, clip)
-            @test length(clip.animations[:contrast].keys) == 2
+            @test length(tcurve!(clip, :contrast).keys) == 2
             # a gesture on ONE slider must not stamp ghost keys on other animated params
-            @test sum(length(c.keys) for (k, c) in clip.animations if k !== :contrast; init = 0) == ghost0
+            @test sum(length(c.keys) for (k, c) in clip.effects if k !== :contrast; init = 0) == ghost0
             @test Makie.to_value(trio()[2].label) == "◆"
             # --- ◀ ▶ jump between keys ---
             notify(trio()[1].clicks); sleep(0.3)
@@ -1991,11 +2021,11 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             # --- ◆ ON a key removes it; removing the last key un-animates ---
             notify(trio()[2].clicks); sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
-            @test [k.frame for k in clip.animations[:contrast].keys] == [f1]
+            @test [k.frame for k in tcurve!(clip, :contrast).keys] == [f1]
             notify(trio()[1].clicks); sleep(0.3)     # ◀ back onto the remaining key
             notify(trio()[2].clicks); sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
-            @test !VE.clipanimated(clip, :contrast)
+            @test !VE.isanimated(tparam(clip, :contrast))
             @test Makie.to_value(trio()[2].label) == "◇"
 
             # --- rebuild a 2-key ramp for the gesture checks ---
@@ -2003,7 +2033,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             press(tlx(2.8)); release(); sleep(0.2)
             Makie.set_close_to!(p.fxsliders[:contrast], 1.6); sleep(0.4)
             clip = VE.locate(p.sequence, p.playhead[])[1]
-            ka, kb = (k.frame for k in clip.animations[:contrast].keys)
+            ka, kb = (k.frame for k in tcurve!(clip, :contrast).keys)
 
             # --- dragging a ◆ snaps onto the playhead when within reach: aim 9 px
             # right of it (>½ frame at this zoom, so WITHOUT the snap the key would
@@ -2014,32 +2044,32 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             near = markerpix(:contrast, mid) .+ Point2f(9, 0)
             press(from); moveto(from .+ Point2f(-30, 0)); moveto(near); release(); sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
-            @test any(k -> k.frame == mid, clip.animations[:contrast].keys)
+            @test any(k -> k.frame == mid, tcurve!(clip, :contrast).keys)
 
             # --- hidden curves are INERT: the same grab must scrub, not retime ---
             p.kfvisible[] = false; sleep(0.2)
             VE.seek!(p, clip.start); sleep(0.2)
-            keysbefore = [(k.frame, k.value) for k in clip.animations[:contrast].keys]
+            keysbefore = [(k.frame, k.value) for k in tcurve!(clip, :contrast).keys]
             hidden = markerpix(:contrast, mid)
             press(hidden); moveto(hidden .+ Point2f(-40, 0)); release(); sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             @test p.playhead[] != clip.start                       # it scrubbed
-            @test [(k.frame, k.value) for k in clip.animations[:contrast].keys] == keysbefore
+            @test [(k.frame, k.value) for k in tcurve!(clip, :contrast).keys] == keysbefore
             p.kfvisible[] = true; sleep(0.2)
 
             # --- Alt-click with no animated curve nearby only hints ---
-            saved = copy(clip.animations); empty!(clip.animations)
+            saved = copy(clip.effects); empty!(clip.effects)
             notify(p.playhead); sleep(0.2)
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.press)
             press(tlx((clip.start + (mid - clip.src_in)) / fps)); release()   # same clip, no curves
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.release)
             sleep(0.2)
-            @test isempty(clip.animations)                         # nothing invented
-            merge!(clip.animations, saved); notify(p.playhead); sleep(0.2)
+            @test !VE.isanimated(clip)                         # nothing invented
+            merge!(clip.effects, saved); notify(p.playhead); sleep(0.2)
 
             # --- right-click ◆ → per-KEY ease: smoothing kb flattens ITS tangent ---
             clip = VE.locate(p.sequence, p.playhead[])[1]
-            c = clip.animations[:contrast]
+            c = tcurve!(clip, :contrast)
             ka, kb = (k.frame for k in c.keys)
             va, vb = (k.value for k in c.keys)
             fq = ka + (kb - ka) ÷ 4
@@ -2073,18 +2103,18 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             @test Makie.to_value(p.fxwidgets[:kfmenubtn2].label) == "Make linear (corner)"
             notify(p.fxwidgets[:kfmenubtn4].clicks); sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
-            @test !VE.clipanimated(clip, :contrast)
+            @test !VE.isanimated(tparam(clip, :contrast))
 
             # --- E2E: the keys really drive the render — sampled ends of the ramp ---
             notify(trio()[2].clicks); sleep(0.3)                   # start it again at the playhead
             clip = VE.locate(p.sequence, p.playhead[])[1]
             sf0 = VE.playheadframe(p, clip)
-            VE.setkey!(clip.animations[:contrast], sf0, 0.2)
-            VE.setkey!(clip.animations[:contrast], clip.src_out - 1, 1.9)
+            VE.setkey!(tcurve!(clip, :contrast), sf0, 0.2)
+            VE.setkey!(tcurve!(clip, :contrast), clip.src_out - 1, 1.9)
             notify(p.playhead); sleep(0.3)
-            @test VE.paramspec(:contrast).get(VE.effectiveclip(clip, sf0)) ≈ 0.2 atol = 1.0e-6
-            @test VE.paramspec(:contrast).get(VE.effectiveclip(clip, clip.src_out - 1)) ≈ 1.9 atol = 1.0e-6
-            delete!(clip.animations, :contrast)                    # leave the state clean
+            @test VE.valueat(tparam(VE.effectiveclip(clip, sf0), :contrast), 0) ≈ 0.2 atol = 1.0e-6
+            @test VE.valueat(tparam(VE.effectiveclip(clip, clip.src_out - 1), :contrast), 0) ≈ 1.9 atol = 1.0e-6
+            (tparam(clip, :contrast).curve = nothing)                    # leave the state clean
             notify(p.playhead); sleep(0.2)
         end
 
@@ -2093,7 +2123,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             press(tlx(2.0)); release(); sleep(0.2)
             fps = p.sequence.framerate
             base = VE.locate(p.sequence, p.playhead[])[1]
-            savedanims = copy(base.animations); empty!(base.animations)   # a clean V1 lane
+            savedanims = copy(base.effects); empty!(base.effects)   # a clean V1 lane
             # split base and stack its right half ABOVE it for this testset (restored
             # by joinclips! at the end) — self-sufficient even on a one-clip timeline
             c2 = VE.split!(p.sequence, base.start + (VE.clipend(base) - base.start) ÷ 2)
@@ -2104,9 +2134,9 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             fB = base.start + 2w ÷ 3                                 # Alt-clicks here
             overt = fB / fps
             # a known flat curve on each lane (model setup; the GESTURES are the test)
-            VE.setkey!(get!(() -> VE.AnimCurve(), base.animations, :temperature),
+            VE.setkey!(tcurve!(base, :temperature),
                        base.src_in + (fA - base.start), 0.0)     # norm 0.5 → band middle
-            VE.setkey!(get!(() -> VE.AnimCurve(), c2.animations, :opacity),
+            VE.setkey!(tcurve!(c2, :opacity),
                        c2.src_in + (fA - c2.start), 0.5)         # ditto — the Alt aims there
             notify(p.playhead); sleep(0.3)
             ntr = VE.ntracks(p.sequence)
@@ -2123,30 +2153,30 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             end
             # Alt-click into the UPPER band adds to c2 only (temperature curve on V1
             # is at band middle = norm 0.5, opacity curve on V2 near band top)
-            nb = length(base.animations[:temperature].keys)
-            nc = length(c2.animations[:opacity].keys)
+            nb = length(tcurve!(base, :temperature).keys)
+            nc = length(tcurve!(c2, :opacity).keys)
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.press)
             press(bandpix(overt, c2.track)); release()
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.release)
             sleep(0.3)
-            @test length(c2.animations[:opacity].keys) == nc + 1
-            @test length(base.animations[:temperature].keys) == nb
+            @test length(tcurve!(c2, :opacity).keys) == nc + 1
+            @test length(tcurve!(base, :temperature).keys) == nb
             # ...and into the LOWER band adds to base only
-            nc2 = length(c2.animations[:opacity].keys)
+            nc2 = length(tcurve!(c2, :opacity).keys)
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.press)
             press(bandpix(overt, base.track)); release()
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.release)
             sleep(0.3)
-            @test length(base.animations[:temperature].keys) == nb + 1
-            @test length(c2.animations[:opacity].keys) == nc2
+            @test length(tcurve!(base, :temperature).keys) == nb + 1
+            @test length(tcurve!(c2, :opacity).keys) == nc2
             # V1's ◆ markers stay editable even though V2 is on top: drag V1's key
             press(tlx(overt)); release(); sleep(0.2)   # playhead over the stack
-            k1 = base.animations[:temperature].keys[1]
+            k1 = tcurve!(base, :temperature).keys[1]
             lo, hi = VE.trackband(base.track, ntr)
             g = min(0.02, VE.trackspan(ntr) * 0.15); lo += g; hi -= g
             inset = 0.12 * (hi - lo)
             y1 = (lo + inset) + (hi - lo - 2inset) *
-                 VE.paramnorm(VE.paramspec(:temperature), k1.value)
+                 VE.paramnorm(tparam(clip, :temperature), k1.value)
             lims = ax.finallimits[]; vp = ax.scene.viewport[]
             mpix = Point2f(vp.origin[1] + ((base.start + (k1.frame - base.src_in)) / fps -
                                minimum(lims)[1]) / (maximum(lims)[1] - minimum(lims)[1]) *
@@ -2154,30 +2184,30 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
                            vp.origin[2] + y1 * vp.widths[2])
             f0 = k1.frame
             press(mpix); moveto(mpix .+ Point2f(-40, 0)); release(); sleep(0.3)
-            @test any(k -> k.frame < f0, base.animations[:temperature].keys)
+            @test any(k -> k.frame < f0, tcurve!(base, :temperature).keys)
             # restore the timeline: unstack the half and join it back onto base
-            empty!(base.animations)
-            empty!(c2.animations)
+            empty!(base.effects)
+            empty!(c2.effects)
             c2.track = base.track
             c2.start = VE.clipend(base)
             @test VE.joinclips!(p.sequence, base.start) !== nothing
-            merge!(base.animations, savedanims)
+            merge!(base.effects, savedanims)
             VE.refreshedit!(p); notify(p.playhead); sleep(0.3)
         end
 
         @testset "slider writes keys while playing (live keying)" begin
             press(tlx(1.2)); release(); sleep(0.2)
             clip = VE.locate(p.sequence, p.playhead[])[1]
-            VE.startanimating!(p, :contrast); sleep(0.3)
+            VE.togglekey!(p, VE.editclip(p)[1], tparam(VE.editclip(p)[1], :contrast)); sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
-            farm = clip.animations[:contrast].keys[1].frame
+            farm = tcurve!(clip, :contrast).keys[1].frame
             VE.play!(p); sleep(0.5)                    # playhead advancing
             Makie.set_close_to!(p.fxsliders[:contrast], 1.8)
             sleep(0.2); VE.pause!(p); sleep(0.2)
             clip = VE.locate(p.sequence, p.playhead[])[1]
-            ks = clip.animations[:contrast].keys
+            ks = tcurve!(clip, :contrast).keys
             @test any(k -> k.frame > farm && abs(k.value - 1.8) < 0.02, ks)
-            delete!(clip.animations, :contrast)        # leave the state clean
+            (tparam(clip, :contrast).curve = nothing)        # leave the state clean
             notify(p.playhead); sleep(0.2)
         end
 
@@ -2260,8 +2290,8 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             VE.activatetool!(p, :blend); sleep(0.5)     # clicking the header blends
             @test VE.activetoolname(p)[] === :none      # and hands the slot straight back
             @test isempty(p.sequence.transitions)       # NOT a transition
-            @test VE.clipanimated(c2, :opacity)         # the later clip fades in
-            @test !VE.clipanimated(c1, :opacity)        # the earlier one is untouched
+            @test VE.isanimated(tparam(c2, :opacity))         # the later clip fades in
+            @test !VE.isanimated(tparam(c1, :opacity))        # the earlier one is untouched
             @test c2.blendfrom == c1.id                 # the pair is REMEMBERED, not guessed
             @test VE.blends(p.sequence) == [(1, 2, VE.fadeinlength(c2))]
             @test length(pctx.rows) == 1                # one row per blend
@@ -2288,7 +2318,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             # an effect too now, so a clip that was stabilized earlier in this
             # session still has its Stabilize slot in the stack.
             @test !any(e -> e isa VE.OpacityEffect, VE.liveeffects(c2))
-            @test VE.clipanimated(c2, :opacity)          # the curve is untouched
+            @test VE.isanimated(tparam(c2, :opacity))          # the curve is untouched
             slot.enabled = true
 
             # the pair survives a move and an undo — nothing is re-derived
@@ -2314,7 +2344,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             # × clears keys, effect entry and the pair together
             VE.clearfade!(c2, :in); c2.blendfrom = UInt64(0)   # what × does
             VE.refreshedit!(p); sleep(0.2)
-            @test !VE.clipanimated(c2, :opacity)
+            @test !VE.isanimated(tparam(c2, :opacity))
             @test VE.findslot(c2, VE.OpacityEffect) === nothing
             @test c2.blendfrom == 0
             @test isempty(VE.blends(p.sequence))
@@ -2356,7 +2386,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             track0, start0 = upper.track, upper.start
             upper.track = 2
             upper.start = lower.start + VE.cliplength(lower) ÷ 2   # overlap the lower one
-            empty!(upper.animations); empty!(lower.animations)
+            empty!(upper.effects); empty!(lower.effects)
             VE.refreshedit!(p); sleep(0.3)
             over = upper.start + 5                                  # both clips cover this
             VE.seek!(p, over); sleep(0.3)
@@ -2369,17 +2399,17 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             press(lanepos(over / fps, 1)); release(); sleep(0.3)    # click the LOWER lane
             @test tl.selected[] == 1
             @test VE.editclip(p)[1] === lower                       # …and that is what you edit
-            VE.togglekey!(p, :opacity); sleep(0.2)
-            @test VE.clipanimated(lower, :opacity)
-            @test !VE.clipanimated(upper, :opacity)                 # the key went to the RIGHT clip
+            VE.togglekey!(p, VE.editclip(p)[1], tparam(VE.editclip(p)[1], :opacity)); sleep(0.2)
+            @test VE.isanimated(tparam(lower, :opacity))
+            @test !VE.isanimated(tparam(upper, :opacity))                 # the key went to the RIGHT clip
 
             press(lanepos(over / fps, 2)); release(); sleep(0.3)    # click the upper lane
             @test tl.selected[] == 2
             @test VE.editclip(p)[1] === upper
-            VE.togglekey!(p, :opacity); sleep(0.2)
-            @test VE.clipanimated(upper, :opacity)
+            VE.togglekey!(p, VE.editclip(p)[1], tparam(VE.editclip(p)[1], :opacity)); sleep(0.2)
+            @test VE.isanimated(tparam(upper, :opacity))
 
-            empty!(upper.animations); empty!(lower.animations)      # restore for later beats
+            empty!(upper.effects); empty!(lower.effects)      # restore for later beats
             upper.track, upper.start = track0, start0
             VE.refreshedit!(p); sleep(0.2)
             VE.undo!(p); VE.undo!(p); VE.undo!(p); sleep(0.2)       # two keyframe snapshots + the split
@@ -2420,7 +2450,7 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
             press(tlx(1.0)); release(); sleep(0.3)   # select a clip: marking needs one
             clip = p.sequence.clips[1]
             clip.mattetrack = nothing
-            filter!(s -> !(s.effect isa VE.MatteEffect), clip.effects)
+            filter!(s -> !(VE.op(s) isa VE.MatteEffect), clip.effects)
             VE.opendock!(p, :effects)
             VE.activatetool!(p, :matte); sleep(0.5)
             col = VE.mattecollect(p)

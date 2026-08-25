@@ -76,7 +76,9 @@ mutable struct Player
                           # copy of the finished image — GLMakie samples `frame[]`
                           # lazily at render time, so decoding/warping in place there
                           # flashes raw or half-processed frames on screen during play
-    const fxsliders::Dict{Symbol, Slider}
+    # keyed by (effect id, parameter name): a parameter is only unique WITHIN
+    # its effect now, and two entries of one kind must not share a slider
+    const fxsliders::Dict{Tuple{UInt64, Symbol}, Slider}
     const fxwidgets::Dict{Symbol, Any}  # panel menu/buttons (dock content is
                                         # invisible to fig.content — tests and
                                         # MCP reach the widgets through here)
@@ -601,7 +603,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     analysisbackend,
                     fig, ax, Ref(false),
                     Observable(Point2f[]),
-                    similar(frame[]), Dict{Symbol, Slider}(),
+                    similar(frame[]), Dict{Tuple{UInt64, Symbol}, Slider}(),
                     Dict{Symbol, Any}(),
                     Ref(false), nothing, (0.0, 0.0, 1.0, 1.0), (0, 0), nothing, nothing, 0.0,
                     nothing, false, nothing, nothing, nothing, nothing, defaultsegmenter(),
@@ -3501,18 +3503,18 @@ function buildkeyframeoverlay!(player::Player)
 
     halo = lines!(ax, lanes; color = (:black, 0.55), linewidth = 4.0)
     translate!(halo, 0, 0, 3)
-    curve = lines!(ax, lanes; color = player.timeline.uicolors.accent, linewidth = 2.0)
+    accent = player.timeline.colors.accent
+    curve = lines!(ax, lanes; color = accent, linewidth = 2.0)
     translate!(curve, 0, 0, 4)
     dots = scatter!(ax, marks; marker = :diamond, markersize = 10,
-                    color = player.timeline.uicolors.accent,
-                    strokecolor = :white, strokewidth = 1.0)
+                    color = accent, strokecolor = :white, strokewidth = 1.0)
     translate!(dots, 0, 0, 5)
 
-    "Where a value sits vertically inside `clip`'s lane, as a fraction of its range."
+    # Where a value sits inside its clip's LANE — the same band the timeline draws
+    # the clip in, so a curve is read against the thing it belongs to.
     function yat(clip::Clip, p::Param, v)
-        lo, hi = p.range === nothing ? (0.0, 1.0) : p.range
-        u = hi > lo ? clamp((Float64(v) - lo) / (hi - lo), 0.0, 1.0) : 0.5
-        return lanebottom(player.timeline, clip) + u * laneheight(player.timeline, clip)
+        lo, hi = trackband(clip.track, player.timeline.ntr[])
+        return lo + paramnorm(p, v) * (hi - lo)
     end
 
     function refresh()
@@ -3619,6 +3621,54 @@ clipanimated(clip::Clip) = isanimated(clip)
 
 "Absolute source frame the playhead currently maps to within `clip`."
 playheadframe(player::Player, clip::Clip) = sourceframe(clip, player.playhead[])
+
+"""
+    syncsliders!(player, clip)
+
+Put every card slider back on what its parameter actually says.
+
+`fxsyncing` is raised while it writes, because a slider's own handler treats a
+change as an EDIT — and an edit at the playhead stamps a keyframe. Without the
+flag, scrubbing across an animated parameter would key it at every frame it
+passed.
+"""
+function syncsliders!(player::Player, clip::Clip)
+    player.fxsyncing[] = true
+    try
+        for fx in clip.effects, prm in fx.params
+            sl = get(player.fxsliders, (fx.id, prm.name), nothing)
+            sl === nothing && continue
+            v = Float64(valueat(prm, playheadframe(player, clip)))
+            Makie.set_close_to!(sl, v)
+        end
+    finally
+        player.fxsyncing[] = false
+    end
+    return nothing
+end
+
+"""
+    syncanimatedsliders!(player, clip)
+
+The same, but only for parameters that HAVE a curve — what a scrub needs. A
+static parameter cannot have moved, so writing it back would be pure work (and
+one more chance to trip the edit path).
+"""
+function syncanimatedsliders!(player::Player, clip::Clip)
+    any(fx -> any(isanimated, fx.params), clip.effects) || return nothing
+    player.fxsyncing[] = true
+    try
+        for fx in clip.effects, prm in fx.params
+            isanimated(prm) || continue
+            sl = get(player.fxsliders, (fx.id, prm.name), nothing)
+            sl === nothing && continue
+            Makie.set_close_to!(sl, Float64(valueat(prm, playheadframe(player, clip))))
+        end
+    finally
+        player.fxsyncing[] = false
+    end
+    return nothing
+end
 
 """
 The ◆ of the inspector trio, Premiere semantics: start animating the parameter if

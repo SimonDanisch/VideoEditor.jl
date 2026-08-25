@@ -480,12 +480,8 @@ function effectiveclip(clip::Clip, srcframe::Integer)
     # own entries (same ids, same on/off) so a sampled value never writes into
     # the clip the user is editing. The PARAMS are copied; the curves are shared,
     # because sampling never touches them.
-    ec = withfields(clip;
-                    effects = [Effect(fx.id, fx.kind, fx.enabled, fx.links,
-                                      Param[Param{typeof(p.value)}(p.name, p.label, p.value,
-                                                                   p.curve, p.visible, p.range)
-                                            for p in fx.params])
-                               for fx in clip.effects])
+    # `curves = false`: the copy IS the sampled state, so nothing may re-sample it
+    ec = withfields(clip; effects = [copy(fx; curves = false) for fx in clip.effects])
     for (i, fx) in enumerate(clip.effects)
         any(isanimated, fx.params) || continue
         # THIS entry's parameters, sampled on THIS entry. Resolving a bare name

@@ -182,6 +182,32 @@ param(fx::Effect, name::Symbol) =
     (i = findfirst(p -> p.name === name, fx.params); i === nothing ? nothing : fx.params[i])
 
 """
+    copy(fx::Effect; id = fx.id, curves = true) -> Effect
+
+An independent copy of `fx`: its own `Param` objects, so writing a value into one
+cannot reach the other.
+
+`curves = false` drops the curves entirely, which is what SAMPLING wants: the
+copy carries the value at one frame, and a parameter that still had its curve
+would be re-sampled by `op` at whatever frame that asks for. Measured: the export
+baked opacity 0.1 into every frame of a 0.1→1.0 ramp, because the sampled copy
+kept the curve and `op` read it at frame 0.
+
+ONE copier, because there were three, and one of them rebuilt the entry from
+`op(fx)` — the payload, which carries a value and no curve. That silently
+dropped every animation into the undo stack; the suite caught it as
+`isanimated(snapshot(seq)[1])` failing.
+"""
+function Base.copy(fx::Effect; id::Integer = fx.id, curves::Bool = true)
+    ps = Param[Param{typeof(p.value)}(p.name, p.label, p.value,
+                                      !curves || p.curve === nothing ? nothing :
+                                      AnimCurve(copy(p.curve.keys), p.curve.interp),
+                                      p.visible, p.range)
+               for p in fx.params]
+    return Effect(UInt64(id), fx.kind, fx.enabled, copy(fx.links), ps)
+end
+
+"""
     paramsfor(kind, values) -> Vector{Param}
 
 A kind's parameters at `values` (a NamedTuple), falling back to its declared
@@ -667,12 +693,7 @@ copyclip(clip::Clip; start::Integer = clip.start, track::Integer = clip.track) =
     withfields(clip; id = freshid(), start = Int(start), track = Int(track),
                # Fresh slot ids and copied link vectors: the copy's stack is its
                # own, so unlinking on one must not reach into the other.
-               effects = [Effect(freshid(), fx.kind, fx.enabled, copy(fx.links),
-                                 Param[Param{typeof(q.value)}(q.name, q.label, q.value,
-                                          q.curve === nothing ? nothing :
-                                          AnimCurve(copy(q.curve.keys), q.curve.interp),
-                                          q.visible, q.range) for q in fx.params])
-                          for fx in clip.effects],
+               effects = [copy(fx; id = freshid()) for fx in clip.effects],
 
                # NOT the original's blend partner — a copy is not in that transition.
                blendfrom = UInt64(0))
@@ -757,11 +778,20 @@ function joinclips!(seq::Sequence, n::Integer)
     j === nothing && return nothing
     nxt = seq.clips[j]
     removetransition!(seq, nxt.start)     # a dissolve on the joined cut is gone with it
-    for (i, fx) in enumerate(nxt.effects)   # carry the right half's keys over
-        i <= length(c.effects) || break
-        for (j, prm) in enumerate(fx.params)
+    # Carry the right half's keys over, matching by KIND — not by position. The
+    # halves need not have the same stack: only the right one may carry the
+    # effect a curve belongs to, and indexing by position then wrote it onto a
+    # different effect or dropped it (measured: the joined clip lost its fade).
+    for fx in nxt.effects
+        any(isanimated, fx.params) || continue
+        i = findfirst(g -> g.kind === fx.kind, c.effects)
+        if i === nothing
+            push!(c.effects, copy(fx; id = freshid()))
+            continue
+        end
+        for prm in fx.params
             prm.curve === nothing && continue
-            dst = j <= length(c.effects[i].params) ? c.effects[i].params[j] : nothing
+            dst = param(c.effects[i], prm.name)
             dst === nothing && continue
             dst.curve === nothing && (dst.curve = AnimCurve{typeof(dst.value)}())
             foreach(k -> setkey!(dst.curve, k.frame, k.value, k.ease), prm.curve.keys)
@@ -865,8 +895,7 @@ snapshot(seq::Sequence) =
     # links are copied, not shared: an undo that put back a slot whose link vector
     # was the live one would not restore a removed partner
     [withfields(c;
-                effects = [Effect(s.id, op(s), s.enabled, copy(s.links)) for s in c.effects],
-)
+                effects = [copy(fx) for fx in c.effects])
      for c in seq.clips]
 
 "Restore a [`snapshot`](@ref) (the snapshot itself stays reusable)."

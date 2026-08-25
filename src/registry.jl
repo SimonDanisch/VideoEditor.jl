@@ -38,7 +38,6 @@ struct EffectKind
     label::String
     description::String
     params::Vector{FxParam}
-    kfkeys::Vector{Symbol}
     make::Any        # (nt::NamedTuple) -> Effect
     matches::Any     # (e::FxOp) -> Bool
     read::Any        # (e::FxOp) -> NamedTuple
@@ -51,19 +50,21 @@ end
 """
     EffectKind(name, label; params, make, matches, read, ...)
 
-Keyword constructor. `kfkeys` defaults to the parameter names, which is right
-whenever a kind's parameter names are already unique keyframe keys (the
-built-ins); a kind whose parameters share names with another's passes its own.
+Keyword constructor.
+
+There is no `kfkeys` any more. It existed to give each parameter a GLOBALLY
+unique name, because a curve was stored on the clip under a bare symbol and had
+to be resolvable from it alone. A curve now lives on the parameter of the effect
+it animates, so two kinds may both call a parameter `:strength` and nothing has
+to tell them apart.
 """
 function EffectKind(name::Symbol, label::AbstractString;
                     description::AbstractString = "",
                     params::Vector{FxParam} = FxParam[],
-                    kfkeys::Union{Nothing, Vector{Symbol}} = nothing,
                     make = nothing, matches = nothing, read = nothing,
                     body = nothing, activate = nothing,
                     deactivate = ctx -> nothing, analysis::Bool = false)
     return EffectKind(name, String(label), String(description), params,
-                      kfkeys === nothing ? [p.name for p in params] : kfkeys,
                       make, matches, read, body, activate, deactivate, analysis)
 end
 
@@ -246,9 +247,9 @@ kind needs a card body or an action of its own.
 function registerplugin!(name::Symbol, label::AbstractString, params::Vector{FxParam}, kind;
                          description::AbstractString = "", registry::EffectRegistry = EFFECTS)
     KINDCALLBACKS[name] = kind
-    # one parameter → its own key (:vignette); several → namespaced (:duotone_mix)
-    keys = length(params) == 1 ? [name] : [Symbol(name, :_, p.name) for p in params]
-    return registereffect!(EffectKind(name, label; description, params, kfkeys = keys,
+    # No key namespacing: a plugin's parameters keep the names it gave them, and
+    # they only have to be unique WITHIN the plugin.
+    return registereffect!(EffectKind(name, label; description, params,
         make = nt -> PluginEffect(name, nt),
         matches = e -> e isa PluginEffect && e.name === name,
         read = e -> NamedTuple(p.name => Float64(get(e.params, p.name, p.default)) for p in params));
@@ -338,7 +339,6 @@ registereffect!(EffectKind(:transform, "Transform";
               FxParam(:x, "Position X"; min = -1.0, max = 1.0, default = 0.0),
               FxParam(:y, "Position Y"; min = -1.0, max = 1.0, default = 0.0),
               FxParam(:rotation, "Rotation"; min = -180.0, max = 180.0, default = 0.0)],
-    kfkeys = [:scale, :pos_x, :pos_y, :rotation],
     make = nt -> TransformEffect(scale = nt.scale, x = nt.x, y = nt.y, rotation = nt.rotation),
     matches = e -> e isa TransformEffect,
     read = e -> (scale = e.scale, x = e.x, y = e.y, rotation = e.rotation)))

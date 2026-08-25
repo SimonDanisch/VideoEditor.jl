@@ -20,6 +20,26 @@ run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -f lavfi -i testsrc2=size=180x320:rate=1
 
 include("refactor.jl")   # registry, analyses-as-slots, links, commands
 
+"The curve of `clip`'s `T` effect parameter `name`, created if needed."
+function paramcurve!(clip, ::Type{T}, name::Symbol) where {T}
+    fx = VE.findslot(clip, T)
+    prm = VE.param(fx, name)
+    prm.curve === nothing && (prm.curve = VE.AnimCurve())
+    return prm.curve
+end
+
+# The curve of a clip's opacity, creating the effect and the curve if needed.
+# `clip.animations[:opacity]` used to be the way in; a curve now belongs to the
+# Param of the effect that renders it, so this is the whole of the change.
+function opacitycurve!(clip)
+    VE.findslot(clip, VE.OpacityEffect) === nothing &&
+        VE.seteffect!(clip, VE.OpacityEffect(1.0f0))
+    prm = VE.param(VE.findslot(clip, VE.OpacityEffect), :opacity)
+    prm.curve === nothing && (prm.curve = VE.AnimCurve())
+    return prm.curve
+end
+opacitycurve(clip) = (prm = VE.opacityparam(clip); prm === nothing ? nothing : prm.curve)
+
 @testset "VideoSource" begin
     src = VideoSource(testvideo)
     @test src.width == 320 && src.height == 180
@@ -136,25 +156,24 @@ end
 @testset "keyframe animation roundtrip" begin
     src = VideoSource(testvideo)
     clip = VE.Clip(src, 0, 60, 0, (0.0, 0.0, 1.0, 1.0))
-    curve = VE.AnimCurve()
+    curve = opacitycurve!(clip)
     VE.setkey!(curve, 0, 1.0); VE.setkey!(curve, 30, 0.25); VE.setkey!(curve, 59, 0.8)
     curve.interp = :smooth
-    clip.animations[:opacity] = curve
     seq = Sequence([clip], src.framerate)
 
     path = joinpath(mktempdir(), "anim.videoedit.toml")
     saveproject(path, seq)
     c2 = loadproject(path).clips[1]
-    @test haskey(c2.animations, :opacity)                       # curve survived the roundtrip
-    a = c2.animations[:opacity]
+    a = opacitycurve(c2)
+    @test a !== nothing                                         # curve survived the roundtrip
     @test a.interp == :smooth                                   # easing preserved
     @test [(k.frame, k.value) for k in a.keys] == [(0, 1.0), (30, 0.25), (59, 0.8)]
     @test VE.valueat(a, 15) ≈ VE.valueat(curve, 15)            # interpolation identical after reload
-    @test !isempty(VE.snapshot(seq)[1].animations)             # undo snapshot keeps it too
+    @test VE.isanimated(VE.snapshot(seq)[1])                   # undo snapshot keeps it too
     # per-key eases survive the roundtrip too
     VE.setease!(curve, 2, :hold)
     saveproject(path, seq)
-    a2 = loadproject(path).clips[1].animations[:opacity]
+    a2 = opacitycurve(loadproject(path).clips[1])
     @test [k.ease for k in a2.keys] == [:linear, :hold, :linear]
 end
 
@@ -282,19 +301,19 @@ end
     right = split!(seq, 40)
     @test length(seq.clips) == 2
     # a key on the right half must survive the join (absolute-frame keyed)
-    VE.setkey!(get!(() -> VE.AnimCurve(), right.animations, :opacity), 50, 0.5)
+    VE.setkey!(opacitycurve!(right), 50, 0.5)
     joined = VE.joinclips!(seq, 10)
     @test joined !== nothing
     @test length(seq.clips) == 1
     @test seq.clips[1].src_out == n0
-    @test haskey(seq.clips[1].animations, :opacity)
+    @test opacitycurve(seq.clips[1]) !== nothing
     @test VE.joinclips!(seq, 10) === nothing          # nothing left to join
     # split COPIES curves — the halves must edit independently (Premiere razor)
-    VE.setkey!(get!(() -> VE.AnimCurve(), seq.clips[1].animations, :opacity), 20, 0.8)
+    VE.setkey!(opacitycurve!(seq.clips[1]), 20, 0.8)
     r3 = split!(seq, 40)
-    @test r3.animations[:opacity] !== seq.clips[1].animations[:opacity]
-    VE.setkey!(seq.clips[1].animations[:opacity], 20, 0.1)
-    @test VE.valueat(r3.animations[:opacity], 20) == 0.8
+    @test opacitycurve(r3) !== opacitycurve(seq.clips[1])
+    VE.setkey!(opacitycurve(seq.clips[1]), 20, 0.1)
+    @test VE.valueat(opacitycurve(r3), 20) == 0.8
     VE.joinclips!(seq, 10)
     # a trim that breaks source-contiguity refuses to join (not one cut anymore)
     seq2 = Sequence(VideoSource(testvideo))
@@ -309,17 +328,19 @@ end
     slot = c.effects[end]
     id = slot.id
     slot.enabled = false
-    @test isempty(collect(VE.liveeffects(c)))
+    # the disabled entry is skipped — the stack itself is not empty, because a
+    # curve now belongs to an effect and the fade above put an OpacityEffect here
+    @test !any(e -> e isa ColorEffect, VE.liveeffects(c))
     @test VE.findeffect(c, ColorEffect).adj.saturation == 1.8f0   # params survive
     @test VE.findslot(c, id) === slot                             # addressable by id
     d = VE.slotdict(slot)                             # project-file roundtrip
     s2 = VE.slotfromdict(d)
-    @test s2.id == id && !s2.enabled && s2.effect.adj.saturation == 1.8f0
+    @test s2.id == id && !s2.enabled && VE.op(s2).adj.saturation == 1.8f0
     # files written before ids existed still load — a wrapped effect becomes an off slot
     old = Dict{String, Any}("type" => "bypassed",
                             "inner" => VE.effectdict(ColorEffect(saturation = 1.2)))
     s3 = VE.slotfromdict(old)
-    @test !s3.enabled && s3.effect.adj.saturation == 1.2f0 && s3.id != 0
+    @test !s3.enabled && VE.op(s3).adj.saturation == 1.2f0 && s3.id != 0
     slot.enabled = true
 end
 
@@ -573,8 +594,8 @@ end
 
     # keyframed parameters bake per-frame into the export (opacity ramp → luma ramp)
     kseq = Sequence(VideoSource(testvideo))
-    kcurve = VE.AnimCurve(); VE.setkey!(kcurve, 0, 0.1); VE.setkey!(kcurve, 119, 1.0)
-    kseq.clips[1].animations[:opacity] = kcurve
+    kcurve = opacitycurve!(kseq.clips[1])
+    VE.setkey!(kcurve, 0, 0.1); VE.setkey!(kcurve, 119, 1.0)
     kout = joinpath(mktempdir(), "kf.mp4")
     exportvideo(kout, kseq; audio = false, encoder_options = (crf = 18, preset = "fast"))
     luma(f) = mean(Float32(px.r) + px.g + px.b for px in f) / 3
@@ -1139,24 +1160,23 @@ end
     @test VideoEditor.effectfromdict(VideoEditor.effectdict(MatteEffect(0.7, 0.2))) ==
           MatteEffect(0.7f0, 0.2f0)
     k = VideoEditor.kindbyname(:matte)
-    @test k.kfkeys == [:matte_strength, :matte_feather]
+    @test [pr.name for pr in k.params] == [:strength, :feather]
     @test k.matches(MatteEffect(1.0, 0.0))
     @test k.read(MatteEffect(0.5, 0.25)) == (strength = 0.5, feather = 0.25)
     @test k.make((strength = 0.5, feather = 0.25)) == MatteEffect(0.5f0, 0.25f0)
 
     # --- keyframes drive it through the normal param path
     push!(clip.effects, VideoEditor.Effect(MatteEffect()))
-    curve(k) = get!(() -> VideoEditor.AnimCurve(VideoEditor.Keyframe[], :linear),
-                    clip.animations, k)
-    VideoEditor.setkey!(curve(:matte_strength), 0, 0.0)
-    VideoEditor.setkey!(curve(:matte_strength), 11, 1.0)
-    @test VideoEditor.valueat(clip.animations[:matte_strength], 0) ≈ 0.0
+    mc = paramcurve!(clip, MatteEffect, :strength)
+    VideoEditor.setkey!(mc, 0, 0.0)
+    VideoEditor.setkey!(mc, 11, 1.0)
+    @test VideoEditor.valueat(mc, 0) ≈ 0.0
     e0 = VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 0), MatteEffect)
     e1 = VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 11), MatteEffect)
     @test e0.strength ≈ 0.0f0
     @test e1.strength ≈ 1.0f0
     # feather keyframes must not clobber strength (shared-effect rebuild)
-    VideoEditor.setkey!(curve(:matte_feather), 11, 0.5)
+    VideoEditor.setkey!(paramcurve!(clip, MatteEffect, :feather), 11, 0.5)
     e1b = VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 11), MatteEffect)
     @test e1b.strength ≈ 1.0f0 && e1b.feather ≈ 0.5f0
 
@@ -1412,13 +1432,12 @@ end
         @test VideoEditor.effectfromdict(VideoEditor.effectdict(RestoreEffect(0.6))) ==
               RestoreEffect(0.6f0)
         k = VideoEditor.kindbyname(:restore)
-        @test k.kfkeys == [:restore_strength]
+        @test [pr.name for pr in k.params] == [:strength]
         @test k.read(RestoreEffect(0.5)) == (strength = 0.5,)
 
         # keyframable through the normal param path
         push!(clip.effects, VideoEditor.Effect(RestoreEffect()))
-        cur = get!(() -> VideoEditor.AnimCurve(VideoEditor.Keyframe[], :linear),
-                   clip.animations, :restore_strength)
+        cur = paramcurve!(clip, RestoreEffect, :strength)
         VideoEditor.setkey!(cur, 0, 0.0)
         VideoEditor.setkey!(cur, 5, 1.0)
         @test VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 0), RestoreEffect).strength ≈ 0.0f0
@@ -1497,7 +1516,7 @@ end
         cl = VE.Clip(slow, 0, slow.nframes, 0, (0.0,0.0,1.0,1.0), 0.5)
         VE.keyfade!(cl, 30, :in)                   # 30 timeline frames = 1 s at 30 fps
         @test VE.fadeinlength(cl) == 30            # reads back in the same unit
-        ks = cl.animations[:opacity].keys
+        ks = opacitycurve(cl).keys
         @test (ks[end].frame - ks[1].frame + 1) == 15   # …which is 15 SOURCE frames
     end
 
@@ -1630,13 +1649,14 @@ end
     @test over[canvas[1] ÷ 2, mid] != base[canvas[1] ÷ 2, mid]   # …and the layer itself on top
 
     # scale/position are ordinary animatable params: keyframes, project, undo
-    @test VE.paramspec(:scale).group === :geometry
-    VE.paramspec(:scale).set(c2, 1.4)
-    @test VE.transformof(c2)[1] == 1.4 && VE.paramspec(:scale).get(c2) == 1.4
-    VE.paramspec(:pos_x).set(c2, -0.2)
+    tfx = VE.findslot(c2, VE.TransformEffect)
+    @test VE.param(tfx, :scale) !== nothing
+    VE.param(tfx, :scale).value = 1.4
+    @test VE.transformof(c2)[1] == 1.4 && VE.param(tfx, :scale).value == 1.4
+    VE.param(tfx, :x).value = -0.2
     @test VE.transformof(c2)[2] == -0.2
-    cur = VE.AnimCurve(); VE.setkey!(cur, 0, 1.0); VE.setkey!(cur, 20, 2.0)
-    c2.animations[:scale] = cur
+    cur = paramcurve!(c2, VE.TransformEffect, :scale)
+    VE.setkey!(cur, 0, 1.0); VE.setkey!(cur, 20, 2.0)
     @test VE.transformof(VE.effectiveclip(c2, 10))[1] ≈ 1.5   # baked at the frame
     path = joinpath(mktempdir(), "reframe.videoedit.toml")
     VE.saveproject(path, seq)

@@ -34,9 +34,14 @@
         end
     end
 
-    # every kind's keyframe keys resolve to a registered parameter spec
-    for k in kinds, key in k.kfkeys
-        @test VE.paramspec(key, nothing) !== nothing
+    # Every declared parameter becomes a `Param` on a fresh entry of that kind —
+    # no global index to look it up in, and none needed.
+    for k in kinds
+        k.make === nothing && continue
+        fx = VE.Effect(k)
+        for pr in k.params
+            @test VE.param(fx, pr.name) !== nothing
+        end
     end
 end
 
@@ -49,7 +54,7 @@ end
     track = VE.MotionTrack([VE.Mat3f(1I) for _ in 1:40], clip.src_in, :similarity)
     VE.setmotiontrack!(clip, track)
     @test clip.motiontrack === track
-    @test count(s -> s.effect isa VE.StabilizeEffect, clip.effects) == 1
+    @test count(s -> VE.op(s) isa VE.StabilizeEffect, clip.effects) == 1
 
     # …and detaching removes both
     VE.setmotiontrack!(clip, nothing)
@@ -61,8 +66,8 @@ end
     ct = VE.ColorTrack([VE.Vec3f(1, 1, 1) for _ in 1:40], [VE.Vec3f(0, 0, 0) for _ in 1:40],
                        clip.src_in, 0.6f0, 0.3f0)
     VE.setcolortrack!(clip, ct)
-    fx = only(filter(s -> s.effect isa VE.FlickerEffect, clip.effects))
-    @test fx.effect.strength ≈ 0.6f0
+    fx = only(filter(s -> VE.op(s) isa VE.FlickerEffect, clip.effects))
+    @test VE.op(fx).strength ≈ 0.6f0
 
     # the render graph takes them from the STACK now, in stack order
     VE.setmotiontrack!(clip, track)

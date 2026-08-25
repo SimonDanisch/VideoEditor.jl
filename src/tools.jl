@@ -1295,7 +1295,6 @@ registereffect!(EffectKind(:flicker, "Fix flicker";
     description = "Evens out exposure/colour jitter on the SELECTED clip: everything faster " *
         "than the cutoff is treated as flicker, slower changes survive.",
     params = [FxParam(:strength, "Strength"; min = 0.0, max = 1.0, default = 1.0)],
-    kfkeys = [:flicker_strength],
     make = nt -> FlickerEffect(Float32(nt.strength)),
     matches = e -> e isa FlickerEffect,
     read = e -> (strength = Float64(e.strength),),
@@ -1315,7 +1314,6 @@ registereffect!(EffectKind(:blend, "Blend clips";
         "fades in. The two halves link to each other, so each card shows the other's " *
         "fade next to its own.",
     params = [FxParam(:seconds, "Length (s)"; min = 0.1, max = 3.0, default = 0.6)],
-    kfkeys = [:blend_seconds],
     make = nt -> BlendEffect(Float64(nt.seconds)),
     matches = e -> e isa BlendEffect,
     read = e -> (seconds = e.seconds,),
@@ -3442,7 +3440,6 @@ registereffect!(EffectKind(:matte, "Matte";
         "stabilized — so a tighter crop is also a faster, easier matte.",
     params = [FxParam(:strength, "Matte"; min = 0.0, max = 1.0, default = 1.0),
               FxParam(:feather, "Feather"; min = 0.0, max = 1.0, default = 0.0)],
-    kfkeys = [:matte_strength, :matte_feather],
     make = nt -> MatteEffect(Float32(nt.strength), Float32(nt.feather)),
     matches = e -> e isa MatteEffect,
     read = e -> (strength = Float64(e.strength), feather = Float64(e.feather)),
@@ -3525,7 +3522,6 @@ registereffect!(EffectKind(:restore, "Restore";
     description = "Runs an upscaling/restoration model over frames around the playhead on the " *
         "SELECTED clip. Needs a model installed (examples/basicvsrpp.jl).",
     params = [FxParam(:strength, "Restore"; min = 0.0, max = 1.0, default = 1.0)],
-    kfkeys = [:restore_strength],
     make = nt -> RestoreEffect(Float32(nt.strength)),
     matches = e -> e isa RestoreEffect,
     read = e -> (strength = Float64(e.strength),),
