@@ -143,15 +143,8 @@ function clipdict(clip::Clip)
             "dim" => size(clip.look, 1),
             "table" => Float64.(vec(clip.look)))
     end
-    # keyframed parameters — losing them on reopen would silently drop an animation
-    anims = Dict{String, Any}(
-        String(key) => Dict{String, Any}(
-            "interp" => String(curve.interp),
-            "frames" => [k.frame for k in curve.keys],
-            "values" => [Float64(k.value) for k in curve.keys],
-            "eases" => [String(k.ease) for k in curve.keys])
-        for (key, curve) in clip.animations if !isempty(curve))
-    isempty(anims) || (cd["animations"] = anims)
+    # NO clip-level `animations`: a curve is written inside the effect whose
+    # parameter it animates (see `slotdict`), which is where it lives in memory.
     return cd
 end
 
@@ -223,13 +216,6 @@ function loadproject(path::AbstractString)
             lk = cd["look"]
             d = Int(lk["dim"])
             clip.look = reshape(Float32.(lk["table"]), d, d, d, 3)
-        end
-        for (key, ad) in get(cd, "animations", Dict{String, Any}())
-            eases = get(ad, "eases", fill("linear", length(ad["frames"])))  # older files
-            clip.animations[Symbol(key)] = AnimCurve(
-                [Keyframe(Int(f), Float64(v), Symbol(e))
-                 for (f, v, e) in zip(ad["frames"], ad["values"], eases)],
-                Symbol(get(ad, "interp", "linear")))
         end
         clip
     end

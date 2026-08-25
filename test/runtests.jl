@@ -1145,7 +1145,7 @@ end
     @test k.make((strength = 0.5, feather = 0.25)) == MatteEffect(0.5f0, 0.25f0)
 
     # --- keyframes drive it through the normal param path
-    push!(clip.effects, VideoEditor.FxSlot(MatteEffect()))
+    push!(clip.effects, VideoEditor.Effect(MatteEffect()))
     curve(k) = get!(() -> VideoEditor.AnimCurve(VideoEditor.Keyframe[], :linear),
                     clip.animations, k)
     VideoEditor.setkey!(curve(:matte_strength), 0, 0.0)
@@ -1215,7 +1215,7 @@ end
     alpha = zeros(UInt8, 160, 90, 10)
     alpha[40:120, 20:70, :] .= 0xff
     clip.mattetrack = MatteTrack(alpha, clip.src_in, [clip.src_in])
-    push!(clip.effects, VE.FxSlot(MatteEffect(; strength = 1.0)))
+    push!(clip.effects, VE.Effect(MatteEffect(; strength = 1.0)))
     f0 = clip.src_in
 
     # the node carries the plane's shape, because that shape sizes a graph
@@ -1233,7 +1233,7 @@ end
 
     # a changed parameter is a store, not a new plan — the plane did not move
     plans = length(engine.plans)
-    clip.effects[end] = VE.FxSlot(MatteEffect(; strength = 0.5))
+    clip.effects[end] = VE.Effect(MatteEffect(; strength = 0.5))
     half = copy(VE.chainimage(VE.runchain!(engine, frame, clip, f0)))
     @test length(engine.plans) == plans
     @test half != out
@@ -1248,7 +1248,7 @@ end
     # what replaced the eight explicit `freematteplanes!` calls.
     alpha2 = zeros(UInt8, 160, 90, 10); alpha2[10:40, 10:30, :] .= 0xff
     clip.mattetrack = MatteTrack(alpha2, clip.src_in, [clip.src_in])
-    clip.effects[end] = VE.FxSlot(MatteEffect(; strength = 1.0))
+    clip.effects[end] = VE.Effect(MatteEffect(; strength = 1.0))
     fresh = copy(VE.chainimage(VE.runchain!(engine, frame, clip, f0)))
     @test fresh == VE.applymatte!(copy(frame), clip, f0; strength = 1.0)
     @test fresh != out
@@ -1263,7 +1263,7 @@ end
     base = VE.Clip(src)
     top = VE.Clip(src); top.track = 2
     top.mattetrack = MatteTrack(alpha, top.src_in, [top.src_in])
-    push!(top.effects, VE.FxSlot(MatteEffect(; strength = 1.0)))
+    push!(top.effects, VE.Effect(MatteEffect(; strength = 1.0)))
     red  = fill(VE.RGB{VE.N0f8}(1, 0, 0), src.width, src.height)
     blue = fill(VE.RGB{VE.N0f8}(0, 0, 1), src.width, src.height)
     eng2 = VE.FxEngine(VE.KA.CPU())
@@ -1416,7 +1416,7 @@ end
         @test k.read(RestoreEffect(0.5)) == (strength = 0.5,)
 
         # keyframable through the normal param path
-        push!(clip.effects, VideoEditor.FxSlot(RestoreEffect()))
+        push!(clip.effects, VideoEditor.Effect(RestoreEffect()))
         cur = get!(() -> VideoEditor.AnimCurve(VideoEditor.Keyframe[], :linear),
                    clip.animations, :restore_strength)
         VideoEditor.setkey!(cur, 0, 0.0)

@@ -118,7 +118,7 @@ function showtransformgizmo!(player::Player, clip::Union{Nothing, Clip},
     # with nothing to click to put them away.
     sel = fxselected(player)
     slot = clip === nothing || sel === nothing ? nothing :
-           findfirst(s -> (:fx, s.id) == sel && s.effect isa TransformEffect, clip.effects)
+           findfirst(s -> (:fx, s.id) == sel && op(s) isa TransformEffect, clip.effects)
     if slot === nothing
         g.scene.visible[] = false
         g.scene.captures_mouse = false

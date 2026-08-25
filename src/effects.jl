@@ -6,18 +6,18 @@ placed by the engine's Mantle device, so the same code runs on host memory under
 `KA.CPU()` and on the GPU through Lava. There is no CPU stack and no GPU stack;
 there is one graph and a backend parameter.
 """
-abstract type Effect end
+abstract type FxOp end
 
-struct ColorEffect <: Effect
+struct ColorEffect <: FxOp
     adj::ColorAdjustments
 end
 ColorEffect(; kwargs...) = ColorEffect(ColorAdjustments(; kwargs...))
 
-struct BlurEffect <: Effect
+struct BlurEffect <: FxOp
     σ::Float32
 end
 
-struct SharpenEffect <: Effect
+struct SharpenEffect <: FxOp
     σ::Float32
     amount::Float32
 end
@@ -31,7 +31,7 @@ is the point of the split: `strength` fading 0→1 is a keyframed reveal, and
 `feather` softening an edge over time is a keyframed edge, both with no
 re-analysis.
 """
-struct MatteEffect <: Effect
+struct MatteEffect <: FxOp
     strength::Float32
     feather::Float32
 end
@@ -45,7 +45,7 @@ the clip's restore cache, so this stays a scalar the keyframe registry can
 animate. Cross-fading it in is a legitimate edit — a restoration is a judgement
 call, and half of one is often what you want.
 """
-struct RestoreEffect <: Effect
+struct RestoreEffect <: FxOp
     strength::Float32
 end
 RestoreEffect(; strength = 1.0) = RestoreEffect(Float32(strength))
@@ -61,7 +61,7 @@ Declines with no depth track, exactly as the matte declines with no matte — th
 analysis is the expensive part and the effect is free to sit in the stack
 waiting for it.
 """
-struct DepthBlurEffect <: Effect
+struct DepthBlurEffect <: FxOp
     focus::Float32
     strength::Float32
 end
@@ -76,14 +76,14 @@ the clip, so this stays a scalar the keyframe registry can animate. Dialling a
 grade in over a few frames is a real edit, and re-predicting to do it would be
 absurd — the look is the same, the amount of it is what changes.
 """
-struct LookEffect <: Effect
+struct LookEffect <: FxOp
     strength::Float32
 end
 LookEffect(; strength = 1.0) = LookEffect(Float32(strength))
 
 "Composite opacity: scales the frame toward black by `α` (1 = opaque). The main
 use is a keyframed fade in/out; on a single track α<1 fades to black."
-struct OpacityEffect <: Effect
+struct OpacityEffect <: FxOp
     α::Float32
 end
 
@@ -95,7 +95,7 @@ Renders NOTHING — `isneutral` is true, so the graph never sees it. It exists s
 that a search has a card on the clip it searches, like everything else the editor
 does to a clip.
 """
-struct LoopFinderEffect <: Effect end
+struct LoopFinderEffect <: FxOp end
 isneutral(::LoopFinderEffect) = true
 
 """
@@ -107,7 +107,7 @@ and `Transition` is what the composite reads. This is the entry in the stack tha
 those belong to, and the slot a [`FxLink`](@ref) points at, so the two halves of
 one blend can find each other.
 """
-struct BlendEffect <: Effect
+struct BlendEffect <: FxOp
     seconds::Float64
 end
 BlendEffect(; seconds = 0.6) = BlendEffect(Float64(seconds))
@@ -122,7 +122,7 @@ analysis used to be applied ahead of every effect by the graph builder, which
 meant there was no card to fold, no toggle to compare with, and no way to say
 "stabilize the cropped picture, not the raw one".
 """
-struct StabilizeEffect <: Effect end
+struct StabilizeEffect <: FxOp end
 
 """
 Applies the clip's colour/exposure stabilization (see `analyzecolor!`).
@@ -131,7 +131,7 @@ Applies the clip's colour/exposure stabilization (see `analyzecolor!`).
 — or keyframed — without re-analyzing. It lives here rather than on the track
 because a parameter you tune belongs to the thing in the stack you tune it on.
 """
-struct FlickerEffect <: Effect
+struct FlickerEffect <: FxOp
     strength::Float32
 end
 FlickerEffect(; strength = 1.0) = FlickerEffect(Float32(strength))
@@ -149,7 +149,7 @@ other one — and so the transform gizmo has a card to belong to. It holds no
 pixels; `layermatrix` reads it when it places the layer, which is why there is no
 `TransformNode` in the graph.
 """
-struct TransformEffect <: Effect
+struct TransformEffect <: FxOp
     scale::Float64
     x::Float64
     y::Float64
@@ -192,11 +192,11 @@ isneutral(e::LookEffect) = e.strength <= 0.001f0
     liveeffects(clip)
 
 The effects of `clip` that actually render: enabled slots whose effect isn't
-neutral, in stack order. Disabling a slot ([`FxSlot`](@ref)`.enabled`) keeps its
+neutral, in stack order. Disabling a slot ([`Effect`](@ref)`.enabled`) keeps its
 parameters — the inspector's toggle is lossless — while every render path (CPU
 stack, GPU graph, compositor, export) simply skips it.
 """
-liveeffects(clip::Clip) = (s.effect for s in clip.effects if s.enabled && !isneutral(s.effect))
+liveeffects(clip::Clip) = (op(s) for s in clip.effects if s.enabled && !isneutral(op(s)))
 
 "The slot with `id` on `clip`, or `nothing` — how anything points at ONE entry."
 function findslot(clip::Clip, id::Integer)
@@ -242,10 +242,23 @@ effectdict(e::BlendEffect) = Dict{String, Any}("type" => "blend", "seconds" => e
 effectdict(e::FlickerEffect) = Dict{String, Any}("type" => "flicker", "strength" => e.strength)
 
 "A stack entry as a project-file dict: the effect plus its id, enabled state and links."
-function slotdict(s::FxSlot)
-    d = merge(effectdict(s.effect),
-              Dict{String, Any}("id" => string(s.id), "enabled" => s.enabled))
-    isempty(s.links) || (d["links"] = [linkdict(l) for l in s.links])
+function slotdict(fx::Effect)
+    d = merge(effectdict(op(fx)),
+              Dict{String, Any}("id" => string(fx.id), "enabled" => fx.enabled))
+    isempty(fx.links) || (d["links"] = [linkdict(l) for l in fx.links])
+    # ITS parameters' curves, inside the effect. There is no clip-level
+    # `animations` block any more: a curve belongs to the parameter it animates,
+    # in the file exactly as in memory.
+    anims = Dict{String, Any}(
+        String(prm.name) => Dict{String, Any}(
+            "interp" => String(prm.curve.interp),
+            "frames" => [k.frame for k in prm.curve.keys],
+            "values" => [Float64(k.value) for k in prm.curve.keys],
+            "eases"  => [String(k.ease) for k in prm.curve.keys])
+        for prm in fx.params if isanimated(prm))
+    isempty(anims) || (d["animations"] = anims)
+    vis = [String(prm.name) for prm in fx.params if prm.visible]
+    isempty(vis) || (d["lanes"] = vis)
     return d
 end
 
@@ -256,11 +269,24 @@ and a wrapped effect becomes a disabled slot.
 """
 function slotfromdict(d::AbstractDict)
     if d["type"] == "bypassed"
-        return FxSlot(effectfromdict(d["inner"]); enabled = false)
+        return Effect(effectfromdict(d["inner"]); enabled = false)
     end
     id = haskey(d, "id") ? parse(UInt64, d["id"]) : freshid()
     links = FxLink[linkfromdict(l) for l in get(d, "links", [])]
-    return FxSlot(id, effectfromdict(d), get(d, "enabled", true), links)
+    fx = Effect(id, effectfromdict(d), get(d, "enabled", true), links)
+    for (name, ad) in get(d, "animations", Dict{String, Any}())
+        prm = param(fx, Symbol(name))
+        prm === nothing && continue        # a parameter this kind no longer has
+        eases = get(ad, "eases", fill("linear", length(ad["frames"])))
+        prm.curve = AnimCurve{typeof(prm.value)}(
+            [Keyframe(Int(f), convert(typeof(prm.value), v), Symbol(e))
+             for (f, v, e) in zip(ad["frames"], ad["values"], eases)],
+            Symbol(get(ad, "interp", "linear")))
+    end
+    for name in get(d, "lanes", String[])
+        prm = param(fx, Symbol(name)); prm === nothing || (prm.visible = true)
+    end
+    return fx
 end
 
 function effectfromdict(d::AbstractDict)
@@ -290,21 +316,21 @@ end
 
 "The clip's effect of type `T`, or `nothing` — a DISABLED slot still answers, so
 the inspector shows a switched-off effect's real parameters."
-function findeffect(clip::Clip, ::Type{T}) where {T <: Effect}
-    i = findfirst(s -> s.effect isa T, clip.effects)
-    return i === nothing ? nothing : clip.effects[i].effect::T
+function findeffect(clip::Clip, ::Type{T}) where {T <: FxOp}
+    i = findfirst(s -> op(s) isa T, clip.effects)
+    return i === nothing ? nothing : op(clip.effects[i])::T
 end
 
 "The clip's slot holding an effect of type `T`, or `nothing`."
-function findslot(clip::Clip, ::Type{T}) where {T <: Effect}
-    i = findfirst(s -> s.effect isa T, clip.effects)
+function findslot(clip::Clip, ::Type{T}) where {T <: FxOp}
+    i = findfirst(s -> op(s) isa T, clip.effects)
     return i === nothing ? nothing : clip.effects[i]
 end
 
 # Effects upsert by kind: one entry per type — except plugin effects, which share
 # a type, so they upsert per plugin name (see registry.jl). Writing a kind that is
 # switched off replaces its effect AND switches it back on.
-effectkey(e::Effect) = typeof(e)
+effectkey(e::FxOp) = typeof(e)
 
 """
     seteffect!(clip, e) -> clip
@@ -312,12 +338,12 @@ effectkey(e::Effect) = typeof(e)
 Replace the effect in the slot of the same kind (keeping that slot's id, so
 anything pointing at it still points at it) or append a new slot.
 """
-function seteffect!(clip::Clip, e::Effect)
-    i = findfirst(s -> effectkey(s.effect) == effectkey(e), clip.effects)
+function seteffect!(clip::Clip, e::FxOp)
+    i = findfirst(s -> effectkey(op(s)) == effectkey(e), clip.effects)
     if i === nothing
-        push!(clip.effects, FxSlot(e))
+        push!(clip.effects, Effect(e))
     else
-        clip.effects[i].effect = e
+        setparams!(clip.effects[i], effectkindfor(e).read(e))
         clip.effects[i].enabled = true
     end
     return clip
@@ -332,21 +358,21 @@ ANALYSIS lands: stabilizing the raw picture and then colour-grading it is the
 order that was hard-wired into the graph builder before analyses had slots, so it
 stays the default — the user can drag it elsewhere afterwards.
 """
-function prependeffect!(clip::Clip, e::Effect)
-    i = findfirst(s -> effectkey(s.effect) == effectkey(e), clip.effects)
+function prependeffect!(clip::Clip, e::FxOp)
+    i = findfirst(s -> effectkey(op(s)) == effectkey(e), clip.effects)
     if i === nothing
-        pushfirst!(clip.effects, FxSlot(e))
+        pushfirst!(clip.effects, Effect(e))
     else
-        clip.effects[i].effect = e
+        setparams!(clip.effects[i], effectkindfor(e).read(e))
         clip.effects[i].enabled = true
     end
     return clip
 end
 
 "Drop every slot holding an effect of type `T` (returns how many went)."
-function removeeffects!(clip::Clip, ::Type{T}) where {T <: Effect}
-    n = count(s -> s.effect isa T, clip.effects)
-    filter!(s -> !(s.effect isa T), clip.effects)
+function removeeffects!(clip::Clip, ::Type{T}) where {T <: FxOp}
+    n = count(s -> op(s) isa T, clip.effects)
+    filter!(s -> !(op(s) isa T), clip.effects)
     return n
 end
 
@@ -414,7 +440,7 @@ withcolor(clip::Clip, adj::ColorAdjustments) = seteffect!(clip, ColorEffect(adj)
 
 """
 The animatable parameters of the built-in effects and of a clip's placement.
-Each [`ParamSpec`](@ref) declares how one named parameter reads from / writes to
+Each parameter declares how it reads from / writes to
 a `Clip` (color and blur/sharpen live in the effect stack, opacity is an
 `OpacityEffect`, pan/zoom are the crop rect).
 
@@ -424,107 +450,21 @@ the built-in half. A registered kind's parameters get their specs generated —
 these are hand-written because several of them (the crop rect, the placement)
 are not an effect's fields at all.
 """
-const BUILTINPARAMS = ParamSpec[
-    ParamSpec(:opacity, "Opacity", :composite, 0.0, 1.0, 1.0,
-        c -> (e = findeffect(c, OpacityEffect); e === nothing ? 1.0 : Float64(e.α)),
-        (c, v) -> seteffect!(c, OpacityEffect(Float32(v)))),
-    ParamSpec(:brightness, "Brightness", :color, -0.5, 0.5, 0.0,
-        c -> Float64(curadj(c).brightness),
-        (c, v) -> withcolor(c, ColorAdjustments(Float32(v), curadj(c).contrast, curadj(c).saturation, curadj(c).temperature))),
-    ParamSpec(:contrast, "Contrast", :color, 0.0, 2.0, 1.0,
-        c -> Float64(curadj(c).contrast),
-        (c, v) -> withcolor(c, ColorAdjustments(curadj(c).brightness, Float32(v), curadj(c).saturation, curadj(c).temperature))),
-    ParamSpec(:saturation, "Saturation", :color, 0.0, 2.0, 1.0,
-        c -> Float64(curadj(c).saturation),
-        (c, v) -> withcolor(c, ColorAdjustments(curadj(c).brightness, curadj(c).contrast, Float32(v), curadj(c).temperature))),
-    ParamSpec(:temperature, "Temperature", :color, -1.0, 1.0, 0.0,
-        c -> Float64(curadj(c).temperature),
-        (c, v) -> withcolor(c, ColorAdjustments(curadj(c).brightness, curadj(c).contrast, curadj(c).saturation, Float32(v)))),
-    ParamSpec(:blur, "Blur", :blur, 0.0, 12.0, 0.0,
-        c -> (e = findeffect(c, BlurEffect); e === nothing ? 0.0 : Float64(e.σ)),
-        (c, v) -> seteffect!(c, BlurEffect(Float32(v)))),
-    ParamSpec(:sharpen, "Sharpen", :sharpen, 0.0, 2.0, 0.0,
-        c -> (e = findeffect(c, SharpenEffect); e === nothing ? 0.0 : Float64(e.amount)),
-        (c, v) -> seteffect!(c, SharpenEffect(2.0f0, Float32(v)))),
-    ParamSpec(:depth_focus, "Focus", :depth, 0.0, 1.0, 1.0,
-        c -> (e = findeffect(c, DepthBlurEffect); e === nothing ? 1.0 : Float64(e.focus)),
-        (c, v) -> (e = findeffect(c, DepthBlurEffect);
-                   seteffect!(c, DepthBlurEffect(Float32(v),
-                                                 e === nothing ? 0.6f0 : e.strength)))),
-    ParamSpec(:depth_strength, "Defocus", :depth, 0.0, 1.0, 0.6,
-        c -> (e = findeffect(c, DepthBlurEffect); e === nothing ? 0.6 : Float64(e.strength)),
-        (c, v) -> (e = findeffect(c, DepthBlurEffect);
-                   seteffect!(c, DepthBlurEffect(e === nothing ? 1.0f0 : e.focus,
-                                                 Float32(v))))),
-    ParamSpec(:look_strength, "Look", :look, 0.0, 1.0, 1.0,
-        c -> (e = findeffect(c, LookEffect); e === nothing ? 1.0 : Float64(e.strength)),
-        (c, v) -> seteffect!(c, LookEffect(Float32(v)))),
-    ParamSpec(:restore_strength, "Restore", :restore, 0.0, 1.0, 1.0,
-        c -> (e = findeffect(c, RestoreEffect); e === nothing ? 1.0 : Float64(e.strength)),
-        (c, v) -> seteffect!(c, RestoreEffect(Float32(v)))),
-    ParamSpec(:matte_strength, "Matte", :matte, 0.0, 1.0, 1.0,
-        c -> (e = findeffect(c, MatteEffect); e === nothing ? 1.0 : Float64(e.strength)),
-        (c, v) -> (e = findeffect(c, MatteEffect);
-                   seteffect!(c, MatteEffect(Float32(v), e === nothing ? 0.0f0 : e.feather)))),
-    ParamSpec(:matte_feather, "Feather", :matte, 0.0, 1.0, 0.0,
-        c -> (e = findeffect(c, MatteEffect); e === nothing ? 0.0 : Float64(e.feather)),
-        (c, v) -> (e = findeffect(c, MatteEffect);
-                   seteffect!(c, MatteEffect(e === nothing ? 1.0f0 : e.strength, Float32(v))))),
-    # The crop rect may sit OUTSIDE the picture, which is how the canvas grows:
-    # the rect is what gets rendered, `canvassize` is its size in source pixels,
-    # and the warp leaves whatever it cannot reach as background. So the ranges
-    # run past the image rather than stopping at its edges — clamped to `0..1`
-    # these sliders could only ever shrink a project, and there was no way at all
-    # to make one taller. `CROPREACH` is how far past the edge they go.
-    ParamSpec(:crop_x, "Pan X", :geometry, -CROPREACH, 1.0 + CROPREACH, 0.0,
-        c -> c.crop[1], (c, v) -> (c.crop = (cropunit(v), c.crop[2], c.crop[3], c.crop[4]))),
-    ParamSpec(:crop_y, "Pan Y", :geometry, -CROPREACH, 1.0 + CROPREACH, 0.0,
-        c -> c.crop[2], (c, v) -> (c.crop = (c.crop[1], cropunit(v), c.crop[3], c.crop[4]))),
-    ParamSpec(:crop_w, "Zoom W", :geometry, 0.05, 1.0 + 2CROPREACH, 1.0,
-        c -> c.crop[3], (c, v) -> (c.crop = (c.crop[1], c.crop[2], cropextent(v), c.crop[4]))),
-    ParamSpec(:crop_h, "Zoom H", :geometry, 0.05, 1.0 + 2CROPREACH, 1.0,
-        c -> c.crop[4], (c, v) -> (c.crop = (c.crop[1], c.crop[2], c.crop[3], cropextent(v)))),
-    # …and where the cropped picture SITS in the canvas. The fit is automatic
-    # (whole, centred, black bars); these three are the manual override for
-    # material that doesn't share the sequence's shape — 1.0 fits, >1 fills past
-    # the edges, and the shift moves it inside the frame.
-    ParamSpec(:scale, "Scale", :geometry, 0.1, 4.0, 1.0,
-        c -> transformof(c)[1], (c, v) -> settransform(c; scale = v)),
-    ParamSpec(:pos_x, "Position X", :geometry, -1.0, 1.0, 0.0,
-        c -> transformof(c)[2], (c, v) -> settransform(c; x = v)),
-    ParamSpec(:pos_y, "Position Y", :geometry, -1.0, 1.0, 0.0,
-        c -> transformof(c)[3], (c, v) -> settransform(c; y = v)),
-    ParamSpec(:rotation, "Rotation", :geometry, -180.0, 180.0, 0.0,
-        c -> transformof(c)[4], (c, v) -> settransform(c; rotation = v)),
-]
-
-# A stable, visually distinct color per animatable parameter — shared by its keyframe
-# curve and its ◆ toggle so a parameter's control and its line are easy to match.
-const PARAMPALETTE = map(Makie.to_color,
-    ["#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#EECA3B",
-     "#B279A2", "#FF9DA6", "#9D755D", "#5C6BC0", "#26A69A", "#8E24AA"])
-
-"A distinct, stable display color for parameter `key` (by its registry position)."
-function paramcolor(key::Symbol)
-    specs = paramspecs()
-    i = findfirst(p -> p.key == key, specs)
-    i === nothing && (i = abs(hash(key)) % length(PARAMPALETTE) + 1)
-    return PARAMPALETTE[mod1(i, length(PARAMPALETTE))]
-end
 
 "Whether any registered parameter is keyframed on `clip`."
-isanimated(clip::Clip) = !isempty(clip.animations)
+isanimated(clip::Clip) = any(fx -> any(isanimated, fx.params), clip.effects)
+isanimated(fx::Effect) = any(isanimated, fx.params)
 
 "`clip` without its matte — what the matte pipeline renders through, so the seed
 is not computed from a frame the previous matte already keyed."
 withoutmatte(clip::Clip) =
     withfields(clip; mattetrack = nothing,
-               effects = filter(s -> !(s.effect isa MatteEffect), clip.effects))
+               effects = filter(s -> !(op(s) isa MatteEffect), clip.effects))
 
 "`clip` without its opacity effects — compositing reads opacity as the LAYER
 alpha, not a per-pixel fade to black."
 withoutopacity(clip::Clip) =
-    withfields(clip; effects = filter(s -> !(s.effect isa OpacityEffect), clip.effects))
+    withfields(clip; effects = filter(s -> !(op(s) isa OpacityEffect), clip.effects))
 
 """
     effectiveclip(clip, srcframe) -> Clip
@@ -536,27 +476,26 @@ static fast path. The copy shares the source and analysis tracks; only `crop`
 and a copied effect stack are mutated.
 """
 function effectiveclip(clip::Clip, srcframe::Integer)
-    any(s -> !isempty(s.animations), clip.effects) || return clip
-    # own slots (same ids, same on/off) so a sampled value never writes into the
-    # clip the user is editing
+    isanimated(clip) || return clip
+    # own entries (same ids, same on/off) so a sampled value never writes into
+    # the clip the user is editing. The PARAMS are copied; the curves are shared,
+    # because sampling never touches them.
     ec = withfields(clip;
-                    effects = [FxSlot(s.id, s.effect, s.enabled, s.links) for s in clip.effects])
-    for (i, slot) in enumerate(clip.effects)
-        isempty(slot.animations) && continue
-        # THIS slot's kind, so the value lands on THIS effect. Resolving a bare
-        # name through the global index instead sent every curve to the FIRST
-        # effect of its kind — two Blurs, one animated radius, and the second
-        # stayed at its static value (measured: [(blur = 12.0,), (blur = 0.0,)]).
-        kind = effectkindfor(slot.effect)
-        kind === nothing && continue
-        cur = kind.read(slot.effect)
-        changed = NamedTuple()
-        for (name, curve) in slot.animations
-            haskey(cur, name) || continue   # a curve for a parameter this kind lost
-            v = valueat(curve, srcframe)
-            v === nothing || (changed = merge(changed, NamedTuple{(name,)}((Float64(v),))))
+                    effects = [Effect(fx.id, fx.kind, fx.enabled, fx.links,
+                                      Param[Param{typeof(p.value)}(p.name, p.label, p.value,
+                                                                   p.curve, p.visible, p.range)
+                                            for p in fx.params])
+                               for fx in clip.effects])
+    for (i, fx) in enumerate(clip.effects)
+        any(isanimated, fx.params) || continue
+        # THIS entry's parameters, sampled on THIS entry. Resolving a bare name
+        # through a global index instead sent every curve to the FIRST effect of
+        # its kind — two Blurs, one animated radius, and the second stayed at its
+        # static value (measured: [(blur = 12.0,), (blur = 0.0,)]).
+        for p in ec.effects[i].params
+            src = param(fx, p.name)
+            src === nothing || (p.value = valueat(src, srcframe))
         end
-        isempty(changed) || (ec.effects[i].effect = kind.make(merge(cur, changed)))
     end
     return ec
 end

@@ -40,8 +40,8 @@ struct EffectKind
     params::Vector{FxParam}
     kfkeys::Vector{Symbol}
     make::Any        # (nt::NamedTuple) -> Effect
-    matches::Any     # (e::Effect) -> Bool
-    read::Any        # (e::Effect) -> NamedTuple
+    matches::Any     # (e::FxOp) -> Bool
+    read::Any        # (e::FxOp) -> NamedTuple
     body::Any        # (ctx::EffectContext) -> nothing, or nothing
     activate::Any    # (ctx::EffectContext) -> nothing, or nothing
     deactivate::Any  # (ctx::EffectContext) -> nothing
@@ -65,6 +65,32 @@ function EffectKind(name::Symbol, label::AbstractString;
     return EffectKind(name, String(label), String(description), params,
                       kfkeys === nothing ? [p.name for p in params] : kfkeys,
                       make, matches, read, body, activate, deactivate, analysis)
+end
+
+"""
+    Effect(k::EffectKind; enabled = true) -> Effect
+
+A fresh entry of `k`, its parameters at their declared defaults. Lives here
+rather than in clips.jl because that file is included before `EffectKind`
+exists, and an untyped single-argument method there would be ambiguous with
+`Effect(payload)`.
+"""
+Effect(k::EffectKind; enabled::Bool = true) =
+    Effect(freshid(), k.name, enabled, FxLink[], paramsfor(k))
+
+"""
+    setparams!(fx, values)
+
+Write `values` (a NamedTuple) onto `fx`'s parameters, leaving their curves and
+lane visibility alone. What a slider does, and what replacing a payload used to
+do by overwriting the whole struct.
+"""
+function setparams!(fx::Effect, values::NamedTuple)
+    for (name, v) in pairs(values)
+        p = param(fx, name)
+        p === nothing || (p.value = convert(typeof(p.value), v))
+    end
+    return fx
 end
 
 "Default parameter values of `k`, as the NamedTuple `make` takes."
@@ -91,12 +117,9 @@ A `Player` holds a reference to one of these — [`EFFECTS`](@ref) by default.
 struct EffectRegistry
     kinds::Vector{EffectKind}
     byname::Dict{Symbol, EffectKind}
-    params::Vector{ParamSpec}
-    parambykey::Dict{Symbol, ParamSpec}
     version::Observable{Int}
 end
-EffectRegistry() = EffectRegistry(EffectKind[], Dict{Symbol, EffectKind}(),
-                                  ParamSpec[], Dict{Symbol, ParamSpec}(), Observable(0))
+EffectRegistry() = EffectRegistry(EffectKind[], Dict{Symbol, EffectKind}(), Observable(0))
 
 """
 The registry a `Player` gets unless it is given another.
@@ -124,7 +147,6 @@ function registereffect!(kind::EffectKind; registry::EffectRegistry = EFFECTS)
     registry.byname[kind.name] = kind
     i = findfirst(k -> k.name === kind.name, registry.kinds)
     i === nothing ? push!(registry.kinds, kind) : (registry.kinds[i] = kind)
-    registerparams!(registry, kind)
     registry.version[] = registry.version[] + 1
     return kind
 end
@@ -145,48 +167,12 @@ end
 
 # ---------------------------------------------------------------- parameters
 
-"""
-Make every parameter of `kind` keyframable and slider-visible, by giving it a
-[`ParamSpec`](@ref) — the accessor pair the keyframe engine and the panel work
-through. A kind whose key is already registered (a built-in that declares its own
-spec, or a re-registration) keeps the existing one.
-"""
-function registerparams!(registry::EffectRegistry, kind::EffectKind)
-    for (i, p) in enumerate(kind.params)
-        key = kind.kfkeys[i]
-        haskey(registry.parambykey, key) && continue
-        kind.make === nothing && continue     # nothing to write the value onto
-        label = length(kind.params) == 1 ? kind.label : "$(kind.label) $(p.label)"
-        spec = ParamSpec(key, label, kind.name, p.min, p.max, p.default,
-                         c -> paramof(c, kind, p.name, p.default),
-                         (c, v) -> setparam!(c, kind, p.name, v))
-        push!(registry.params, spec)
-        registry.parambykey[key] = spec
-    end
-    return registry
-end
-
-"Every animatable parameter, in registration order."
-paramspecs(registry::EffectRegistry = EFFECTS) = registry.params
-
-"""
-    paramspec(key) -> ParamSpec
-    paramspec(key, default)
-
-The spec for keyframe key `key`. Throws when there is none — a curve for an
-unknown parameter is a bug everywhere except when loading a project written by a
-session that had an effect registered which this one does not, so that one caller
-passes a `default` and skips.
-"""
-paramspec(key::Symbol) = paramspec(key, EFFECTS)
-paramspec(key::Symbol, registry::EffectRegistry) = registry.parambykey[key]
-paramspec(key::Symbol, default) = get(EFFECTS.parambykey, key, default)
 
 "The first effect of `kind` on `clip`, or `nothing`."
 function findeffect(clip::Clip, kind::EffectKind)
     kind.matches === nothing && return nothing
     for s in clip.effects
-        kind.matches(s.effect) && return s.effect
+        kind.matches(op(s)) && return op(s)
     end
     return nothing
 end
@@ -218,7 +204,7 @@ its parameter values. Built-ins have their own types (`ColorEffect` and friends,
 which the render graph dispatches specialized kernels on); everything registered
 later is one of these, rendered through its kind's callback.
 """
-struct PluginEffect <: Effect
+struct PluginEffect <: FxOp
     name::Symbol
     params::NamedTuple
 end
@@ -283,10 +269,6 @@ definepluginfromcode!(code::AbstractString) = Base.eval(@__MODULE__, Meta.parsea
 # The placement and crop parameters are not any effect's fields, and the
 # built-in effects' accessors are hand-written, so they are seeded rather than
 # generated. Everything registered after this point generates its own.
-for spec in BUILTINPARAMS
-    push!(EFFECTS.params, spec)
-    EFFECTS.parambykey[spec.key] = spec
-end
 
 registereffect!(EffectKind(:color, "Color";
     description = "Brightness, contrast, saturation and warmth.",

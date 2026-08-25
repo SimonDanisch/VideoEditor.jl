@@ -546,44 +546,6 @@ function scenebounds(path::AbstractString)
     return (-200.0, 200.0)
 end
 
-"""
-    kfspec(ov::Overlay, key) -> Union{Nothing, ParamSpec}
-
-A scene path as a keyframable parameter — built per path, not looked up.
-
-`nothing` when the overlay carries no scene or the path addresses nothing, which
-is how a project written by a newer editor (a part this one has not got) loses a
-curve instead of the whole panel.
-"""
-function kfspec(ov::Overlay, key::Symbol)
-    spec = get(ov.settings, :spec, nothing)
-    spec isa SceneSpec || return nothing
-    path = String(key)
-    scenepathvalue(spec, path) === nothing && return nothing
-    lo, hi = scenebounds(path)
-    return ParamSpec(key, path, :scene, lo, hi, 0.0,
-                     o -> begin
-                         s = get(o.settings, :spec, nothing)
-                         v = s isa SceneSpec ? scenepathvalue(s, path) : nothing
-                         v === nothing ? 0.0 : Float64(v)
-                     end,
-                     (o, v) -> begin
-                         s = get(o.settings, :spec, nothing)
-                         s isa SceneSpec && setscenepath!(s, path, Float64(v))
-                         nothing
-                     end)
-end
-
-"""
-A curve on a scene overlay changed.
-
-Deliberately does NOT touch the bake. The frames are still good work and may
-become valid again the moment the edit is undone; what decides whether they are
-shown is [`bakecurrent`](@ref), asked per frame. Dropping them here was the first
-version, and it meant that nudging one keyframe and undoing it cost a full
-re-bake — minutes, for a scene that ended up identical.
-"""
-kfchanged!(::Overlay) = nothing
 
 # ---------------------------------------------------------------- in the editor
 

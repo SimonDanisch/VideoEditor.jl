@@ -110,7 +110,7 @@ struct Stencil{F} <: FxKind
 end
 
 """
-    fxkind(e::Effect) -> FxKind
+    fxkind(e::FxOp) -> FxKind
 
 The render callback for a per-pixel/neighborhood effect. Define this (plus a struct
 and [`isneutral`](@ref)) and the effect renders on the CPU stack AND the GPU graph —
@@ -605,7 +605,7 @@ nodefor(e::MatteEffect, input, clip) = planenode(MatteOp(e.strength, e.feather),
 nodefor(e::ColorEffect, input, clip) = ColorNode(input, e.adj)       # specialized kernels
 nodefor(e::BlurEffect, input, clip) = BlurNode(input, e.σ)
 nodefor(e::SharpenEffect, input, clip) = SharpenNode(input, e.σ, e.amount)
-nodefor(e::Effect, input, clip) = PixelNode(input, fxkind(e))        # callback effects (incl. plugins)
+nodefor(e::FxOp, input, clip) = PixelNode(input, fxkind(e))        # callback effects (incl. plugins)
 
 "A plane node for `op`, or `nothing` when the clip has no plane for it to read.
 The shape comes from the same `planeshape` the node carries into the plan
@@ -963,7 +963,8 @@ function composite(f, engine::FxEngine, clips, n::Integer, sourcefor;
         cp = renderlayer!(engine, lclip, srcframe, source; applytracks, playing, exact,
                           chunks, phase = sourcephase(clip, n))
         layer = chainimage(cp)
-        α = Float32(clamp(paramvalue(clip, :opacity, srcframe), 0.0, 1.0))
+        prm = opacityparam(clip)
+        α = Float32(clamp(prm === nothing ? 1.0 : valueat(prm, srcframe), 0.0, 1.0))
         # COVERAGE, per pixel: white where this layer is opaque, black where
         # what is underneath must show through — the letterbox bars, and the
         # background a matte removed. Keying paints that background black,

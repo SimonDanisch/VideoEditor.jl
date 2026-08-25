@@ -113,7 +113,7 @@ freshid() = UInt64(Threads.atomic_add!(NEXTID, UInt64(1)) + 1)
 """
 A reference from one effect slot to another, possibly on another clip — see
 links.jl for what they mean and how they are followed. The type lives here
-because `FxSlot` has a field of it.
+because `Effect` has a field of it.
 """
 struct FxLink
     clip::UInt64      # target clip id; 0 = the same clip
@@ -147,20 +147,72 @@ be ambiguous, so none of that machinery is needed: the slot has the effect, the
 effect's kind has the parameters, and the parameter has its curve. No global is
 involved at any step.
 """
-mutable struct FxSlot
+mutable struct Effect
     const id::UInt64
-    effect::Any        # an Effect — effects.jl is included after this file
+    const kind::Symbol                  # which kind this is (:blur, :color, …)
     enabled::Bool
     const links::Vector{FxLink}
-    # parameter name (as the effect's own kind names it) -> its curve
-    const animations::Dict{Symbol, AnimCurve}
+    const params::Vector{Param}         # ITS parameters, each with its own curve
 end
-FxSlot(effect; enabled::Bool = true) =
-    FxSlot(freshid(), effect, enabled, FxLink[], Dict{Symbol, AnimCurve}())
-FxSlot(id::Integer, effect, enabled::Bool) =
-    FxSlot(UInt64(id), effect, enabled, FxLink[], Dict{Symbol, AnimCurve}())
-FxSlot(id::Integer, effect, enabled::Bool, links::Vector{FxLink}) =
-    FxSlot(UInt64(id), effect, enabled, links, Dict{Symbol, AnimCurve}())
+
+"""
+    op(fx, frame = 0) -> FxOp
+
+`fx` as the typed payload the render graph dispatches on (`BlurEffect`, …), with
+every parameter sampled at `frame`.
+
+THE PAYLOAD IS A RESULT, NOT A PLACE. It used to be a stored field —
+which made it a second home for a value that the parameters also claimed to own,
+and the two were joined by a name and a global index. Building it on demand
+leaves exactly one place a value can live. The render path is unchanged: it
+still receives a `BlurEffect` and still dispatches on its type, and
+`effectiveclip` already constructed one per frame this way.
+"""
+function op(fx::Effect, frame::Real = 0)
+    k = kindbyname(fx.kind)
+    k === nothing && error("no effect kind named $(repr(fx.kind)) is registered")
+    return k.make(NamedTuple(p.name => valueat(p, frame) for p in fx.params))
+end
+
+"The parameters of `fx`, in the order its kind declares them."
+params(fx::Effect) = fx.params
+
+"`fx`'s parameter called `name`, or `nothing`."
+param(fx::Effect, name::Symbol) =
+    (i = findfirst(p -> p.name === name, fx.params); i === nothing ? nothing : fx.params[i])
+
+"""
+    paramsfor(kind, values) -> Vector{Param}
+
+A kind's parameters at `values` (a NamedTuple), falling back to its declared
+defaults. The one place a `Param` is minted, so a fresh effect and one built
+from a payload cannot drift apart.
+"""
+paramsfor(k, values = NamedTuple()) =
+    Param[Param(p.name, p.label, Float64(get(values, p.name, p.default));
+                range = (Float64(p.min), Float64(p.max)))
+          for p in k.params]
+
+"""
+    Effect(payload::FxOp; enabled = true) -> Effect
+
+An entry holding what `payload` says, for the call sites that build an effect by
+constructing its typed struct (`Effect(BlurEffect(3f0))`). The kind is the one
+that recognises it and the values are read back out through the kind, so this is
+the exact inverse of [`op`](@ref).
+"""
+function Effect(payload; enabled::Bool = true)
+    k = effectkindfor(payload)
+    k === nothing && error("no registered effect kind recognises $(typeof(payload))")
+    return Effect(freshid(), k.name, enabled, FxLink[], paramsfor(k, k.read(payload)))
+end
+
+Effect(id::Integer, payload, enabled::Bool) = Effect(id, payload, enabled, FxLink[])
+function Effect(id::Integer, payload, enabled::Bool, links::Vector{FxLink})
+    k = effectkindfor(payload)
+    k === nothing && error("no registered effect kind recognises $(typeof(payload))")
+    return Effect(UInt64(id), k.name, enabled, links, paramsfor(k, k.read(payload)))
+end
 
 """
     Clip(source; src_in=0, src_out=source.nframes, start=0)
@@ -190,7 +242,7 @@ mutable struct Clip
     src_out::Int
     start::Int
     crop::NTuple{4, Float64}
-    const effects::Vector{FxSlot}  # ordered effect stack (see effects.jl)
+    const effects::Vector{Effect}  # ordered effect stack (see effects.jl)
     colortrack::Union{Nothing, ColorTrack}
     motiontrack::Union{Nothing, MotionTrack}
     mattetrack::Union{Nothing, MatteTrack}
@@ -217,7 +269,6 @@ mutable struct Clip
     # is minted fresh for the right half, so nothing followed. `nothing` until a
     # window is restored; a cache, so it is never written to a project file.
     restorecache::Union{Nothing, RestoreCache}
-    const animations::Dict{Symbol, AnimCurve}  # keyframed params (see keyframes.jl)
     track::Int                  # stacking layer; higher = on top (1 = base)
     blendfrom::UInt64           # clip this one blends away FROM (0 = nothing)
     rate::Float64               # source frames per timeline frame (1 = native)
@@ -225,12 +276,12 @@ end
 
 Clip(source::VideoSource, src_in, src_out, start, crop, rate::Real = 1.0,
      reframe::Union{Nothing, NTuple{<:Any, <:Real}} = nothing) =
-    withreframe!(Clip(freshid(), source, src_in, src_out, start, crop, FxSlot[],
+    withreframe!(Clip(freshid(), source, src_in, src_out, start, crop, Effect[],
                       # colortrack, motiontrack, mattetrack, depthtrack, look
                       nothing, nothing, nothing, nothing, nothing,
                       :sample,          # timeinterp
                       nothing,          # restorecache
-                      Dict{Symbol, AnimCurve}(), 1, UInt64(0), Float64(rate)),
+                      1, UInt64(0), Float64(rate)),
                  reframe)
 
 function Clip(source::VideoSource; src_in::Integer = 0, src_out::Integer = source.nframes,
@@ -553,7 +604,7 @@ function split!(seq::Sequence, n::Integer, track::Union{Nothing, Integer} = noth
     # the blend card can address one half's entry without touching the other's
     # each half owns its stack, with its own slot ids — and its own copy of the
     # links, so cutting a blended clip does not give two slots the same partner
-    append!(right.effects, [FxSlot(freshid(), s.effect, s.enabled, copy(s.links))
+    append!(right.effects, [Effect(freshid(), op(s), s.enabled, copy(s.links))
                             for s in clip.effects])
     # keyed by absolute source frame, so both halves stay valid. Assigned
     # directly: the stack was already copied above, slots and all, so going
@@ -569,9 +620,17 @@ function split!(seq::Sequence, n::Integer, track::Union{Nothing, Integer} = noth
     # two then share the eviction budget, which is the bargain a shared track
     # makes anyway.
     right.restorecache = clip.restorecache
-    for (key, curve) in clip.animations   # absolute-frame keyed, but each half gets
-        right.animations[key] = AnimCurve(copy(curve.keys), curve.interp)
-    end                                   # its OWN copy — halves must edit independently
+    # Keys are absolute-frame, so both halves keep every one — but each half gets
+    # its OWN curve object, or editing one would reach into the other. `fi`/`pi`,
+    # not `i`: `i` is the clip's index in the sequence and `insert!` below needs
+    # it (shadowing it put the right half at the wrong place in the timeline).
+    for (fi, fx) in enumerate(clip.effects)
+        for (pi, prm) in enumerate(fx.params)
+            prm.curve === nothing && continue
+            right.effects[fi].params[pi].curve =
+                AnimCurve(copy(prm.curve.keys), prm.curve.interp)
+        end
+    end
     clip.src_out = cut
     insert!(seq.clips, i + 1, right)
     return right
@@ -588,7 +647,7 @@ the question is the same one: a derived clip reads the same source frames, so
 anything keyed by absolute source frame is correct to share and expensive to
 duplicate.
 
-* **Fresh:** the clip `id`, and one `id` per [`FxSlot`](@ref) with its own copy of
+* **Fresh:** the clip `id`, and one `id` per [`Effect`](@ref) with its own copy of
   the links. Two slots sharing an id would make the inspector and the blend card
   address both at once. The `Effect` inside a slot is shared and that is safe —
   every effect is an immutable `struct`, so a parameter change replaces it rather
@@ -608,10 +667,13 @@ copyclip(clip::Clip; start::Integer = clip.start, track::Integer = clip.track) =
     withfields(clip; id = freshid(), start = Int(start), track = Int(track),
                # Fresh slot ids and copied link vectors: the copy's stack is its
                # own, so unlinking on one must not reach into the other.
-               effects = [FxSlot(freshid(), s.effect, s.enabled, copy(s.links))
-                          for s in clip.effects],
-               animations = Dict{Symbol, AnimCurve}(
-                   k => AnimCurve(copy(c.keys), c.interp) for (k, c) in clip.animations),
+               effects = [Effect(freshid(), fx.kind, fx.enabled, copy(fx.links),
+                                 Param[Param{typeof(q.value)}(q.name, q.label, q.value,
+                                          q.curve === nothing ? nothing :
+                                          AnimCurve(copy(q.curve.keys), q.curve.interp),
+                                          q.visible, q.range) for q in fx.params])
+                          for fx in clip.effects],
+
                # NOT the original's blend partner — a copy is not in that transition.
                blendfrom = UInt64(0))
 
@@ -695,11 +757,14 @@ function joinclips!(seq::Sequence, n::Integer)
     j === nothing && return nothing
     nxt = seq.clips[j]
     removetransition!(seq, nxt.start)     # a dissolve on the joined cut is gone with it
-    for (key, curve) in nxt.animations    # carry the right half's keys over
-        if haskey(c.animations, key)
-            foreach(k -> setkey!(c.animations[key], k.frame, k.value, k.ease), curve.keys)
-        else
-            c.animations[key] = curve
+    for (i, fx) in enumerate(nxt.effects)   # carry the right half's keys over
+        i <= length(c.effects) || break
+        for (j, prm) in enumerate(fx.params)
+            prm.curve === nothing && continue
+            dst = j <= length(c.effects[i].params) ? c.effects[i].params[j] : nothing
+            dst === nothing && continue
+            dst.curve === nothing && (dst.curve = AnimCurve{typeof(dst.value)}())
+            foreach(k -> setkey!(dst.curve, k.frame, k.value, k.ease), prm.curve.keys)
         end
     end
     c.src_out = nxt.src_out
@@ -789,10 +854,10 @@ withfields(clip::Clip;
            motiontrack = clip.motiontrack, mattetrack = clip.mattetrack,
            depthtrack = clip.depthtrack, look = clip.look,
            timeinterp = clip.timeinterp, restorecache = clip.restorecache,
-           animations = clip.animations, track = clip.track,
+           track = clip.track,
            blendfrom = clip.blendfrom, rate = clip.rate) =
     Clip(id, source, src_in, src_out, start, crop, effects, colortrack, motiontrack,
-         mattetrack, depthtrack, look, timeinterp, restorecache, animations, track,
+         mattetrack, depthtrack, look, timeinterp, restorecache, track,
          blendfrom, rate)
 
 "Copy of the edit state for undo/redo. Sources and analysis tracks are shared."
@@ -800,8 +865,8 @@ snapshot(seq::Sequence) =
     # links are copied, not shared: an undo that put back a slot whose link vector
     # was the live one would not restore a removed partner
     [withfields(c;
-                effects = [FxSlot(s.id, s.effect, s.enabled, copy(s.links)) for s in c.effects],
-                animations = deepcopy(c.animations))
+                effects = [Effect(s.id, op(s), s.enabled, copy(s.links)) for s in c.effects],
+)
      for c in seq.clips]
 
 "Restore a [`snapshot`](@ref) (the snapshot itself stays reusable)."

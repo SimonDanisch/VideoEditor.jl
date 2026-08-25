@@ -144,24 +144,6 @@ FxParam(name, label; min = 0.0, max = 1.0, default = min) =
     FxParam(Symbol(name), String(label), Float64(min), Float64(max), Float64(default))
 
 """
-Descriptor for one animatable clip parameter — the ONLY place that knows how a
-named parameter maps to clip state. `get(clip)` reads its current static value;
-`set(clip, v)` writes `v` onto the clip. Everything else (keyframe storage, the
-render override, the editor UI) enumerates [`PARAMS`](@ref) and works through
-these accessors, so adding a new animatable parameter is a single table row.
-"""
-struct ParamSpec
-    key::Symbol
-    label::String
-    group::Symbol
-    lo::Float64
-    hi::Float64
-    default::Float64
-    get::Function   # clip -> Float64
-    set::Function   # (clip, value) -> nothing
-end
-
-"""
 One parameter of one effect: what it is called, what it is now, and — if it is
 animated — its curve.
 
@@ -169,18 +151,20 @@ THE VALUE AND THE CURVE LIVE TOGETHER, and that is the whole point. They used to
 be a field on a typed effect struct and an entry in a flat `Dict{Symbol,
 AnimCurve}` on the CLIP, joined by a name and a global index. A curve therefore
 knew only a bare name, not which effect it animated, and resolution took the
-first effect of a kind: two Blur slots with one keyframe of 12 rendered
+first effect of a kind: two Blur entries with one keyframe of 12 rendered
 `[(blur = 12.0,), (blur = 0.0,)]` — the second silently static, while its own
 card's slider wrote to it correctly. Slider and diamond of one row pointed at
-different objects. Holding a parameter in your hand makes that unsayable.
+different objects. Holding the parameter itself makes that unsayable.
 
 `visible` is its lane on the timeline, and it is INDEPENDENT of `curve`: showing
 an empty lane is how you get somewhere to put the first key. Coupling the two —
-which is what a registry of animated-parameters-only forces — means you must
-keyframe something before you can see where its keyframes would go.
+which a registry of animated-parameters-only forces — means you must keyframe
+something before you can see where its keyframes would go.
 
-`range` is whatever the type needs to be edited: a `(lo, hi)` for a number,
-`nothing` for a colour.
+`T` is whatever the parameter IS. A rotation is a curve of quaternions rather
+than three curves of Euler angles, because interpolating a rotation
+component-wise is wrong; [`lerp`](@ref) is the only thing the engine needs to
+know about a type.
 """
 mutable struct Param{T}
     const name::Symbol      # as the EFFECT names it — no global uniqueness needed
@@ -188,7 +172,7 @@ mutable struct Param{T}
     value::T
     curve::Union{Nothing, AnimCurve{T}}
     visible::Bool
-    const range::Any
+    const range::Any        # (lo, hi) for a number, `nothing` where it means nothing
 end
 Param(name::Symbol, label::AbstractString, value::T;
       curve = nothing, visible = false, range = nothing) where {T} =
@@ -207,7 +191,16 @@ clearing the last key leaves the parameter where it was rather than at zero.
 valueat(p::Param, frame::Real) =
     isanimated(p) ? something(valueat(p.curve, frame), p.value) : p.value
 
-"Fraction of the param's range (for the editor's normalized lanes), clamped to [0,1]."
-paramnorm(p::ParamSpec, v::Real) = clamp((v - p.lo) / (p.hi - p.lo), 0.0, 1.0)
-"Inverse of [`paramnorm`](@ref): a [0,1] lane fraction back to a parameter value."
-paramdenorm(p::ParamSpec, u::Real) = p.lo + clamp(u, 0.0, 1.0) * (p.hi - p.lo)
+"Fraction of `p`'s range, clamped to [0,1] — where its value sits in its lane."
+function paramnorm(p::Param, v)
+    p.range === nothing && return 0.5
+    lo, hi = p.range
+    return hi > lo ? clamp((Float64(v) - lo) / (hi - lo), 0.0, 1.0) : 0.5
+end
+
+"Inverse of [`paramnorm`](@ref): a [0,1] lane fraction back to a value."
+function paramdenorm(p::Param, u::Real)
+    p.range === nothing && return p.value
+    lo, hi = p.range
+    return lo + clamp(u, 0.0, 1.0) * (hi - lo)
+end

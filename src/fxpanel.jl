@@ -158,21 +158,10 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     # shared by every rebuild of its button and driven by a single playhead
     # listener — a `map(playhead)` inside the card builder would leak a listener
     # per rebuild.
+    # No shared ◆ state: each parameter row in `paramform!` follows the playhead
+    # for the Param it was drawn for. There is nothing to keep in step by hand.
     kfaccstate = Dict{Symbol, NamedTuple}()
-    function updatekfaccs()
-        loc = editclip(player)
-        clip = loc === nothing ? nothing : loc[1]
-        for (key, st) in kfaccstate
-            anim = clip !== nothing && clipanimated(clip, key)
-            onkey = anim && any(k -> k.frame == playheadframe(player, clip),
-                                clip.animations[key].keys)
-            lbl = onkey ? "◆" : "◇"
-            col = anim ? paramcolor(key) : uicolors.text_muted
-            st.label[] == lbl || (st.label[] = lbl)
-            st.color[] == col || (st.color[] = col)
-        end
-        return
-    end
+    updatekfaccs() = nothing
     on(_ -> updatekfaccs(), player.playhead)
 
     # The live cards, in stack order, and the contexts their bodies built into.
@@ -248,17 +237,11 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
 
         # rows the empty state consumed, so the tool cards below start clear of it
         skip = 0
-        # …and whether the stack is really empty. A scene overlay belongs to the
-        # SEQUENCE, so it has a card here while the clip has no effects at all —
-        # which read as "No effects on this clip." printed directly above a
-        # visible card. The message is about the whole stack, so it has to know
-        # about everything in it.
-        scenes = scenesat(player)
-        if clip === nothing && isempty(scenes)
+        if clip === nothing
             append!(strays, emptystate!(stackgl, 1, "No clip at the playhead.",
                         "Move the playhead onto a clip to give it effects.", uicolors))
             skip = 1
-        elseif clip !== nothing && isempty(clip.effects) && isempty(scenes)
+        elseif clip !== nothing && isempty(clip.effects)
             append!(strays, emptystate!(stackgl, 1, "No effects on this clip.",
                         "Add one above, or press Ctrl+P.", uicolors))
             skip = 1
@@ -267,7 +250,7 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
                 card, ctx = fxcard!(player, stackgl, length(cards) + 1, clip, slot,
                                     uicolors, kfaccstate, updatekfaccs)
                 push!(cards, card)
-                push!(cardkinds, effectkindfor(slot.effect))
+                push!(cardkinds, effectkindfor(op(slot)))
                 if ctx !== nothing
                     push!(bodyctxs, ctx)
                     get!(() -> Dict{Symbol, Any}(), player.fxwidgets, :toolpanels)[ctx.tool] = ctx
@@ -287,15 +270,6 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
                 push!(bodyctxs, ctx)
                 get!(() -> Dict{Symbol, Any}(), player.fxwidgets, :toolpanels)[ctx.tool] = ctx
             end
-        end
-        # …and a card per 3D scene standing at the playhead. NOT a clip effect and
-        # not a tool: an overlay belongs to the SEQUENCE, so it shows whenever it
-        # covers the playhead, including over a gap where there is no clip at all.
-        for ov in scenesat(player)
-            card = scenecard!(player, stackgl, length(cards) + 1 + skip, ov, uicolors)
-            card === nothing && continue
-            push!(cards, card)
-            push!(cardkinds, nothing)
         end
         colsize!(stackgl, 1, Makie.Relative(1.0))
         applyfilter()          # a rebuild must honour the filter that is showing
@@ -415,13 +389,6 @@ every frame change would be a real cost for a summary that never needed it.
 docsig(seq, clip) =
     (length(seq.captions), hash(seq.captions), seq.canvas,
      Tuple((n.text, n.at, n.voice, isempty(n.samples)) for n in seq.narration),
-     # …and the scene overlays, because their cards live in this stack too: which
-     # ones exist, over which frames, and WHICH PATHS they animate. Without the
-     # last of those, adding a path from the card's own menu changed nothing the
-     # signature could see, `rebuildstack` returned early, and the row you just
-     # asked for did not appear.
-     Tuple((ov.id, ov.start, ov.stop, Tuple(sort!(collect(keys(ov.animations)))))
-           for ov in seq.overlays if ov.kind === :scene),
      clip === nothing ? nothing : (clip.timeinterp, clip.rate, clip.crop))
 
 """
@@ -432,10 +399,13 @@ one must not throw the panel away.
 """
 effsig(clip) = clip === nothing ? nothing :
     (clip.id,
-     Tuple((s.id, s.enabled, nameof(typeof(s.effect)),
-            s.effect isa PluginEffect ? s.effect.name : :_,
+     Tuple((s.id, s.enabled, nameof(typeof(op(s))),
+            op(s) isa PluginEffect ? op(s).name : :_,
             Tuple((l.clip, l.slot, l.role) for l in s.links)) for s in clip.effects),
-     Tuple(sort!(collect(keys(clip.animations)))))
+     # which parameters are animated and which lanes are open — both change what
+     # the cards show, and neither is on the effect's identity above
+     Tuple((fx.id, Tuple(p.name for p in fx.params if isanimated(p)),
+            Tuple(p.name for p in fx.params if p.visible)) for fx in clip.effects))
 
 """
     addeffect!(player, name) -> Bool
@@ -457,7 +427,7 @@ function addeffect!(player::Player, name::Symbol)
     end
     clip = loc[1]
     snapshot!(player)
-    push!(clip.effects, FxSlot(k.make(defaults(k))))
+    push!(clip.effects, Effect(k.make(defaults(k))))
     selectfxcard!(player, (:fx, clip.effects[end].id))
     setstatus!(player, "added $(k.label) — tune it below (Ctrl+Z removes)")
     notify(player.playhead)      # rebuilds the stack + re-presents
@@ -486,7 +456,7 @@ function showkind!(player::Player, name::Symbol)
     if findeffect(clip, k) === nothing
         addeffect!(player, name) || return false
     end
-    slot = findfirst(s -> k.matches !== nothing && k.matches(s.effect), clip.effects)
+    slot = findfirst(s -> k.matches !== nothing && k.matches(op(s)), clip.effects)
     slot === nothing && return false
     id = clip.effects[slot].id
     selectfxcard!(player, (:fx, id))
@@ -623,10 +593,10 @@ toolonlykinds() = filter(k -> k.body !== nothing && k.make === nothing, effectki
 One card: the effect's name in the header, its enable toggle and remove ×
 in the accessory, its parameters and its own body inside.
 """
-function fxcard!(player::Player, stackgl, row::Integer, clip::Clip, slot::FxSlot,
+function fxcard!(player::Player, stackgl, row::Integer, clip::Clip, slot::Effect,
                  uicolors, kfaccstate, updatekfaccs)
-    kind = effectkindfor(slot.effect)
-    title = kind === nothing ? string(nameof(typeof(slot.effect))) : kind.label
+    kind = effectkindfor(op(slot))
+    title = kind === nothing ? string(nameof(typeof(op(slot)))) : kind.label
     key = (:fx, slot.id)
     card = Card(stackgl[row, 1]; title,
                 selected = fxselected(player) == key,
@@ -734,229 +704,6 @@ function fxcard!(player::Player, stackgl, row::Integer, clip::Clip, slot::FxSlot
     return card, ctx
 end
 
-"""
-    scenecard!(player, stackgl, row, ov, uicolors) -> Card
-
-The 3D scene overlay's card: its animated paths, a way to add one, and the bake.
-
-ONE ROW PER ANIMATED PATH, not one per animatable path. A lego figure has 43
-addressable values (ten parts × angle + three offsets, plus the camera), and a
-card that listed them all would be a wall of sliders you scroll past rather than
-a list you read. What you are editing is what you have animated, so that is the
-list — and the menu underneath adds the next one. The same shape as the matte
-card: a row per thing, with its own controls, not a board of buttons.
-
-Every row is the ordinary Premiere trio, on the ordinary keyframe machinery:
-`togglekey!(player, ov, key)` is the same function the clip cards call, reached
-through the same `kfstore`/`kfframe`/`kfspec` dispatch. There is no second
-keyframe implementation here, which is the whole reason those four questions were
-made dispatchable first.
-"""
-function scenecard!(player::Player, stackgl, row::Integer, ov, uicolors)
-    spec = get(ov.settings, :spec, nothing)
-    spec isa SceneSpec || return nothing
-    card = Card(stackgl[row, 1]; title = "3D Scene",
-                backgroundcolor = Makie.lerp_oklab(RGBf(Makie.to_color(uicolors.background)),
-                                                   RGBf(1, 1, 1), 0.075),
-                headercolor = uicolors.surface,
-                strokecolor = uicolors.border,
-                titlecolor = uicolors.text)
-    flat = (buttoncolor = (:transparent, 0.0), strokewidth = 0, cornerradius = 3,
-            buttoncolor_hover = uicolors.accent_subtle,
-            buttoncolor_active = uicolors.accent, height = 20)
-    refresh = get(player.fxwidgets, :fxlistrefresh, () -> nothing)
-    animated = sort!(collect(keys(ov.animations)); by = String)
-    kfstates = Tuple{Symbol, Any}[]      # (path, its ◆ button), filled in below
-    r = 0
-
-    if isempty(animated)
-        r += 1
-        Label(card[r, 1], "Nothing animated yet — pick a path below."; halign = :left,
-              fontsize = 10, color = uicolors.text_muted, tellwidth = false)
-    end
-    for key in animated
-        p = kfspec(ov, key)
-        p === nothing && continue      # a path this scene no longer has
-        r += 1
-        # NAME ON ITS OWN LINE. Side by side the label got 118 px of a card that
-        # does not have them to give, and every row came out reading "a", "t",
-        # "l" — one character each, seven identical sliders underneath. A path is
-        # long by nature ("arm_left.angle", "torso.offset[2]"), so it gets the
-        # full width above the control instead of competing with it.
-        rowgl = GridLayout(card[r, 1])
-        Label(rowgl[1, 1:2], p.label; halign = :left, fontsize = 10,
-              color = uicolors.text_muted, tellwidth = false)
-        v0 = kfvalue(ov, key, kfframe(player, ov))
-        sl = Slider(rowgl[2, 1]; range = range(p.lo, p.hi; length = 401),
-                    startvalue = v0, width = Makie.Relative(1.0), tellwidth = false)
-        # ONLY A REAL MOVE ACTS. A Slider fires `value` while it is being built,
-        # and this handler ends in `notify(player.playhead)` — which rebuilds the
-        # panel, which builds this slider again, which fires again. Measured
-        # twice: a Player that never finished opening, window already up, pegged
-        # at 104% CPU. It is the same trap `paramform!` carries its whole
-        # `lastvals`/`moved` machinery for on the clip cards.
-        lastv = Ref(Float64(v0))
-        on(sl.value) do v
-            player.fxsyncing[] && return         # scrub-sync echo, not an edit
-            abs(Float64(v) - lastv[]) < 1.0e-9 && return
-            lastv[] = Float64(v)
-            kfanimated(ov, key) ? setkey!(ov.animations[key], kfframe(player, ov), Float64(v)) :
-                                  p.set(ov, Float64(v))
-            kfchanged!(ov)                       # the bake described the old value
-            player.playing[] || notify(player.playhead)
-        end
-        acc = GridLayout(rowgl[2, 2])
-        prevb = Button(acc[1, 1]; label = "◀", width = 16, fontsize = 8,
-                       labelcolor = uicolors.text_muted, flat...)
-        kfb = Button(acc[1, 2]; label = "◆", width = 22,
-                     labelcolor = uicolors.accent, flat...)
-        # ◆ FILLED = there is a key on THIS frame, ◇ hollow = the path is animated
-        # but the playhead sits between keys. Without it every row showed the same
-        # filled orange diamond whatever the playhead did, so the card could not
-        # answer "did my click land?" or "where are my keys?" — which is exactly
-        # what it is for. Same convention as the clip cards' trio.
-        push!(kfstates, (key, kfb))
-        nextb = Button(acc[1, 3]; label = "▶", width = 16, fontsize = 8,
-                       labelcolor = uicolors.text_muted, flat...)
-        clr = Button(acc[1, 4]; label = "×", width = 18, fontsize = 12,
-                     labelcolor = uicolors.text_muted, flat...)
-        colgap!(acc, 1); colgap!(rowgl, 6); rowgap!(rowgl, 1)
-        on(_ -> gotokey!(player, ov, key, -1), prevb.clicks)
-        on(_ -> togglekey!(player, ov, key), kfb.clicks)
-        on(_ -> gotokey!(player, ov, key, 1), nextb.clicks)
-        on(clr.clicks) do _
-            player.kffocus[] = key
-            clearkeyframes!(player, ov)
-            refresh()                            # the row is gone now
-        end
-        player.fxwidgets[Symbol(:scenekf_, key)] = (prevb, kfb, nextb, clr)
-    end
-
-    # ADD a path: everything the scene can animate that is not animated yet
-    r += 1
-    addgl = GridLayout(card[r, 1])
-    choices = [p for p in scenepaths(spec) if !haskey(ov.animations, Symbol(p))]
-    # `default = nothing` is NOT decoration — the same pairing the Add-effect menu
-    # above uses. Without it the menu comes up on its FIRST option and fires
-    # `selection` while being built: the handler then keyframed that path and
-    # asked for a rebuild, which built a new menu, which fired again. Measured as
-    # a Player that never finished opening, spinning at 101% CPU with its window
-    # already on screen — a hang that is really a loop.
-    menu = Menu(addgl[1, 1]; options = choices, width = 180, fontsize = 10,
-                prompt = "add a path…", default = nothing, searchable = true,
-                search_placeholder = "type to filter…")
-    on(menu.selection) do sel
-        sel === nothing && return
-        menu.i_selected[] = 0                    # back to the prompt (re-fires with nothing)
-        togglekey!(player, ov, Symbol(sel))      # first key = its current value
-        refresh()
-    end
-    player.fxwidgets[:sceneadd] = menu
-
-    # …and the two things no clip parameter needs: which renderer, and the bake.
-    r += 1
-    bgl = GridLayout(card[r, 1])
-    Label(bgl[1, 1], "bake with"; halign = :left, fontsize = 10,
-          color = uicolors.text_muted, tellwidth = false, width = 62)
-    # The project's OWN choice belongs in the list even when nobody registered it.
-    # A project that names RayMakie opened in a session without RayMakie loaded
-    # threw here — "Initial menu selection was set to RayMakie but that was not
-    # found in the option names" — and took the whole panel build down with it,
-    # from `Player(path)`. The scene is still described correctly; only the
-    # renderer is absent, and that is a thing to say, not to crash over.
-    current = string(get(ov.settings, :bakewith, spec.backend))
-    backends = sort!(unique!(vcat(String.(collect(keys(BACKENDS))), current)))
-    bmenu = Menu(bgl[1, 2]; options = backends, width = 96, fontsize = 10,
-                 default = current)
-    on(bmenu.selection) do sel
-        # This menu SHOWS its value, so unlike the add-menu it keeps its default —
-        # and therefore fires once while being built. Acting on that fire would
-        # rewrite the setting and stamp the status line on every single rebuild,
-        # i.e. on every playhead move. Only a real change is a change.
-        (sel === nothing || string(sel) == current) && return
-        ov.settings = merge(ov.settings, (bakewith = Symbol(sel),))
-        setstatus!(player, haskey(BACKENDS, Symbol(sel)) ?
-            "3D Scene: baking with $sel" :
-            "3D Scene: $sel is not loaded — `using $sel` then `usebackend!($sel)`")
-    end
-    player.fxwidgets[:scenebakewith] = bmenu
-    # WHETHER IT IS BAKED, in words. The button label alone could not say it:
-    # "Bake 180 frames" and "Re-bake" differ by one word and you have to know the
-    # convention to read it, so the state was invisible — and a bake is minutes,
-    # which is exactly the thing you must not have to guess about.
-    r += 1
-    total = ov.stop - ov.start
-    baked = bakedframes(ov)
-    state = Label(card[r, 1],
-                  baked === nothing ? "not baked — previewing live on $(spec.backend)" :
-                  length(baked) < total ? "baked $(length(baked)) of $total — the rest draws live" :
-                  "baked $(length(baked))/$total frames · $current";
-                  halign = :left, fontsize = 10, tellwidth = false,
-                  color = baked === nothing ? uicolors.text_muted : uicolors.accent)
-    player.fxwidgets[:scenebakestate] = state
-    r += 1
-    bake = Button(card[r, 1];
-                  label = baked === nothing ? "Bake $total frames" : "Re-bake $total frames",
-                  tellwidth = false, width = Makie.Relative(1.0))
-    on(_ -> bakescene!(player, ov), bake.clicks)
-    player.fxwidgets[:scenebake] = bake
-
-    # ONE playhead handler for the whole card, taken off again on the next
-    # rebuild. Per-row handlers would pile up on an Observable that outlives the
-    # card, and the card is rebuilt on every structural change.
-    old = get(player.fxwidgets, :scenekfobs, nothing)
-    old === nothing || Observables.off(player.playhead, old)
-    player.fxwidgets[:scenekfobs] = on(player.playhead; update = true) do _
-        f = kfframe(player, ov)
-        for (k, btn) in kfstates
-            here = kfanimated(ov, k) && any(x -> x.frame == f, ov.animations[k].keys)
-            btn.label[] = here ? "◆" : "◇"
-            btn.labelcolor[] = here ? uicolors.accent : uicolors.text_muted
-        end
-    end
-    return card
-end
-
-"""
-    bakescene!(player, ov)
-
-Run the overlay's bake off the UI thread, into the project's sidecar.
-
-Off the thread because it is MINUTES — 180 raytraced frames took 74 s at
-240x320 and ~6 minutes at the project's own 640x1138 — and a frozen window for
-that long reads as a hang. The progress goes to the status line for the same
-reason.
-
-`into` is [`projectfile`](@ref) — the same path the editor saves to by default —
-so the frames land in that project's sidecar as they finish and survive a crash.
-"""
-function bakescene!(player::Player, ov)
-    path = projectfile(player)
-    canvas = canvassize(player.sequence)
-    total = max(ov.stop - ov.start, 0)
-    setstatus!(player, "3D Scene: baking $total frames…")
-    Threads.@spawn try
-        n = bake!(ov, canvas; framerate = player.sequence.framerate, into = path,
-                  progress = (done, tot) -> (done % 10 == 0 || done == tot) &&
-                      put!(player.statusqueue, "3D Scene: baked $done/$tot"))
-        put!(player.uiqueue, () -> begin
-            setstatus!(player, "3D Scene: $n frames baked and written beside the project")
-            f = get(player.fxwidgets, :fxlistrefresh, nothing)
-            f === nothing || f()
-            notify(player.playhead)
-        end)
-    catch e
-        @error "scene bake failed" exception = (e, catch_backtrace())
-        put!(player.statusqueue, "3D Scene: bake failed — see the console")
-    end
-    return nothing
-end
-
-"The scene overlays showing at the playhead — what `scenecard!` builds a card for."
-scenesat(player::Player) =
-    [ov for ov in player.sequence.overlays
-     if ov.kind === :scene && showsat(ov, player.playhead[])]
-
 "What the card's action button says — the kind's own verb, not a generic 'Run'."
 actionlabel(kind::EffectKind) =
     kind.name === :stabilize ? "Stabilize clip" :
@@ -974,66 +721,63 @@ whose own slider moved since the last one may act — anything else is a synced 
 (scrubbing keeps animated sliders on their curves, quantized to the slider step),
 and treating those as edits stamped keyframes on parameters nobody touched.
 """
-function paramform!(player::Player, pos, clip::Clip, slot::FxSlot, kind::EffectKind,
+function paramform!(player::Player, pos, clip::Clip, fx::Effect, kind::EffectKind,
                     uicolors, kfaccstate, updatekfaccs;
                     labelcolor = uicolors.text, widgetwidth = 132)
-    cur0 = kind.read(slot.effect)
-    fieldsym(pr) = Symbol(pr.label)
-    spec = NamedTuple(fieldsym(pr) => (Float64(cur0[pr.name]), Makie.Between(pr.min, pr.max))
-                      for pr in kind.params)
+    # THE PARAMETERS OF THIS ENTRY. Not a kind's declared list resolved through a
+    # global index — `fx.params` are the objects themselves, so a row writes to
+    # the parameter it is drawn for and two entries of one kind cannot collide.
+    fieldsym(p) = Symbol(p.label)
+    frame() = playheadframe(player, clip)
+    spec = NamedTuple(fieldsym(p) => (Float64(valueat(p, frame())),
+                                      Makie.Between(p.range[1], p.range[2]))
+                      for p in fx.params)
     accessory = (field, gp) -> begin
-        key = kind.kfkeys[findfirst(pr -> fieldsym(pr) === field, kind.params)]
-        st = get!(() -> (label = Observable("◇"), color = Observable{Any}(uicolors.text_muted)),
-                  kfaccstate, key)
+        p = fx.params[findfirst(q -> fieldsym(q) === field, fx.params)]
         acc = GridLayout(gp)
         prevb = Button(acc[1, 1]; label = "◀", width = 16, fontsize = 8,
                        labelcolor = uicolors.text_muted)
-        kf = Button(acc[1, 2]; label = st.label, width = 22, labelcolor = st.color)
+        kf = Button(acc[1, 2]; label = "◇", width = 22, labelcolor = uicolors.text_muted)
         nextb = Button(acc[1, 3]; label = "▶", width = 16, fontsize = 8,
                        labelcolor = uicolors.text_muted)
         colgap!(acc, 1)
-        on(_ -> gotokey!(player, key, -1), prevb.clicks)
-        on(_ -> togglekey!(player, key), kf.clicks)
-        on(_ -> gotokey!(player, key, 1), nextb.clicks)
-        player.fxwidgets[Symbol(:kfacc_, key)] = (prevb, kf, nextb)
+        on(_ -> gotokey!(player, clip, p, -1), prevb.clicks)
+        on(_ -> togglekey!(player, clip, p), kf.clicks)
+        on(_ -> gotokey!(player, clip, p, 1), nextb.clicks)
+        # ◆ filled where a key sits on this frame, ◇ hollow between keys, muted
+        # when the parameter is not animated at all
+        on(player.playhead; update = true) do _
+            here = isanimated(p) && any(k -> k.frame == frame(), p.curve.keys)
+            kf.label[] = here ? "◆" : "◇"
+            kf.labelcolor[] = here ? uicolors.accent :
+                              isanimated(p) ? uicolors.text : uicolors.text_muted
+        end
+        player.fxwidgets[Symbol(:kfacc_, fx.id, :_, p.name)] = (prevb, kf, nextb)
         acc
     end
     pf = Makie.ParamForm(pos, spec, accessory; labelwidth = 88, widgetwidth = widgetwidth,
                          accessorywidth = 62, rowgap = 4, halign = :left,
                          labelcolor = labelcolor)
-    updatekfaccs()
-    for (j, pr) in enumerate(kind.params)      # scrub-sync registry
-        w = get(pf.widgets, fieldsym(pr), nothing)
-        w isa Slider && (player.fxsliders[kind.kfkeys[j]] = w)
+    for p in fx.params                          # scrub-sync registry
+        w = get(pf.widgets, fieldsym(p), nothing)
+        w isa Slider && (player.fxsliders[(fx.id, p.name)] = w)
     end
     lastvals = Ref{Any}(nothing)
     on(pf.graph[:values]) do vals
         prevvals = lastvals[]; lastvals[] = vals
         player.fxsyncing[] && return           # sync: just refresh the baseline
-        cur = findslot(clip, slot.id)
-        cur === nothing && return
-        kind.matches(cur.effect) || return
-        prev = kind.read(cur.effect)
-        changedstatic = NamedTuple()
-        for (j, pr) in enumerate(kind.params)
-            v = Float64(vals[fieldsym(pr)])
-            key = kind.kfkeys[j]
-            moved = prevvals === nothing ?
-                abs(v - (clipanimated(clip, key) ?
-                         paramvalue(clip, key, playheadframe(player, clip)) :
-                         Float64(prev[pr.name]))) > 1.0e-9 :
-                v != Float64(prevvals[fieldsym(pr)])
+        for p in fx.params
+            v = Float64(vals[fieldsym(p)])
+            moved = prevvals === nothing ? abs(v - Float64(valueat(p, frame()))) > 1.0e-9 :
+                                           v != Float64(prevvals[fieldsym(p)])
             moved || continue
             if time() - player.lastslidersnap > 1.5    # one undo entry per gesture
                 snapshot!(player); player.lastslidersnap = time()
             end
-            if clipanimated(clip, key)                 # animated: the slider writes a key
-                setkey!(clip.animations[key], playheadframe(player, clip), v)
-            else
-                changedstatic = merge(changedstatic, NamedTuple{(pr.name,)}((v,)))
-            end
+            # animated: the slider writes a KEY at the playhead; otherwise it
+            # moves the static value. Same object either way.
+            isanimated(p) ? setkey!(p.curve, frame(), v) : (p.value = v)
         end
-        isempty(changedstatic) || (cur.effect = kind.make(merge(prev, changedstatic)))
         player.playing[] || notify(player.playhead)
     end
     return pf
@@ -1069,35 +813,37 @@ function buildkeyframemodal!(player::Player, uicolors)
 
     function refresh()
         legend[] === nothing || (Makie.delete!(legend[]); legend[] = nothing)
-        loc = editclip(player)
-        clip = loc === nothing ? nothing : loc[1]
-        curves = kfcurves(player)
-        keys_ = clip === nothing ? Symbol[] :
-                [k for k in sort!(collect(keys(clip.animations))) if haskey(curves, k)]
-        if isempty(keys_)
-            hint.text[] = clip === nothing ? "No clip at the playhead." :
-                "Nothing is animated on this clip yet — press a ◆ next to a parameter."
+        foreach(Makie.delete!, get!(() -> Any[], player.fxwidgets, :kflanerows))
+        empty!(player.fxwidgets[:kflanerows])
+        sel = selectedeffect(player)
+        if sel === nothing
+            hint.text[] = "Select an effect card to see its parameter lanes."
             return
         end
-        nkeys = sum(length(clip.animations[k]) for k in keys_)
-        hint.text[] = "$(length(keys_)) parameter$(length(keys_) == 1 ? "" : "s") · " *
-                      "$nkeys keyframe$(nkeys == 1 ? "" : "s")\n" *
-                      "click to hide one · right-click hides all · middle-click shows all"
-        # `plot => element` keeps the plot connected (that is what the click
-        # toggles) while drawing the swatch as a ◆ — the same marker, colour and
-        # white stroke the keyframes have on the clip, so the list reads as the
-        # thing it controls rather than as a chart legend.
-        entries = [curves[k].plot => Makie.MarkerElement(marker = :diamond,
-                                                         color = paramcolor(k),
-                                                         markersize = 11,
-                                                         strokecolor = :white,
-                                                         strokewidth = 1.0)
-                   for k in keys_]
-        legend[] = Makie.Legend(holder[1, 1], entries,
-                                [paramspec(k).label for k in keys_];
-                                framevisible = false, patchsize = (18, 14), labelsize = 11,
-                                rowgap = 4, padding = (4, 4, 4, 4),
-                                halign = :left, valign = :top, tellwidth = false)
+        clip, fx = sel
+        nanim = count(isanimated, fx.params)
+        nopen = count(p -> p.visible, fx.params)
+        hint.text[] = "$(length(fx.params)) parameter$(length(fx.params) == 1 ? "" : "s") · " *
+                      "$nanim animated · $nopen lane$(nopen == 1 ? "" : "s") shown\n" *
+                      "a lane can be shown BEFORE it has keyframes — that is where you put the first"
+        # ONE ROW PER PARAMETER, each with its own eye. Showing a lane is not the
+        # same question as animating it, so the two are separate controls.
+        for (i, p) in enumerate(fx.params)
+            row = GridLayout(holder[i, 1])
+            eye = Button(row[1, 1]; label = p.visible ? "◉" : "○", width = 24,
+                         buttoncolor = (:transparent, 0.0), strokewidth = 0)
+            Label(row[1, 2], p.label; halign = :left, tellwidth = false,
+                  color = isanimated(p) ? uicolors.text : uicolors.text_muted)
+            Label(row[1, 3], isanimated(p) ? "$(length(p.curve.keys)) keys" : "static";
+                  halign = :right, fontsize = 10, color = uicolors.text_muted)
+            on(eye.clicks) do _
+                p.visible = !p.visible
+                eye.label[] = p.visible ? "◉" : "○"
+                f = get(player.fxwidgets, :kfrefresh, nothing); f === nothing || f()
+                notify(player.playhead)
+            end
+            push!(player.fxwidgets[:kflanerows], row)
+        end
         return
     end
 

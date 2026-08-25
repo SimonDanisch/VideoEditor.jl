@@ -24,7 +24,7 @@
 
 using Random
 import VideoEditor as VE
-using VideoEditor: Clip, FxSlot, MotionTrack, Mat3f, RGBFrame, clipsat, clipend, cliplength,
+using VideoEditor: Clip, Effect, MotionTrack, Mat3f, RGBFrame, clipsat, clipend, cliplength,
                    effectiveclip, locate, ntracks, seqlength
 
 "A synthetic stabilization: real transforms (no analysis to run) plus the crop
@@ -137,7 +137,7 @@ function fuzzactions(player, rng)
             c = randclip(); c === nothing && return "effect (no clip)"
             e = rand(rng, (VE.ColorEffect(; brightness = 0.2f0), VE.BlurEffect(1.5f0),
                            VE.SharpenEffect(1.0f0, 0.6f0), VE.OpacityEffect(0.7f0)))
-            push!(c.effects, FxSlot(e))
+            push!(c.effects, Effect(e))
             "effect $(typeof(e).name.name) on clip@$(c.start)"
         end),
         ("keyframe", () -> begin

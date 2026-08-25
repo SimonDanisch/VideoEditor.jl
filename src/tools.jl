@@ -721,6 +721,19 @@ end
 # ---------------------------------------------------------------- Blend tool
 
 """
+    opacityparam(clip) -> Union{Nothing, Param}
+
+The `Param` behind the clip's opacity, or `nothing` when it has no opacity
+effect. The fade helpers below reach for THIS rather than a clip-level curve
+keyed `:opacity`: the curve belongs to the parameter of the effect that renders
+it, so there is nothing to look up and nothing that can point at the wrong entry.
+"""
+function opacityparam(clip::Clip)
+    fx = findslot(clip, OpacityEffect)
+    return fx === nothing ? nothing : param(fx, :opacity)
+end
+
+"""
     keyfade!(clip, frames, dir) -> clip
 
 Key `clip`'s opacity as a fade over `frames` at its START (`dir = :in`, 0 → 1) or
@@ -732,7 +745,10 @@ the curve animates, and the ◆ editor reshapes the curve.
 function keyfade!(clip::Clip, frames::Integer, dir::Symbol)
     clearfade!(clip, dir)
     findslot(clip, OpacityEffect) === nothing && seteffect!(clip, OpacityEffect(1.0f0))
-    curve = get!(AnimCurve, clip.animations, :opacity)
+    prm = opacityparam(clip)
+    prm.curve === nothing && (prm.curve = AnimCurve{typeof(prm.value)}())
+    prm.visible = true
+    curve = prm.curve
     # callers count the fade in TIMELINE frames (a length in seconds off the
     # sequence rate); keys live on SOURCE frames. On a conformed clip those are
     # different counts, and a 0.6 s blend would otherwise last 0.3 s or 1.2 s.
@@ -755,14 +771,16 @@ its end (`:out`). Keys the user placed elsewhere on the clip survive; when none
 are left the curve and its (now pointless) `OpacityEffect` go too.
 """
 function clearfade!(clip::Clip, dir::Symbol)
-    c = get(clip.animations, :opacity, nothing)
+    prm = opacityparam(clip)
+    prm === nothing && return clip
+    c = prm.curve
     c === nothing && return clip
     half = max(srclength(clip) ÷ 2, 1)   # the fade zone is keyed in SOURCE frames
     zone = dir === :out ? ((clip.src_out - half):clip.src_out) :
            (clip.src_in:(clip.src_in + half))
     filter!(k -> !(k.frame in zone), c.keys)
     if isempty(c.keys)
-        delete!(clip.animations, :opacity)
+        prm.curve = nothing
         slot = findslot(clip, OpacityEffect)
         slot === nothing || removeslot!(clip, slot.id)
     end
@@ -781,7 +799,8 @@ clip the incoming side of a blend, so the blend list is DERIVED from the keys
 instead of tracked beside them.
 """
 function fadeinlength(clip::Clip)
-    c = get(clip.animations, :opacity, nothing)
+    prm = opacityparam(clip)
+    c = prm === nothing ? nothing : prm.curve
     c === nothing && return 0
     ks = c.keys
     length(ks) >= 2 && ks[1].frame == clip.src_in && ks[1].value < 0.02 || return 0
@@ -2036,7 +2055,7 @@ function rundepth!(player::Player)
                 # The effect too — see the docstring on why the analysis alone is
                 # not a usable result.
                 findeffect(clip, DepthBlurEffect) === nothing &&
-                    push!(clip.effects, FxSlot(DepthBlurEffect()))
+                    push!(clip.effects, Effect(DepthBlurEffect()))
                 player.jobprogress[] = NaN
                 refreshedit!(player)
                 notify(player.playhead)
@@ -2080,7 +2099,7 @@ function runlook!(player::Player)
             analyzelook!(clip, img)
             put!(player.uiqueue, () -> begin
                 findeffect(clip, LookEffect) === nothing &&
-                    push!(clip.effects, FxSlot(LookEffect()))
+                    push!(clip.effects, Effect(LookEffect()))
                 refreshedit!(player)
                 notify(player.playhead)
                 setstatus!(player, "look applied — Look is keyframable in the inspector")
@@ -2281,7 +2300,7 @@ function runmatte!(ctx::ToolContext; clip = nothing, seeds = nothing)
             end
             put!(player.uiqueue, () -> begin
                 findeffect(clip, MatteEffect) === nothing &&
-                    push!(clip.effects, FxSlot(MatteEffect()))
+                    push!(clip.effects, Effect(MatteEffect()))
                 cov = mattecoverage(track)
                 player.matteinfo[] = "matte: $(length(track.seeds)) marked frame(s), " *
                                      "$(size(track.alpha, 3)) frames, " *
@@ -2323,7 +2342,7 @@ function removematte!(player::Player)
     col === nothing || col.clip !== clip || cancelmattecollect!(col)
     clip.mattetrack = nothing
     delete!(player.mattemarks, clip.id)
-    i = findfirst(s -> s.effect isa MatteEffect, clip.effects)
+    i = findfirst(s -> op(s) isa MatteEffect, clip.effects)
     i === nothing || deleteat!(clip.effects, i)
     player.matteinfo[] = "no matte"
     refreshmattepanel!(player; structure = true)
@@ -3210,7 +3229,7 @@ function cancelmattecollect!(col::MatteCollect)
     restorematteeffect!(col)
     col.clip.mattetrack = col.prevtrack
     if !col.hadeffect                      # we added it; take it back off again
-        i = findfirst(s -> s.effect isa MatteEffect, col.clip.effects)
+        i = findfirst(s -> op(s) isa MatteEffect, col.clip.effects)
         i === nothing || deleteat!(col.clip.effects, i)
     end
     col.ctx.player.matteinfo[] = "marking cancelled"
@@ -3452,7 +3471,7 @@ function restorepanel!(ctx::ToolContext)
         loc = editclip(player)
         loc === nothing && return setstatus!(player, "restore: no clip under the playhead")
         clearrestore!(loc[1])
-        i = findfirst(s -> s.effect isa RestoreEffect, loc[1].effects)
+        i = findfirst(s -> op(s) isa RestoreEffect, loc[1].effects)
         i === nothing || deleteat!(loc[1].effects, i)
         player.restoreinfo[] = "no restoration"
         refreshmattepanel!(player)
@@ -3484,7 +3503,7 @@ function runrestore!(ctx::ToolContext)
                                  progress = (d, t) -> (player.jobprogress[] = d / max(t, 1)))
             put!(player.uiqueue, () -> begin
                 findeffect(clip, RestoreEffect) === nothing &&
-                    push!(clip.effects, FxSlot(RestoreEffect()))
+                    push!(clip.effects, Effect(RestoreEffect()))
                 player.restoreinfo[] = "$got frames restored from $(first) (x$(restorescale()))"
                 player.jobprogress[] = NaN
                 refreshmattepanel!(player)

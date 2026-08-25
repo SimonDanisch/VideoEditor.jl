@@ -314,10 +314,11 @@ function viewsummary(seq::Sequence)
          source_fps = c.source.framerate,
          conformed = conformed(c),
          crop = round.(c.crop, digits = 3),
-         effects = [string(nameof(typeof(s.effect))) for s in c.effects if s.enabled],
+         effects = [string(nameof(typeof(op(s)))) for s in c.effects if s.enabled],
          stabilized = c.motiontrack !== nothing,
          flicker_fixed = c.colortrack !== nothing,
-         animated = sort!(string.(collect(keys(c.animations)))))
+         animated = sort!([string(fx.kind, ".", prm.name) for fx in c.effects
+                           for prm in fx.params if isanimated(prm)]))
     end
     return (duration = round(seqduration(seq), digits = 3), framerate = fps,
             frames = seqlength(seq), canvas = canvassize(seq),

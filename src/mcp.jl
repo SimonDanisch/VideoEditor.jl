@@ -424,7 +424,8 @@ function statedict(player::Player)
             "effects" => [slotdict(s) for s in clip.effects],
             # keyframed parameters — their values vary ACROSS the clip, so a single
             # frame does not describe it; view_sheet the clip's range to see them
-            "animated" => sort!(string.(collect(keys(clip.animations)))),
+            "animated" => sort!([string(fx.kind, ".", prm.name) for fx in clip.effects
+                                 for prm in fx.params if isanimated(prm)]),
             "has_colortrack" => clip.colortrack !== nothing,
             "has_motiontrack" => clip.motiontrack !== nothing,
         ) for (i, clip) in enumerate(seq.clips)],

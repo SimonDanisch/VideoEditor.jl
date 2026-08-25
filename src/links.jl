@@ -11,7 +11,7 @@
 # so a chain of links does not shrink each step into a strip. The target keeps
 # its own card in the list; editing either edits the same slot.
 
-# `FxLink` itself is declared in clips.jl, next to the `FxSlot` that holds one.
+# `FxLink` itself is declared in clips.jl, next to the `Effect` that holds one.
 """
     FxLink(slot; clip = 0, role = :linked)
 
@@ -50,7 +50,7 @@ Link slot `sa` on clip `a` to slot `sb` on clip `b`, and back again. Links are
 made in PAIRS because that is what "these two are the same edit" means: removing
 either side has to be able to find the other.
 """
-function linkeffects!(seq::Sequence, a::Clip, sa::FxSlot, b::Clip, sb::FxSlot;
+function linkeffects!(seq::Sequence, a::Clip, sa::Effect, b::Clip, sb::Effect;
                       role::Symbol = :linked, backrole::Symbol = role)
     push!(sa.links, FxLink(sb.id; clip = b.id, role))
     push!(sb.links, FxLink(sa.id; clip = a.id, role = backrole))
@@ -77,15 +77,15 @@ function prunelinks!(seq::Sequence)
 end
 
 """
-    linkchain(seq, clip, slot; seen = Set()) -> Vector{Tuple{Clip, FxSlot, Symbol}}
+    linkchain(seq, clip, slot; seen = Set()) -> Vector{Tuple{Clip, Effect, Symbol}}
 
 Everything `slot` links to, transitively, each with the role it was reached by —
 and each visited at most once. The guard is not paranoia: a blend links both ways
 by construction, so the first thing any walk hits is the way back.
 """
-function linkchain(seq::Sequence, clip::Clip, slot::FxSlot;
+function linkchain(seq::Sequence, clip::Clip, slot::Effect;
                    seen::Set{UInt64} = Set{UInt64}([slot.id]))
-    out = Tuple{Clip, FxSlot, Symbol}[]
+    out = Tuple{Clip, Effect, Symbol}[]
     for l in slot.links
         r = resolvelink(seq, clip, l)
         r === nothing && continue
@@ -99,7 +99,7 @@ function linkchain(seq::Sequence, clip::Clip, slot::FxSlot;
 end
 
 """
-    linkedparams(seq, clip, slot) -> Vector{Tuple{Clip, FxSlot, EffectKind, Symbol}}
+    linkedparams(seq, clip, slot) -> Vector{Tuple{Clip, Effect, EffectKind, Symbol}}
 
 What a card should show inline: the DIRECT links of `slot` that have parameters
 to show, with the kind needed to render them.
@@ -109,13 +109,13 @@ chain here would draw the same parameters twice and nest a little further each
 time. That is the rule Simon set — link the parameters in the parent card
 instead of inlining a smaller card.
 """
-function linkedparams(seq::Sequence, clip::Clip, slot::FxSlot)
-    out = Tuple{Clip, FxSlot, EffectKind, Symbol}[]
+function linkedparams(seq::Sequence, clip::Clip, slot::Effect)
+    out = Tuple{Clip, Effect, EffectKind, Symbol}[]
     for l in slot.links
         r = resolvelink(seq, clip, l)
         r === nothing && continue
         tclip, tslot = r
-        k = effectkindfor(tslot.effect)
+        k = effectkindfor(op(tslot))
         k === nothing && continue
         push!(out, (tclip, tslot, k, l.role))
     end
@@ -138,9 +138,9 @@ The line that goes above an inlined parameter group: which effect, on which clip
 and how it is related. A link the user cannot trace back to a card in the list is
 just a mystery slider.
 """
-function linkcaption(seq::Sequence, clip::Clip, target::Clip, tslot::FxSlot, role::Symbol)
-    k = effectkindfor(tslot.effect)
-    name = k === nothing ? string(nameof(typeof(tslot.effect))) : k.label
+function linkcaption(seq::Sequence, clip::Clip, target::Clip, tslot::Effect, role::Symbol)
+    k = effectkindfor(op(tslot))
+    name = k === nothing ? string(nameof(typeof(op(tslot)))) : k.label
     if target === clip
         return "↗ $(linkrolelabel(role)) $name — same clip"
     end
@@ -162,7 +162,7 @@ would give every step of a chain less room than the last.
 
 Returns the blocks it made, so the card can drop them on a rebuild.
 """
-function linkedgroups!(player::Player, pos, clip::Clip, slot::FxSlot, uicolors,
+function linkedgroups!(player::Player, pos, clip::Clip, slot::Effect, uicolors,
                        kfaccstate, updatekfaccs)
     made = Any[]
     groups = linkedparams(player.sequence, clip, slot)
@@ -207,7 +207,7 @@ Selection is the feedback — the card draws its accent outline — which is why
 link button does not merely scroll. "It jumped somewhere" and "it jumped HERE"
 are different messages.
 """
-function revealslot!(player::Player, clip::Clip, slot::FxSlot)
+function revealslot!(player::Player, clip::Clip, slot::Effect)
     cur = editclip(player)
     if cur === nothing || cur[1] !== clip
         seek!(player, clamp(clip.start, 0, max(seqlength(player.sequence) - 1, 0)))
@@ -216,7 +216,7 @@ function revealslot!(player::Player, clip::Clip, slot::FxSlot)
         i === nothing || (player.timeline.selected[] = i)
     end
     selectfxcard!(player, (:fx, slot.id))
-    k = effectkindfor(slot.effect)
+    k = effectkindfor(op(slot))
     setstatus!(player, "showing $(k === nothing ? "the linked effect" : k.label)")
     notify(player.playhead)
     return nothing
