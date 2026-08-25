@@ -29,6 +29,7 @@ end
 function tcurve!(clip, name::Symbol)
     pr = tparam(clip, name)
     pr.curve === nothing && (pr.curve = VE.AnimCurve())
+    pr.visible = true          # keying a parameter opens its lane, as ◆ does
     return pr.curve
 end
 tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing : pr.curve)
@@ -1929,8 +1930,8 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
                 lo, hi = VE.trackband(clip.track, ntr)
                 g = min(0.02, VE.trackspan(ntr) * 0.15); lo += g; hi -= g
                 inset = 0.12 * (hi - lo); lo += inset; hi -= inset
-                c = clip.effects[key]; pr = tparam(clip, key)
-                v = something(VE.valueat(c, sf), pr.get(clip))
+                pr = tparam(clip, key)
+                v = VE.valueat(pr, sf)
                 y = lo + (hi - lo) * clamp(VE.paramnorm(pr, v), 0.0, 1.0)
                 t = (clip.start + (sf - clip.src_in)) / p.sequence.framerate
                 lims = ax.finallimits[]; vp = ax.scene.viewport[]
@@ -1949,10 +1950,8 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             sleep(0.2)
             @test length(tcurve!(clip, :sharpen).keys) == ns + 1
             @test length(tcurve!(clip, :brightness).keys) == nb
-            @test p.kffocus[] === :sharpen
             # grabbing a brightness ◆ refocuses it
             press(curvepos(:brightness, fkey)); release(); sleep(0.2)
-            @test p.kffocus[] === :brightness
             # right-click opens the keyframe menu on the clicked ◆; Delete removes
             # exactly that key (and only it) — the clip context menu stays closed
             ns2 = length(tcurve!(clip, :sharpen).keys)
@@ -1978,8 +1977,8 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
                 lo, hi = VE.trackband(clip.track, ntr)
                 g = min(0.02, VE.trackspan(ntr) * 0.15); lo += g; hi -= g
                 inset = 0.12 * (hi - lo); lo += inset; hi -= inset
-                c = clip.effects[key]; pr = tparam(clip, key)
-                v = something(VE.valueat(c, sf), pr.get(clip))
+                pr = tparam(clip, key)
+                v = VE.valueat(pr, sf)
                 y = lo + (hi - lo) * clamp(VE.paramnorm(pr, v), 0.0, 1.0)
                 t = (clip.start + (sf - clip.src_in)) / fps
                 lims = ax.finallimits[]; vp = ax.scene.viewport[]
@@ -2005,13 +2004,15 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             # --- scrub off the key (◇), slider writes a second key (◆ again) ---
             press(tlx(2.8)); release(); sleep(0.3)
             @test Makie.to_value(trio()[2].label) == "◇"
-            ghost0 = sum(length(c.keys) for (k, c) in clip.effects if k !== :contrast; init = 0)
+            ghost0 = sum(length(q.curve.keys) for fx in clip.effects for q in fx.params
+                          if VE.isanimated(q) && q.name !== :contrast; init = 0)
             Makie.set_close_to!(p.fxsliders[:contrast], 1.6); sleep(0.4)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             f2 = VE.playheadframe(p, clip)
             @test length(tcurve!(clip, :contrast).keys) == 2
             # a gesture on ONE slider must not stamp ghost keys on other animated params
-            @test sum(length(c.keys) for (k, c) in clip.effects if k !== :contrast; init = 0) == ghost0
+            @test sum(length(q.curve.keys) for fx in clip.effects for q in fx.params
+                          if VE.isanimated(q) && q.name !== :contrast; init = 0) == ghost0
             @test Makie.to_value(trio()[2].label) == "◆"
             # --- ◀ ▶ jump between keys ---
             notify(trio()[1].clicks); sleep(0.3)
@@ -2176,7 +2177,7 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             g = min(0.02, VE.trackspan(ntr) * 0.15); lo += g; hi -= g
             inset = 0.12 * (hi - lo)
             y1 = (lo + inset) + (hi - lo - 2inset) *
-                 VE.paramnorm(tparam(clip, :temperature), k1.value)
+                 VE.paramnorm(tparam(base, :temperature), k1.value)
             lims = ax.finallimits[]; vp = ax.scene.viewport[]
             mpix = Point2f(vp.origin[1] + ((base.start + (k1.frame - base.src_in)) / fps -
                                minimum(lims)[1]) / (maximum(lims)[1] - minimum(lims)[1]) *

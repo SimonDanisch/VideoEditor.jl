@@ -3510,20 +3510,30 @@ function buildkeyframeoverlay!(player::Player)
                     color = accent, strokecolor = :white, strokewidth = 1.0)
     translate!(dots, 0, 0, 5)
 
-    # Where a value sits inside its clip's LANE — the same band the timeline draws
-    # the clip in, so a curve is read against the thing it belongs to.
-    function yat(clip::Clip, p::Param, v)
-        lo, hi = trackband(clip.track, player.timeline.ntr[])
-        return lo + paramnorm(p, v) * (hi - lo)
+    # The band a curve is drawn in: the clip's own track lane, inset so a value at
+    # 0 or 1 does not sit exactly on the lane edge (where it reads as belonging to
+    # the neighbour, and where it cannot be grabbed).
+    function clipband(clip::Clip)
+        ntr = ntracks(seq)
+        g = min(0.02, trackspan(ntr) * 0.15)
+        lo, hi = trackband(clip.track, ntr)
+        lo += g; hi -= g
+        inset = 0.12 * (hi - lo)
+        return (lo + inset, hi - inset)
     end
+    yat(clip::Clip, p::Param, v) =
+        (b = clipband(clip); b[1] + (b[2] - b[1]) * clamp(paramnorm(p, v), 0.0, 1.0))
 
     function refresh()
         segs = Point2f[]; pts = Point2f[]; empty!(markmeta)
-        sel = selectedeffect(player)
-        clip = sel === nothing ? nothing : sel[1]
-        fx = sel === nothing ? nothing : sel[2]
-        if fx !== nothing
-            for p in fx.params
+        # ONE condition: `p.visible`. Not "visible AND its card is selected" —
+        # a second, invisible condition is how a lane you turned on stays dark
+        # and you go looking for the bug in the wrong place. Selecting a card is
+        # what SETS visibility; drawing only ever reads it.
+        loc = editclip(player)
+        clip = loc === nothing ? nothing : loc[1]
+        if clip !== nothing
+            for fx in clip.effects, p in fx.params
                 p.visible || continue
                 x0 = clip.start / fps; x1 = clipend(clip) / fps
                 for i in 0:60                       # the curve, sampled across the clip
@@ -3548,6 +3558,183 @@ function buildkeyframeoverlay!(player::Player)
     on(_ -> refresh(), player.playhead)
     on(_ -> refresh(), player.timeline.selected)
     refresh()
+
+    # ---- editing on the overlay: drag a ◆ (snaps to the playhead, live readout),
+    # Alt-click ON a lane to add, Ctrl-click a ◆ to delete, right-click a ◆ for the
+    # keyframe menu. `markmeta` already carries `(clip, fx, param, index)` for every
+    # ◆ drawn, so the gesture edits the object it hit — there is no key to resolve
+    # and no "currently focused parameter" to guess at.
+    tl = player.timeline
+    dragref = Ref{Any}(nothing)                 # (clip, param, index)
+    dragtippos = Observable(Point2f(0, 0))
+    dragtiptext = Observable("")
+    dragtip = text!(ax, dragtippos; text = dragtiptext, visible = false,
+                    fontsize = 12, font = :bold, color = :white,
+                    strokecolor = (:black, 0.8), strokewidth = 2,
+                    offset = (10, 10), align = (:left, :bottom))
+    translate!(dragtip, 0, 0, 7)
+
+    "The value a lane's y coordinate means for `p` — the inverse of `yat`."
+    yval(clip::Clip, p::Param, y) =
+        (b = clipband(clip); paramdenorm(p, clamp((y - b[1]) / (b[2] - b[1]), 0.0, 1.0)))
+
+    "Index into `markmeta` of the ◆ near (t, y), or 0."
+    function nearestmarker(t, y)
+        pts = marks[]; isempty(pts) && return 0
+        vp = ax.scene.viewport[]; (x0, x1) = tl.viewrange[]
+        sx = (x1 - x0) / max(vp.widths[1], 1); sy = 1.0 / max(vp.widths[2], 1)
+        best = 0; bestd = 14.0
+        for (i, pt) in enumerate(pts)
+            d = hypot((t - pt[1]) / sx, (y - pt[2]) / sy)
+            d < bestd && ((best, bestd) = (i, d))
+        end
+        return best
+    end
+
+    "The shown parameter of `clip` whose lane passes within `maxpx` of (t, y)."
+    function nearestlane(clip, sf, y; maxpx = 22.0)
+        vp = ax.scene.viewport[]
+        best = nothing; bestd = maxpx / max(vp.widths[2], 1)
+        for fx in clip.effects, p in fx.params
+            p.visible || continue
+            d = abs(y - yat(clip, p, valueat(p, sf)))
+            d < bestd && ((best, bestd) = (p, d))
+        end
+        return best
+    end
+
+    function deletekey!(clip, p::Param, kidx)
+        snapshot!(player)
+        deleteat!(p.curve.keys, kidx)
+        if isempty(p.curve)
+            p.value = valueat(p, playheadframe(player, clip))
+            p.curve = nothing
+            setstatus!(player, "$(p.label): last keyframe removed — back to a static value")
+        end
+        notify(player.playhead)
+        return
+    end
+
+    kfmenu = Modal(player.fig; title = "Keyframe", min_size = (200, 10),
+                   backdrop_color = (:black, 0.15))
+    kfmenuctx = Ref{Any}(nothing)               # (clip, param, index)
+    easelabel = Observable("Ease in & out")
+    holdlabel = Observable("Hold until the next key")
+    function retoggle(mode)
+        clip, p, kidx = kfmenuctx[]
+        snapshot!(player)
+        materializeease!(p.curve)
+        cur = p.curve.keys[kidx].ease
+        new = cur === mode ? :linear : mode
+        setease!(p.curve, kidx, new)
+        setstatus!(player, "$(p.label): keyframe is now " *
+                           (new === :smooth ? "eased (in & out)" :
+                            new === :hold ? "held until the next key" : "linear"))
+        notify(player.playhead)
+    end
+    for (row, (lbl, action)) in enumerate([
+        ("Delete keyframe", () -> (c, p, i) = kfmenuctx[] |> t -> deletekey!(t[1], t[2], t[3])),
+        (easelabel, () -> retoggle(:smooth)),
+        (holdlabel, () -> retoggle(:hold)),
+        ("Clear all keys of this parameter", () -> begin
+            clip, p, _ = kfmenuctx[]
+            snapshot!(player)
+            n = length(p.curve.keys)
+            p.value = valueat(p, playheadframe(player, clip))
+            p.curve = nothing
+            syncsliders!(player, clip)
+            setstatus!(player, "$(p.label): cleared $n keyframe$(n == 1 ? "" : "s") (Ctrl+Z to restore)")
+            notify(player.playhead)
+        end)])
+        btn = Button(kfmenu[row, 1]; label = lbl, tellwidth = false)
+        on(btn.clicks) do _
+            close!(kfmenu)
+            kfmenuctx[] === nothing || action()
+        end
+        player.fxwidgets[Symbol(:kfmenubtn, row)] = btn
+    end
+    player.fxwidgets[:kfmenu] = kfmenu
+
+    on(events(ax.scene).mousebutton; priority = 20) do event
+        isempty(marks[]) && isempty(lanes[]) && return Consume(false)   # nothing shown = inert
+        is_mouseinside(ax.scene) || return Consume(false)
+        t, y = mouseposition(ax.scene)
+        if event.button == Mouse.left && event.action == Mouse.press
+            if ispressed(ax.scene, Keyboard.left_alt | Keyboard.right_alt)
+                # Resolved by time AND track band — aiming at V2 must never key V1.
+                # The same rule the drawing uses: whichever SHOWN lane you hit,
+                # on whichever clip that band belongs to. Requiring a selected
+                # card here as well would make a visible lane unclickable.
+                n = timelineframe(tl, t)
+                tr = trackat(y, ntracks(seq))
+                ci = findfirst(c -> c.track == tr && c.start <= n < clipend(c), seq.clips)
+                ci === nothing && return Consume(false)
+                clip = seq.clips[ci]
+                sf = sourceframe(clip, n)
+                p = nearestlane(clip, sf, y)
+                if p === nothing
+                    setstatus!(player, any(fx -> any(q -> q.visible, fx.params), clip.effects) ?
+                        "Alt-click ON a lane to add a keyframe to it" :
+                        "no lane shown — open one with its ◆ in the Inspector first")
+                    return Consume(true)
+                end
+                snapshot!(player)
+                p.curve === nothing && (p.curve = AnimCurve{typeof(p.value)}())
+                setkey!(p.curve, sf, yval(clip, p, y))
+                refresh(); notify(player.playhead); return Consume(true)
+            end
+            i = nearestmarker(t, y); i == 0 && return Consume(false)
+            clip, _, p, kidx = markmeta[i]
+            if ispressed(ax.scene, Keyboard.left_control | Keyboard.right_control)
+                deletekey!(clip, p, kidx); refresh(); return Consume(true)
+            end
+            snapshot!(player)
+            dragref[] = (clip, p, kidx)
+            return Consume(true)
+        elseif event.button == Mouse.left && event.action == Mouse.release && dragref[] !== nothing
+            dragref[] = nothing
+            dragtip.visible = false
+            return Consume(true)
+        elseif event.button == Mouse.right && event.action == Mouse.press
+            i = nearestmarker(t, y); i == 0 && return Consume(false)
+            clip, _, p, kidx = markmeta[i]
+            kfmenuctx[] = (clip, p, kidx)
+            k = p.curve.keys[kidx]
+            kfmenu.title = "◆ $(p.label) · $(timestring(timelineframe(clip, k.frame) / fps))"
+            easelabel[] = keyease(p.curve, k) === :smooth ? "Make linear (corner)" : "Ease in & out"
+            holdlabel[] = k.ease === :hold ? "Interpolate again" : "Hold until the next key"
+            mp = events(player.fig).mouseposition[]
+            vp = player.fig.scene.viewport[]
+            kfmenu.halign = clamp(mp[1] / max(vp.widths[1], 1), 0.0, 1.0)
+            kfmenu.valign = clamp(mp[2] / max(vp.widths[2], 1), 0.0, 1.0)
+            open!(kfmenu)
+            return Consume(true)
+        end
+        return Consume(false)
+    end
+
+    on(events(ax.scene).mouseposition; priority = 20) do _
+        dragref[] === nothing && return Consume(false)
+        clip, p, i = dragref[]
+        t, y = mouseposition(ax.scene)
+        f = clamp(sourceframe(clip, timelineframe(tl, t)), clip.src_in, clip.src_out)
+        # snap to the playhead when close — RAW pixel distance, since one frame can
+        # already be wider than the threshold
+        vp = ax.scene.viewport[]; (x0, x1) = tl.viewrange[]
+        pxpersec = max(vp.widths[1], 1) / max(x1 - x0, 1.0e-9)
+        phf = clamp(playheadframe(player, clip), clip.src_in, clip.src_out)
+        abs(t - timelineframe(clip, phf) / fps) * pxpersec < 12 && (f = phf)
+        v = yval(clip, p, y)
+        movekey!(p.curve, i, f, v)
+        j = findfirst(k -> k.frame == f, p.curve.keys)
+        j === nothing || (dragref[] = (clip, p, j))
+        dragtippos[] = Point2f(timelineframe(clip, f) / fps, yat(clip, p, v))
+        dragtiptext[] = "$(p.label)  $(round(Float64(v); digits = 2)) · " *
+                        timestring(timelineframe(clip, f) / fps)
+        dragtip.visible = true
+        refresh(); notify(player.playhead); return Consume(true)
+    end
+
     player.fxwidgets[:kfrefresh] = refresh
     return refresh
 end
