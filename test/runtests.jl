@@ -333,14 +333,20 @@ end
     @test !any(e -> e isa ColorEffect, VE.liveeffects(c))
     @test VE.findeffect(c, ColorEffect).adj.saturation == 1.8f0   # params survive
     @test VE.findslot(c, id) === slot                             # addressable by id
-    d = VE.slotdict(slot)                             # project-file roundtrip
-    s2 = VE.slotfromdict(d)
+    d = VE.effectdict(slot)                           # project-file roundtrip
+    s2 = VE.effectfromdict(d)
     @test s2.id == id && !s2.enabled && VE.op(s2).adj.saturation == 1.8f0
-    # files written before ids existed still load — a wrapped effect becomes an off slot
-    old = Dict{String, Any}("type" => "bypassed",
-                            "inner" => VE.effectdict(ColorEffect(saturation = 1.2)))
-    s3 = VE.slotfromdict(old)
-    @test !s3.enabled && VE.op(s3).adj.saturation == 1.2f0 && s3.id != 0
+    # the file is the PARAMETERS — no per-type writer, no per-type reader
+    @test d["kind"] == "color"
+    @test Set(pd["name"] for pd in d["params"]) ==
+          Set(["brightness", "contrast", "saturation", "temperature"])
+    # a parameter the kind no longer declares is skipped, not fatal
+    d2 = deepcopy(d); push!(d2["params"], Dict{String, Any}("name" => "gone", "value" => 1.0))
+    @test VE.op(VE.effectfromdict(d2)).adj.saturation == 1.8f0
+    # …and one the file omits keeps the kind's default
+    d3 = deepcopy(d); filter!(pd -> pd["name"] != "contrast", d3["params"])
+    @test VE.param(VE.effectfromdict(d3), :contrast).value ==
+          VE.param(VE.Effect(VE.kindbyname(:color)), :contrast).value
     slot.enabled = true
 end
 
@@ -452,7 +458,7 @@ end
     e = VE.plugineffect(:mcpfx; gain = 0.25)
     f = applyfx(fill(VE.RGB{VE.N0f8}(0.8, 0.8, 0.8), 8, 8), e)
     @test all(px -> Float32(px.r) < 0.8, f)                        # gain 0.25 darkens
-    @test VE.plugineffectfromdict(VE.effectdict(e)).params.gain == 0.25
+    @test VE.op(VE.effectfromdict(VE.effectdict(VE.Effect(e)))).params.gain == 0.25
 
     # the stock :soften plugin exercises the OTHER effect kind — Stencil (reads a
     # neighbourhood), applied through the same kernel the GPU graph uses
@@ -1157,7 +1163,8 @@ end
     # --- effect: registries, neutrality, serialization
     @test VideoEditor.isneutral(MatteEffect(0.0, 0.0))
     @test !VideoEditor.isneutral(MatteEffect(1.0, 0.0))
-    @test VideoEditor.effectfromdict(VideoEditor.effectdict(MatteEffect(0.7, 0.2))) ==
+    @test VideoEditor.op(VideoEditor.effectfromdict(
+              VideoEditor.effectdict(VideoEditor.Effect(MatteEffect(0.7, 0.2))))) ==
           MatteEffect(0.7f0, 0.2f0)
     k = VideoEditor.kindbyname(:matte)
     @test [pr.name for pr in k.params] == [:strength, :feather]
@@ -1429,7 +1436,8 @@ end
         # effect + registries
         @test VideoEditor.isneutral(RestoreEffect(0.0))
         @test !VideoEditor.isneutral(RestoreEffect(1.0))
-        @test VideoEditor.effectfromdict(VideoEditor.effectdict(RestoreEffect(0.6))) ==
+        @test VideoEditor.op(VideoEditor.effectfromdict(
+                VideoEditor.effectdict(VideoEditor.Effect(RestoreEffect(0.6))))) ==
               RestoreEffect(0.6f0)
         k = VideoEditor.kindbyname(:restore)
         @test [pr.name for pr in k.params] == [:strength]
@@ -1677,7 +1685,7 @@ end
     # `TransformEffect` from the `settransform` above, and dropping only the
     # legacy tuple leaves that one answering `transformof`.
     delete!(d["clips"][end], "reframe")
-    filter!(e -> get(e, "type", "") != "transform", d["clips"][end]["effects"])
+    filter!(e -> get(e, "kind", "") != "transform", d["clips"][end]["effects"])
     open(io -> VE.JSON.print(io, d, 2), path, "w")
     @test VE.transformof(VE.loadproject(path).clips[end]) == VE.NEUTRALFRAME
 end

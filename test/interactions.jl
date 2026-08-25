@@ -882,7 +882,7 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             # The effect survives a project-file roundtrip, which is what a new effect
             # most often forgets: `effectdict`/`effectfromdict` are two lists to update.
             e = VE.DepthBlurEffect(; focus = 0.25, strength = 0.75)
-            @test VE.effectfromdict(VE.effectdict(e)) == e
+            @test VE.op(VE.effectfromdict(VE.effectdict(VE.Effect(e)))) == e
             @test VE.isneutral(VE.DepthBlurEffect(; strength = 0.0))
             @test !VE.isneutral(e)
 

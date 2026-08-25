@@ -421,7 +421,7 @@ function statedict(player::Player)
             "source_in" => clip.src_in / clip.source.framerate,
             "crop" => collect(clip.crop),
             "id" => string(clip.id),
-            "effects" => [slotdict(s) for s in clip.effects],
+            "effects" => [effectdict(s) for s in clip.effects],
             # keyframed parameters — their values vary ACROSS the clip, so a single
             # frame does not describe it; view_sheet the clip's range to see them
             "animated" => sort!([string(fx.kind, ".", prm.name) for fx in clip.effects

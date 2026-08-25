@@ -219,98 +219,85 @@ end
 
 # ------------------------------------------------------------- serialization
 
-effectdict(e::ColorEffect) = Dict{String, Any}(
-    "type" => "color", "brightness" => e.adj.brightness, "contrast" => e.adj.contrast,
-    "saturation" => e.adj.saturation, "temperature" => e.adj.temperature)
-effectdict(e::BlurEffect) = Dict{String, Any}("type" => "blur", "sigma" => e.σ)
-effectdict(e::SharpenEffect) =
-    Dict{String, Any}("type" => "sharpen", "sigma" => e.σ, "amount" => e.amount)
-effectdict(e::OpacityEffect) = Dict{String, Any}("type" => "opacity", "alpha" => e.α)
-effectdict(e::RestoreEffect) =
-    Dict{String, Any}("type" => "restore", "strength" => e.strength)
-effectdict(e::DepthBlurEffect) =
-    Dict{String, Any}("type" => "depthblur", "focus" => e.focus, "strength" => e.strength)
-effectdict(e::LookEffect) = Dict{String, Any}("type" => "look", "strength" => e.strength)
-effectdict(e::TransformEffect) =
-    Dict{String, Any}("type" => "transform", "scale" => e.scale, "x" => e.x, "y" => e.y,
-                      "rotation" => e.rotation)
-effectdict(e::MatteEffect) =
-    Dict{String, Any}("type" => "matte", "strength" => e.strength, "feather" => e.feather)
-effectdict(::StabilizeEffect) = Dict{String, Any}("type" => "stabilize")
-effectdict(::LoopFinderEffect) = Dict{String, Any}("type" => "loopfinder")
-effectdict(e::BlendEffect) = Dict{String, Any}("type" => "blend", "seconds" => e.seconds)
-effectdict(e::FlickerEffect) = Dict{String, Any}("type" => "flicker", "strength" => e.strength)
+"""
+    effectdict(fx) -> Dict
 
-"A stack entry as a project-file dict: the effect plus its id, enabled state and links."
-function slotdict(fx::Effect)
-    d = merge(effectdict(op(fx)),
-              Dict{String, Any}("id" => string(fx.id), "enabled" => fx.enabled))
+One effect as project-file data: its kind, and its PARAMETERS — each with its
+value and, if it has one, its curve.
+
+There is nothing type-specific here. This used to be thirteen hand-written
+methods (`effectdict(e::BlurEffect) = ... "sigma" => e.σ ...`) mirrored by a
+`t == "blur" && return BlurEffect(...)` chain on the way back, so adding an
+effect meant writing its parameters down three times: once in its kind, once
+out, once in. The parameters ARE the effect now, so writing them is writing it,
+and a new kind needs no serialization code at all.
+"""
+function effectdict(fx::Effect)
+    d = Dict{String, Any}("kind" => String(fx.kind),
+                          "id" => string(fx.id),
+                          "enabled" => fx.enabled,
+                          "params" => [paramdict(p) for p in fx.params])
     isempty(fx.links) || (d["links"] = [linkdict(l) for l in fx.links])
-    # ITS parameters' curves, inside the effect. There is no clip-level
-    # `animations` block any more: a curve belongs to the parameter it animates,
-    # in the file exactly as in memory.
-    anims = Dict{String, Any}(
-        String(prm.name) => Dict{String, Any}(
-            "interp" => String(prm.curve.interp),
-            "frames" => [k.frame for k in prm.curve.keys],
-            "values" => [Float64(k.value) for k in prm.curve.keys],
-            "eases"  => [String(k.ease) for k in prm.curve.keys])
-        for prm in fx.params if isanimated(prm))
-    isempty(anims) || (d["animations"] = anims)
-    vis = [String(prm.name) for prm in fx.params if prm.visible]
-    isempty(vis) || (d["lanes"] = vis)
     return d
 end
 
+"One parameter: what it is now, its lane, and its keys when it has any."
+function paramdict(p::Param)
+    d = Dict{String, Any}("name" => String(p.name), "value" => tojson(p.value))
+    p.visible && (d["lane"] = true)
+    isanimated(p) && (d["curve"] = Dict{String, Any}(
+        "interp" => String(p.curve.interp),
+        "frames" => [k.frame for k in p.curve.keys],
+        "values" => [tojson(k.value) for k in p.curve.keys],
+        "eases"  => [String(k.ease) for k in p.curve.keys]))
+    return d
+end
+
+# A parameter value as JSON. Scalars go as themselves; anything with components
+# goes as an array, so a `Vec3f` offset or an `RGBf` colour needs no special case
+# on either side — `fromjson` puts it back into the type the parameter already
+# has, which is the only place that type is known.
+tojson(v::Real) = Float64(v)
+tojson(v) = collect(Float64.(v))
+tojson(v::Colorant) = [Float64(red(v)), Float64(green(v)), Float64(blue(v))]
+
+fromjson(::Type{T}, v) where {T <: Real} = T(v)
+fromjson(::Type{T}, v) where {T} = T(v...)
+fromjson(::Type{T}, v) where {T <: Colorant} = T(v...)
+
 """
-Read a stack entry back. Files written before effects had ids (and before
-`enabled` replaced the `bypassed` wrapper) still load: the entry gets a fresh id,
-and a wrapped effect becomes a disabled slot.
+    effectfromdict(d) -> Effect
+
+`effectdict`'s inverse. The kind supplies the parameter LIST (names, labels,
+ranges and types); the file supplies the values and curves. A parameter the kind
+no longer has is skipped, and one the file does not mention keeps its default —
+so a kind may gain or lose parameters without stranding a project.
 """
-function slotfromdict(d::AbstractDict)
-    if d["type"] == "bypassed"
-        return Effect(effectfromdict(d["inner"]); enabled = false)
-    end
-    id = haskey(d, "id") ? parse(UInt64, d["id"]) : freshid()
-    links = FxLink[linkfromdict(l) for l in get(d, "links", [])]
-    fx = Effect(id, effectfromdict(d), get(d, "enabled", true), links)
-    for (name, ad) in get(d, "animations", Dict{String, Any}())
-        prm = param(fx, Symbol(name))
-        prm === nothing && continue        # a parameter this kind no longer has
-        eases = get(ad, "eases", fill("linear", length(ad["frames"])))
-        prm.curve = AnimCurve{typeof(prm.value)}(
-            [Keyframe(Int(f), convert(typeof(prm.value), v), Symbol(e))
-             for (f, v, e) in zip(ad["frames"], ad["values"], eases)],
-            Symbol(get(ad, "interp", "linear")))
-    end
-    for name in get(d, "lanes", String[])
-        prm = param(fx, Symbol(name)); prm === nothing || (prm.visible = true)
+function effectfromdict(d::AbstractDict)
+    kind = kindbyname(Symbol(d["kind"]))
+    kind === nothing && error("unknown effect kind: $(d["kind"])")
+    fx = Effect(freshid(), Symbol(d["kind"]), get(d, "enabled", true),
+                FxLink[linkfromdict(l) for l in get(d, "links", [])],
+                paramsfor(kind))
+    haskey(d, "id") && (fx = Effect(parse(UInt64, d["id"]), fx.kind, fx.enabled,
+                                    fx.links, fx.params))
+    for pd in get(d, "params", [])
+        prm = param(fx, Symbol(pd["name"]))
+        prm === nothing && continue          # a parameter this kind no longer has
+        T = typeof(prm.value)
+        haskey(pd, "value") && (prm.value = fromjson(T, pd["value"]))
+        get(pd, "lane", false) && (prm.visible = true)
+        haskey(pd, "curve") || continue
+        cd = pd["curve"]
+        eases = get(cd, "eases", fill("linear", length(cd["frames"])))
+        prm.curve = AnimCurve{T}(
+            [Keyframe(Int(f), fromjson(T, v), Symbol(e))
+             for (f, v, e) in zip(cd["frames"], cd["values"], eases)],
+            Symbol(get(cd, "interp", "linear")))
     end
     return fx
 end
 
-function effectfromdict(d::AbstractDict)
-    t = d["type"]
-    t == "bypassed" && return effectfromdict(d["inner"])
-    t == "color" && return ColorEffect(; brightness = d["brightness"], contrast = d["contrast"],
-                                       saturation = d["saturation"], temperature = d["temperature"])
-    t == "blur" && return BlurEffect(Float32(d["sigma"]))
-    t == "sharpen" && return SharpenEffect(Float32(d["sigma"]), Float32(d["amount"]))
-    t == "opacity" && return OpacityEffect(Float32(d["alpha"]))
-    t == "restore" && return RestoreEffect(Float32(d["strength"]))
-    t == "depthblur" && return DepthBlurEffect(Float32(get(d, "focus", 1.0)),
-                                               Float32(get(d, "strength", 0.6)))
-    t == "look" && return LookEffect(Float32(get(d, "strength", 1.0)))
-    t == "matte" && return MatteEffect(Float32(d["strength"]), Float32(get(d, "feather", 0.0)))
-    t == "stabilize" && return StabilizeEffect()
-    t == "loopfinder" && return LoopFinderEffect()
-    t == "blend" && return BlendEffect(Float64(get(d, "seconds", 0.6)))
-    t == "flicker" && return FlickerEffect(Float32(get(d, "strength", 1.0)))
-    t == "transform" && return TransformEffect(scale = get(d, "scale", 1.0), x = get(d, "x", 0.0),
-                                               y = get(d, "y", 0.0), rotation = get(d, "rotation", 0.0))
-    t == "plugin" && return plugineffectfromdict(d)   # requires the plugin registered
-    error("unknown effect type: $t")
-end
 
 # ------------------------------------------------------- fixed-stack helpers
 

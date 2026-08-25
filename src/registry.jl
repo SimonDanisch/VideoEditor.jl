@@ -212,10 +212,11 @@ end
 fxkind(e::PluginEffect) = KINDCALLBACKS[e.name](e.params)
 isneutral(::PluginEffect) = false                    # a registered op applies whenever present
 effectkey(e::PluginEffect) = (PluginEffect, e.name)  # upsert per kind, not per (shared) type
-effectdict(e::PluginEffect) = Dict{String, Any}("type" => "plugin", "name" => String(e.name),
-    "params" => Dict{String, Any}(String(k) => Float64(v) for (k, v) in pairs(e.params)))
-plugineffectfromdict(d::AbstractDict) = PluginEffect(Symbol(d["name"]),
-    NamedTuple(Symbol(k) => Float64(v) for (k, v) in d["params"]))
+# No serialization of its own: a plugin is a kind like any other, so `effectdict`
+# writes its parameters and `effectfromdict` reads them back through its kind.
+# The pair that used to live here — a `"type" => "plugin"` writer and a
+# `plugineffectfromdict` reader — existed only because the format stored typed
+# payloads instead of parameters.
 
 """
 Render callback per registered kind, keyed by name.

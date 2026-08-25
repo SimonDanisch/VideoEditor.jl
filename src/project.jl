@@ -104,7 +104,7 @@ function clipdict(clip::Clip)
         "timeinterp" => String(clip.timeinterp),        # conform factor; 1.0 on native-rate clips
         "id" => string(clip.id),
         "blendfrom" => string(clip.blendfrom),
-        "effects" => [slotdict(s) for s in clip.effects],
+        "effects" => [effectdict(s) for s in clip.effects],
     )
     # stabilization tracks are part of the edit — losing an analysis on
     # save/reopen would be silently destructive
@@ -144,7 +144,7 @@ function clipdict(clip::Clip)
             "table" => Float64.(vec(clip.look)))
     end
     # NO clip-level `animations`: a curve is written inside the effect whose
-    # parameter it animates (see `slotdict`), which is where it lives in memory.
+    # parameter it animates (see `effectdict`), which is where it lives in memory.
     return cd
 end
 
@@ -187,7 +187,7 @@ function loadproject(path::AbstractString)
         haskey(cd, "id") && (clip.id = parse(UInt64, cd["id"]))
         clip.blendfrom = haskey(cd, "blendfrom") ? parse(UInt64, cd["blendfrom"]) : UInt64(0)
         for ed in get(cd, "effects", [])
-            push!(clip.effects, slotfromdict(ed))
+            push!(clip.effects, effectfromdict(ed))
         end
         # An analysis and the stack slot that applies it are attached together
         # (`setmotiontrack!`), which is also how a project written before analyses
