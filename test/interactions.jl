@@ -2119,73 +2119,76 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             notify(p.playhead); sleep(0.2)
         end
 
-        @testset "multi-track keyframes: every lane edits, Alt aims by track" begin
+        @testset "stacked tracks: only the EDITED clip's lanes take a gesture" begin
+            # THE GUARANTEE CHANGED, and this is what it is now. Lanes are drawn
+            # for the clip the cards are built from — one clip at a time — so a
+            # gesture can only ever reach that clip. The old promise ("every lane
+            # edits, Alt aims by track") described an overlay that drew every
+            # clip's curves at once and therefore had to disambiguate by band; a
+            # clip whose card is not up has no sliders and no lanes, so there is
+            # nothing to aim at.
             Makie.limits!(ax, 0.0, 4.0, 0.0, 1.0)
             press(tlx(2.0)); release(); sleep(0.2)
             fps = p.sequence.framerate
             base = VE.locate(p.sequence, p.playhead[])[1]
-            savedanims = copy(base.effects); empty!(base.effects)   # a clean V1 lane
-            # split base and stack its right half ABOVE it for this testset (restored
-            # by joinclips! at the end) — self-sufficient even on a one-clip timeline
+            savedanims = copy(base.effects); empty!(base.effects)
             c2 = VE.split!(p.sequence, base.start + (VE.clipend(base) - base.start) ÷ 2)
             c2.start = base.start; c2.track = base.track + 1
             VE.refreshedit!(p); sleep(0.3)
-            w = min(VE.clipend(base), VE.clipend(c2)) - base.start   # overlap window
-            fA = base.start + w ÷ 3                                  # model key here
-            fB = base.start + 2w ÷ 3                                 # Alt-clicks here
+            w = min(VE.clipend(base), VE.clipend(c2)) - base.start
+            fA = base.start + w ÷ 3
+            fB = base.start + 2w ÷ 3
             overt = fB / fps
-            # a known flat curve on each lane (model setup; the GESTURES are the test)
-            VE.setkey!(tcurve!(base, :temperature),
-                       base.src_in + (fA - base.start), 0.0)     # norm 0.5 → band middle
-            VE.setkey!(tcurve!(c2, :opacity),
-                       c2.src_in + (fA - c2.start), 0.5)         # ditto — the Alt aims there
-            notify(p.playhead); sleep(0.3)
+            VE.setkey!(tcurve!(base, :temperature), base.src_in + (fA - base.start), 0.0)
+            VE.setkey!(tcurve!(c2, :opacity), c2.src_in + (fA - c2.start), 0.5)
+            press(tlx(overt)); release(); sleep(0.3)     # playhead over the stack
+
+            # whichever clip the cards are bound to is the one with lanes
+            bound = p.fxwidgets[:fxbound]
+            @test bound !== nothing
+            edited = bound[1]
+            other = edited === c2 ? base : c2
+            oparam = edited === c2 ? tparam(c2, :opacity) : tparam(base, :temperature)
+            xparam = other === c2 ? tparam(c2, :opacity) : tparam(base, :temperature)
+
             ntr = VE.ntracks(p.sequence)
-            bandmid(tr) = begin
-                lo, hi = VE.trackband(tr, ntr)
-                g = min(0.02, VE.trackspan(ntr) * 0.15)
-                (lo + g + hi - g) / 2
-            end
-            bandpix(t, tr) = begin
+            lanepix(clip, prm, t) = begin
+                lo, hi = VE.trackband(clip.track, ntr)
+                g = min(0.02, VE.trackspan(ntr) * 0.15); lo += g; hi -= g
+                ins = 0.12 * (hi - lo)
+                sf = clip.src_in + (round(Int, t * fps) - clip.start)
+                y = (lo + ins) + (hi - lo - 2ins) * VE.paramnorm(prm, VE.valueat(prm, sf))
                 lims = ax.finallimits[]; vp = ax.scene.viewport[]
                 Point2f(vp.origin[1] + (t - minimum(lims)[1]) /
                             (maximum(lims)[1] - minimum(lims)[1]) * vp.widths[1],
-                        vp.origin[2] + bandmid(tr) * vp.widths[2])
+                        vp.origin[2] + y * vp.widths[2])
             end
-            # Alt-click into the UPPER band adds to c2 only (temperature curve on V1
-            # is at band middle = norm 0.5, opacity curve on V2 near band top)
-            nb = length(tcurve!(base, :temperature).keys)
-            nc = length(tcurve!(c2, :opacity).keys)
+
+            # Alt-click the edited clip's lane: its key lands, the other clip is untouched
+            ne, nx = length(oparam.curve.keys), length(xparam.curve.keys)
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.press)
-            press(bandpix(overt, c2.track)); release()
+            press(lanepix(edited, oparam, overt)); release()
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.release)
             sleep(0.3)
-            @test length(tcurve!(c2, :opacity).keys) == nc + 1
-            @test length(tcurve!(base, :temperature).keys) == nb
-            # ...and into the LOWER band adds to base only
-            nc2 = length(tcurve!(c2, :opacity).keys)
+            @test length(oparam.curve.keys) == ne + 1
+            @test length(xparam.curve.keys) == nx
+
+            # …and the other clip's band takes nothing at all — it has no lanes
+            ne2 = length(oparam.curve.keys)
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.press)
-            press(bandpix(overt, base.track)); release()
+            press(lanepix(other, xparam, overt)); release()
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.release)
             sleep(0.3)
-            @test length(tcurve!(base, :temperature).keys) == nb + 1
-            @test length(tcurve!(c2, :opacity).keys) == nc2
-            # V1's ◆ markers stay editable even though V2 is on top: drag V1's key
-            press(tlx(overt)); release(); sleep(0.2)   # playhead over the stack
-            k1 = tcurve!(base, :temperature).keys[1]
-            lo, hi = VE.trackband(base.track, ntr)
-            g = min(0.02, VE.trackspan(ntr) * 0.15); lo += g; hi -= g
-            inset = 0.12 * (hi - lo)
-            y1 = (lo + inset) + (hi - lo - 2inset) *
-                 VE.paramnorm(tparam(base, :temperature), k1.value)
-            lims = ax.finallimits[]; vp = ax.scene.viewport[]
-            mpix = Point2f(vp.origin[1] + ((base.start + (k1.frame - base.src_in)) / fps -
-                               minimum(lims)[1]) / (maximum(lims)[1] - minimum(lims)[1]) *
-                               vp.widths[1],
-                           vp.origin[2] + y1 * vp.widths[2])
+            @test length(xparam.curve.keys) == nx        # nothing keyed there
+            @test length(oparam.curve.keys) == ne2       # …and nothing leaked back
+
+            # a ◆ of the edited clip is still draggable
+            k1 = oparam.curve.keys[1]
             f0 = k1.frame
+            mpix = lanepix(edited, oparam, (edited.start + (f0 - edited.src_in)) / fps)
             press(mpix); moveto(mpix .+ Point2f(-40, 0)); release(); sleep(0.3)
-            @test any(k -> k.frame < f0, tcurve!(base, :temperature).keys)
+            @test any(k -> k.frame < f0, oparam.curve.keys)
+
             # restore the timeline: unstack the half and join it back onto base
             empty!(base.effects)
             empty!(c2.effects)

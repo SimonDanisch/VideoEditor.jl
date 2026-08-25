@@ -271,6 +271,19 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
                 get!(() -> Dict{Symbol, Any}(), player.fxwidgets, :toolpanels)[ctx.tool] = ctx
             end
         end
+        # WHAT THE CARDS ARE BOUND TO — the one answer to "which clip and which
+        # effects are being edited". The timeline lanes read this instead of
+        # asking `editclip` themselves: a card's sliders and its keyframe lane
+        # belong to the same (clip, effect), so they must not be able to disagree
+        # about which one that is.
+        player.fxwidgets[:fxbound] = clip === nothing ? nothing :
+            (clip, Effect[fx for fx in clip.effects])
+        # …and redraw the lanes from it, HERE, rather than leaving them to the
+        # playhead handler: both run on a playhead move and the order between
+        # them is not fixed, so the lanes would show the previous card set.
+        let f = get(player.fxwidgets, :kfrefresh, nothing)
+            f === nothing || f()
+        end
         colsize!(stackgl, 1, Makie.Relative(1.0))
         applyfilter()          # a rebuild must honour the filter that is showing
         fxscroll.scroll[] = keepscroll

@@ -3526,14 +3526,18 @@ function buildkeyframeoverlay!(player::Player)
 
     function refresh()
         segs = Point2f[]; pts = Point2f[]; empty!(markmeta)
-        # ONE condition: `p.visible`. Not "visible AND its card is selected" —
-        # a second, invisible condition is how a lane you turned on stays dark
-        # and you go looking for the bug in the wrong place. Selecting a card is
-        # what SETS visibility; drawing only ever reads it.
-        loc = editclip(player)
-        clip = loc === nothing ? nothing : loc[1]
+        # THE CARDS SAY WHAT IS DRAWN. `:fxbound` is what the panel built its
+        # cards from — a (clip, effects) pair. Asking `editclip` here instead
+        # would be a second route to the same answer, and two routes can
+        # disagree: a lane could be drawn for a clip that has no card, or a card
+        # could exist whose lane is nowhere.
+        #
+        # Within that, ONE condition: `p.visible`. Not "visible AND selected" —
+        # a second, invisible condition is how a lane you turned on stays dark.
+        bound = get(player.fxwidgets, :fxbound, nothing)
+        clip = bound === nothing ? nothing : bound[1]
         if clip !== nothing
-            for fx in clip.effects, p in fx.params
+            for fx in bound[2], p in fx.params
                 p.visible || continue
                 x0 = clip.start / fps; x1 = clipend(clip) / fps
                 for i in 0:60                       # the curve, sampled across the clip
@@ -3661,15 +3665,16 @@ function buildkeyframeoverlay!(player::Player)
         t, y = mouseposition(ax.scene)
         if event.button == Mouse.left && event.action == Mouse.press
             if ispressed(ax.scene, Keyboard.left_alt | Keyboard.right_alt)
-                # Resolved by time AND track band — aiming at V2 must never key V1.
-                # The same rule the drawing uses: whichever SHOWN lane you hit,
-                # on whichever clip that band belongs to. Requiring a selected
-                # card here as well would make a visible lane unclickable.
+                # THE CLIP WHOSE LANES ARE DRAWN, and no search. `refresh` draws
+                # `editclip(player)` and nothing else, so that is the only clip a
+                # lane on screen can belong to. Hunting for one by track band and
+                # time — which is what the old overlay did, because it drew every
+                # clip's curves — could land on a clip with no lanes shown at all.
+                bound = get(player.fxwidgets, :fxbound, nothing)
+                bound === nothing && return Consume(false)
+                clip = bound[1]
                 n = timelineframe(tl, t)
-                tr = trackat(y, ntracks(seq))
-                ci = findfirst(c -> c.track == tr && c.start <= n < clipend(c), seq.clips)
-                ci === nothing && return Consume(false)
-                clip = seq.clips[ci]
+                clip.start <= n < clipend(clip) || return Consume(false)
                 sf = sourceframe(clip, n)
                 p = nearestlane(clip, sf, y)
                 if p === nothing
