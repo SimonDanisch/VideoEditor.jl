@@ -9,21 +9,36 @@ per-keyframe temporal interpolation:
   - `:smooth` — a flat tangent: the value eases in AND out at the key
   - `:hold`   — a step: the value freezes until the next key
 
-The engine is parameter-agnostic: what a key's `value` means is decided
-entirely by the matching [`ParamSpec`](@ref).
+The engine is parameter-agnostic in the VALUE too: a key holds a `T`, and how
+two of them blend is [`lerp`](@ref). That is what lets a rotation be a curve of
+quaternions rather than three curves of Euler angles — interpolating a rotation
+component-wise is simply wrong, and decomposing it here would make that the only
+option.
 """
-struct Keyframe
+struct Keyframe{T}
     frame::Int
-    value::Float64
+    value::T
     ease::Symbol     # :linear · :smooth · :hold
 end
-Keyframe(frame::Integer, value::Real) = Keyframe(frame, value, :linear)
+Keyframe(frame::Integer, value) = Keyframe(Int(frame), value, :linear)
 
-mutable struct AnimCurve
-    const keys::Vector{Keyframe}
-    interp::Symbol   # legacy curve-wide default: :smooth eases EVERY key (old projects)
+mutable struct AnimCurve{T}
+    const keys::Vector{Keyframe{T}}
+    interp::Symbol   # curve-wide default: :smooth eases EVERY key
 end
-AnimCurve() = AnimCurve(Keyframe[], :linear)
+AnimCurve{T}() where {T} = AnimCurve{T}(Keyframe{T}[], :linear)
+AnimCurve() = AnimCurve{Float64}()
+
+"""
+    lerp(a, b, t) -> typeof(a)
+
+Blend two keyframe values. The ONLY thing [`valueat`](@ref) needs to know about
+a parameter's type, so a new animatable type is one method and nothing else.
+"""
+lerp(a::Real, b::Real, t::Real) = a + t * (b - a)
+lerp(a::AbstractVector, b::AbstractVector, t::Real) = a .+ t .* (b .- a)
+lerp(a::Colorant, b::Colorant, t::Real) =
+    Makie.lerp_oklab(RGBf(a), RGBf(b), Float32(t))
 
 Base.isempty(c::AnimCurve) = isempty(c.keys)
 Base.length(c::AnimCurve) = length(c.keys)
@@ -49,18 +64,23 @@ function valueat(c::AnimCurve, f::Real)
     m0 = keyease(c, a) === :smooth ? 0.0 : 1.0
     m1 = keyease(c, b) === :smooth ? 0.0 : 1.0
     h = (t^3 - 2t^2 + t) * m0 + (-2t^3 + 3t^2) + (t^3 - t^2) * m1
-    return a.value + h * (b.value - a.value)
+    # `h` is the eased position between the two keys; `lerp` is what the VALUE
+    # type says blending means. `h` may leave [0,1] at a linear corner, which is
+    # the overshoot a hermite is supposed to have — every `lerp` above is an
+    # affine combination, so that carries through unchanged.
+    return lerp(a.value, b.value, h)
 end
 
 "Insert or replace the key at `frame` (keeps `keys` sorted and the replaced
 key's ease). Returns the curve."
-function setkey!(c::AnimCurve, frame::Integer, value::Real)
+function setkey!(c::AnimCurve{T}, frame::Integer, value) where {T}
     i = findfirst(k -> k.frame == frame, c.keys)
     if i === nothing
         j = findfirst(k -> k.frame > frame, c.keys)
-        insert!(c.keys, j === nothing ? length(c.keys) + 1 : j, Keyframe(frame, value))
+        insert!(c.keys, j === nothing ? length(c.keys) + 1 : j,
+                Keyframe(Int(frame), convert(T, value), :linear))
     else
-        c.keys[i] = Keyframe(frame, value, c.keys[i].ease)
+        c.keys[i] = Keyframe(Int(frame), convert(T, value), c.keys[i].ease)
     end
     return c
 end
@@ -75,17 +95,17 @@ end
 
 "Move the key at index `i` to `(frame, value)` — its ease travels with it —
 and re-sort. Returns the curve."
-function movekey!(c::AnimCurve, i::Integer, frame::Integer, value::Real)
-    c.keys[i] = Keyframe(frame, value, c.keys[i].ease)
+function movekey!(c::AnimCurve{T}, i::Integer, frame::Integer, value) where {T}
+    c.keys[i] = Keyframe(Int(frame), convert(T, value), c.keys[i].ease)
     sort!(c.keys; by = k -> k.frame)
     return c
 end
 
 "Insert or replace the key at `frame` with an explicit ease mode."
-function setkey!(c::AnimCurve, frame::Integer, value::Real, ease::Symbol)
+function setkey!(c::AnimCurve{T}, frame::Integer, value, ease::Symbol) where {T}
     setkey!(c, frame, value)
     i = findfirst(k -> k.frame == frame, c.keys)::Int
-    c.keys[i] = Keyframe(frame, value, ease)
+    c.keys[i] = Keyframe(Int(frame), convert(T, value), ease)
     return c
 end
 
@@ -140,6 +160,52 @@ struct ParamSpec
     get::Function   # clip -> Float64
     set::Function   # (clip, value) -> nothing
 end
+
+"""
+One parameter of one effect: what it is called, what it is now, and — if it is
+animated — its curve.
+
+THE VALUE AND THE CURVE LIVE TOGETHER, and that is the whole point. They used to
+be a field on a typed effect struct and an entry in a flat `Dict{Symbol,
+AnimCurve}` on the CLIP, joined by a name and a global index. A curve therefore
+knew only a bare name, not which effect it animated, and resolution took the
+first effect of a kind: two Blur slots with one keyframe of 12 rendered
+`[(blur = 12.0,), (blur = 0.0,)]` — the second silently static, while its own
+card's slider wrote to it correctly. Slider and diamond of one row pointed at
+different objects. Holding a parameter in your hand makes that unsayable.
+
+`visible` is its lane on the timeline, and it is INDEPENDENT of `curve`: showing
+an empty lane is how you get somewhere to put the first key. Coupling the two —
+which is what a registry of animated-parameters-only forces — means you must
+keyframe something before you can see where its keyframes would go.
+
+`range` is whatever the type needs to be edited: a `(lo, hi)` for a number,
+`nothing` for a colour.
+"""
+mutable struct Param{T}
+    const name::Symbol      # as the EFFECT names it — no global uniqueness needed
+    const label::String
+    value::T
+    curve::Union{Nothing, AnimCurve{T}}
+    visible::Bool
+    const range::Any
+end
+Param(name::Symbol, label::AbstractString, value::T;
+      curve = nothing, visible = false, range = nothing) where {T} =
+    Param{T}(name, String(label), value, curve, visible, range)
+
+"Whether `p` is animated — has a curve with at least one key."
+isanimated(p::Param) = p.curve !== nothing && !isempty(p.curve)
+
+"""
+    valueat(p::Param, frame) -> T
+
+`p`'s value at `frame`: its curve where it has one, its static value otherwise.
+The static value is also the fallback for a curve that exists but is empty, so
+clearing the last key leaves the parameter where it was rather than at zero.
+"""
+valueat(p::Param, frame::Real) =
+    isanimated(p) ? something(valueat(p.curve, frame), p.value) : p.value
 
 "Fraction of the param's range (for the editor's normalized lanes), clamped to [0,1]."
 paramnorm(p::ParamSpec, v::Real) = clamp((v - p.lo) / (p.hi - p.lo), 0.0, 1.0)
