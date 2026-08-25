@@ -536,18 +536,27 @@ static fast path. The copy shares the source and analysis tracks; only `crop`
 and a copied effect stack are mutated.
 """
 function effectiveclip(clip::Clip, srcframe::Integer)
-    isempty(clip.animations) && return clip
+    any(s -> !isempty(s.animations), clip.effects) || return clip
     # own slots (same ids, same on/off) so a sampled value never writes into the
     # clip the user is editing
     ec = withfields(clip;
                     effects = [FxSlot(s.id, s.effect, s.enabled, s.links) for s in clip.effects])
-    for (key, curve) in clip.animations
-        # a project can hold a curve for a parameter this session has no effect
-        # registered for — skip it rather than fail the render
-        spec = paramspec(key, nothing)
-        spec === nothing && continue
-        v = valueat(curve, srcframe)
-        v === nothing || spec.set(ec, v)
+    for (i, slot) in enumerate(clip.effects)
+        isempty(slot.animations) && continue
+        # THIS slot's kind, so the value lands on THIS effect. Resolving a bare
+        # name through the global index instead sent every curve to the FIRST
+        # effect of its kind — two Blurs, one animated radius, and the second
+        # stayed at its static value (measured: [(blur = 12.0,), (blur = 0.0,)]).
+        kind = effectkindfor(slot.effect)
+        kind === nothing && continue
+        cur = kind.read(slot.effect)
+        changed = NamedTuple()
+        for (name, curve) in slot.animations
+            haskey(cur, name) || continue   # a curve for a parameter this kind lost
+            v = valueat(curve, srcframe)
+            v === nothing || (changed = merge(changed, NamedTuple{(name,)}((Float64(v),))))
+        end
+        isempty(changed) || (ec.effects[i].effect = kind.make(merge(cur, changed)))
     end
     return ec
 end

@@ -124,18 +124,43 @@ end
 """
 One entry in a clip's effect stack: the effect, a STABLE `id` so anything can
 point at exactly this entry (a linked card, the panel, MCP), `enabled` — the
-honest form of what wrapping an effect in `Bypassed` used to express — and any
-`links` to other slots. Several entries of the same kind may coexist; they are
-told apart by their id.
+honest form of what wrapping an effect in `Bypassed` used to express — any
+`links` to other slots, and the curves of ITS OWN parameters. Several entries of
+the same kind may coexist; they are told apart by their id.
+
+THE CURVES BELONG HERE, not on the clip — and that last sentence is why. `Clip`
+used to carry one flat
+`Dict{Symbol, AnimCurve}` for everything on it, which meant a curve knew only a
+bare name and not which effect it animated. Everything else followed from that:
+a global `key -> ParamSpec` index had to exist to make the name resolvable
+again, `registerparams!` had to fill it at registration, and resolution went
+through `findeffect`, which returns the FIRST effect of a kind.
+
+Measured on two Blur slots with one keyframe of 12 on `:blur`:
+`[(blur = 12.0,), (blur = 0.0,)]` — the first slot animates, the second silently
+keeps its static value, while each card's SLIDER writes to its own slot
+correctly. The slider and the diamond of the same row pointed at different
+objects.
+
+A curve keyed by the effect's own parameter name on the slot that owns it cannot
+be ambiguous, so none of that machinery is needed: the slot has the effect, the
+effect's kind has the parameters, and the parameter has its curve. No global is
+involved at any step.
 """
 mutable struct FxSlot
     const id::UInt64
     effect::Any        # an Effect — effects.jl is included after this file
     enabled::Bool
     const links::Vector{FxLink}
+    # parameter name (as the effect's own kind names it) -> its curve
+    const animations::Dict{Symbol, AnimCurve}
 end
-FxSlot(effect; enabled::Bool = true) = FxSlot(freshid(), effect, enabled, FxLink[])
-FxSlot(id::Integer, effect, enabled::Bool) = FxSlot(UInt64(id), effect, enabled, FxLink[])
+FxSlot(effect; enabled::Bool = true) =
+    FxSlot(freshid(), effect, enabled, FxLink[], Dict{Symbol, AnimCurve}())
+FxSlot(id::Integer, effect, enabled::Bool) =
+    FxSlot(UInt64(id), effect, enabled, FxLink[], Dict{Symbol, AnimCurve}())
+FxSlot(id::Integer, effect, enabled::Bool, links::Vector{FxLink}) =
+    FxSlot(UInt64(id), effect, enabled, links, Dict{Symbol, AnimCurve}())
 
 """
     Clip(source; src_in=0, src_out=source.nframes, start=0)

@@ -481,7 +481,32 @@ function bakedframe(ov, n::Integer, canvas::NTuple{2, Integer})
     b = bakedframes(ov)
     b === nothing && return nothing
     get(ov.settings, :bakedcanvas, nothing) == canvas || return nothing
+    bakecurrent(ov, canvas) || return nothing
     return get(b, Int(n), nothing)
+end
+
+"""
+    bakecurrent(ov, canvas) -> Bool
+
+Whether the bake still describes what would be rendered right now.
+
+THE EDIT DOES NOT DESTROY THE BAKE. Moving a keyframe used to call `unbake!` and
+throw the frames away, so the preview came back live — and the only way back to
+the baked picture was to spend the minutes again, even if you undid the edit
+immediately. Instead the frames stay exactly where they are and this asks whether
+they still apply: edit, and the fingerprint stops matching, so every frame draws
+live on the preview backend; undo, and it matches again and the bake is simply
+there. Nothing was rendered twice and nothing was lost.
+
+Same rule `loadbakes!` applies when a project opens, which is the point — a bake
+is valid exactly when it was made from what is there now, whether that question
+is asked a second or a week later. `unbake!` remains for DISCARDING one on
+purpose.
+"""
+function bakecurrent(ov, canvas::NTuple{2, Integer})
+    print = get(ov.settings, :bakedprint, nothing)
+    print isa Integer || return false          # no fingerprint, nothing to vouch for it
+    return print == bakefingerprint(ov, canvas)
 end
 
 # ------------------------------------------------- the scene's keyframable paths
@@ -550,14 +575,15 @@ function kfspec(ov::Overlay, key::Symbol)
 end
 
 """
-A curve on a scene overlay changed, so its BAKE no longer describes it.
+A curve on a scene overlay changed.
 
-Dropping it is what makes an edit visible: `bakedframe` wins over a live render,
-so without this the limb you just keyframed would keep showing its old pose and
-the panel would look broken. The frames on disk are not deleted — the fingerprint
-already refuses them, and an undo brings them back.
+Deliberately does NOT touch the bake. The frames are still good work and may
+become valid again the moment the edit is undone; what decides whether they are
+shown is [`bakecurrent`](@ref), asked per frame. Dropping them here was the first
+version, and it meant that nudging one keyframe and undoing it cost a full
+re-bake — minutes, for a scene that ended up identical.
 """
-kfchanged!(ov::Overlay) = (unbake!(ov); nothing)
+kfchanged!(::Overlay) = nothing
 
 # ---------------------------------------------------------------- in the editor
 
