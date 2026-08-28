@@ -7,13 +7,20 @@ the clip list on edits and feeds shared view observables — zooming or
 panning only updates `viewrange`/`pixelspersecond` and the recipes recompute
 their strips themselves.
 
-Interaction: left-drag scrubs and selects the clip under the cursor — and does
-nothing else, ever: a scrub cannot become a move. Ctrl+left-drag moves the clip with a translucent ghost (snap lines,
-red tint when the drop would overlap; commits on release), scroll zooms
-(x only), right-drag pans, right-click calls `onrightclick(time)`. A time
-tooltip follows the cursor; hover brightens a clip's border. Clip edges are
-trim handles: hovering one shows a handle bar, dragging it adjusts the
-in/out point (the tooltip switches to the clip's length).
+Interaction, and **where the playhead lives is the first thing to know**: the
+strip above the lanes ([`SCRUBBAND`](@ref)) scrubs, always. Pressing a CLIP
+selects it and leaves the playhead alone — picking the thing you want to work on
+must not move the frame you are working at. Empty lane space still scrubs, having
+nothing else to mean.
+
+The rest: Ctrl+left-drag moves the clip with a translucent ghost (snap lines, red
+tint when the drop would overlap; commits on release), scroll zooms (x only),
+right-drag pans, right-click calls `onrightclick(time)`. A time tooltip follows
+the cursor; hover brightens a clip's border. Clip edges are trim handles:
+hovering one shows a handle bar, dragging it adjusts the in/out point (the
+tooltip switches to the clip's length). A lane's TOP EDGE is a resize grip —
+dragging it makes that track taller, and the height is saved with the project
+(see [`settrackheight!`](@ref)).
 """
 # ---- track geometry (shared by the timeline, drag targeting, the media-bin drop
 # ghost and the keyframe overlay): lanes fill axis-y `TRACKBASE`..0.86, with an
@@ -23,14 +30,80 @@ in/out point (the tooltip switches to the clip's length).
 "Axis-y where the lanes start; below it is the drop zone for a track UNDERNEATH."
 const TRACKBASE = 0.09
 
-"Vertical share of the axis one lane takes with `ntr` stacked tracks."
-trackspan(ntr::Integer) = (0.86 - TRACKBASE) / max(ntr, 1)
+"Axis-y the lanes end at; above it is the drop zone for a track ON TOP."
+const TRACKTOP = 0.86
 
-"`(lo, hi)` axis-y band of `track` (1 = bottom) out of `ntr` lanes."
+"""
+The SCRUB STRIP: the band where the playhead can always be moved, whatever is
+selected and whatever tool is up.
+
+It sits ABOVE everything rather than taking a slice out of the lanes, which is
+why the axis runs past 1. Dragging the playhead used to be the default meaning of
+a press anywhere in the timeline, so selecting a clip to work on it moved the
+playhead too — and while trimming or dragging you had to keep clear of a gesture
+you never wanted. Now the two live in different places: this strip scrubs, the
+lanes edit.
+"""
+const SCRUBBAND = (1.0, 1.10)
+const AXISTOP = 1.12
+
+
+"How tall track `track` is drawn relative to its neighbours; 1.0 unless resized."
+trackweight(seq::Sequence, track::Integer) =
+    (1 <= track <= length(seq.trackheights)) ? max(seq.trackheights[track], 0.15) : 1.0
+
+"Axis-y the lanes have between them: the whole stack, or a soloed lane's band."
+lanearea(seq::Sequence) = seq.solo == 0 ? TRACKTOP - TRACKBASE : SOLOBAND[2] - SOLOBAND[1]
+
+"Sum of the weights of `ntr` tracks — the unit the lane heights divide."
+totalweight(seq::Sequence, ntr::Integer) = sum(trackweight(seq, t) for t in 1:max(ntr, 1))
+
+"Vertical share of the axis one lane takes with `ntr` stacked tracks, unweighted."
+trackspan(ntr::Integer) = (TRACKTOP - TRACKBASE) / max(ntr, 1)
+
+"…and what `track` actually gets once the tracks have their own heights."
+trackspan(seq::Sequence, track::Integer, ntr::Integer) =
+    (TRACKTOP - TRACKBASE) * trackweight(seq, track) / totalweight(seq, ntr)
+
+"`(lo, hi)` axis-y band of `track` (1 = bottom) out of `ntr` equally tall lanes."
 function trackband(track::Integer, ntr::Integer)
     s = trackspan(ntr)
     lo = TRACKBASE + (track - 1) * s
     return (lo, lo + s)
+end
+
+"""
+Where anything hidden goes: a band above the axis' own top, so it costs nothing
+to draw and cannot be hit. Solo parks the other lanes AND the "+ new track"
+strips here.
+
+A zero-height band at `TRACKTOP` would do neither — the clip's border stays as a
+line across the lanes, with a degenerate filmstrip image behind it.
+"""
+const HIDDENBAND = (AXISTOP + 0.4, AXISTOP + 0.5)
+
+"""
+The band a SOLOED lane fills: everything under the scrub strip.
+
+The "+ new track" drop zones go off screen with the other lanes — adding a track
+is not what you are doing while one of them is blown up to fill the window, and
+keeping their strips would leave the lane pinched between two captions about
+tracks that are not visible.
+"""
+const SOLOBAND = (0.02, 0.99)
+
+"`(lo, hi)` axis-y band of `track`, honouring the sequence's own track heights —
+or, while one track is [`solotrack!`](@ref)ed, that one filling the whole stack."
+function trackband(seq::Sequence, track::Integer, ntr::Integer)
+    if seq.solo != 0
+        return track == seq.solo ? SOLOBAND : HIDDENBAND
+    end
+    tot = totalweight(seq, ntr)
+    lo = TRACKBASE
+    for t in 1:(track - 1)
+        lo += (TRACKTOP - TRACKBASE) * trackweight(seq, t) / tot
+    end
+    return (lo, lo + (TRACKTOP - TRACKBASE) * trackweight(seq, track) / tot)
 end
 
 """
@@ -44,6 +117,118 @@ function trackat(y::Real, ntr::Integer)
     yy = Float64(y)
     yy < TRACKBASE && return 0
     return clamp(floor(Int, (yy - TRACKBASE) / trackspan(ntr)) + 1, 1, ntr + 1)
+end
+
+"…and the same with the sequence's own track heights, which is what a drop on a
+resized stack has to use."
+function trackat(seq::Sequence, y::Real, ntr::Integer)
+    yy = Float64(y)
+    if seq.solo != 0                    # the soloed lane is everything under the strip
+        return SOLOBAND[1] <= yy < SOLOBAND[2] ? seq.solo : 0
+    end
+    yy < TRACKBASE && return 0
+    yy >= TRACKTOP && return ntr + 1
+    for t in 1:ntr
+        _, hi = trackband(seq, t, ntr)
+        yy < hi && return t
+    end
+    return ntr + 1
+end
+
+"Whether axis-y `y` is in the [`SCRUBBAND`](@ref) — where a press always scrubs."
+inscrubband(y::Real) = SCRUBBAND[1] <= Float64(y) <= SCRUBBAND[2]
+
+"""
+    trackedgeat(seq, y, ntr; grab = 0.03) -> track | nothing
+
+The track whose TOP edge `y` is within `grab` of — the grip that resizes it.
+
+Only the **dividers** (`1:ntr-1`): the top lane's own upper edge is the stack's
+boundary, not a border between two lanes, and there is nothing above it to trade
+height with. The bottom lane's base is the drop zone's boundary and stays out of
+it for the same reason.
+"""
+function trackedgeat(seq::Sequence, y::Real, ntr::Integer; grab::Real = 0.03)
+    seq.solo == 0 || return nothing     # one lane, no divider to grab
+    yy = Float64(y)
+    for t in 1:(ntr - 1)
+        _, hi = trackband(seq, t, ntr)
+        abs(yy - hi) <= grab && return t
+    end
+    return nothing
+end
+
+"""
+    settrackheight!(seq, track, weight) -> seq
+
+Set one track's height weight, keeping the vector long enough to hold it. Clamped
+to a band where a lane is still both grabbable and not the whole timeline.
+"""
+function settrackheight!(seq::Sequence, track::Integer, weight::Real)
+    track >= 1 || return seq
+    while length(seq.trackheights) < track
+        push!(seq.trackheights, 1.0)
+    end
+    seq.trackheights[track] = clamp(Float64(weight), 0.25, 6.0)
+    return seq
+end
+
+"""
+    solotrack!(seq, track) -> seq
+
+Give `track` the WHOLE lane area and take the others off screen, or pass `0` to
+put the stack back. Toggled by double-clicking a lane.
+
+The scrub strip is untouched, which is the point: a curve you are editing gets
+the full height AND you can still put the playhead anywhere. Nothing is written
+to the file — see `Sequence.solo`.
+"""
+function solotrack!(seq::Sequence, track::Integer)
+    seq.solo = (1 <= track <= ntracks(seq)) ? Int(track) : 0
+    return seq
+end
+
+"""
+    lanescale(seq, ntr) -> factor >= 1
+
+How much taller the timeline panel has to be for the BIGGEST lane to keep the
+pixels an equal share would have given it.
+
+Making a lane taller is asking for ROOM TO WORK IN, so the panel gives up the
+space and the other lanes keep their pixels. Held inside the fixed row instead,
+"taller" only ever meant "squashes its neighbour" — with two tracks the one you
+enlarged gained about as much as the other lost, which is not what the gesture
+promises.
+"""
+function lanescale(seq::Sequence, ntr::Integer)
+    ntr >= 1 || return 1.0
+    tot = totalweight(seq, ntr)
+    tot > 0 || return 1.0
+    return max(1.0, ntr * maximum(t -> trackweight(seq, t), 1:ntr) / tot)
+end
+
+"""
+    settrackedge!(seq, track, y, ntr) -> seq
+
+Put the divider above `track` AT axis-y `y` — where the cursor is.
+
+Lane heights are weights, so this is a solve rather than an offset. With `u` the
+share of the stack below the edge and `S` the weights above and below the dragged
+lane, `hi(w) = TRACKBASE + H (S_below + w) / (S_below + w + S_above)` inverts to
+`w = u S_above / (1 - u) - S_below`.
+
+**Adding the drag to the weight instead — the obvious version — moves the edge by
+about a third of the cursor's travel**, because the normalisation hands most of
+what the lane gains straight back to its neighbours. Measured in the walkthrough:
+27 px of drag, 11 px of edge. A grip that lags the hand like that reads as broken
+long before anyone works out why.
+"""
+function settrackedge!(seq::Sequence, track::Integer, y::Real, ntr::Integer)
+    above = sum(t -> trackweight(seq, t), (track + 1):ntr; init = 0.0)
+    above > 0 || return seq            # the top lane's edge IS the stack's top
+    below = sum(t -> trackweight(seq, t), 1:(track - 1); init = 0.0)
+    u = clamp((Float64(y) - TRACKBASE) / (TRACKTOP - TRACKBASE), 0.02, 0.98)
+    return settrackheight!(seq, track, u * above / (1 - u) - below)
 end
 
 mutable struct Timeline
@@ -92,6 +277,11 @@ mutable struct Timeline
     ontrimend::Function                         # …and the drag is over: stop chasing it,
                                                 # or the retry publishes the edge frame
                                                 # back over the playhead on release
+    onlayout::Function                          # the lanes' TOTAL height changed — the
+                                                # panel gives up the space (see the row
+                                                # rule in the player). NOT the playhead:
+                                                # notifying that per mouse move rebuilds
+                                                # the inspector on every pixel of a drag
     refreshtask::Task
     transbox::Observable{Vector{Rect2f}}        # cross-dissolve span boxes
     transx::Observable{Vector{Point2f}}         # the bowtie X inside each box
@@ -110,19 +300,32 @@ mutable struct Timeline
     # (clipindex, t, y) of a scrub press. Only its presence is read now — Ctrl is
     # the sole way to move a clip, so a press never becomes anything but a scrub.
     presspick::Union{Nothing, Tuple{Int, Float64, Float64}}
+    # (track, how far the grab landed from that lane's top edge) while a divider
+    # is being dragged. The offset is what keeps the edge from jumping the few
+    # pixels you were off when you grabbed it.
+    resizetrack::Union{Nothing, Tuple{Int, Float64}}
+    # (wall clock, t, axis-y) of the last press in the lanes — the second one on
+    # the same spot within `wiretimelinemouse`'s `doubleclick` is a double-click,
+    # which solos the lane
+    lastclick::Union{Nothing, Tuple{Float64, Float64, Float64}}
+    scrubband::Observable{Rect2f}   # the always-live playhead strip above the lanes
     gpurun::Any   # synchronous GPU-worker runner for thumbnail decoding (nothing = CPU)
     rightpress::Any   # (t, px) of a right press — release decides menu vs pan
 
     function Timeline(gridpos, sequence::Sequence, playhead::Observable{Int},
                       playing::Observable{Bool})
         colors = timelinecolors()
+        # TICKS ON TOP, right against the scrub strip: the numbers and the band you
+        # scrub in are then one ruler, the way every editor puts it. With the ticks
+        # underneath, the one place the playhead can be moved had no scale next to
+        # it and the scale you read had nothing to do with the gesture.
         axis = Axis(gridpos; yzoomlock = true, ypanlock = true, yrectzoom = false,
                     xautolimitmargin = (0.0, 0.0), xgridvisible = false,
-                    backgroundcolor = colors.background)
+                    xaxisposition = :top, backgroundcolor = colors.background)
         hideydecorations!(axis)
         hidespines!(axis, :l, :r)
         deregister_interaction!(axis, :rectanglezoom)  # left-drag is scrubbing
-        limits!(axis, 0.0, max(seqduration(sequence), 1.0), 0.0, 1.0)
+        limits!(axis, 0.0, max(seqduration(sequence), 1.0), 0.0, AXISTOP)
 
         timeline = new(axis, sequence, Dict{VideoSource, ThumbnailCache}(),
                        playhead, Ref(false), colors,
@@ -136,7 +339,7 @@ mutable struct Timeline
                        Observable(""), Observable(Point2f(0, 0)),
                        Threads.Atomic{Bool}(true),
                        nothing, nothing, nothing, 0, 1, false, nothing, identity, identity,
-                       (_, _) -> nothing, () -> nothing)
+                       (_, _) -> nothing, () -> nothing, () -> nothing)
         timeline.gpurun = nothing
         timeline.rightpress = nothing
 
@@ -153,7 +356,7 @@ mutable struct Timeline
         translate!(phline, 0, 0, 10)
         timeline.tooltip_plot = text!(axis, timeline.tooltip_pos; text = timeline.tooltip_text,
                                       color = colors.text, fontsize = 12,
-                                      align = (:center, :top), offset = (0, -2),
+                                      align = (:center, :center),
                                       space = :data, visible = false, overdraw = true)
         translate!(timeline.tooltip_plot, 0, 0, 12)
         # cross-dissolve markers: a translucent span with a bowtie X over the cut
@@ -170,6 +373,29 @@ mutable struct Timeline
         # outline + caption; fills accent while a drag is in flight) — adding a
         # track must be visible before you know the gesture, not only during it
         timeline.presspick = nothing
+        timeline.resizetrack = nothing
+        timeline.lastclick = nothing
+        # THE SCRUB STRIP — see `SCRUBBAND`. Drawn as its own band above the lanes
+        # with the playhead's own colour, so the one place that moves the playhead
+        # is also the one place that looks like the playhead.
+        timeline.scrubband = Observable(Rect2f(0, SCRUBBAND[1], 1, SCRUBBAND[2] - SCRUBBAND[1]))
+        scrubfill = poly!(axis, timeline.scrubband;
+                          color = (colors.accent, 0.13), strokewidth = 0)
+        translate!(scrubfill, 0, 0, 2)
+        scrubedge = lines!(axis, map(r -> Point2f[(r.origin[1], r.origin[2]),
+                                                  (r.origin[1] + r.widths[1], r.origin[2])],
+                                     timeline.scrubband);
+                           color = (colors.accent, 0.5), linewidth = 1.0)
+        translate!(scrubedge, 0, 0, 3)
+        # …and it says so. The gesture MOVED — a strip that looks like decoration
+        # is a strip nobody presses. Anchored to the band's own rect, so it rides
+        # the left edge as the view pans without a second observable to keep in step.
+        scrublabel = text!(axis, map(r -> Point2f(r.origin[1], r.origin[2] + r.widths[2] / 2),
+                                     timeline.scrubband);
+                           text = "playhead — drag here", fontsize = 10,
+                           align = (:left, :center), offset = (6, 0),
+                           color = (colors.accent, 0.55))
+        translate!(scrublabel, 0, 0, 3)
         timeline.ntr = Observable(1)
         timeline.tracklabelpos = Observable{Point2f}[]
         timeline.tracklabelplots = Any[]
@@ -234,9 +460,11 @@ mutable struct Timeline
             x1 > x0 || return
             timeline.viewrange[] = (x0, x1)
             timeline.pps[] = vp.widths[1] / (x1 - x0)
-            timeline.bandheight[] = 0.84 * vp.widths[2]  # the lanes' share of the axis
-            timeline.newtrackzone[] = Rect2f(x0, 0.875, x1 - x0, 0.115)
-            timeline.newtrackzonelo[] = Rect2f(x0, 0.005, x1 - x0, TRACKBASE - 0.01)
+            # on-screen height of the WHOLE lane stack; each clip takes its lane's
+            # share of it (`bandshare`) for the tile pitch
+            timeline.bandheight[] = lanearea(timeline.sequence) / AXISTOP * vp.widths[2]
+            updatezones!(timeline)
+            timeline.scrubband[] = Rect2f(x0, SCRUBBAND[1], x1 - x0, SCRUBBAND[2] - SCRUBBAND[1])
             updatetracklabels!(timeline)                 # badges stick to the left edge
             return
         end
@@ -291,6 +519,16 @@ cachefor(timeline::Timeline, source::VideoSource) =
     get!(() -> ThumbnailCache(source; gpurun = timeline.gpurun), timeline.caches, source)
 
 """
+A source that has no file to scan has no thumbnail cache and never gets one.
+
+`nothing`, not an empty cache: a cache is a decode worker plus a ring, and
+starting one for a clip that renders its frames would spawn a thread to seek a
+file that does not exist. The band draws as a plain block instead — see
+[`thumbsfor`](@ref).
+"""
+cachefor(::Timeline, ::ClipSource) = nothing
+
+"""
 Switch thumbnail decoding to the GPU runner `f`. Caches created before the
 player's GPU worker existed (the initial sources — `relayout!` runs inside the
 Timeline constructor) restart their workers on the GPU loop; decoded thumbs
@@ -316,6 +554,21 @@ function thumbsfor(timeline::Timeline, source::VideoSource)
         thumb
     end
 end
+
+"A source with no thumbnails asks for none: its band is a plain block."
+thumbsfor(::Timeline, ::ClipSource) = _ -> nothing
+
+"""
+The thumbnail size a cache reports.
+
+A source with no cache still needs a SIZE — the filmstrip's tile pitch is
+`bandheight * (w/h) / pixelspersecond`, so a zero here divides the lane into
+infinitely many tiles and `floor(Int, NaN)` throws inside the plot. 16:9 is the
+honest stand-in: there are no thumbnails to be the wrong shape, and the band is
+drawn as one plain block at that pitch.
+"""
+thumbdims(cache) = (cache.thumbwidth, cache.thumbheight)
+thumbdims(::Nothing) = (16, 9)
 
 function timelineframe(timeline::Timeline, t::Real)
     return clamp(round(Int, t * timeline.sequence.framerate), 0,
@@ -344,7 +597,7 @@ function relayout!(timeline::Timeline)
                         strokecolor_idle = timeline.colors.border,
                         strokecolor_hovered = timeline.colors.accent_subtle,
                         strokecolor_selected = timeline.colors.accent,
-                        thumbsize = (cache.thumbwidth, cache.thumbheight))
+                        thumbsize = thumbdims(cache))
         push!(timeline.clipplots, plt)
         push!(timeline.clipranges, rng)
         push!(timeline.clipstarts, srcstart)
@@ -362,28 +615,51 @@ function relayout!(timeline::Timeline)
     sel = filter(i -> 1 <= i <= length(seq.clips), timeline.selection[])
     length(sel) == length(timeline.selection[]) || (timeline.selection[] = sel)
     ntr = ntracks(seq)
-    g = min(0.02, trackspan(ntr) * 0.15)    # gap between stacked tracks
+    g = min(0.02, trackspan(ntr) * 0.15)    # gap between stacked tracks (of an EQUAL lane:
+                                            # a resized one keeps the same gutter)
     for (i, clip) in enumerate(seq.clips)
         timeline.clipranges[i][] = (clip.start / fps, clipend(clip) / fps)
         timeline.clipstarts[i][] = clip.src_in / clip.source.framerate
         # higher track sits higher up the axis (on top)
-        lo, hi = trackband(clip.track, ntr)
+        lo, hi = trackband(seq, clip.track, ntr)
         timeline.clipplots[i].bandlo = lo + g
         timeline.clipplots[i].bandhi = hi - g
-        timeline.clipplots[i].ntracks = ntr
+        # the filmstrip's tile pitch is per LANE, not per stack: a resized track
+        # gets bigger frames, not the same ones pulled tall
+        timeline.clipplots[i].bandshare = (hi - lo) / lanearea(seq)
         if timeline.plotsources[i] !== clip.source  # edits shift clips across plots
             timeline.plotsources[i] = clip.source
             cache = cachefor(timeline, clip.source)
             timeline.clipplots[i].thumbs = thumbsfor(timeline, clip.source)
-            timeline.clipplots[i].thumbsize = (cache.thumbwidth, cache.thumbheight)
+            timeline.clipplots[i].thumbsize = thumbdims(cache)
         end
     end
     timeline.ntr[] = ntr
+    updatezones!(timeline)
     updatetracklabels!(timeline)
     prunetransitions!(seq)
     refreshtransitions!(timeline)
     cliplimits!(timeline)
     setstates!(timeline)
+    return nothing
+end
+
+"""
+The "+ new track" drop strips, above the lanes and below them — pinned to the
+view's left edge, and OFF SCREEN while a lane is soloed: the soloed lane fills
+their space (see [`SOLOBAND`](@ref)), and a caption about adding a track next to
+one blown-up lane is an offer for a gesture that has nowhere to land.
+"""
+function updatezones!(timeline::Timeline)
+    x0, x1 = timeline.viewrange[]
+    w = x1 - x0
+    if timeline.sequence.solo != 0
+        timeline.newtrackzone[] = Rect2f(x0, HIDDENBAND[1], w, 0.02)
+        timeline.newtrackzonelo[] = Rect2f(x0, HIDDENBAND[1], w, 0.02)
+    else
+        timeline.newtrackzone[] = Rect2f(x0, 0.875, w, 0.115)
+        timeline.newtrackzonelo[] = Rect2f(x0, 0.005, w, TRACKBASE - 0.01)
+    end
     return nothing
 end
 
@@ -402,15 +678,27 @@ function updatetracklabels!(timeline::Timeline)
     end
     (x0, _) = timeline.viewrange[]
     xpad = 8 / max(timeline.pps[], 1.0e-9)
-    span = trackspan(ntr)
+    seq = timeline.sequence
     for (k, pl) in enumerate(timeline.tracklabelplots)
         show = k <= ntr
         pl.visible = show
         show || continue
-        timeline.tracklabelpos[k][] = Point2f(x0 + xpad, 0.02 + (k - 0.5) * span)
+        # the badge rides its lane's OWN band — with per-track heights the equal
+        # share it used to be computed from is not where the lane is. A soloed
+        # lane says so, and the hidden ones' badges go off screen with them.
+        lo, hi = trackband(seq, k, ntr)
+        # the way OUT of solo has to be on screen: the other lanes are gone, and
+        # nothing else says the double-click is a toggle
+        pl.text[] = seq.solo == k ? "V$k · solo — double-click to show all tracks" : "V$k"
+        timeline.tracklabelpos[k][] = Point2f(x0 + xpad, (lo + hi) / 2)
     end
-    timeline.zonelabelpos[] = Point2f(x0 + xpad, 0.9325)
-    timeline.zonelabelposlo[] = Point2f(x0 + xpad, TRACKBASE / 2)
+    if seq.solo == 0
+        timeline.zonelabelpos[] = Point2f(x0 + xpad, 0.9325)
+        timeline.zonelabelposlo[] = Point2f(x0 + xpad, TRACKBASE / 2)
+    else                                    # …the captions leave with their strips
+        timeline.zonelabelpos[] = Point2f(x0 + xpad, HIDDENBAND[1])
+        timeline.zonelabelposlo[] = Point2f(x0 + xpad, HIDDENBAND[1])
+    end
     return nothing
 end
 
@@ -441,7 +729,7 @@ function cliplimits!(timeline::Timeline)
     x0, x1 = minimum(lims)[1], maximum(lims)[1]
     x1 > dur * 1.05 || return nothing
     newx1 = dur * 1.03  # a sliver of headroom keeps the last clip edge grabbable
-    limits!(timeline.axis, max(0.0, newx1 - (x1 - x0)), newx1, 0.0, 1.0)
+    limits!(timeline.axis, max(0.0, newx1 - (x1 - x0)), newx1, 0.0, AXISTOP)
     return nothing
 end
 
@@ -457,8 +745,46 @@ end
 
 # ------------------------------------------------------------------ mouse
 
-function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
+function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int};
+                           doubleclick::Real = 0.4)
     axis, seq = timeline.axis, timeline.sequence
+    # DOUBLE-CLICK A LANE = SOLO IT: that lane fills the whole stack, the others go
+    # off screen. The scrub strip sits above the lanes and is untouched, so the
+    # playhead is still yours. Double-click again to put the stack back.
+    #
+    # ABOVE THE KEYFRAME OVERLAY (priority 20), which consumes a press that lands
+    # on a ◆ — and a lane carpeted in anchors is exactly the one worth blowing up,
+    # so at the timeline's own priority the gesture never arrived. Everything else
+    # passes straight through: this handler consumes the second click and nothing
+    # else.
+    on(events(axis.scene).mousebutton; priority = 30) do event
+        event.button == Mouse.left || return Consume(false)
+        is_mouseinside(axis.scene) || return Consume(false)
+        t, ypos = mouseposition(axis.scene)
+        ntr = ntracks(seq)
+        tr = (TRACKBASE <= ypos < TRACKTOP) ? trackat(seq, ypos, ntr) : 0
+        if event.action == Mouse.press
+            1 <= tr <= ntr || return Consume(false)
+            last = timeline.lastclick
+            if last !== nothing && time() - last[1] < doubleclick &&
+               abs(t - last[2]) * timeline.pps[] < 6 && abs(ypos - last[3]) < grabzone(timeline)
+                timeline.lastclick = nothing
+                solotrack!(seq, seq.solo == 0 ? tr : 0)
+                timeline.onlayout()
+                relayout!(timeline)
+                return Consume(true)
+            end
+            timeline.lastclick = (time(), Float64(t), Float64(ypos))
+        elseif event.action == Mouse.release && timeline.lastclick !== nothing
+            # A CLICK THAT MOVED IS NOT A CLICK. Without this, a press, a drag and
+            # a press back at the start counted as a double-click — scrub away from
+            # a clip, touch it again, and the lane soloed itself.
+            lc = timeline.lastclick
+            (abs(t - lc[2]) * timeline.pps[] < 6 && abs(ypos - lc[3]) < grabzone(timeline)) ||
+                (timeline.lastclick = nothing)
+        end
+        return Consume(false)
+    end
     on(events(axis.scene).mousebutton) do event
         if event.button == Mouse.right
             # right-DRAG pans the view (the axis interaction) — the clip menu
@@ -485,10 +811,25 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
         if event.action == Mouse.press && is_mouseinside(axis.scene)
             t, ypos = mouseposition(axis.scene)
             n = timelineframe(timeline, t)
+            # THE STRIP SCRUBS, ALWAYS — whatever is selected, whatever is up.
+            if inscrubband(ypos)
+                timeline.presspick = (0, Float64(t), Float64(ypos))
+                n == playhead[] || (playhead[] = n)
+                return Consume(true)
+            end
+            # …and a lane's top edge is the grip that makes it taller
+            let ntr = ntracks(seq)
+                te = trackedgeat(seq, ypos, ntr; grab = grabzone(timeline))
+                if te !== nothing
+                    timeline.onedit()
+                    timeline.resizetrack = (te, Float64(ypos) - trackband(seq, te, ntr)[2])
+                    return Consume(true)
+                end
+            end
             # the clip you POINT AT: on stacked lanes that is the one in the band
             # under the cursor, not the topmost — the preview shows the upper clip,
             # but the lower one has to be selectable (and thus editable) too
-            lane = clipat(seq, n, trackat(ypos, ntracks(seq)))
+            lane = clipat(seq, n, trackat(seq, ypos, ntracks(seq)))
             i = lane === nothing ? clipat(seq, n) : lane
             # Shift+click MARKS clips (toggle in the multi-selection) without
             # scrubbing; a plain click collapses the marks to the one clip
@@ -514,19 +855,30 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
                 timeline.selected[] = edge[1]
                 timeline.onedit()
                 timeline.trimclip = (seq.clips[edge[1]], edge[2], edge[1])
-            else
-                # a press alone is a CLICK, not yet a scrub — `presspick` says the
-                # button is down on the ruler (and what it landed on: dragging OUT
-                # of that clip's lane converts the scrub into a clip move, no Ctrl
-                # needed); `scrubbing` turns on at the first move, so a click gets
-                # the exact frame instead of the decoder's stand-ins
-                timeline.presspick = (something(i, 0), Float64(t), Float64(ypos))
+            elseif i === nothing
+                # EMPTY LANE SPACE still scrubs: there is nothing to edit there, so
+                # the gesture has only one sensible meaning. `presspick` says the
+                # button is down; `scrubbing` turns on at the first move, so a click
+                # gets the exact frame instead of the decoder's stand-ins.
+                timeline.presspick = (0, Float64(t), Float64(ypos))
                 n == playhead[] || (playhead[] = n)
             end
+            # ON A CLIP: select it and leave the playhead where it is. Pressing a
+            # clip used to scrub as well, so picking the thing you wanted to work
+            # on moved the frame you were working at — and every trim or drag
+            # started with a jump you had to undo by scrubbing back. The strip
+            # above the lanes is where a deliberate scrub lives now.
             return Consume(true)
         elseif event.action == Mouse.release
             timeline.scrubbing[] = false
             timeline.presspick = nothing
+            if timeline.resizetrack !== nothing
+                timeline.resizetrack = nothing
+                # THE PANEL GROWS ON RELEASE, not per mouse move: the row's height
+                # decides how many pixels an axis-y is, so growing it mid-drag pulls
+                # the divider out from under the cursor it is supposed to follow.
+                timeline.onlayout()
+            end
             finishdrag!(timeline)
             if timeline.trimclip !== nothing
                 timeline.trimclip = nothing
@@ -550,7 +902,16 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
             vp = axis.scene.viewport[]
             dt = (mp[1] - px0[1]) / max(vp.widths[1], 1) * (lims0[2] - lims0[1])
             abs(mp[1] - px0[1]) > 3 &&
-                limits!(axis, lims0[1] - dt, lims0[2] - dt, 0.0, 1.0)
+                limits!(axis, lims0[1] - dt, lims0[2] - dt, 0.0, AXISTOP)
+            return Consume(true)
+        end
+        if timeline.resizetrack !== nothing
+            # DRAGGING A DIVIDER: the edge goes where the cursor is, which for
+            # weights is a solve — see `settrackedge!`.
+            t, grab = timeline.resizetrack
+            settrackedge!(seq, t, mouseposition(axis.scene)[2] - grab, ntracks(seq))
+            relayout!(timeline)
+            laneedgemark!(timeline, t)   # the grip stays under the cursor while dragging
             return Consume(true)
         end
         if timeline.dragclip !== nothing
@@ -579,14 +940,17 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int})
             timeline.scrubbing[] = true    # the press became a drag
             n == playhead[] || (playhead[] = n)
         elseif inside
-            hoverat!(timeline, mouseposition(axis.scene)[1])
+            mp = mouseposition(axis.scene)
+            hoverat!(timeline, mp[1], mp[2])
         end
         if inside
             t = clamp(mouseposition(axis.scene)[1], 0.0, seqduration(seq))
             trim = timeline.trimclip
             timeline.tooltip_text[] = trim === nothing ? timestring(t) :
                                       "clip " * timestring(cliplength(trim[1]) / seq.framerate)
-            timeline.tooltip_pos[] = Point2f(t, 1.0)
+            # the time readout rides IN the scrub strip — that band is the ruler now,
+            # and hung under it the text landed on the "+ new track" caption
+            timeline.tooltip_pos[] = Point2f(t, (SCRUBBAND[1] + SCRUBBAND[2]) / 2)
             timeline.tooltip_plot.visible = true
         else
             timeline.tooltip_plot.visible = false
@@ -605,6 +969,18 @@ end
 
 "Half-width of the clip-edge trim grab zone, in seconds at the current zoom."
 edgezone(timeline::Timeline) = 12 / max(timeline.pps[], 1.0e-9)
+
+"""
+    grabzone(timeline; px = 6) -> axis-y half-width of the lane-edge grip
+
+A grab zone is a GESTURE, so it has to be a constant number of PIXELS. Written as
+a constant in axis units it silently depends on the window: the timeline axis is
+around 200 px tall here, where [`trackedgeat`](@ref)'s own fallback works out to
+some six pixels — but on a taller window the same number is a grip nobody can hit.
+"""
+function grabzone(timeline::Timeline; px::Real = 6)
+    return AXISTOP * px / max(timeline.axis.scene.viewport[].widths[2], 1)
+end
 
 """
 The trim edge within grab range of time `t`: `(clipindex, :left/:right)`, or
@@ -633,7 +1009,22 @@ function edgeat(timeline::Timeline, t::Real)
 end
 
 "Hover feedback: brighten the border of the clip under the cursor (the edge's
-clip when a trim handle is grabbable), and mark that edge with a handle bar."
+clip when a trim handle is grabbable), and mark that edge with a handle bar.
+
+With `y`, a lane's top edge takes precedence and shows the resize grip instead —
+the same order the press handler decides in, so what is drawn and what a press
+does can never disagree."
+function hoverat!(timeline::Timeline, t::Real, y::Real)
+    seq = timeline.sequence
+    te = trackedgeat(seq, y, ntracks(seq); grab = grabzone(timeline))
+    if te !== nothing
+        laneedgemark!(timeline, te)
+        timeline.hovered[] == 0 || (timeline.hovered[] = 0; setstates!(timeline))
+        return nothing
+    end
+    return hoverat!(timeline, t)
+end
+
 function hoverat!(timeline::Timeline, t::Real)
     edge = edgeat(timeline, t)
     hovered = edge !== nothing ? edge[1] :
@@ -660,6 +1051,16 @@ function edgemark!(timeline::Timeline, edge)
     return nothing
 end
 
+"The lane-resize grip where a press would grab it: a bar across the view at that
+lane's top edge. It shares the trim handle's plot — the two grips live in
+different directions and can never both be under the cursor."
+function laneedgemark!(timeline::Timeline, track::Integer)
+    _, hi = trackband(timeline.sequence, track, ntracks(timeline.sequence))
+    x0, x1 = timeline.viewrange[]
+    timeline.edgeline[] = Point2f[Point2f(x0, hi), Point2f(x1, hi)]
+    return nothing
+end
+
 "Ctrl-drag: move a translucent ghost to the (snapped) drop position; cursor height
 picks the target track (drag above the top row to create a new one)."
 function dragto!(timeline::Timeline, t::Real, y::Real = NaN)
@@ -681,7 +1082,7 @@ function dragto!(timeline::Timeline, t::Real, y::Real = NaN)
     # target track from cursor height (bands match relayout!); the marked zone
     # above the top lane targets a NEW track
     ntr = ntracks(seq)
-    track = isnan(y) ? clip.track : trackat(y, ntr)
+    track = isnan(y) ? clip.track : trackat(seq, y, ntr)
     # A drop onto an occupied lane is REFUSED, not relocated.
     #
     # It used to ride upward looking for a free lane, which made moving a clip
@@ -704,7 +1105,7 @@ function dragto!(timeline::Timeline, t::Real, y::Real = NaN)
     # reads as "it will land on V1" — the opposite of what the drop does.
     n2 = max(ntr, track)
     g = min(0.02, trackspan(n2) * 0.15)
-    lo, hi = track == 0 ? (0.008, TRACKBASE - 0.013) : trackband(track, n2)
+    lo, hi = track == 0 ? (0.008, TRACKBASE - 0.013) : trackband(seq, track, n2)
     lo += g; hi -= g
     timeline.ghost_rect[] = Rect2f(snapped / fps, lo, cliplength(clip) / fps, hi - lo)
     timeline.ghost_color[] = timeline.dragvalid ? (timeline.colors.accent_subtle, 0.55) :
@@ -717,7 +1118,7 @@ function dragto!(timeline::Timeline, t::Real, y::Real = NaN)
     # lane simply refused clips, rather than refusing THIS one HERE. One label
     # carries both messages, so there is never more than one hint on screen.
     if !timeline.dragvalid
-        lo2, hi2 = trackband(track, n2)
+        lo2, hi2 = trackband(seq, track, n2)
         timeline.newtrackpos[] = Point2f(snapped / fps + cliplength(clip) / fps / 2,
                                          (lo2 + hi2) / 2)
         # a VECTOR, matching how the plot was created: Makie type-locks an

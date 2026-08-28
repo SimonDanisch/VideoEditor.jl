@@ -2,19 +2,25 @@
     saveproject(path, seq; checkpoint = true) -> path
     loadproject(path) -> Sequence
 
-A project file is JSON of the edit metadata — source paths, in/out points,
-timeline positions, crops, effects, analyses. Sources are re-probed on load, so
-the file stays small and readable; matte alpha, the one thing too big for text,
-sits next to it as raw planes.
+A project file is the edit metadata — source paths, in/out points, timeline
+positions, crops, effects, analyses — as MessagePack. Sources are re-probed on
+load, so the file holds no pixels; matte alpha, the one thing per-frame enough to
+matter, sits next to it as raw planes.
 
-JSON rather than TOML because a project is a tree — clips holding effects holding
-parameters — and TOML says that in table-array syntax nobody reads twice. A
-project file is something you may have to open in an editor at 2am.
+MessagePack rather than JSON because most of a real project is not the edit but
+per-frame ANALYSIS. One hour of stabilization and colour tracking on ONE clip is
+108 000 `Mat3f` and 216 000 `Vec3f`, and measured on exactly that:
+
+    JSON                             52.4 MB   write 1.87 s   read 0.30 s
+    MessagePack, numbers as numbers  14.9 MB   write 0.08 s   read 0.19 s
+    …with the analysis tracks raw     6.5 MB   write 0.00 s   read 0.05 s
+
+Nothing about the tree changed — see pack.jl for how a type says what it is. The
+saving is that a number stops being decimal text: `0.20000000298023224` was
+nineteen bytes for a `Float32` that JSON could not represent in the first place.
 
 Writing is ATOMIC (write a temp, rename) and keeps the previous version as a
 checkpoint: an interrupted save must not be able to destroy the last good one.
-TOML projects still LOAD — the format is sniffed, not assumed — so older files
-keep working.
 """
 function saveproject(path::AbstractString, seq::Sequence; checkpoint::Bool = true)
     dict = Dict{String, Any}(
@@ -27,7 +33,6 @@ function saveproject(path::AbstractString, seq::Sequence; checkpoint::Bool = tru
         [Dict{String, Any}("kind" => String(t.kind), "at" => t.at, "duration" => t.duration)
          for t in seq.transitions])
     # overlays are edits like any other — a lost title is a lost edit
-    isempty(seq.overlays) || (dict["overlays"] = [overlaydict(ov) for ov in seq.overlays])
     # …and the transcript, for the same reason: a corrected caption is an edit,
     # and re-running Whisper to get it back costs minutes.
     # …and the narration's WORDS. The samples are a cache of them and would be
@@ -35,6 +40,9 @@ function saveproject(path::AbstractString, seq::Sequence; checkpoint::Bool = tru
     # The canvas, when it has been set — the crop tool's output size.
     seq.canvas === nothing ||
         (dict["canvas"] = [seq.canvas[1], seq.canvas[2]])
+    # …and how tall each track was made. Only written once somebody has resized
+    # one, so a project nobody laid out by hand reads and writes exactly as before.
+    isempty(seq.trackheights) || (dict["trackheights"] = copy(seq.trackheights))
     isempty(seq.narration) ||
         (dict["narration"] = [Dict{String, Any}("text" => n.text, "at" => n.at,
                                                 "voice" => n.voice) for n in seq.narration])
@@ -43,12 +51,12 @@ function saveproject(path::AbstractString, seq::Sequence; checkpoint::Bool = tru
                                                "text" => c.text) for c in seq.captions])
     checkpoint && checkpointproject(path)
     tmp = path * ".part"
-    open(io -> JSON.print(io, dict, 2), tmp, "w")
+    open(io -> write(io, MsgPack.pack(dict)), tmp, "w")
     mv(tmp, path; force = true)          # atomic: a half-written file never replaces the good one
     savemattes(path, seq)
-    # …and the baked scene frames, for the same reason: minutes of raytracing is
-    # an edit's output, not something to recompute on every open. Defined in
-    # scenerender.jl, which loads after this file — resolved at call time.
+    # …and the baked frames, for the same reason: minutes of raytracing is an
+    # edit's OUTPUT, not something to recompute on every open. Defined in bake.jl,
+    # which loads after this file — resolved at call time.
     savebakes(path, seq)
     return path
 end
@@ -75,7 +83,13 @@ function checkpointproject(path::AbstractString)
     end
     keep = sort!(readdir(dir))
     for old in keep[1:max(0, length(keep) - CHECKPOINTS)]
-        try; rm(joinpath(dir, old); force = true); catch; end
+        # a checkpoint that will not go is worth ONE line, not silence: the
+        # directory then grows without bound and nothing ever says why
+        try
+            rm(joinpath(dir, old); force = true)
+        catch e
+            @warn "could not remove an old project checkpoint" file = old exception = (e, catch_backtrace())
+        end
     end
     return dir
 end
@@ -91,47 +105,88 @@ function projectcheckpoints(path::AbstractString)
     return [joinpath(dir, f) for f in sort!(readdir(dir))]
 end
 
+"""
+How a clip's SOURCE is written: a path for a file, the format for a scene.
+
+A scene clip has no media on disk — what it draws is a `SceneSpec` on its `:scene`
+effect, which goes out through the ordinary effect writer like every other
+parameter. All the file needs is how big its frames are and how many.
+"""
+sourcedict(s::VideoSource) = Dict{String, Any}("source" => s.path)
+sourcedict(s::SceneSource) = Dict{String, Any}(
+    "source" => "", "scene" => Dict{String, Any}(
+        "width" => s.width, "height" => s.height,
+        "framerate" => s.framerate, "nframes" => s.nframes,
+        "backend" => String(s.backend), "bakewith" => String(s.bakewith),
+        "build" => s.build))
+
+"The inverse: a source from what the file says about it."
+function sourcefromdict(cd::AbstractDict, sources::Dict{String, VideoSource})
+    sd = get(cd, "scene", nothing)
+    if sd !== nothing
+        build = get(sd, "build", nothing)
+        built = build === nothing ?
+                plainscene(Makie.SpecApi.Scene(; camera = Makie.cam3d!)) :
+                buildscene(build)
+        return SceneSource(built.root; joints = built.joints, camera = built.camera,
+                           build = build,
+                           backend = Symbol(get(sd, "backend", "GLMakie")),
+                           bakewith = Symbol(get(sd, "bakewith", "auto")),
+                           width = Int(get(sd, "width", 1920)),
+                           height = Int(get(sd, "height", 1080)),
+                           framerate = Float64(get(sd, "framerate", 30.0)),
+                           nframes = Int(get(sd, "nframes", 90)))
+    end
+    path = String(cd["source"])
+    return get!(() -> VideoSource(path), sources, path)
+end
+
 function clipdict(clip::Clip)
-    cd = Dict{String, Any}(
-        "source" => clip.source.path,
+    cd = merge(sourcedict(clip.source), Dict{String, Any}(
         "src_in" => clip.src_in,
         "src_out" => clip.src_out,
         "start" => clip.start,
         "track" => clip.track,
         "crop" => collect(clip.crop),
-        "rate" => clip.rate,
+        "rate" => clip.rate,                            # conform factor; 1.0 on native-rate clips
         # …and how it fills the frames between: an edit, not a cache
-        "timeinterp" => String(clip.timeinterp),        # conform factor; 1.0 on native-rate clips
-        "id" => string(clip.id),
-        "blendfrom" => string(clip.blendfrom),
-        "effects" => [effectdict(s) for s in clip.effects],
-    )
+        "timeinterp" => String(clip.timeinterp),
+        # ids go as themselves. JSON has one number type and it is `Float64`, so
+        # a `UInt64` id had to be written as its decimal STRING to survive the
+        # round trip; MessagePack has unsigned integers.
+        "id" => clip.id,
+        # …and the effects go as themselves too — see pack.jl.
+        "effects" => clip.effects,
+    ))
     # stabilization tracks are part of the edit — losing an analysis on
-    # save/reopen would be silently destructive
+    # save/reopen would be silently destructive. `packvec` writes the whole track
+    # as one Float32 block: this is the field that decides what a project of any
+    # length costs to open.
     if clip.motiontrack !== nothing
+        mt = clip.motiontrack
         cd["motiontrack"] = Dict{String, Any}(
-            "src_in" => clip.motiontrack.src_in,
-            "mode" => String(clip.motiontrack.mode),
-            "transforms" => [vec(Float64.(collect(M))) for M in clip.motiontrack.transforms])
-        clip.motiontrack.basecrop === nothing ||
-            (cd["motiontrack"]["basecrop"] = collect(clip.motiontrack.basecrop))
+            "src_in" => mt.src_in,
+            "mode" => String(mt.mode),
+            "transforms" => packvec(mt.transforms))
+        mt.basecrop === nothing || (cd["motiontrack"]["basecrop"] = collect(mt.basecrop))
     end
     if clip.colortrack !== nothing
+        ct = clip.colortrack
         cd["colortrack"] = Dict{String, Any}(
-            "src_in" => clip.colortrack.src_in,
-            "strength" => Float64(clip.colortrack.strength),
-            "gains" => [Float64.(collect(g)) for g in clip.colortrack.gains],
-            "offsets" => [Float64.(collect(o)) for o in clip.colortrack.offsets])
+            "src_in" => ct.src_in,
+            "strength" => Float64(ct.strength),
+            "gains" => packvec(ct.gains),
+            "offsets" => packvec(ct.offsets))
     end
     # The matte's SEEDS are the edit and go in the project file; the propagated
     # alpha is a cache and goes to a sidecar, because a clip's worth of per-frame
-    # mattes has no business inside a TOML and losing it costs a recompute rather
-    # than an edit.
+    # mattes has no business inside the project file and losing it costs a
+    # recompute rather than an edit.
     if clip.mattetrack !== nothing
         t = clip.mattetrack
         cd["matte"] = Dict{String, Any}(
-            "src_in" => t.src_in, "seeds" => t.seeds,
-            "size" => collect(Int.(size(t.alpha))))
+            "src_in" => t.src_in, "seeds" => collect(Int64, t.seeds),
+            "size" => collect(Int64, size(t.alpha)))
     end
     # The learned look, on the same terms as the stabilization track above: it is
     # an ANALYSIS but not a cache. Re-learning it is not the same operation —
@@ -141,53 +196,59 @@ function clipdict(clip::Clip)
     if clip.look !== nothing
         cd["look"] = Dict{String, Any}(
             "dim" => size(clip.look, 1),
-            "table" => Float64.(vec(clip.look)))
+            # stays Float32 — it IS a Float32 table — and goes raw: `dim`³×3
+            "table" => Block(vec(clip.look)))
     end
+    # The bake: where it is is derived from the project path on load, so only
+    # what it covers and whether it is on go in the file.
+    clip.bake === nothing || (cd["bake"] = bakedict(clip.bake))
     # NO clip-level `animations`: a curve is written inside the effect whose
-    # parameter it animates (see `effectdict`), which is where it lives in memory.
+    # parameter it animates, which is where it lives in memory.
     return cd
 end
 
-"""
-Parse a project file, whatever it was written as.
-
-Sniffed, not assumed: JSON starts with `{`. Projects written before the format
-moved to JSON are TOML and still open — a file format change must not strand the
-edits somebody already saved.
-"""
-function readprojectdict(path::AbstractString)
-    txt = read(path, String)
-    return startswith(lstrip(txt), "{") ? JSON.parse(txt) : TOML.parse(txt)
-end
-
 function loadproject(path::AbstractString)
-    dict = readprojectdict(path)
-    missing_sources = unique(String[cd["source"] for cd in dict["clips"] if !isfile(cd["source"])])
+    # `decodeblocks` first, so nothing below this line has to know that a numeric
+    # array may have been written as raw bytes — see pack.jl.
+    dict = decodeblocks(MsgPack.unpack(read(path)))
+    # A scene clip has no file to be missing (its `"source"` is empty).
+    missing_sources = unique(String[cd["source"] for cd in dict["clips"]
+                                    if !isempty(get(cd, "source", "")) && !isfile(cd["source"])])
     isempty(missing_sources) ||
         error("project references missing video file(s):\n  " * join(missing_sources, "\n  ") *
               "\nMove them back (or edit the paths in $path) and reload.")
     sources = Dict{String, VideoSource}()
+    # `saveproject` writes every field below, but the reader takes a DEFAULT for
+    # each one it can. A project file is meant to be writable by a script — an
+    # agent placing clips does not want to spell out `timeinterp` to say nothing
+    # — so the minimum is a source and a range, and everything else means what
+    # a freshly dropped clip means.
     clips = map(dict["clips"]) do cd
-        source = get!(() -> VideoSource(cd["source"]), sources, cd["source"])
-        # files written before conforming existed hold only native-rate clips
+        source = sourcefromdict(cd, sources)
         clip = Clip(source, cd["src_in"], cd["src_out"], cd["start"],
-                    Tuple(Float64.(cd["crop"])), Float64(get(cd, "rate", 1.0)),
-                    # a 3-tuple here is a project saved before rotation existed
-                    reframe4(Tuple(Float64.(get(cd, "reframe", collect(NEUTRALFRAME))))))
+                    NTuple{4, Float64}(get(cd, "crop", (0.0, 0.0, 1.0, 1.0))),
+                    Float64(get(cd, "rate", 1.0)))
         clip.track = Int(get(cd, "track", 1))
-        # Files written before optical flow existed hold no mode and mean `:sample`,
-        # which is what every editor does without a model. Validated rather than
-        # trusted: the value picks a source node, and an unrecognised one would
-        # silently mean `:sample` forever with no way to notice.
+        # Validated rather than trusted: the value picks a source node, and an
+        # unrecognised one would silently mean `:sample` forever with no way to
+        # notice.
         ti = Symbol(get(cd, "timeinterp", "sample"))
         clip.timeinterp = ti in (:sample, :flow) ? ti : :sample
         # ids are part of the edit: a blend points at its partner by id, and the
-        # inspector at a stack entry. Files written before ids existed simply keep
-        # the fresh ones the constructor handed out.
-        haskey(cd, "id") && (clip.id = parse(UInt64, cd["id"]))
-        clip.blendfrom = haskey(cd, "blendfrom") ? parse(UInt64, cd["blendfrom"]) : UInt64(0)
-        for ed in get(cd, "effects", [])
-            push!(clip.effects, effectfromdict(ed))
+        # inspector at a stack entry. A file that names none keeps the fresh one
+        # the constructor handed out.
+        haskey(cd, "id") && (clip.id = UInt64(cd["id"]))
+        # A project written when the pairing was a clip field: it becomes an edge
+        # on the opacity parameter once the effects are in (below).
+        oldpair = UInt64(get(cd, "blendfrom", 0))
+        for ed in get(cd, "effects", ())
+            addslot!(clip, MsgPack.from_msgpack(Effect, ed))
+        end
+        # …and now the old clip-level pairing has somewhere to go.
+        if oldpair != 0
+            prm = opacityparam(clip)
+            prm === nothing ||
+                (prm.input = ParamInput(:pairedwith, ParamRef(:opacity; clip = oldpair)))
         end
         # An analysis and the stack slot that applies it are attached together
         # (`setmotiontrack!`), which is also how a project written before analyses
@@ -195,27 +256,30 @@ function loadproject(path::AbstractString)
         if haskey(cd, "motiontrack")
             mt = cd["motiontrack"]
             setmotiontrack!(clip, MotionTrack(
-                [Mat3f(Float32.(v)...) for v in mt["transforms"]], Int(mt["src_in"]),
-                Symbol(get(mt, "mode", "unknown")),
-                haskey(mt, "basecrop") ? NTuple{4, Float64}(mt["basecrop"]) : nothing))
+                unpackvec(Mat3f, mt["transforms"]), Int(mt["src_in"]),
+                Symbol(mt["mode"]),
+                haskey(mt, "basecrop") ?
+                    NTuple{4, Float64}(mt["basecrop"]) : nothing))
         end
         if haskey(cd, "colortrack")
             ct = cd["colortrack"]
             setcolortrack!(clip, ColorTrack(
-                [Vec3f(Float32.(v)...) for v in ct["gains"]],
-                [Vec3f(Float32.(v)...) for v in ct["offsets"]], Int(ct["src_in"]),
-                Float32(get(ct, "strength", 1.0))))   # absent in older project files
+                unpackvec(Vec3f, ct["gains"]),
+                unpackvec(Vec3f, ct["offsets"]),
+                Int(ct["src_in"]), Float32(ct["strength"])))
         end
         if haskey(cd, "matte")
             mt = cd["matte"]
-            sz = NTuple{3, Int}(Int.(mt["size"]))
+            sz = NTuple{3, Int}(mt["size"])
             clip.mattetrack = MatteTrack(loadmatte(path, clip.id, sz), Int(mt["src_in"]),
-                                         Int.(mt["seeds"]))
+                                         Int[Int(x) for x in mt["seeds"]])
         end
+        haskey(cd, "bake") &&
+            (clip.bake = bakefromdict(cd["bake"], bakeclipdir(path, clip.id)))
         if haskey(cd, "look")
             lk = cd["look"]
             d = Int(lk["dim"])
-            clip.look = reshape(Float32.(lk["table"]), d, d, d, 3)
+            clip.look = reshape(collect(Float32, lk["table"]), d, d, d, 3)
         end
         clip
     end
@@ -223,8 +287,15 @@ function loadproject(path::AbstractString)
     for td in get(dict, "transitions", [])
         push!(seq.transitions, Transition(Symbol(td["kind"]), Int(td["at"]), Int(td["duration"])))
     end
+    # A project written when overlays were a thing of their own: each becomes a
+    # clip on a track above the footage, which is where it was drawn anyway.
     for od in get(dict, "overlays", [])
-        push!(seq.overlays, overlayfromdict(od))
+        c = clipfromoverlay(od, seq)
+        c === nothing || push!(seq.clips, c)
+    end
+    if haskey(dict, "trackheights")
+        empty!(seq.trackheights)
+        append!(seq.trackheights, Float64.(dict["trackheights"]))
     end
     if haskey(dict, "canvas")
         cv = dict["canvas"]
@@ -238,10 +309,51 @@ function loadproject(path::AbstractString)
         push!(seq.captions, Caption(Float64(cd["start"]), Float64(cd["stop"]),
                                     String(cd["text"])))
     end
-    # baked scene frames, when the sidecar still matches what would be rendered.
-    # AFTER the overlays are in: it is keyed on their ids and fingerprints them.
-    loadbakes!(path, seq)
+    # A parameter driven by another one is written as the IDS of what drives it;
+    # this is where those become the objects `valueat` follows. LAST, because it
+    # needs every clip and every effect to be in place — an edge is allowed to
+    # point across a clip boundary, in either direction.
+    #
+    # (The two lines that used to open this comment described loading baked scene
+    # frames from a sidecar "keyed on the overlays' ids and fingerprinted" —
+    # machinery that is gone twice over: a bake belongs to a CLIP and is
+    # invalidated by a dirty flag, not a fingerprint, and there are no overlays.
+    # It sat above a line that does something else entirely.)
+    bindinputs!(seq)
+    # …and the bakes: their directory follows the project, and one whose inputs
+    # moved on disk is switched off rather than shown as current.
+    adoptbakes!(path, seq)
+    reportbackends(seq)
     return seq
+end
+
+"""
+    reportbackends(seq) -> Vector{Symbol}
+
+Warn about every renderer this project names that is not loaded, and return them.
+
+REPORTED, NOT SUBSTITUTED. A scene says which renderer draws it, and silently
+falling back to another one means opening a project and being shown a different
+picture than the one that was saved — quietly, with nothing on screen to say so.
+Loading the package that provides it (and `usebackend!`) is a thing the user can
+do; guessing on their behalf is not.
+
+At LOAD rather than at the first render, because "why does this clip throw when I
+scrub onto it" is a worse way to find out than a line when the file opens.
+"""
+function reportbackends(seq::Sequence)
+    want = Symbol[]
+    for clip in seq.clips
+        src = clip.source
+        src isa SceneSource || continue
+        push!(want, src.backend)
+        src.bakewith === :auto || push!(want, src.bakewith)
+    end
+    missing = sort!(unique!(filter(n -> !haskey(BACKENDS, n), want)))
+    isempty(missing) ||
+        @warn "this project names scene renderers that are not loaded — those clips " *
+              "cannot render until they are" missing = missing loaded = sort!(collect(keys(BACKENDS)))
+    return missing
 end
 
 
@@ -366,3 +478,4 @@ function loadmatte(path::AbstractString, id::Integer, sz::NTuple{3, Int})
     isfile(f) && @warn "matte sidecar for clip $id is $(filesize(f)) bytes, expected $n — ignoring"
     return zeros(UInt8, sz)
 end
+

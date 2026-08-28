@@ -110,10 +110,89 @@ function rungpusync(f::Function, w::GPUWorker)
             put!(done, (false, e))
         end
     end
+    # WITH A DEADLINE. This is the one place the UI thread waits on ANOTHER thread,
+    # and it is on the path of every frame the editor shows. A bare `take!` means
+    # that if the worker stops — a driver wait that never returns, a job that
+    # blocks on something the UI thread itself holds — the editor is frozen, with
+    # no error, nothing on screen, and nothing in the log. Reported live as
+    # "frozen forever"; `@profview` on such a session shows only `wait`, which is
+    # true and says nothing about which wait.
+    #
+    # A job legitimately takes seconds (a cold shader compile, a first scene), so
+    # the bound is generous. What matters is that it EXISTS: an error names the
+    # queue that stopped, and the editor lives to show it.
+    t0 = time()
+    while !isready(done)
+        # …and the message SAYS WHICH of the three it is, because they need
+        # different fixes and "the queue stopped" named none of them: a dead task
+        # (something escaped the job loop), a full queue (jobs posted faster than
+        # they run), or a live task still inside one job (a driver wait, or a job
+        # that needs thread 1 while thread 1 is here waiting for it).
+        time() - t0 > GPUWAIT && error(
+            "the GPU worker did not answer within $(GPUWAIT)s — " * stalldump(w) *
+            (istaskfailed(w.task) ? "its task FAILED: $(sprint(showerror, Base.task_result(w.task)))" :
+             istaskdone(w.task) ? "its task has EXITED, so nothing drains the queue any more" :
+             "its task is alive and still inside a job") *
+            ". Queued: $(Base.n_avail(w.jobs)) of $(w.jobs.sz_max), channel " *
+            (isopen(w.jobs) ? "open" : "CLOSED") * ", worker thread " *
+            "$(Threads.threadid(w.task)). Every frame goes through here, so the " *
+            "editor would otherwise simply stop with nothing to look at.")
+        sleep(0.001)
+    end
     ok, val = take!(done)
     ok || throw(val)
     return val
 end
+
+"""
+    stalldump(w) -> String
+
+Write every task's stack to a file and name it, when the GPU worker has stopped
+answering.
+
+"Its task is alive and still inside a job" is a diagnosis one step short of
+useful: it says the worker is wedged, not WHERE. The worker is pinned and the
+rest of the process is still running, so `jl_print_task_backtraces` can walk it
+— the same call that named the layout cascade behind the editor's freeze. It
+writes ~3000 lines, which belongs in a file rather than in an exception message,
+so the message carries the path.
+
+Returns a fragment for the caller's message; never throws — a diagnostic that
+takes the error with it is worse than none.
+"""
+function stalldump(w::GPUWorker)
+    path = joinpath(tempdir(), "videoeditor-gpu-stall-$(getpid()).txt")
+    try
+        open(path, "w") do io
+            println(io, "GPU worker stalled >", GPUWAIT, "s on thread ",
+                    Threads.threadid(w.task), "; ", Base.n_avail(w.jobs), " job(s) queued behind it.")
+            println(io, "Look for the task on that thread: it is the one inside the job.")
+            flush(io)
+            redirect_stderr(io) do
+                ccall(:jl_print_task_backtraces, Cvoid, (Cint,), 0)
+            end
+        end
+        return "stacks of every task written to $(path) — "
+    catch e
+        return "(could not write the stack dump: $(sprint(showerror, e))) — "
+    end
+end
+
+"""
+How long [`rungpusync`](@ref) waits for the GPU worker before giving up.
+
+Finite, because the alternative is an editor that stops with nothing to look at.
+But long enough for a COLD COMPILE, which is the part 30 s got wrong: the first
+matte on a clip reaches SAM 2, whose first `coopmat_gemm!` launch has to be code-
+generated, and the stack dump from that timeout was `jl_compile_codeinst_now` in
+LLVM's `AsmPrinter`, not a driver wait. Two GUI tests failed on it every run. A
+deadline that fires on a legitimate first render is worse than the freeze it
+guards against — it turns a slow frame into a lost one.
+
+Kept well above what a cold `Player` + SAM 2 path costs here (see the frozen
+kernel cache: the same route was ~97 s before it existed).
+"""
+const GPUWAIT = 150.0
 
 function rungpusync(f::Function, player::Player)
     player.gpuworker === nothing && (player.gpuworker = GPUWorker())
@@ -170,7 +249,19 @@ function setupgpupreview!(player::Player, gp::GPUPreview, W::Integer, H::Integer
 
     # GL side: import both fds and swap the preview plot's texture (main thread)
     screen = player.screen
-    GLMakie.GLFW.MakeContextCurrent(screen.glscreen)
+    # THROUGH GLMakie, NEVER `GLFW.MakeContextCurrent` DIRECTLY. GLMakie tracks
+    # which context is current in a process-global (`ShaderAbstractions.
+    # ACTIVE_OPENGL_CONTEXT`), and `switch_context!(x)` is documented as "a noop if
+    # `x` is already current" — it believes that global. Switching behind its back
+    # leaves the global naming a context that is no longer the real one, and the
+    # next switch to it does NOTHING. With a second GL context in the process — a
+    # scene clip renders into its own `Screen` — that meant the scene drew its own
+    # vertex arrays while the EDITOR's context was current: a SIGSEGV inside
+    # `glDrawElements`, in a screen that had nothing to do with this call, one or
+    # two frames later. Reproducible in two clip switches; 12/12 clean with
+    # `gpupreview = false`, which is simply the path that does not come through
+    # here.
+    GLMakie.GLAbstraction.gl_switch_context!(screen.glscreen)
     getfn(n) = GLMakie.GLFW.GetProcAddress(n)
     GL = GLMakie.ModernGL
     robj = previewrobj(player)
@@ -227,13 +318,15 @@ function presentgpu!(player::Player, clip::Clip, srcframe::Integer;
         # source = the streaming decoder (disk→VRAM) or a decoded CPU frame (one upload)
         src = stream !== nothing ? stream : source !== nothing ? source : player.frame[]
         # the CANVAS, not the layer: a clip's crop, reframe and rotation are baked
-        # in by `placelayer!` here exactly as the export bakes them
+        # in by the composite's "place" pass here, exactly as the export bakes
+        # them — it is the same `composite` call, differing only in `sourcefor`
         W, H = canvassize(player.sequence)
         if (gp.width, gp.height) != (W, H)
             notify(player.frame)  # settle plot geometry for the new size first
             setupgpupreview!(player, gp, W, H)
         end
         nxt = gp.doublebuffer ? 3 - gp.cur : gp.cur   # blit target (see doublebuffer)
+        prerender!(clip.source, clip, srcframe)       # …while still on this thread
         ok = runowned(player) do
             composite(player.engine, [clip], n_of(player, clip, srcframe), (_, _) -> src;
                       canvas = (W, H), applytracks = player.applytracks[],
@@ -259,16 +352,35 @@ function presentgpu!(player::Player, clip::Clip, srcframe::Integer;
 end
 
 """
+    streamed(player, clips) -> Bool
+
+Whether this stack can go down the zero-copy path: every layer that DECODES has
+a GPU stream ready.
+
+`!decodable` first, and that is the fix it carries: a scene clip decodes nothing
+and never appears in `gpucache`, so a plain `all(haskey(...))` said no to every
+frame it was on. One scene in the stack pushed the WHOLE composite onto the CPU
+present — canvas read back to the host, then Makie's image→texture path, ~2 MB a
+frame — while the identical timeline without it stayed on the blit. Measured on
+the lego project: 12.1 fps with the scene, 32.6 without, and 9.4 with the scene
+BAKED, which is what proved the cost was the path and not the drawing.
+"""
+streamed(player::Player, clips) =
+    all(c -> !decodable(c.source) || haskey(player.gpucache, readerkey(player.sequence, c)),
+        clips)
+
+"""
 Composite a stack of clips (bottom track → top) entirely on the GPU: each layer's
 effect graph runs device-resident, its crop is baked with `warp!`, and layers are
-alpha-blended by opacity — the multi-track analogue of [`presentgpu!`]. Every layer's
-source must have a live `GpuVideoStream`; returns `false` otherwise so the caller
-falls back to the CPU composite. The composited canvas is blitted to the shared image.
+alpha-blended by opacity — the multi-track analogue of [`presentgpu!`]. Every
+DECODING layer's source must have a live `GpuVideoStream` (see [`streamed`](@ref));
+returns `false` otherwise so the caller falls back to the CPU composite. The
+composited canvas is blitted to the shared image.
 """
 function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer;
                               chunks::Integer = 5)
     gp = player.gpupreview
-    all(haskey(player.gpucache, readerkey(player.sequence, c)) for c in clips) || return false
+    streamed(player, clips) || return false
     try
         W, H = canvassize(player.sequence)   # the SEQUENCE's format, not the top layer's
         if (gp.width, gp.height) != (W, H)
@@ -278,9 +390,11 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer;
         nxt = gp.doublebuffer ? 3 - gp.cur : gp.cur   # same switch as presentgpu!
         # the GPU tier of ONE composite (see `composite`): its only job is to
         # name each layer's stream and to blit the finished canvas
+        prerenderscenes!(clips, n)
         ok = runowned(player) do
             composite(player.engine, clips, n,
-                      (clip, _) -> player.gpucache[readerkey(player.sequence, clip)];
+                      # only a DECODING layer is asked; a scene brings its own
+                      (clip, _) -> get(player.gpucache, readerkey(player.sequence, clip), nothing);
                       canvas = (W, H), applytracks = player.applytracks[],
                       playing = player.playing[], chunks = chunks) do canvas
                 gp.packed .= packrgba.(reshape(canvas, W * H))
@@ -328,7 +442,11 @@ so a single stand-in among them dates the whole frame.
 function primecomposite!(player::Player, clips::Vector{Clip}, n::Integer)
     ready = true
     for clip in clips
-        stream = player.gpucache[readerkey(player.sequence, clip)]
+        # a layer that DECODES has a stream; a scene renders its own frames and
+        # has none — see `streamed`. Indexing blind threw a `KeyError` naming the
+        # whole `SceneSource` the moment a scene reached this path.
+        stream = get(player.gpucache, readerkey(player.sequence, clip), nothing)
+        stream === nothing && continue
         srcframe = sourceframe(clip, n)
         hasframe(stream, srcframe) && continue
         # a failed decode is loud and hands the frame to the CPU composite —
@@ -402,11 +520,22 @@ function preloadgpu!(player::Player, source::VideoSource; key = source)
     mezz = mezzaninepath(source)
     path = isfile(mezz) ? mezz : source.path
     try
-        stream = openstream(player.analysisbackend, path, source.width, source.height;
-                            capacity = GPU_STREAM_CAPACITY)
-        # probe: decode GOP 0, confirm it's supported at the display size
-        # (cold this also compiles the decode session + kernels)
-        ok = rungpusync(player) do
+        # OPENING IS GPU WORK TOO, so it belongs on the thread that owns the
+        # context — the probe below always knew that, the open did not. This is
+        # called deliberately OFF the UI thread (see above), so it opened a Lava
+        # decode session from whichever thread happened to run it: `AssertionError:
+        # BatchQueue is single-writer; cross-thread sweep forbidden`, caught below,
+        # reported as "not GPU-streamable" and silently demoted to CPU decode. It
+        # is not a codec problem at all. Measured consequence: the benchmark's
+        # playback drop rate at 3.3% against a 3.0% floor, because playback was on
+        # the CPU lane it never should have reached.
+        #
+        # One `runowned` for both, so the open and its probe are also one hop.
+        ok = runowned(player) do
+            stream = openstream(player.analysisbackend, path, source.width, source.height;
+                                capacity = GPU_STREAM_CAPACITY)
+            # probe: decode GOP 0, confirm it's supported at the display size
+            # (cold this also compiles the decode session + kernels)
             f = frameat!(stream, 0)
             size(f.y) == (source.width, source.height)
         end
@@ -418,7 +547,13 @@ function preloadgpu!(player::Player, source::VideoSource; key = source)
             close(stream)
         end
     catch e
-        stream === nothing || (try; close(stream); catch; end)
+        # closing a half-opened stream may fail on its own — but SAY SO, because a
+        # swallowed close is how a leaked VRAM ring stays invisible
+        stream === nothing || (try
+            close(stream)
+        catch closeerr
+            @warn "could not close the half-opened GPU stream" exception = (closeerr, catch_backtrace())
+        end)
         # silent degradation hid a whole codec gap once — say it where the user
         # looks, and where the source is merely not DIRECTLY streamable (codec,
         # open GOPs, profile) start the one-time mezzanine transcode instead of
@@ -510,15 +645,28 @@ end
 effect graph's buffer pool."
 function freegpucache!(player::Player)
     gp = player.gpupreview
+    # TEARDOWN REPORTS. Every one of these used to be `try … catch; end`: a free
+    # that failed left VRAM held with nothing said, and the next symptom was an
+    # out-of-memory somewhere unrelated. Freeing continues past a failure — that is
+    # what the `try` is for — but never silently.
     if gp isa GPUPreview
-        try; rungpusync(player) do; emptyengine!(player.engine); end; catch; end
+        try
+            rungpusync(player) do; emptyengine!(player.engine); end
+        catch e
+            @warn "could not empty the effect graph's buffer pool" exception = (e, catch_backtrace())
+        end
     end
     isempty(player.gpucache) && return nothing
     for s in values(player.gpucache)
         try
             rungpusync(player) do; close(s); end
-        catch
-            try; close(s); catch; end
+        catch e
+            @warn "closing a GPU stream on the worker failed — closing it here" exception = (e, catch_backtrace())
+            try
+                close(s)
+            catch direct
+                @warn "…and closing it directly failed too; its VRAM stays held" exception = (direct, catch_backtrace())
+            end
         end
     end
     empty!(player.gpucache)

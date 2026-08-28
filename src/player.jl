@@ -79,6 +79,13 @@ mutable struct Player
     # keyed by (effect id, parameter name): a parameter is only unique WITHIN
     # its effect now, and two entries of one kind must not share a slider
     const fxsliders::Dict{Tuple{UInt64, Symbol}, Slider}
+    # Every parameter row currently on screen (see `ParamRow`), rebuilt with the
+    # cards. What a row SHOWS is derived from its parameter and the playhead, and
+    # this vector is where that derivation happens — once, for all of them, from
+    # the single listener in `buildui`. Before it, `paramform!` put an
+    # `on(player.playhead)` on every row: 118 of them on the lego project, none
+    # ever unregistered, and a fresh set with every card rebuild.
+    const fxrows::Vector{ParamRow}
     const fxwidgets::Dict{Symbol, Any}  # panel menu/buttons (dock content is
                                         # invisible to fig.content — tests and
                                         # MCP reach the widgets through here)
@@ -118,7 +125,6 @@ mutable struct Player
     const tool::Observable{Symbol}       # active tool: :none, :split, :crop
     const playrate::Base.RefValue{Float64}  # JKL shuttle rate: 1.0 normal, <0 reverse, |·|>1 fast
     const kffocus::Observable{Symbol}    # param whose ◆ markers the timeline overlay shows
-    const kfvisible::Observable{Bool}    # keyframe curves on the timeline visible
     const jobprogress::Threads.Atomic{Float64}  # running job fraction 0..1, NaN when idle
                                                 # (written from worker threads, polled by the UI)
     const gpucache::Dict{Any, Any}       # source → device-resident decoded frames (pure-GPU playback)
@@ -144,6 +150,13 @@ mutable struct Player
     # than publishing it late over a newer one.
     const trimming::Threads.Atomic{Bool}
     trimtarget::Any
+    # The project file this edit IS, once it has one — `nothing` until a project
+    # is opened or saved. Not derived from the first source: two projects can cut
+    # the same footage, and deriving meant that opening `lego.videoedit` and
+    # pressing Ctrl+S wrote `demo_source.videoedit` instead. The edit forked in
+    # silence, and the checkpoint list, the autosave and the recovery prompt all
+    # followed the wrong file with it.
+    projectpath::Union{Nothing, String}
 end
 
 """
@@ -389,9 +402,8 @@ function Player(path::AbstractString; capacity::Integer = 64,
     wantgpu = gpupreview === true || (gpupreview === nothing && !(backend isa KA.CPU))
     wantgpu && backend isa KA.CPU &&
         error("gpupreview = true requires a GPU backend, e.g. Player(path; analysisbackend = LavaBackend(), gpupreview = true)")
-    # a project path (.json, or a .toml from before the format moved) opens the
-    # saved edit instead of a video
-    isproject = endswith(lowercase(path), ".toml") || endswith(lowercase(path), ".json")
+    # a project path opens the saved edit instead of a video
+    isproject = endswith(lowercase(path), ".videoedit")
     sequence = isproject ? loadproject(path) : Sequence(VideoSource(path))
     isempty(sequence.clips) && error("project has no clips: $path")
     source = sequence.clips[1].source
@@ -427,7 +439,9 @@ function Player(path::AbstractString; capacity::Integer = 64,
     wantgpu && setgpurun!(player.timeline, f -> rungpusync(f, player))
     audiopreview && (player.audio = AudioPreview())
     retrypresent(player)
-    for src in unique(c.source for c in sequence.clips)  # projects may be multi-source
+    # …only the ones with a file: a proxy and a GPU decode stream are both about
+    # reading media, and a clip that renders its frames has none.
+    for src in unique(c.source for c in sequence.clips if decodable(c.source))
         needsproxy(src; maxpixels = proxythreshold) && startproxy!(player, src)
         # with the GPU preview on, stream-decode each source on the GPU so playback
         # runs purely on the GPU (background; CPU decode until the stream is ready)
@@ -436,7 +450,9 @@ function Player(path::AbstractString; capacity::Integer = 64,
     # The repairs come back with the project. They live here rather than on the
     # sequence, so `loadproject` cannot restore them — see `loadrepairs!` for what
     # losing them silently cost.
-    isproject && loadrepairs!(player, path)
+    # …and the edit now IS that file: Ctrl+S goes back to it rather than to a
+    # name derived from the footage.
+    isproject && (player.projectpath = String(path); loadrepairs!(player, path))
     autodetect && Threads.@spawn autodetectgpu!(player)  # enable GPU playback if capable
     Threads.@spawn begin  # keep the regenerable proxy/PCM caches bounded
         pruned = prunecache!()
@@ -604,16 +620,17 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     fig, ax, Ref(false),
                     Observable(Point2f[]),
                     similar(frame[]), Dict{Tuple{UInt64, Symbol}, Slider}(),
+                    ParamRow[],
                     Dict{Symbol, Any}(),
                     Ref(false), nothing, (0.0, 0.0, 1.0, 1.0), (0, 0), nothing, nothing, 0.0,
                     nothing, false, nothing, nothing, nothing, nothing, defaultsegmenter(),
                     Any[], Any[], 0.0, 0, 0, nothing, 0, 0,
                     Dict{Symbol, Any}(), Observable(:none),
                     Observable(VideoSource[]), Any[], nothing, Observable(:none),
-                    Ref(1.0), Observable(:opacity), Observable(true),
+                    Ref(1.0), Observable(:opacity),
                     Threads.Atomic{Float64}(NaN), Dict{Any, Any}(), FxEngine(analysisbackend),
                     effects, Clip[], Threads.Atomic{Bool}(false),
-                    Threads.Atomic{Bool}(false), nothing)
+                    Threads.Atomic{Bool}(false), nothing, nothing)
     # The built-in depth model, so an editor has depth without being asked. Lazy
     # inside — this only points `registerdepth!` at it and builds nothing.
     installdepth!()
@@ -654,14 +671,31 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
             sleep(0.12)
         end
     end
-    # the timeline row grows when clips stack on more tracks (edits notify the playhead)
-    lastntr = Ref(1)
-    on(playhead) do _
+    # The timeline row grows when clips stack on more tracks — and by the SAME 48 px
+    # per unit of height when a lane is made taller (see `settrackedge!`). Sharing a
+    # fixed row would mean a taller track is one that squashes its neighbour, when
+    # what you asked for was room to work in; this way the neighbour keeps its
+    # pixels and the panel gives up the space.
+    lastrow = Ref(0.0)
+    # A SOLOED LANE TAKES THE WINDOW, not just the other lanes' share: filling the
+    # same 110 px strip is what "fullscreen" is NOT, so the timeline takes `solorow`
+    # of the figure and the preview gives it up. `keepfree` is what the REST keeps
+    # whatever solo asks for — the tool column is a stack of fixed-size buttons and
+    # Makie does not clip it, so at 0.45 the last two buttons landed on the ruler
+    # and the effect panel was cut off mid-parameter.
+    function fittimelinerow!(; solorow = 0.35, keepfree = 620.0)
         ntr = ntracks(sequence)
-        ntr == lastntr[] && return
-        lastntr[] = ntr
-        rowsize!(fig.layout, 2, Makie.Fixed(112 + 48 * (ntr - 1)))
+        base = (112 + 48 * (ntr - 1)) * lanescale(sequence, ntr)
+        winh = Float64(fig.scene.viewport[].widths[2])
+        h = sequence.solo == 0 ? base : max(base, min(solorow * winh, winh - keepfree))
+        isapprox(h, lastrow[]; atol = 0.5) && return nothing
+        lastrow[] = h
+        rowsize!(fig.layout, 2, Makie.Fixed(h))
+        return nothing
     end
+    on(_ -> fittimelinerow!(), fig.scene.viewport)   # …and it follows a window resize
+    on(_ -> fittimelinerow!(), playhead)     # track added/removed by an edit
+    timeline.onlayout = fittimelinerow!      # …and a lane dragged taller
     on(exportbtn.clicks) do _
         toggledock!(player, :export)   # options live in the export dock panel
     end
@@ -714,12 +748,19 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                         offset = (6, -18), align = (:left, :top))
     translate!(cropreadout, 0, 0, 9)
 
-    fxdock = dockpanel!(player, :effects; width = 360)
+    # 392, not 360: a parameter row is 256 px (label + slider + the ◀ ◆ ▶ trio) and
+    # sits under a section indent, which at 360 put its right end 22 px past what
+    # the card's scene draws — the ▶ was clipped away entirely, silently.
+    fxdock = dockpanel!(player, :effects; width = 392)
     buildfxpanel!(player, fxdock[1, 1], uicolors)
     buildpalette!(player, uicolors)      # Ctrl+P: every command, one search box
     buildkeyframemodal!(player, uicolors)   # ◆: what is animated on this clip
     fxbtn = toolbarbutton!(player, toolbar[1, 1], "FX", :effects, uicolors)
-    player.mediasources[] = unique([c.source for c in sequence.clips])
+    # THE MEDIA BIN IS FILES. A clip that renders its own frames has nothing to
+    # import, re-link or make a proxy of, and it is already on the timeline —
+    # listing it here would offer to drag a second copy of a title into the edit.
+    player.mediasources[] =
+        unique(VideoSource[c.source for c in sequence.clips if c.source isa VideoSource])
     mediadock = dockpanel!(player, :media)
     buildmediabin!(player, mediadock[1, 1], uicolors)
     exportdock = dockpanel!(player, :export)
@@ -886,7 +927,11 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
         # is_mouseinside, not `in viewport`: an active blade must not cut THROUGH
         # a dropdown or a modal that happens to hang over the timeline
         Makie.is_mouseinside(tlscene) || return Consume(false)
-        t = Makie.mouseposition(tlscene)[1]
+        t, y = Makie.mouseposition(tlscene)
+        # THE STRIP IS THE PLAYHEAD'S, whatever tool is up ([`SCRUBBAND`](@ref)).
+        # A blade that also cuts up there takes away the one gesture that has to
+        # work at all times — and leaves no way to line the cut up first.
+        inscrubband(y) && return Consume(false)
         # NB: must NOT be named `frame` — that would rebind the shared preview
         # Observable this scope captures (used by image! + the scrub fallback)
         cutat = clamp(round(Int, t * sequence.framerate), 0, max(seqlength(sequence) - 1, 0))
@@ -909,13 +954,13 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
         if clip !== player.lastclip
             player.lastclip = clip
             if clip !== nothing
-                syncsliders!(player, clip)
                 # the panel always tells WHICH stabilization this clip carries
                 player.stabinfo[] = stabdescription(clip.motiontrack)
             end
-        elseif clip !== nothing
-            syncanimatedsliders!(player, clip)  # follow the curves while scrubbing
         end
+        # …and the cards follow the playhead, whichever clip it is on. One call,
+        # for every row on screen — see `refreshfxrows!`.
+        refreshfxrows!(player)
         if !present!(player)
             if timeline.scrubbing[]
                 loc = locate(sequence, n)
@@ -945,6 +990,10 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                 end
             end
             playing[] || retrypresent(player)
+        else
+            # The frame is up. If any of it is still converging — a raytraced
+            # scene clip — keep adding samples while the playhead holds.
+            refinepreview!(player)
         end
     end
 
@@ -1007,7 +1056,7 @@ function Base.show(io::IO, ::MIME"text/plain", p::Player)
     nclip = length(seq.clips)
     ntr = ntracks(seq)
     nfx = sum(c -> length(c.effects), seq.clips; init = 0)
-    names = unique(basename(c.source.path) for c in seq.clips)
+    names = unique(basename(sourcepath(c.source)) for c in seq.clips)
     w, h = p.lastcanvas
     println(io, "Player")
     if nclip == 0
@@ -1049,30 +1098,38 @@ function showtransition!(player::Player, sample, n::Integer)
     left, srcA, right, srcB, p = sample
     spA = pool(player, left)
     spB = pool(player, right)
-    (spA.source.width, spA.source.height) == (spB.source.width, spB.source.height) || return false
     settarget!(spA.worker, srcA)
     settarget!(spB.worker, srcB)
-    ensureframesize!(player, spA.source)
-    bufA = player.composebuf
+    bufA = RGBFrame(undef, spA.source.width, spA.source.height)
     fetchframe!(bufA, spA.ring, srcA) || return false
-    bufB = similar(bufA)
+    bufB = RGBFrame(undef, spB.source.width, spB.source.height)
     fetchframe!(bufB, spB.ring, srcB) || return false
-    lclip = effectiveclip(left, srcA)   # keyframed params on each side
-    rclip = effectiveclip(right, srcB)
-    if player.applytracks[]   # false = hold-to-compare: original frames, no effects
-        runowned(player) do    # both sides on the engine's owning thread, one hop
-            render(player.engine, bufA, lclip, Int(srcA)) do out
-                copyto!(bufA, out)
-            end
-            render(player.engine, bufB, rclip, Int(srcB)) do out
-                copyto!(bufB, out)
-            end
+    ensureframesize!(player, canvassize(player.sequence))
+    # TWO LAYERS IN ONE COMPOSITE, the outgoing under the incoming, and the
+    # dissolve's fraction handed in as the incoming layer's opacity. Compositing
+    # `B` over `A` at `α` where `B` is opaque IS `α·B + (1-α)·A`, which is what
+    # the host-side lerp computed — so the picture is the same and the path is
+    # the one every other frame takes.
+    #
+    # It also lifts a restriction: the old route blended two already-fitted
+    # frames, so it REFUSED (`return false`, a black preview) whenever the two
+    # clips had different resolutions. Each layer is fitted to the canvas on its
+    # own here, which is what a dissolve between mixed material has to do.
+    #
+    # `applytracks = false` is hold-to-compare; the chains read it themselves.
+    prerenderscenes!([left, right], n)
+    ok = runowned(player) do
+        composite(player.engine, [left, right], n,
+                  (clip, _) -> clip === left ? bufA : bufB;
+                  canvas = canvassize(player.sequence),
+                  applytracks = player.applytracks[], playing = player.playing[],
+                  alphafor = (clip, _) -> clip === right ? Float64(p) : nothing) do canvas
+            copyto!(player.frame[], canvas)
         end
     end
-    blend!(bufA, bufA, bufB, p)
-    copyto!(player.frame[], bufA)   # publish the finished blend in one copy
+    ok === true || return false
     publishframe!(player, n)
-    applycrop!(player, lclip)  # both sides share framing in the common (split) case
+    applycrop!(player, left)  # both sides share framing in the common (split) case
     return true
 end
 
@@ -1100,6 +1157,10 @@ function compositeframe!(player::Player, n::Integer, clips::Vector{Clip})
         end
         return buf
     end
+    # SCENES FIRST, on THIS thread — see `prerender!`. `runowned` below hands the
+    # frame to whichever thread owns the Lava context, and a GLMakie screen cannot
+    # follow it there.
+    prerenderscenes!(clips, n)
     ok = runowned(player) do
         composite(player.engine, clips, n, decoded; canvas = canvas,
                   applytracks = player.applytracks[], playing = player.playing[]) do composed
@@ -1147,30 +1208,21 @@ end
 """
     publishframe!(player, n) -> nothing
 
-Put what is in `player.frame[]` on screen as timeline frame `n` — overlays drawn,
-texture re-pointed, observable notified.
+Put what is in `player.frame[]` on screen as timeline frame `n`: texture
+re-pointed, observable notified.
 
-THE ONE DOOR. Every preview path ends here, because the overlay pass is the last
-stage of a rendered frame and a call site that skips it is a call site that shows
-the user a different picture than the export produces. Four of them published by
-hand — a straight `showcpuframe!` + `notify` — so `drawoverlays!` ran only from
-`export.jl`, and every overlay kind was invisible in the editor while being
-correct in the file it wrote. That is the failure `drawoverlays!` documents
-itself against ("no call site can accidentally be the one that renders WITHOUT
-overlays") and it was true of the whole preview.
+THE ONE DOOR. Every preview path ends here.
 
-Costs nothing when nothing is drawn at `n`: `drawoverlays!` returns before it
-touches a pixel, and the round trip is bit-exact when it does not.
+It used to also RENDER here — a second compositing stage that pushed the finished
+frame into a Makie scene, drew the overlays over it and read it back out. There is
+nothing left to draw: a title, a subtitle and a 3D scene are clips, so they are
+composited by the graph along with everything else, at their place in the track
+order, with an opacity and an effect stack. What was a whole second rasterizer,
+kept in step with the first by hand, is now one more layer in the one composite.
 
-Main thread ONLY. Rasterising an overlay needs the GL context, so this must not
-be called from inside `runowned` — a `composite` callback runs on the engine's
-owning thread and GLFW aborts there (`ThreadAssertionError`, measured). All four
-callers reach it after the callback has returned.
+Main thread ONLY: it re-points a GL texture.
 """
 function publishframe!(player::Player, n::Integer)
-    seq = player.sequence
-    drawoverlays!(player.frame[], seq.overlays, n;
-                  framerate = seq.framerate, captions = seq.captions)
     showcpuframe!(player)
     notify(player.frame)
     return nothing
@@ -1200,8 +1252,7 @@ function showframe!(player::Player, n::Integer; standin::Bool = !atrest(player))
         clips = clipsat(player.sequence, n)
         if length(clips) > 1
             shown = false
-            if gpuready(player) &&
-               all(haskey(player.gpucache, readerkey(player.sequence, c)) for c in clips)
+            if gpuready(player) && streamed(player, clips)
                 # composites mix layers: one stand-in among them dates the whole frame
                 standin || primecomposite!(player, clips, n) || return false
                 shown = presentgpucomposite!(player, clips, n;
@@ -1267,7 +1318,6 @@ function presentclipframe!(player::Player, clip::Clip, srcframe::Integer;
                 primeframe!(player, stream, srcframe) && return false
             end
             ensureframesize!(player, canvassize(player.sequence))
-            eclip = effectiveclip(clip, srcframe)
             # A STAND-IN MUST NOT DECODE. `frameat!` spends up to 5 decode chunks
             # reaching `srcframe` before it settles for the nearest decoded frame,
             # and on a seek that is ~62 ms of exactly the work this call exists to
@@ -1284,12 +1334,29 @@ function presentclipframe!(player::Player, clip::Clip, srcframe::Integer;
             end
         end
     end
+    # A clip that RENDERS its frames has no decoder, no ring and no proxy: it goes
+    # straight to the composite, which is the same call the decoded path makes
+    # below once it has a frame in hand.
+    if !decodable(clip.source)
+        ensureframesize!(player, canvassize(player.sequence))
+        prerender!(clip.source, clip, srcframe)      # …while still on this thread
+        ok = runowned(player) do
+            composite(player.engine, [clip], n_of(player, clip, srcframe), (_, _) -> nothing;
+                      canvas = canvassize(player.sequence),
+                      applytracks = player.applytracks[], playing = player.playing[]) do canvas
+                copyto!(player.frame[], canvas)
+            end
+        end
+        ok === true || return false
+        publishframe!(player, n_of(player, clip, srcframe))
+        applycrop!(player)
+        return true
+    end
     sp = pool(player, clip)
     settarget!(sp.worker, target; protect)
     ensuredecodesize!(player, sp.source)   # proxy resolution when one is active
     buf = player.composebuf
     if fetchframe!(buf, sp.ring, srcframe)
-        eclip = effectiveclip(clip, srcframe)  # keyframed params sampled at this frame
         ensureframesize!(player, canvassize(player.sequence))
         if gpuready(player)
             if presentgpu!(player, clip, srcframe; source = buf)
@@ -1303,6 +1370,7 @@ function presentclipframe!(player::Player, clip::Clip, srcframe::Integer;
         # stand in for the framing made the framing a viewport: the crop removed
         # nothing you could not scroll back to, and a rotation could not show at
         # all, because axis limits do not rotate.
+        prerender!(clip.source, clip, srcframe)
         ok = runowned(player) do        # the engine's context has ONE owning thread
             composite(player.engine, [clip], n_of(player, clip, srcframe),
                       (_, _) -> buf; canvas = canvassize(player.sequence),
@@ -1356,7 +1424,7 @@ ensureframesize!(player::Player, source::VideoSource) =
 Size the PUBLISHED frame — which is the sequence CANVAS, always.
 
 What the preview shows is the canvas, exactly what the export writes: a clip's
-crop, its scale/position and its rotation are baked into it by `placelayer!`. It
+crop, its scale/position and its rotation are baked into it by the composite. It
 used to be the rendered LAYER at source resolution, with the preview axis LIMITS
 standing in for the framing — which meant the framing was a viewport, not an
 edit. Cropping did not remove anything (zoom out and the "removed" material was
@@ -1421,6 +1489,43 @@ function retrytrim!(player::Player, clip::Clip, srcframe::Integer; budget::Real 
         end
     finally
         player.trimming[] = false
+    end
+    return nothing
+end
+
+"""
+    refinepreview!(player) -> nothing
+
+Keep adding samples to a PROGRESSIVE clip's picture while the playhead stands
+still.
+
+A path tracer's frame is a running average: the seek returns one sample in
+subseconds and this adds to it until it converges or the playhead moves. Rendering
+a full sample budget on every playhead move instead is a freeze per click, which
+is what this replaces — and it works only because the scene's screen is held
+across frames (see `SceneSource`).
+
+Bounded by `MAXSAMPLES`, and it stops the moment the playhead moves, playback
+starts, or nothing visible is progressive. Shares `player.refining` with
+[`retrypresent`](@ref): both mean "the picture on screen is not final yet", and
+exactly one of them should be improving it.
+"""
+function refinepreview!(player::Player)
+    atrest(player) || return nothing
+    any(c -> refining(c.source), clipsat(player.sequence, player.playhead[])) || return nothing
+    Threads.atomic_cas!(player.refining, false, true) === false || return nothing
+    @async try
+        n = player.playhead[]
+        while atrest(player) && player.playhead[] == n
+            clips = clipsat(player.sequence, n)
+            any(c -> refining(c.source), clips) || break
+            present!(player) || break
+            yield()
+        end
+    catch e
+        @warn "progressive refinement stopped" exception = (e, catch_backtrace())
+    finally
+        player.refining[] = false
     end
     return nothing
 end
@@ -1565,7 +1670,7 @@ end
 Frame the preview on the CANVAS — the whole of it, every time.
 
 There is nothing left for the limits to express: the crop, the reframe and the
-rotation are baked into the published frame by `placelayer!`, exactly as the
+rotation are baked into the published frame by the composite, exactly as the
 export bakes them. The limits used to BE the framing, which is what made a crop a
 viewport instead of an edit.
 """
@@ -1940,7 +2045,10 @@ function addsource!(player::Player, path::AbstractString)
     clip = Clip(source, 0, source.nframes, seqlength(seq), (0.0, 0.0, 1.0, 1.0), rate)
     push!(seq.clips, clip)
     registermedia!(player, source)
-    limits!(player.timeline.axis, 0.0, seqduration(seq), 0.0, 1.0)  # reveal the new clip
+    # AXISTOP, not 1.0 — the axis runs past 1 to carry the scrub strip above the
+    # lanes, and a y-limit of 1 pushes that strip off-screen: the playhead's own
+    # band silently disappears the first time a source is added.
+    limits!(player.timeline.axis, 0.0, seqduration(seq), 0.0, AXISTOP)  # reveal the new clip
     refreshedit!(player)
     note = conformnote(source, seq.framerate)
     setstatus!(player, "added $(basename(path)) — $(source.width)×$(source.height), " *
@@ -1950,9 +2058,15 @@ function addsource!(player::Player, path::AbstractString)
     return clip
 end
 
-"The player's default project file: next to the first source."
+"""
+    projectfile(player) -> String
+
+The file this edit is, or would be: the project it was opened from or last
+saved to, and otherwise a name beside the first source.
+"""
 projectfile(player::Player) =
-    splitext(player.sequence.clips[1].source.path)[1] * ".videoedit.json"
+    something(player.projectpath,
+              splitext(sourcepath(player.sequence.clips[1].source))[1] * ".videoedit")
 
 """
 Fill the Project dock: what this edit is called, how to save or open one, and
@@ -1976,7 +2090,7 @@ function buildprojectpanel!(player::Player, gridpos, uicolors)
     built = Any[]
 
     function refresh()
-        foreach(b -> (try Makie.delete!(b) catch end), built); empty!(built)
+        foreach(Makie.delete!, built); empty!(built)
         Makie.trim!(recovergl); Makie.trim!(rows)
         isempty(player.sequence.clips) && (namelbl.text[] = "no clips yet"; return nothing)
         path = projectfile(player)
@@ -2016,12 +2130,21 @@ function buildprojectpanel!(player::Player, gridpos, uicolors)
         Threads.@spawn try
             f = Makie.choose_file_dialogue()
             f === nothing && return nothing
-            put!(player.uiqueue, () -> restoreproject!(player, String(f)))
+            put!(player.uiqueue, () -> restoreproject!(player, String(f); adopt = true))
         catch e
             setstatus!(player, "file dialog failed: $(sprint(showerror, e))")
         end
     end
-    on(_ -> refresh(), player.playhead)     # the name follows the clip under the cursor
+    # NOT ON THE PLAYHEAD. This used to be `on(_ -> refresh(), player.playhead)`,
+    # commented "the name follows the clip under the cursor" — which is not true:
+    # `projectfile` reads `player.projectpath` or `clips[1]`, and the version rows
+    # come off disk. Nothing here moves with the playhead, so every frame of
+    # playback deleted and rebuilt this panel's Labels and Buttons and listed the
+    # checkpoint directory to draw the same thing again: measured at 13.3 ms and
+    # 1.79 MB per playhead move WITH THE DOCK CLOSED, the largest of the ten
+    # playhead listeners by an order of magnitude, and a per-frame source of dead
+    # blocks. It refreshes when it OPENS (`opendock!`) and when something it shows
+    # actually changed — a save, a restore, an edit.
     refresh()
     player.fxwidgets[:projectrefresh] = refresh
     return panel
@@ -2033,8 +2156,13 @@ Load a saved version over the running edit.
 Snapshot first: going back to a checkpoint is an edit like any other, and Ctrl+Z
 has to undo it. The file is READ before anything is thrown away, so a corrupt
 checkpoint leaves the session alone.
+
+`adopt` says whether `file` becomes the project. OPENING one it is; restoring a
+checkpoint or an autosave it is NOT — those are versions OF the project, and
+adopting them would make the next Ctrl+S write the edit into the checkpoint
+directory and leave the project itself at the older state.
 """
-function restoreproject!(player::Player, file::AbstractString)
+function restoreproject!(player::Player, file::AbstractString; adopt::Bool = false)
     seq = try
         loadproject(file)
     catch e
@@ -2043,7 +2171,7 @@ function restoreproject!(player::Player, file::AbstractString)
     end
     snapshot!(player)
     # ONLY when the checkpoint brought its own. `checkpointproject` copies the
-    # JSON and not the `.mattes` directory beside it, so most checkpoints have no
+    # project file and not the `.mattes` directory beside it, so most have no
     # masks at all — clearing unconditionally would throw away the session's marks
     # and put nothing back, which is strictly worse than the stale-but-present
     # marks the restore used to leave alone.
@@ -2052,8 +2180,8 @@ function restoreproject!(player::Player, file::AbstractString)
     end
     empty!(player.sequence.clips); append!(player.sequence.clips, seq.clips)
     empty!(player.sequence.transitions); append!(player.sequence.transitions, seq.transitions)
-    empty!(player.sequence.overlays); append!(player.sequence.overlays, seq.overlays)
     loadrepairs!(player, file)               # …and the repairs saved beside it
+    adopt && (player.projectpath = String(file))
     postrestore!(player)
     r = get(player.fxwidgets, :projectrefresh, nothing); r === nothing || r()
     setstatus!(player, "restored $(basename(file)) — Ctrl+Z puts the edit back")
@@ -2069,7 +2197,7 @@ must not be able to overwrite a file the user chose to write.
 """
 function autosavepath(player::Player)
     p = projectfile(player)
-    return joinpath(dirname(p), "." * basename(p) * ".autosave.json")
+    return joinpath(dirname(p), "." * basename(p) * ".autosave")
 end
 
 """
@@ -2348,6 +2476,12 @@ end
 function refreshedit!(player::Player)
     relayout!(player.timeline)
     ensurestreams!(player)
+    # an edit can change what the Project panel says — its derived name comes from
+    # `clips[1]`. It no longer listens to the playhead, so it is told here instead.
+    if player.dockopen[] === :project
+        r = get(player.fxwidgets, :projectrefresh, nothing)
+        r === nothing || r()
+    end
     notify(player.playhead)
     player.playing[] || retrypresent(player)
     return nothing
@@ -2379,21 +2513,19 @@ click needs the crop fit undone and nothing else.
 """
 function previewtomatte(player::Player, clip::Clip, srcframe::Integer, p)
     layer  = (clip.source.width, clip.source.height)
-    lclip  = effectiveclip(clip, srcframe)
-    q = previewtolayer(player, lclip, layer, p)
+    q = previewtolayer(player, clip, layer, p, srcframe)
     cw, ch = mattelayersize(clip)
-    return (clamp((q[1] - lclip.crop[1] * layer[1]) / cw, 0.0, 1.0),
-            clamp((q[2] - lclip.crop[2] * layer[2]) / ch, 0.0, 1.0))
+    return (clamp((q[1] - clip.crop[1] * layer[1]) / cw, 0.0, 1.0),
+            clamp((q[2] - clip.crop[2] * layer[2]) / ch, 0.0, 1.0))
 end
 
 "The inverse of `previewtomatte`: a normalized matte point in canvas pixels."
 function mattetopreview(player::Player, clip::Clip, srcframe::Integer, n)
     layer  = (clip.source.width, clip.source.height)
-    lclip  = effectiveclip(clip, srcframe)
     cw, ch = mattelayersize(clip)
-    sx = n[1] * cw + lclip.crop[1] * layer[1]
-    sy = n[2] * ch + lclip.crop[2] * layer[2]
-    return layertopreview(player, lclip, layer, (sx, sy))
+    sx = n[1] * cw + clip.crop[1] * layer[1]
+    sy = n[2] * ch + clip.crop[2] * layer[2]
+    return layertopreview(player, clip, layer, (sx, sy), srcframe)
 end
 
 """
@@ -2409,18 +2541,20 @@ frame and grows toward its edges, so the bug hid until somebody clicked near an
 edge.) On the composite path the buffer is the sequence canvas, and then the
 matrix is exactly right.
 """
-function previewtolayer(player::Player, lclip::Clip, layer::Tuple{Int, Int}, p)
+function previewtolayer(player::Player, clip::Clip, layer::Tuple{Int, Int}, p,
+                       frame::Real = 0)
     canvas = size(player.frame[])
     canvas == layer && return (Float64(p[1]), Float64(p[2]))
-    q = layermatrix(lclip, layer, canvas) * Vec3f(p[1], p[2], 1)
+    q = layermatrix(clip, layer, canvas, frame) * Vec3f(p[1], p[2], 1)
     return (Float64(q[1]), Float64(q[2]))
 end
 
 "The inverse of [`previewtolayer`](@ref)."
-function layertopreview(player::Player, lclip::Clip, layer::Tuple{Int, Int}, q)
+function layertopreview(player::Player, clip::Clip, layer::Tuple{Int, Int}, q,
+                        frame::Real = 0)
     canvas = size(player.frame[])
     canvas == layer && return (Float64(q[1]), Float64(q[2]))
-    r = inv(layermatrix(lclip, layer, canvas)) * Vec3f(q[1], q[2], 1)
+    r = inv(layermatrix(clip, layer, canvas, frame)) * Vec3f(q[1], q[2], 1)
     return (Float64(r[1]), Float64(r[2]))
 end
 
@@ -2449,8 +2583,7 @@ function previewtosource(player::Player, clip::Clip, srcframe::Integer, p)
     # pixels and makes the whole mapping proxy-independent — which matters,
     # because a proxy swap replaces the decode pool, not `clip.source`.
     layer = (clip.source.width, clip.source.height)
-    lclip = effectiveclip(clip, srcframe)   # crop/reframe can be keyframed
-    q = layermatrix(lclip, layer, canvas) * Vec3f(p[1], p[2], 1)   # canvas -> source
+    q = layermatrix(clip, layer, canvas, srcframe) * Vec3f(p[1], p[2], 1)  # canvas -> source
     track = clip.motiontrack
     if track !== nothing
         i = srcframe - track.src_in + 1
@@ -2482,7 +2615,7 @@ function sourcetopreview(player::Player, clip::Clip, srcframe::Integer, s)
         i = srcframe - track.src_in + 1
         1 <= i <= length(track.transforms) && (q = inv(track.transforms[i]) * q)
     end
-    r = inv(layermatrix(effectiveclip(clip, srcframe), layer, canvas)) * q
+    r = inv(layermatrix(clip, layer, canvas, srcframe)) * q
     return (r[1], r[2])
 end
 
@@ -2683,8 +2816,9 @@ function finishcrop!(player::Player, corner::Point2f)
     #
     # `canvassize` already multiplies these by the source's pixels, so a width
     # past 1.0 IS a wider canvas; nothing downstream needed a new concept. What
-    # falls outside the source renders as the letterbox background, which
-    # `placelayer!` already paints for every clip that does not fill the canvas.
+    # falls outside the source renders as the letterbox background: the canvas
+    # pass clears it and a layer only writes where its warp reaches, so a clip
+    # that does not fill the canvas leaves the rest as it found it.
     x0, x1 = x0 / W, x1 / W
     y0, y1 = y0 / H, y1 / H
     # A degenerate drag is still degenerate, but the floor is on the SIZE, not on
@@ -2910,6 +3044,11 @@ function opendock!(player::Player, key::Symbol)
     if key === :effects
         r = get(player.fxwidgets, :fxlistrefresh, nothing)
         r === nothing || r(force = true)
+    elseif key === :project
+        # same rule as the effects panel: a panel that does not update while it is
+        # hidden has to catch up when it comes back
+        r = get(player.fxwidgets, :projectrefresh, nothing)
+        r === nothing || r()
     end
     return nothing
 end
@@ -3155,14 +3294,14 @@ function buildmediabin!(player::Player, gridpos, uicolors)
             nfr = floor(Int, src.nframes / conformrate(src, seq.framerate))
             # target the hovered lane; if that spot is taken, the ghost snaps to
             # the first free lane above (stacking), never silently to the end
-            want = trackat(pos[2], ntr)
+            want = trackat(seq, pos[2], ntr)
             track = want == 0 ? 0 :        # 0 = the zone BELOW the bottom lane
                     freetrack(seq, round(Int, t * seq.framerate), nfr, want)
             droptrack[] = track
             dur = nfr / seq.framerate
             n2 = max(ntr, track)
             g = min(0.02, trackspan(n2) * 0.15)
-            lo, hi = track == 0 ? (0.008, TRACKBASE - 0.013) : trackband(track, n2)
+            lo, hi = track == 0 ? (0.008, TRACKBASE - 0.013) : trackband(seq, track, n2)
             lo += g; hi -= g
             dropghost[] = Rect2f(t, lo, dur, hi - lo)
             dropvis[] = true
@@ -3371,7 +3510,7 @@ function placesource!(player::Player, source::VideoSource, at::Integer; track::I
     clip.track = track
     push!(seq.clips, clip)
     sort!(seq.clips, by = c -> (c.track, c.start))
-    limits!(player.timeline.axis, 0.0, seqduration(seq), 0.0, 1.0)  # reveal it
+    limits!(player.timeline.axis, 0.0, seqduration(seq), 0.0, AXISTOP)  # reveal it (see `AXISTOP`)
     refreshedit!(player)
     needsproxy(source; maxpixels = player.proxythreshold) && startproxy!(player, source)
     return clip
@@ -3390,7 +3529,7 @@ function buildexportpanel!(player::Player, gridpos, uicolors)
     Label(panel[1, 1:2], "Export"; font = :bold, halign = :left, tellwidth = false)
     clips = player.sequence.clips
     path = Observable(isempty(clips) ? abspath("export.mp4") :
-                      splitext(clips[1].source.path)[1] * "_export.mp4")
+                      splitext(sourcepath(clips[1].source))[1] * "_export.mp4")
     Label(panel[2, 1:2], map(basename, path); halign = :left, fontsize = 11,
           color = uicolors.text_muted, tellwidth = false)
     browsebtn = Button(panel[3, 1:2]; label = "Choose file…", tellwidth = false,
@@ -3499,7 +3638,16 @@ function buildkeyframeoverlay!(player::Player)
     fps = seq.framerate
     lanes = Observable(Point2f[])          # the curve polylines, NaN-separated
     marks = Observable(Point2f[])          # the ◆ positions
-    markmeta = Tuple{Clip, Effect, Param, Int}[]   # what each ◆ IS, by index
+    # what each ◆ IS, by index. The first element is the TARGET, a clip or an
+    # overlay — the two differ only in how a frame maps, and the gestures below
+    # go through `lanespan`/`sourceframe`/`keyspan` for exactly that reason.
+    markmeta = Tuple{Any, Effect, Param, Int}[]
+    # The pixels two ◆ must be apart to be drawn as two. `nearestmarker` grabs
+    # within 14 px, so anything closer than that is not a separate target either.
+    MARKGAP = 9.0
+    "Seconds per pixel at the current zoom — what decides whether two ◆ are two."
+    secperpx() = (vp = ax.scene.viewport[]; (a, b) = player.timeline.viewrange[];
+                  (b - a) / max(vp.widths[1], 1))
 
     halo = lines!(ax, lanes; color = (:black, 0.55), linewidth = 4.0)
     translate!(halo, 0, 0, 3)
@@ -3510,19 +3658,36 @@ function buildkeyframeoverlay!(player::Player)
                     color = accent, strokecolor = :white, strokewidth = 1.0)
     translate!(dots, 0, 0, 5)
 
+    # ---- Bézier handles, Photoshop's way: shown for the SELECTED anchor only.
+    # All of them at once is a thicket you cannot aim in, and Photoshop does not
+    # do it either — you see the handles of what you are working on.
+    handlebars = Observable(Point2f[])     # anchor→tip, NaN-separated
+    handletips = Observable(Point2f[])     # the round grips
+    handlemeta = Tuple{Any, Param, Int, Symbol}[]   # target, param, key index, :in/:out
+    selkey = Ref{Any}(nothing)             # (target, fx, param, key index)
+    bars = lines!(ax, handlebars; color = (:white, 0.75), linewidth = 1.2)
+    translate!(bars, 0, 0, 5)
+    grips = scatter!(ax, handletips; marker = :circle, markersize = 8,
+                     color = :white, strokecolor = accent, strokewidth = 1.5)
+    translate!(grips, 0, 0, 6)
+
     # The band a curve is drawn in: the clip's own track lane, inset so a value at
     # 0 or 1 does not sit exactly on the lane edge (where it reads as belonging to
     # the neighbour, and where it cannot be grabbed).
     function clipband(clip::Clip)
         ntr = ntracks(seq)
         g = min(0.02, trackspan(ntr) * 0.15)
-        lo, hi = trackband(clip.track, ntr)
+        lo, hi = trackband(seq, clip.track, ntr)
         lo += g; hi -= g
         inset = 0.12 * (hi - lo)
         return (lo + inset, hi - inset)
     end
-    yat(clip::Clip, p::Param, v) =
-        (b = clipband(clip); b[1] + (b[2] - b[1]) * clamp(paramnorm(p, v), 0.0, 1.0))
+    # AN OVERLAY IS NOT ON A TRACK — it sits over the finished canvas, so its
+    # lanes span the whole timeline height rather than borrowing a clip's band.
+    # Only one binding is drawn at a time, so there is nothing to overlap with.
+    clipband(::Any) = (TRACKBASE + 0.02, TRACKTOP)
+    yat(target, p::Param, v) =
+        (b = clipband(target); b[1] + (b[2] - b[1]) * clamp(paramnorm(p, v), 0.0, 1.0))
 
     function refresh()
         segs = Point2f[]; pts = Point2f[]; empty!(markmeta)
@@ -3535,27 +3700,78 @@ function buildkeyframeoverlay!(player::Player)
         # Within that, ONE condition: `p.visible`. Not "visible AND selected" —
         # a second, invisible condition is how a lane you turned on stays dark.
         bound = get(player.fxwidgets, :fxbound, nothing)
-        clip = bound === nothing ? nothing : bound[1]
-        if clip !== nothing
+        target = bound === nothing ? nothing : bound[1]
+        if target !== nothing
+            f0, f1 = lanespan(target)
+            klo, khi = keyspan(target)
             for fx in bound[2], p in fx.params
                 p.visible || continue
-                x0 = clip.start / fps; x1 = clipend(clip) / fps
-                for i in 0:60                       # the curve, sampled across the clip
-                    t = x0 + (x1 - x0) * i / 60
-                    sf = sourceframe(clip, round(Int, t * fps))
-                    push!(segs, Point2f(t, yat(clip, p, valueat(p, sf))))
+                # SAMPLED TO THE PIXEL over what is ON SCREEN, and never coarser
+                # than the frames the animation actually plays. 61 points across
+                # the whole clip — what this was — is four samples per Bézier
+                # segment on the LEGO walk: the curve drew as a chain of straight
+                # chords, so the shape being edited was not the shape on screen.
+                x0 = max(f0 / fps, tl.viewrange[][1])
+                x1 = min(f1 / fps, tl.viewrange[][2])
+                if x1 > x0
+                    npx = (x1 - x0) / max(secperpx(), 1.0e-12)
+                    nsamp = clamp(round(Int, min(npx / 2, (x1 - x0) * fps)), 40, 4000)
+                    for i in 0:nsamp
+                        t = x0 + (x1 - x0) * i / nsamp
+                        sf = sourceframe(target, round(Int, t * fps))
+                        push!(segs, Point2f(t, yat(target, p, valueat(p, sf))))
+                    end
                 end
                 push!(segs, Point2f(NaN, NaN))      # break between lanes
                 isanimated(p) || continue
+                # THINNED. A baked animation has a key on every frame — the LEGO
+                # walk is 181 of them on each of seven curves — and drawing all
+                # 1267 ◆ carpets the timeline into one orange band that says
+                # nothing and hits nothing: two markers a pixel apart cannot be
+                # told apart, let alone grabbed. Below the separation a gesture
+                # needs, the CURVE says where the keys are.
+                lastx = -Inf
                 for (k, key) in enumerate(p.curve.keys)
-                    clip.src_in <= key.frame <= clip.src_out || continue
-                    push!(pts, Point2f(timelineframe(clip, key.frame) / fps,
-                                       yat(clip, p, key.value)))
-                    push!(markmeta, (clip, fx, p, k))
+                    klo <= key.frame <= khi || continue
+                    x = timelineframe(target, key.frame) / fps
+                    x - lastx < MARKGAP * secperpx() && continue
+                    lastx = x
+                    push!(pts, Point2f(x, yat(target, p, key.value)))
+                    push!(markmeta, (target, fx, p, k))
                 end
             end
         end
         lanes[] = segs; marks[] = pts
+        refreshhandles!()
+        return
+    end
+
+    "Timeline frames per SOURCE frame for `target` — the scale a handle's `x` is in."
+    perframe(target, f) = timelineframe(target, f + 1) - timelineframe(target, f)
+
+    "Draw the selected anchor's handles, and nothing else's."
+    function refreshhandles!()
+        empty!(handlemeta)
+        bars = Point2f[]; tips = Point2f[]
+        sel = selkey[]
+        if sel !== nothing
+            tgt, _, p, kidx = sel
+            if isanimated(p) && kidx <= length(p.curve.keys)
+                k = p.curve.keys[kidx]
+                scale = perframe(tgt, k.frame)
+                ax0 = timelineframe(tgt, k.frame) / fps
+                ay0 = yat(tgt, p, k.value)
+                for (side, h) in ((:in, k.inhandle), (:out, k.outhandle))
+                    hashandle(h) || continue
+                    tx = (timelineframe(tgt, k.frame) + scale * h[1]) / fps
+                    ty = yat(tgt, p, k.value + h[2])
+                    append!(bars, (Point2f(ax0, ay0), Point2f(tx, ty), Point2f(NaN, NaN)))
+                    push!(tips, Point2f(tx, ty))
+                    push!(handlemeta, (tgt, p, kidx, side))
+                end
+            end
+        end
+        handlebars[] = bars; handletips[] = tips
         return
     end
 
@@ -3570,6 +3786,7 @@ function buildkeyframeoverlay!(player::Player)
     # and no "currently focused parameter" to guess at.
     tl = player.timeline
     dragref = Ref{Any}(nothing)                 # (clip, param, index)
+    handledrag = Ref{Any}(nothing)              # (target, param, index, :in/:out)
     dragtippos = Observable(Point2f(0, 0))
     dragtiptext = Observable("")
     dragtip = text!(ax, dragtippos; text = dragtiptext, visible = false,
@@ -3579,8 +3796,8 @@ function buildkeyframeoverlay!(player::Player)
     translate!(dragtip, 0, 0, 7)
 
     "The value a lane's y coordinate means for `p` — the inverse of `yat`."
-    yval(clip::Clip, p::Param, y) =
-        (b = clipband(clip); paramdenorm(p, clamp((y - b[1]) / (b[2] - b[1]), 0.0, 1.0)))
+    yval(target, p::Param, y) =
+        (b = clipband(target); paramdenorm(p, clamp((y - b[1]) / (b[2] - b[1]), 0.0, 1.0)))
 
     "Index into `markmeta` of the ◆ near (t, y), or 0."
     function nearestmarker(t, y)
@@ -3595,13 +3812,28 @@ function buildkeyframeoverlay!(player::Player)
         return best
     end
 
+    "Index into `handlemeta` of the grip near (t, y), or 0. Grips beat ◆: they are
+    drawn on top, they are the smaller target, and one always sits ON its anchor
+    when its handle is short."
+    function nearesthandle(t, y)
+        tips = handletips[]; isempty(tips) && return 0
+        vp = ax.scene.viewport[]; (x0, x1) = tl.viewrange[]
+        sx = (x1 - x0) / max(vp.widths[1], 1); sy = 1.0 / max(vp.widths[2], 1)
+        best = 0; bestd = 12.0
+        for (i, pt) in enumerate(tips)
+            d = hypot((t - pt[1]) / sx, (y - pt[2]) / sy)
+            d < bestd && ((best, bestd) = (i, d))
+        end
+        return best
+    end
+
     "The shown parameter of `clip` whose lane passes within `maxpx` of (t, y)."
-    function nearestlane(clip, sf, y; maxpx = 22.0)
+    function nearestlane(target, sf, y; maxpx = 22.0)
         vp = ax.scene.viewport[]
         best = nothing; bestd = maxpx / max(vp.widths[2], 1)
-        for fx in clip.effects, p in fx.params
+        for fx in laneeffects(target), p in fx.params
             p.visible || continue
-            d = abs(y - yat(clip, p, valueat(p, sf)))
+            d = abs(y - yat(target, p, valueat(p, sf)))
             d < bestd && ((best, bestd) = (p, d))
         end
         return best
@@ -3637,16 +3869,30 @@ function buildkeyframeoverlay!(player::Player)
         notify(player.playhead)
     end
     for (row, (lbl, action)) in enumerate([
-        ("Delete keyframe", () -> (c, p, i) = kfmenuctx[] |> t -> deletekey!(t[1], t[2], t[3])),
+        ("Delete keyframe", () -> (t = kfmenuctx[]; deletekey!(t[1], t[2], t[3]))),
         (easelabel, () -> retoggle(:smooth)),
         (holdlabel, () -> retoggle(:hold)),
+        ("Simplify to Bézier anchors", () -> begin
+            clip, p, _ = kfmenuctx[]
+            snapshot!(player)
+            before = length(p.curve.keys)
+            materializeease!(p.curve)
+            simplify!(p.curve)
+            after = length(p.curve.keys)
+            selkey[] = nothing
+            setstatus!(player, "$(p.label): $before keyframe$(before == 1 ? "" : "s") → " *
+                               "$after anchor$(after == 1 ? "" : "s") with handles" *
+                               (after < before ? " (Ctrl+Z to restore)" : " — nothing to remove"))
+            refreshfxrows!(player)
+            notify(player.playhead)
+        end),
         ("Clear all keys of this parameter", () -> begin
             clip, p, _ = kfmenuctx[]
             snapshot!(player)
             n = length(p.curve.keys)
             p.value = valueat(p, playheadframe(player, clip))
             p.curve = nothing
-            syncsliders!(player, clip)
+            refreshfxrows!(player)
             setstatus!(player, "$(p.label): cleared $n keyframe$(n == 1 ? "" : "s") (Ctrl+Z to restore)")
             notify(player.playhead)
         end)])
@@ -3664,6 +3910,23 @@ function buildkeyframeoverlay!(player::Player)
         is_mouseinside(ax.scene) || return Consume(false)
         t, y = mouseposition(ax.scene)
         if event.button == Mouse.left && event.action == Mouse.press
+            # THE LANE DIVIDER BELONGS TO THE TIMELINE. A dense curve puts anchors
+            # right at the lane's bottom edge, inside the resize grip's grab zone,
+            # and this handler runs first — so the grip worked on the simplified
+            # lego project (16 sparse anchors) and did nothing at all on the
+            # per-frame one. Same lesson as the blade in the scrub strip: a band
+            # the other layers do not know about is not a grip.
+            trackedgeat(seq, y, ntracks(seq); grab = grabzone(tl)) === nothing ||
+                return Consume(false)
+            # A GRIP IS A GRIP, WITH OR WITHOUT ALT — Alt-dragging one is how the
+            # pair gets broken, so this cannot sit inside the Alt branch below. It
+            # did, and Alt over a grip fell through to "add a keyframe here".
+            ihit = nearesthandle(t, y)
+            if ihit != 0
+                snapshot!(player)
+                handledrag[] = handlemeta[ihit]
+                return Consume(true)
+            end
             if ispressed(ax.scene, Keyboard.left_alt | Keyboard.right_alt)
                 # THE CLIP WHOSE LANES ARE DRAWN, and no search. `refresh` draws
                 # `editclip(player)` and nothing else, so that is the only clip a
@@ -3673,6 +3936,23 @@ function buildkeyframeoverlay!(player::Player)
                 bound = get(player.fxwidgets, :fxbound, nothing)
                 bound === nothing && return Consume(false)
                 clip = bound[1]
+                # ALT ON AN ANCHOR CONVERTS IT, as it does with the pen tool: a
+                # smooth anchor becomes a corner and back. Only Alt on empty lane
+                # adds a key — the old order added one ON TOP of the ◆ you aimed at.
+                im = nearestmarker(t, y)
+                if im != 0
+                    tgt, fx, p, kidx = markmeta[im]
+                    snapshot!(player)
+                    materializeease!(p.curve)
+                    k = p.curve.keys[kidx]
+                    k.ease === :bezier ? cornerkey!(p.curve, kidx) : smoothkey!(p.curve, kidx)
+                    selkey[] = (tgt, fx, p, kidx)
+                    setstatus!(player, "$(p.label): anchor is now " *
+                                       (p.curve.keys[kidx].ease === :bezier ?
+                                        "smooth — its handles stay in line" :
+                                        "a corner — its handles move on their own"))
+                    refresh(); notify(player.playhead); return Consume(true)
+                end
                 n = timelineframe(tl, t)
                 clip.start <= n < clipend(clip) || return Consume(false)
                 sf = sourceframe(clip, n)
@@ -3689,15 +3969,20 @@ function buildkeyframeoverlay!(player::Player)
                 refresh(); notify(player.playhead); return Consume(true)
             end
             i = nearestmarker(t, y); i == 0 && return Consume(false)
-            clip, _, p, kidx = markmeta[i]
+            clip, fx, p, kidx = markmeta[i]
             if ispressed(ax.scene, Keyboard.left_control | Keyboard.right_control)
-                deletekey!(clip, p, kidx); refresh(); return Consume(true)
+                deletekey!(clip, p, kidx); selkey[] = nothing; refresh(); return Consume(true)
             end
             snapshot!(player)
+            # touching an anchor SELECTS it, which is what puts its handles on screen
+            selkey[] = (clip, fx, p, kidx)
             dragref[] = (clip, p, kidx)
+            refreshhandles!()
             return Consume(true)
-        elseif event.button == Mouse.left && event.action == Mouse.release && dragref[] !== nothing
+        elseif event.button == Mouse.left && event.action == Mouse.release &&
+               (dragref[] !== nothing || handledrag[] !== nothing)
             dragref[] = nothing
+            handledrag[] = nothing
             dragtip.visible = false
             return Consume(true)
         elseif event.button == Mouse.right && event.action == Mouse.press
@@ -3719,6 +4004,23 @@ function buildkeyframeoverlay!(player::Player)
     end
 
     on(events(ax.scene).mouseposition; priority = 20) do _
+        if handledrag[] !== nothing
+            tgt, p, kidx, side = handledrag[]
+            t, y = mouseposition(ax.scene)
+            k = p.curve.keys[kidx]
+            scale = perframe(tgt, k.frame)
+            df = (t * fps - timelineframe(tgt, k.frame)) / (scale == 0 ? 1 : scale)
+            # a grip stays on its own side of the anchor; dragging one THROUGH the
+            # anchor would turn the segment inside out, and Photoshop pins it too
+            df = side === :out ? max(df, 0.0) : min(df, 0.0)
+            dv = yval(tgt, p, y) - Float64(k.value)
+            alt = ispressed(ax.scene, Keyboard.left_alt | Keyboard.right_alt)
+            sethandle!(p.curve, kidx, side, Handle(df, dv); couple = !alt)
+            dragtippos[] = Point2f(t, y)
+            dragtiptext[] = "$(p.label)  handle " * (alt ? "(broken)" : "(smooth)")
+            dragtip.visible = true
+            refresh(); notify(player.playhead); return Consume(true)
+        end
         dragref[] === nothing && return Consume(false)
         clip, p, i = dragref[]
         t, y = mouseposition(ax.scene)
@@ -3732,7 +4034,13 @@ function buildkeyframeoverlay!(player::Player)
         v = yval(clip, p, y)
         movekey!(p.curve, i, f, v)
         j = findfirst(k -> k.frame == f, p.curve.keys)
-        j === nothing || (dragref[] = (clip, p, j))
+        # `movekey!` re-sorts, so the index can move under us — the selection has to
+        # follow it or the handles would be drawn for whichever key took its place
+        if j !== nothing
+            dragref[] = (clip, p, j)
+            s = selkey[]
+            s === nothing || (selkey[] = (s[1], s[2], p, j))
+        end
         dragtippos[] = Point2f(timelineframe(clip, f) / fps, yat(clip, p, v))
         dragtiptext[] = "$(p.label)  $(round(Float64(v); digits = 2)) · " *
                         timestring(timelineframe(clip, f) / fps)
@@ -3814,24 +4122,52 @@ clipanimated(clip::Clip) = isanimated(clip)
 "Absolute source frame the playhead currently maps to within `clip`."
 playheadframe(player::Player, clip::Clip) = sourceframe(clip, player.playhead[])
 
-"""
-    syncsliders!(player, clip)
+# These three said what a TARGET is, back when a target could be a clip or an
+# overlay and the two keyed their curves in different frame worlds. There is one
+# kind of target now, so they are the clip's and nothing dispatches.
+"The timeline frames a target's lane is drawn across — its own extent."
+lanespan(clip::Clip) = (clip.start, clipend(clip))
+"The effects whose parameters a target can show lanes for."
+laneeffects(clip::Clip) = clip.effects
+"The frames a keyframe of `target` can sit on — its own span."
+keyspan(clip::Clip) = (clip.src_in, clip.src_out)
 
-Put every card slider back on what its parameter actually says.
+"""
+    refreshfxrows!(player) -> nothing
+
+Re-derive every on-screen parameter row from its parameter and the playhead: where
+the slider sits, and whether the ◆ is filled, hollow or bound.
+
+THE ONE PLACE A ROW IS WRITTEN, driven by the one listener that owns it. A
+displayed value is a view of (parameter, position) — there is no second copy of
+it to keep in step, and nothing pushes into a widget from anywhere else.
 
 `fxsyncing` is raised while it writes, because a slider's own handler treats a
 change as an EDIT — and an edit at the playhead stamps a keyframe. Without the
 flag, scrubbing across an animated parameter would key it at every frame it
 passed.
 """
-function syncsliders!(player::Player, clip::Clip)
+function refreshfxrows!(player::Player)
+    isempty(player.fxrows) && return nothing
     player.fxsyncing[] = true
     try
-        for fx in clip.effects, prm in fx.params
-            sl = get(player.fxsliders, (fx.id, prm.name), nothing)
-            sl === nothing && continue
-            v = Float64(valueat(prm, playheadframe(player, clip)))
-            Makie.set_close_to!(sl, v)
+        for row in player.fxrows
+            p = row.param
+            f = playheadframe(player, row.target)
+            row.slider === nothing ||
+                Makie.set_close_to!(row.slider, Float64(valueat(p, f)))
+            row.kf === nothing && continue
+            accent, text, muted = row.colors
+            if isdriven(p)
+                # NOT a keyframe state at all: the value arrives down an edge, so
+                # the button says where from and offers the only edit there is.
+                row.kf.label[] = "⇥"
+                row.kf.labelcolor[] = accent
+            else
+                here = isanimated(p) && any(k -> k.frame == f, p.curve.keys)
+                row.kf.label[] = here ? "◆" : "◇"
+                row.kf.labelcolor[] = here ? accent : isanimated(p) ? text : muted
+            end
         end
     finally
         player.fxsyncing[] = false
@@ -3840,26 +4176,43 @@ function syncsliders!(player::Player, clip::Clip)
 end
 
 """
-    syncanimatedsliders!(player, clip)
+    bindinput!(player, p, source; op = :copy) -> Bool
 
-The same, but only for parameters that HAVE a curve — what a scrub needs. A
-static parameter cannot have moved, so writing it back would be pure work (and
-one more chance to trip the edit path).
+Drive parameter `p` from `source` — `(clip, effect, name)` — instead of from its
+own value or curve. See [`ParamInput`](@ref).
+
+`p` keeps its curve: unbinding puts it back exactly as it was, so trying an edge
+out costs nothing.
 """
-function syncanimatedsliders!(player::Player, clip::Clip)
-    any(fx -> any(isanimated, fx.params), clip.effects) || return nothing
-    player.fxsyncing[] = true
-    try
-        for fx in clip.effects, prm in fx.params
-            isanimated(prm) || continue
-            sl = get(player.fxsliders, (fx.id, prm.name), nothing)
-            sl === nothing && continue
-            Makie.set_close_to!(sl, Float64(valueat(prm, playheadframe(player, clip))))
-        end
-    finally
-        player.fxsyncing[] = false
+function bindinput!(player::Player, p::Param, clip::Clip, fx::Effect, name::Symbol;
+                    op::Symbol = :copy)
+    snapshot!(player)
+    p.input = ParamInput(op, ParamRef(name; clip = clip.id, effect = fx.id))
+    bindinputs!(player.sequence)
+    if !isdriven(p)
+        p.input = nothing
+        setstatus!(player, "$(p.label): nothing to drive it from there")
+        return false
     end
-    return nothing
+    setstatus!(player, "$(p.label): driven by $name — ⇥ cuts it")
+    notify(player.playhead)
+    return true
+end
+
+"""
+    unbindinput!(player, target, p) -> Bool
+
+Cut `p`'s edge. It keeps the value it was SHOWING, so the picture does not jump
+at the moment the link goes.
+"""
+function unbindinput!(player::Player, target, p::Param)
+    p.input === nothing && return false
+    snapshot!(player)
+    p.value = valueat(p, playheadframe(player, target))
+    p.input = nothing
+    setstatus!(player, "$(p.label): no longer driven — it keeps the value it had")
+    notify(player.playhead)
+    return true
 end
 
 """
@@ -3872,9 +4225,10 @@ Takes the `Param` ITSELF. There is nothing to look up: no key, no registry, no
 "the first effect of this kind". The row that drew the button holds the object
 the button edits.
 """
-function togglekey!(player::Player, clip::Clip, p::Param)
-    sf = playheadframe(player, clip)
+function togglekey!(player::Player, target, p::Param)
+    sf = playheadframe(player, target)
     snapshot!(player)
+    target isa Clip && bakedirty!(target)   # a key changes what the clip renders
     if !isanimated(p)
         p.curve === nothing && (p.curve = AnimCurve{typeof(p.value)}())
         setkey!(p.curve, sf, p.value)
@@ -3899,24 +4253,26 @@ function togglekey!(player::Player, clip::Clip, p::Param)
 end
 
 "Jump the playhead to the previous (`dir < 0`) or next keyframe of `p`."
-function gotokey!(player::Player, clip::Clip, p::Param, dir::Integer)
+function gotokey!(player::Player, target, p::Param, dir::Integer)
     isanimated(p) || return setstatus!(player, "$(p.label): no keyframes yet — ◆ adds one")
-    sf = playheadframe(player, clip)
-    ks = filter(k -> clip.src_in <= k.frame <= clip.src_out, p.curve.keys)
+    sf = playheadframe(player, target)
+    lo, hi = keyspan(target)
+    ks = filter(k -> lo <= k.frame <= hi, p.curve.keys)
     cand = dir < 0 ? filter(k -> k.frame < sf, ks) : filter(k -> k.frame > sf, ks)
     isempty(cand) && return setstatus!(player,
         "$(p.label): no keyframe $(dir < 0 ? "before" : "after") the playhead")
     k = dir < 0 ? last(cand) : first(cand)
-    seek!(player, clamp(timelineframe(clip, k.frame), 0, seqlength(player.sequence) - 1))
+    seek!(player, clamp(timelineframe(target, k.frame), 0, seqlength(player.sequence) - 1))
     return nothing
 end
 
 "Clear every keyframe of `p` (it keeps the value it was showing; undoable)."
-function clearkeyframes!(player::Player, clip::Clip, p::Param)
+function clearkeyframes!(player::Player, target, p::Param)
     isanimated(p) || return setstatus!(player, "$(p.label): no keyframes to clear")
     snapshot!(player)
+    target isa Clip && bakedirty!(target)
     n = length(p.curve.keys)
-    p.value = valueat(p, playheadframe(player, clip))
+    p.value = valueat(p, playheadframe(player, target))
     p.curve = nothing
     notify(player.playhead)
     setstatus!(player, "$(p.label): cleared $n keyframe$(n == 1 ? "" : "s") (Ctrl+Z to restore)")
@@ -3924,27 +4280,41 @@ function clearkeyframes!(player::Player, clip::Clip, p::Param)
 end
 
 """
-    kfcurves(player) -> Dict{Symbol, NamedTuple}
+    boundparams(player) -> Vector{Param}
 
-The keyframe curve plots on the timeline, by parameter key. Each entry carries
-its own `visible` Observable — that is what a legend entry toggles.
+Every parameter the panel currently has a card for.
+
+`:fxbound` is what those cards were built from, and it is also what the keyframe
+overlay draws from — so "which lanes exist" has one answer. It used to have two:
+a `:kfcurves` dictionary of per-name plot handles, written by the sweep that drew
+every clip's curves at once. The sweep is gone and nothing ever wrote that
+dictionary again, so `showcurves!` iterated an empty `Dict` and the palette's
+"Show/hide keyframe curves" did nothing at all, silently.
 """
-kfcurves(player::Player) = get(player.fxwidgets, :kfcurves, Dict{Symbol, Any}())
+function boundparams(player::Player)
+    b = get(player.fxwidgets, :fxbound, nothing)
+    b === nothing && return Param[]
+    return Param[p for fx in b[2] for p in fx.params]
+end
 
-"Whether ANY keyframe curve is currently shown (hidden curves take no clicks)."
-anycurvevisible(player::Player) = any(c -> c.visible[], values(kfcurves(player)))
+"Whether ANY keyframe lane is open right now. A hidden lane takes no clicks."
+anycurvevisible(player::Player) = any(p -> p.visible, boundparams(player))
 
 """
     showcurves!(player, on) -> Bool
 
-Show or hide every keyframe curve at once — what the legend's right-click does,
-and what the palette command reaches. Returns what it set them to.
+Open or close every keyframe lane at once — what the palette command reaches.
+
+`Param.visible` IS the state: the overlay reads it to decide what to draw and the
+gestures read it to decide what can be grabbed, so setting it is the whole
+operation and there is no second flag to keep in step.
 """
 function showcurves!(player::Player, on::Bool)
-    player.kfvisible[] = on
-    for c in values(kfcurves(player))
-        c.visible[] == on || (c.visible[] = on)
+    for p in boundparams(player)
+        p.visible = on
     end
+    refreshfxrows!(player)
+    notify(player.playhead)
     return on
 end
 

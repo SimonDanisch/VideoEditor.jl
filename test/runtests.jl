@@ -18,6 +18,33 @@ testvideo15 = joinpath(mktempdir(), "test15.mp4")
 run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -f lavfi -i testsrc2=size=180x320:rate=15 -t 4 -c:v libx264 -g 15 -pix_fmt yuv420p $testvideo15`,
              stdout = devnull, stderr = devnull))
 
+"""
+A value through a project file and back.
+
+The single call every "does this survive a save?" test makes, so that what is
+being tested is the FORMAT and not a test's idea of it — see pack.jl.
+"""
+packrt(v) = VE.MsgPack.unpack(VE.MsgPack.pack(v), typeof(v))
+packrt(fx::VE.Effect) = VE.MsgPack.unpack(VE.MsgPack.pack(fx), VE.Effect)
+
+"The same, stopping at the packed map — for a test that inspects what was written."
+packdict(v) = VE.MsgPack.unpack(VE.MsgPack.pack(v))
+
+"""
+Edit a project file in place, through the FORMAT.
+
+`f` gets the unpacked document to mutate. Doing it any other way has cost this
+suite two tests that silently asserted nothing: both stripped a line with a
+regex over TOML syntax that had not been written in months, matched nothing, and
+passed on the unchanged file.
+"""
+function editproject!(f, path)
+    d = VE.decodeblocks(VE.MsgPack.unpack(read(path)))
+    f(d)
+    open(io -> write(io, VE.MsgPack.pack(d)), path, "w")
+    return path
+end
+
 include("refactor.jl")   # registry, analyses-as-slots, links, commands
 
 "The curve of `clip`'s `T` effect parameter `name`, created if needed."
@@ -39,6 +66,39 @@ function opacitycurve!(clip)
     return prm.curve
 end
 opacitycurve(clip) = (prm = VE.opacityparam(clip); prm === nothing ? nothing : prm.curve)
+
+@testset "parameter values round-trip by TYPE" begin
+    # One registration per kind of value — see pack.jl. What this pins is that a
+    # value comes back AS ITS OWN TYPE: JSON had one number type and `Float64`
+    # was it, so a `Float32` went out as `0.20000000298023224`.
+    for v in (3.5, 1.0f0, true, :hold,
+              VE.Vec3f(1, 2, 3), VE.Vec2f(0.5, -0.5),
+              VE.RGBf(0.2, 0.4, 0.6), VE.RGBAf(0.2, 0.4, 0.6, 0.25))
+        @test packrt(v) === v
+        @test typeof(packrt(v)) === typeof(v)
+    end
+    # ALPHA specifically: the component the old writer dropped without a word
+    @test packdict(VE.RGBAf(0.2, 0.4, 0.6, 0.25))[4] ≈ 0.25
+    @test length(packdict(VE.RGBf(0.2, 0.4, 0.6))) == 3
+    # …and an array asked to go raw goes as ITS OWN BYTES, which is what makes an
+    # hours-long analysis track cost what it weighs
+    blockrt(v) = VE.decodeblocks(packdict(VE.Block(v)))
+    big = rand(Float32, 4096)
+    @test blockrt(big) == big
+    @test eltype(blockrt(big)) === Float32                   # …as its own type
+    @test length(VE.MsgPack.pack(VE.Block(big))) < sizeof(big) + 16
+    @test blockrt(Float32[]) == Float32[]                    # …and the empty one
+    # `decodeblocks` reaches every level, so no reader below `loadproject` has to
+    # know a block can be there at all
+    nested = VE.decodeblocks(packdict(Dict("a" => [Dict("b" => VE.Block([1.0, 2.0]))])))
+    @test nested["a"][1]["b"] == [1.0, 2.0]
+    # a tag nobody here wrote is left alone rather than reinterpreted as numbers
+    @test VE.decodeblocks(VE.MsgPack.Extension(Int8(99), UInt8[1, 2])) isa VE.MsgPack.Extension
+    # `packvec` is the pair for fixed-size elements — one block, not one array
+    # per frame
+    ms = [VE.Mat3f(1, 2, 3, 4, 5, 6, 7, 8, i) for i in 1:5]
+    @test VE.unpackvec(VE.Mat3f, VE.decodeblocks(packdict(VE.packvec(ms)))) == ms
+end
 
 @testset "VideoSource" begin
     src = VideoSource(testvideo)
@@ -121,7 +181,7 @@ end
     moveclip!(seq, seq.clips[2], 45; snap = 10, snaptargets = [40])
     @test seq.clips[2].start == 40                  # snapped back
 
-    path = joinpath(mktempdir(), "project.toml")
+    path = joinpath(mktempdir(), "project.videoedit")
     seq.clips[2].crop = (0.1, 0.2, 0.5, 0.5)
     # stabilization/color tracks are part of the edit and must survive saves
     import VideoEditor.GeometryBasics: Mat3f, Vec3f
@@ -141,16 +201,86 @@ end
     @test seq2.clips[1].colortrack.offsets == seq.clips[1].colortrack.offsets
     @test seq2.clips[2].motiontrack === nothing   # absent stays absent
 
-    # a moved source file produces a clear error naming the missing path
-    broken = replace(read(path, String), testvideo => testvideo * ".gone")
-    write(path, broken)
+    # a moved source file produces a clear error naming the missing path. The
+    # file is MOVED, not edited: a project is bytes now, and patching a path
+    # inside it by string replacement leaves the length prefix saying the old
+    # one — which is a corrupt file, not a missing source.
+    moved = joinpath(mktempdir(), "moved.mp4")
+    cp(testvideo, moved)
+    mpath = joinpath(mktempdir(), "moved.videoedit")
+    saveproject(mpath, Sequence(VideoSource(moved)))
+    mv(moved, moved * ".gone")
     err = try
-        loadproject(path)
+        loadproject(mpath)
         nothing
     catch e
         sprint(showerror, e)
     end
-    @test err !== nothing && occursin("missing video file", err) && occursin(".gone", err)
+    @test err !== nothing && occursin("missing video file", err) && occursin("moved.mp4", err)
+end
+
+@testset "Bézier anchors: Photoshop handles, and fitting a baked curve" begin
+    # --- the fit: a curve with a key on every frame is what a bake leaves behind
+    c = VE.AnimCurve{Float64}()
+    for f in 0:180
+        VE.setkey!(c, f, 0.785 * sin(2π * f / 40))
+    end
+    before = [VE.valueat(c, f) for f in 0:180]
+    VE.simplify!(c)
+    after = [VE.valueat(c, f) for f in 0:180]
+    @test length(c.keys) < 25                       # 181 samples of 4.5 periods
+    @test maximum(abs.(before .- after)) < 0.005 * (maximum(before) - minimum(before))
+    @test all(k -> k.ease === :bezier, c.keys)
+
+    # a straight ramp is two anchors and a constant is one — nothing to steer with
+    ramp = VE.AnimCurve{Float64}()
+    for f in 0:180; VE.setkey!(ramp, f, -60 + 120f / 180); end
+    VE.simplify!(ramp)
+    @test length(ramp.keys) == 2
+    @test VE.valueat(ramp, 90) ≈ 0.0 atol = 1.0e-6
+    flat = VE.AnimCurve{Float64}()
+    for f in 0:180; VE.setkey!(flat, f, 1.571); end
+    VE.simplify!(flat)
+    @test length(flat.keys) == 1
+
+    # --- the handles: Photoshop's two anchor kinds
+    h = VE.AnimCurve{Float64}()
+    for f in (0, 20, 40); VE.setkey!(h, f, f == 20 ? 1.0 : 0.0); end
+    VE.autohandles!(h, 2)
+    @test h.keys[2].ease === :bezier
+    len = hypot(h.keys[2].inhandle...)
+    VE.sethandle!(h, 2, :out, VE.Handle(5.0, 3.0))
+    k = h.keys[2]
+    # a SMOOTH anchor keeps its handles in line and the other one's LENGTH
+    @test abs(k.inhandle[1] * k.outhandle[2] - k.inhandle[2] * k.outhandle[1]) < 1.0e-5
+    @test hypot(k.inhandle...) ≈ len atol = 1.0e-4
+    kept = k.inhandle
+    VE.sethandle!(h, 2, :out, VE.Handle(2.0, -4.0); couple = false)   # Alt-drag
+    @test h.keys[2].ease === :corner
+    @test h.keys[2].inhandle == kept                                  # the other side stays
+    VE.smoothkey!(h, 2); @test h.keys[2].ease === :bezier             # Alt-click converts
+    VE.cornerkey!(h, 2); @test h.keys[2].ease === :corner
+
+    # --- a handle shapes the value, and survives the project file
+    shaped = VE.AnimCurve{Float64}()
+    VE.setkey!(shaped, 0, 0.0); VE.setkey!(shaped, 40, 1.0)
+    straight = VE.valueat(shaped, 20)
+    VE.sethandle!(shaped, 1, :out, VE.Handle(20.0, 0.0))   # ease out of the first key
+    @test VE.valueat(shaped, 20) < straight                # …so the middle sits lower
+    @test VE.valueat(shaped, 0) == 0.0 && VE.valueat(shaped, 40) == 1.0
+
+    src2 = VideoSource(testvideo)
+    clip2 = VE.Clip(src2, 0, 60, 0, (0.0, 0.0, 1.0, 1.0))
+    cc = opacitycurve!(clip2)
+    VE.setkey!(cc, 0, 0.0); VE.setkey!(cc, 40, 1.0)
+    VE.sethandle!(cc, 1, :out, VE.Handle(20.0, 0.0))
+    mid = VE.valueat(cc, 20)
+    pth = joinpath(mktempdir(), "handles.videoedit")
+    saveproject(pth, Sequence([clip2], src2.framerate))
+    back = opacitycurve!(loadproject(pth).clips[1])
+    @test back.keys[1].ease === :bezier
+    @test VE.hashandle(back.keys[1].outhandle)
+    @test VE.valueat(back, 20) ≈ mid atol = 1.0e-5
 end
 
 @testset "keyframe animation roundtrip" begin
@@ -161,7 +291,7 @@ end
     curve.interp = :smooth
     seq = Sequence([clip], src.framerate)
 
-    path = joinpath(mktempdir(), "anim.videoedit.toml")
+    path = joinpath(mktempdir(), "anim.videoedit")
     saveproject(path, seq)
     c2 = loadproject(path).clips[1]
     a = opacitycurve(c2)
@@ -249,7 +379,7 @@ end
     split!(seq, 40)
     VE.addtransition!(seq, 40; duration = 12)
     @test length(seq.transitions) == 1
-    path = joinpath(mktempdir(), "trans.videoedit.toml")
+    path = joinpath(mktempdir(), "trans.videoedit")
     saveproject(path, seq)
     seq2 = loadproject(path)
     @test length(seq2.transitions) == 1                # dissolve survived the roundtrip
@@ -271,6 +401,129 @@ end
     end
 end
 
+@testset "an analysis refuses a clip it cannot read" begin
+    # The Stabilize card is offered on EVERY clip, so it is offered on a scene
+    # clip — which renders its frames and has no file to pull grayscale out of.
+    # Pressing it died with `MethodError: graysource(::CPU, ::SceneSource)`, from
+    # inside the analysis job. `nothing`, like every other "cannot be analysed"
+    # answer here (too short, no model), so the caller reports it the way it
+    # already reports those.
+    build = VE.scenebuild(:bar, (64, 48); opacity = 1.0)
+    clip = VE.sceneclip(VE.buildscene(build); build, frames = 60, canvas = (64, 48))
+    @test !VE.decodable(clip.source)
+    @test VE.analyzemotion!(clip) === nothing
+    @test VE.analyzemotion!(clip; mode = :tripod) === nothing
+    @test VE.analyzecolor!(clip) === nothing
+    @test VE.analyzeobject!(clip, (32.0, 24.0)) === nothing
+    @test clip.motiontrack === nothing && clip.colortrack === nothing
+end
+
+@testset "a migrated scene parameter gets a span" begin
+    # A project written while scenes were overlays stored a parameter's CURVE but
+    # no range — there was no slider to size. All seven of the lego project's
+    # animated scene parameters come back that way, and a row without a range has
+    # no widget to build: the card died in `paramform!` reading `p.range[1]`.
+    M = VE.Makie
+    spec = M.SpecApi.Scene(; camera = M.campixel!,
+                           plots = [M.PlotSpec(:Scatter, [M.Point2f(1, 1)];
+                                               markersize = 8.0, name = :dot)])
+    clip = VE.sceneclip((root = spec, joints = Dict{Symbol, Any}(), camera = nothing);
+                        frames = 30, canvas = (64, 48))
+    fx = VE.findslot(clip, :scene)
+    # …exactly what the reader produces: a curve, and no span
+    curve = VE.AnimCurve{Float64}()
+    VE.setkey!(curve, 0, 4.0); VE.setkey!(curve, 29, 20.0)
+    push!(fx.params, VE.Param(Symbol("dot.markersize[1]"), "dot markersize[1]", 4.0;
+                              curve = curve))
+    @test VE.param(fx, Symbol("dot.markersize[1]")).range === nothing
+
+    engine = VE.FxEngine(VE.KA.CPU())
+    VE.render(o -> nothing, engine, clip.source, clip, 0)   # the scene has to exist
+    secs = VE.sceneparamsections(clip, fx)
+    @test secs !== nothing && !isempty(secs)
+    rows = [q for sec in secs for q in sec.params]
+    @test !isempty(rows)
+    # EVERY row the card would build has a span — that is what makes it buildable
+    @test all(q -> q.range !== nothing, rows)
+    # …and the curve survived the replacement: the span was the only thing missing
+    got = VE.param(fx, Symbol("dot.markersize[1]"))
+    @test got.range !== nothing
+    @test VE.isanimated(got) && length(got.curve.keys) == 2
+    @test VE.valueat(got, 29) ≈ 20.0
+    VE.emptyengine!(engine)
+end
+
+@testset "a dissolve is two layers of the one composite" begin
+    # It used to be its own compositor: render both sides, copy both down to the
+    # host, lerp there — written TWICE, in the player and again in the export, for
+    # one picture. And nothing rendered a transition in any test, so both copies
+    # could have drifted from the graph without a red line anywhere. That is the
+    # same shape as the overlays that were correct in the export and invisible in
+    # the editor.
+    src = VideoSource(testvideo)
+    dims = (src.width, src.height)
+    left = Clip(src; src_in = 0, src_out = 40, start = 0)
+    right = Clip(src; src_in = 40, src_out = 80, start = 40)
+    seq = Sequence([left, right], 30.0)
+    engine = VE.FxEngine(VE.KA.CPU())
+
+    # THE MATH, with the layers handed in as flat colours so the answer is exact.
+    # `B` over `A` at α, with B opaque, is α·B + (1−α)·A — which is what the host
+    # lerp computed.
+    red  = fill(VE.RGB{VE.N0f8}(1, 0, 0), dims...)
+    blue = fill(VE.RGB{VE.N0f8}(0, 0, 1), dims...)
+    for α in (0.0, 0.25, 0.5, 1.0)
+        out = Ref{Any}(nothing)
+        @test VE.composite(engine, [left, right], 40,
+                           (c, _) -> c === left ? red : blue;
+                           canvas = dims,
+                           alphafor = (c, _) -> c === right ? α : nothing) do canvas
+            out[] = copy(canvas)
+        end
+        px = out[][dims[1] ÷ 2, dims[2] ÷ 2]
+        @test Float32(VE.ColorTypes.red(px))  ≈ 1 - α atol = 0.01
+        @test Float32(VE.ColorTypes.blue(px)) ≈ α     atol = 0.01
+    end
+
+    # THE WIRING: `renderframe!` is the one definition of what frame n looks like,
+    # and a dissolve has to go through it like everything else.
+    VE.addtransition!(seq, 40; duration = 12)
+    t = VE.transitionat(seq, 40)
+    @test t !== nothing
+    readers = Dict{String, Any}()
+    dest = VE.RGBFrame(undef, dims...)
+    frames = Dict{Int, Any}()
+    for n in (VE.transstart(t), 40, VE.transstart(t) + t.duration - 1)
+        VE.renderframe!(dest, seq, n, readers, engine)
+        frames[n] = copy(dest)
+    end
+    a, b = VE.transstart(t), VE.transstart(t) + t.duration - 1
+    @test frames[a] != frames[b]                  # the two ends are different pictures
+    @test frames[40] != frames[a] && frames[40] != frames[b]   # …and the middle is neither
+
+    # …and it is the RIGHT mix, to the last bit: render each side alone through
+    # the same graph and check the dissolve against `(1−p)·A + p·B`. Content
+    # distances would not have caught a wrong `p` — testsrc2 moves between frames
+    # anyway, and that swamps the fraction being measured.
+    function alone(clip, n)
+        o = Ref{Any}(nothing)
+        VE.composite(engine, [clip], n,
+                     (c, _) -> get!(() -> VE.opendecoder(c.source, engine.backend),
+                                    readers, VE.sourcepath(c.source));
+                     canvas = dims, exact = true) do canvas
+            o[] = copy(canvas)
+        end
+        return o[]
+    end
+    n = 40
+    frac = clamp((n - VE.transstart(t) + 0.5) / t.duration, 0.0, 1.0)
+    A, B = alone(left, n), alone(right, n)
+    chan(c) = Float32(VE.ColorTypes.red(c))
+    @test maximum(abs(chan(m) - ((1 - frac) * chan(x) + frac * chan(y)))
+                  for (m, x, y) in zip(frames[n], A, B)) < 1.001f0 / 255
+    VE.emptyengine!(engine)
+end
+
 @testset "multi-track edits" begin
     src = VideoSource(testvideo)
     a = VE.Clip(src, 0, 60, 0, (0.0, 0.0, 1.0, 1.0))
@@ -289,7 +542,7 @@ end
 
     # the layer survives snapshot/restore and a project roundtrip
     @test sort([c.track for c in VE.snapshot(seq)]) == [1, 2, 2]
-    path = joinpath(mktempdir(), "mt.videoedit.toml")
+    path = joinpath(mktempdir(), "mt.videoedit")
     saveproject(path, seq)
     @test sort([c.track for c in loadproject(path).clips]) == [1, 2, 2]
 end
@@ -333,20 +586,27 @@ end
     @test !any(e -> e isa ColorEffect, VE.liveeffects(c))
     @test VE.findeffect(c, ColorEffect).adj.saturation == 1.8f0   # params survive
     @test VE.findslot(c, id) === slot                             # addressable by id
-    d = VE.effectdict(slot)                           # project-file roundtrip
-    s2 = VE.effectfromdict(d)
+    s2 = packrt(slot)                                 # project-file roundtrip
     @test s2.id == id && !s2.enabled && VE.op(s2).adj.saturation == 1.8f0
     # the file is the PARAMETERS — no per-type writer, no per-type reader
+    d = packdict(slot)
     @test d["kind"] == "color"
     @test Set(pd["name"] for pd in d["params"]) ==
           Set(["brightness", "contrast", "saturation", "temperature"])
+    fromdict(x) = VE.MsgPack.from_msgpack(VE.Effect, x)
     # a parameter the kind no longer declares is skipped, not fatal
-    d2 = deepcopy(d); push!(d2["params"], Dict{String, Any}("name" => "gone", "value" => 1.0))
-    @test VE.op(VE.effectfromdict(d2)).adj.saturation == 1.8f0
+    d2 = deepcopy(d)
+    push!(d2["params"], Dict{String, Any}("T" => "Float64", "name" => "gone",
+                                          "label" => "Gone", "value" => 1.0,
+                                          "visible" => false))
+    @test VE.op(fromdict(d2)).adj.saturation == 1.8f0
     # …and one the file omits keeps the kind's default
     d3 = deepcopy(d); filter!(pd -> pd["name"] != "contrast", d3["params"])
-    @test VE.param(VE.effectfromdict(d3), :contrast).value ==
+    @test VE.param(fromdict(d3), :contrast).value ==
           VE.param(VE.Effect(VE.kindbyname(:color)), :contrast).value
+    # an effect whose kind is gone NAMES it rather than loading half an edit
+    d4 = deepcopy(d); d4["kind"] = "nosuchkind"
+    @test_throws ErrorException fromdict(d4)
     slot.enabled = true
 end
 
@@ -396,8 +656,8 @@ end
     seq = Sequence(src)
     split!(seq, 40)
     a, b = seq.clips[1], seq.clips[2]
-    b.blendfrom = a.id
-    VE.keyfade!(b, 12, :in)
+    VE.keyfade!(b, 12, :in)          # …which is what creates the opacity parameter
+    VE.pairblend!(seq, b, a)
     @test VE.blends(seq) == [(1, 2, 12)]
     @test VE.findslot(b, VE.OpacityEffect) !== nothing     # the blend IS an effect entry
     slotid = VE.findslot(b, VE.OpacityEffect).id
@@ -407,10 +667,10 @@ end
     sort!(seq.clips; by = c -> (c.track, c.start))
     @test VE.blends(seq) == [(1, 2, 12)]                    # still paired
 
-    path = joinpath(mktempdir(), "blend.videoedit.toml")
+    path = joinpath(mktempdir(), "blend.videoedit")
     saveproject(path, seq)
     seq2 = loadproject(path)
-    @test seq2.clips[2].blendfrom == seq2.clips[1].id       # ids survive the file
+    @test VE.blendpartner(seq2, seq2.clips[2]) == 1        # ids survive the file
     @test VE.blends(seq2) == [(1, 2, 12)]
     @test VE.findslot(seq2.clips[2], VE.OpacityEffect).id == slotid
 
@@ -419,11 +679,44 @@ end
     slot.enabled = false
     @test isempty(collect(VE.liveeffects(seq2.clips[2])))
     @test VE.blends(seq2) == [(1, 2, 12)]                   # still listed, just off
-    VE.clearfade!(seq2.clips[2], :in)
-    seq2.clips[2].blendfrom = UInt64(0)          # the × action clears the pair too
+    VE.removeblend!(seq2, seq2.clips[2])         # what the × action does
     @test isempty(VE.blends(seq2))
-    @test seq2.clips[2].blendfrom == 0
+    @test VE.blendpartner(seq2, seq2.clips[2]) === nothing
     @test VE.findslot(seq2.clips[2], VE.OpacityEffect) === nothing
+end
+
+@testset "a project written before the pairing was an edge still opens paired" begin
+    # `Clip.blendfrom` was a field: which clip this one blends away from, stored on
+    # the clip. It is an edge on the opacity parameter now (`:pairedwith`), and the
+    # reader migrates the old key — the one migration in project.jl that nothing
+    # exercised, which is how a migration path stops working without a sound.
+    src = VideoSource(testvideo)
+    seq = Sequence([Clip(src; src_in = 0, src_out = 30, start = 0),
+                    Clip(src; src_in = 30, src_out = 60, start = 30)], 30.0)
+    a, b = seq.clips
+    VE.keyfade!(b, 6, :in)                       # the fade the blend renders
+    path = tempname() * ".videoedit"
+    saveproject(path, seq)
+
+    # …and now make the file look like the old writer's: the pairing as a clip
+    # field, no edge on the parameter.
+    d = VE.decodeblocks(VE.MsgPack.unpack(read(path)))
+    d["clips"][2]["blendfrom"] = d["clips"][1]["id"]
+    for fx in d["clips"][2]["effects"], prm in get(fx, "params", ())
+        delete!(prm, "input")
+    end
+    open(io -> write(io, VE.MsgPack.pack(d)), path, "w")
+
+    seq2 = loadproject(path)
+    rm(path; force = true)
+    @test length(seq2.clips) == 2
+    prm = VE.opacityparam(seq2.clips[2])
+    @test prm !== nothing
+    @test prm.input !== nothing && prm.input.op === :pairedwith
+    @test VE.blendpartner(seq2, seq2.clips[2]) == 1
+    @test VE.blends(seq2) == [(1, 2, VE.fadeinlength(seq2.clips[2]))]
+    # …and it POINTS rather than drives: `b`'s fade stays its own curve
+    @test !VE.isdriven(prm) && VE.isanimated(prm)
 end
 
 """
@@ -458,7 +751,7 @@ end
     e = VE.plugineffect(:mcpfx; gain = 0.25)
     f = applyfx(fill(VE.RGB{VE.N0f8}(0.8, 0.8, 0.8), 8, 8), e)
     @test all(px -> Float32(px.r) < 0.8, f)                        # gain 0.25 darkens
-    @test VE.op(VE.effectfromdict(VE.effectdict(VE.Effect(e)))).params.gain == 0.25
+    @test VE.op(packrt(VE.Effect(e))).params.gain == 0.25
 
     # the stock :soften plugin exercises the OTHER effect kind — Stencil (reads a
     # neighbourhood), applied through the same kernel the GPU graph uses
@@ -561,7 +854,7 @@ end
     end
 
     # projects roundtrip with several sources
-    path = joinpath(mktempdir(), "multi.toml")
+    path = joinpath(mktempdir(), "multi.videoedit")
     saveproject(path, seq)
     seq2 = loadproject(path)
     @test length(seq2.clips) == 2
@@ -752,7 +1045,7 @@ end
     # strength roundtrips through the project file (older files default to 1)
     track.strength = 0.4f0
     seqct = Sequence([clip], src.framerate)
-    ctpath = joinpath(mktempdir(), "ct.videoedit.toml")
+    ctpath = joinpath(mktempdir(), "ct.videoedit")
     saveproject(ctpath, seqct)
     @test loadproject(ctpath).clips[1].colortrack.strength ≈ 0.4f0
     track.strength = 1.0f0
@@ -1163,8 +1456,7 @@ end
     # --- effect: registries, neutrality, serialization
     @test VideoEditor.isneutral(MatteEffect(0.0, 0.0))
     @test !VideoEditor.isneutral(MatteEffect(1.0, 0.0))
-    @test VideoEditor.op(VideoEditor.effectfromdict(
-              VideoEditor.effectdict(VideoEditor.Effect(MatteEffect(0.7, 0.2))))) ==
+    @test VideoEditor.op(packrt(VideoEditor.Effect(MatteEffect(0.7, 0.2)))) ==
           MatteEffect(0.7f0, 0.2f0)
     k = VideoEditor.kindbyname(:matte)
     @test [pr.name for pr in k.params] == [:strength, :feather]
@@ -1178,22 +1470,23 @@ end
     VideoEditor.setkey!(mc, 0, 0.0)
     VideoEditor.setkey!(mc, 11, 1.0)
     @test VideoEditor.valueat(mc, 0) ≈ 0.0
-    e0 = VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 0), MatteEffect)
-    e1 = VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 11), MatteEffect)
+    mslot = VideoEditor.findslot(clip, MatteEffect)
+    e0 = VideoEditor.op(mslot, 0)
+    e1 = VideoEditor.op(mslot, 11)
     @test e0.strength ≈ 0.0f0
     @test e1.strength ≈ 1.0f0
     # feather keyframes must not clobber strength (shared-effect rebuild)
     VideoEditor.setkey!(paramcurve!(clip, MatteEffect, :feather), 11, 0.5)
-    e1b = VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 11), MatteEffect)
+    e1b = VideoEditor.op(mslot, 11)
     @test e1b.strength ≈ 1.0f0 && e1b.feather ≈ 0.5f0
 
     # --- the graph builds a matte plane node for it, sized by the analysed track
-    g = VideoEditor.graphof(VideoEditor.effectiveclip(clip, 11))
+    g = VideoEditor.graphof!(clip, (src.width, src.height))
     mn = g.nodes[findfirst(n -> n isa VideoEditor.PlaneNode{VideoEditor.MatteOp}, g.nodes)]
     @test mn.shape == VideoEditor.mattesize(clip.mattetrack)
 
     # --- project round-trip: seeds in the file, alpha in the sidecar
-    path = joinpath(mktempdir(), "matte.toml")
+    path = joinpath(mktempdir(), "matte.videoedit")
     seq = Sequence([clip], 30.0)
     saveproject(path, seq)
     @test isfile(VideoEditor.mattefile(path, clip.id))
@@ -1236,76 +1529,81 @@ end
     # outside the pool, never freed, and invisible to the graph that ordered
     # everything around it. The properties below are what that route has to have.
     src = VideoSource(testvideo)
-    frame = fill(VE.RGB{VE.N0f8}(0.2, 0.6, 0.9), src.width, src.height)
+    dims = (src.width, src.height)
+    frame = fill(VE.RGB{VE.N0f8}(0.2, 0.6, 0.9), dims...)
 
     clip = VE.Clip(src)
     alpha = zeros(UInt8, 160, 90, 10)
     alpha[40:120, 20:70, :] .= 0xff
     clip.mattetrack = MatteTrack(alpha, clip.src_in, [clip.src_in])
-    push!(clip.effects, VE.Effect(MatteEffect(; strength = 1.0)))
+    VE.addslot!(clip, VE.Effect(MatteEffect(; strength = 1.0)))
     f0 = clip.src_in
 
     # the node carries the plane's shape, because that shape sizes a graph
-    # resource and so belongs in the plan signature
-    node = VE.graphof(clip).nodes[end]
+    # resource — a matte analysed at another resolution needs its own graph
+    node = VE.graphof!(clip, dims).nodes[end]
     @test node isa VE.PlaneNode{VE.MatteOp}
     @test node.shape == VE.mattesize(clip.mattetrack)
 
     engine = VE.FxEngine(VE.KA.CPU())
-    cp = VE.runchain!(engine, frame, clip, f0)
-    out = copy(VE.chainimage(cp))
-    @test out == VE.applymatte!(copy(frame), clip, f0; strength = 1.0)
-    @test out[3, 3] == VE.RGB{VE.N0f8}(0, 0, 0)                     # background keyed
-    @test out[src.width ÷ 2, src.height ÷ 2] != VE.RGB{VE.N0f8}(0, 0, 0)
+    out = Ref{Any}(nothing)
+    VE.render(engine, frame, clip, f0) do o; out[] = copy(o); end
+    @test out[] == VE.applymatte!(copy(frame), clip, f0; strength = 1.0)
+    @test out[][3, 3] == VE.RGB{VE.N0f8}(0, 0, 0)                # background keyed
+    @test out[][src.width ÷ 2, src.height ÷ 2] != VE.RGB{VE.N0f8}(0, 0, 0)
 
-    # a changed parameter is a store, not a new plan — the plane did not move
-    plans = length(engine.plans)
-    clip.effects[end] = VE.Effect(MatteEffect(; strength = 0.5))
-    half = copy(VE.chainimage(VE.runchain!(engine, frame, clip, f0)))
-    @test length(engine.plans) == plans
-    @test half != out
+    # A CHANGED VALUE IS A STORE, not a new plan. The structure object is the
+    # clip's version: it is replaced when the structure changes and never edited,
+    # so identity is the whole test.
+    g = clip.graph
+    VE.param(clip.effects[end], :strength).value = 0.5
+    half = Ref{Any}(nothing)
+    VE.render(engine, frame, clip, f0) do o; half[] = copy(o); end
+    @test clip.graph === g
+    @test length(engine.layers) == 1
+    @test half[] != out[]
 
-    # the SAME frame of the SAME clip is already in the buffer: nothing to write
-    b = only(cp.planes)
-    VE.loadplane!(engine.store, b, clip, f0)
-    @test (@atomic b.update.pending) === nothing
-
-    # …but a re-propagation is a NEW track under an unchanged clip and frame, and
-    # a stamp that could not see that would render the old alpha forever. This is
-    # what replaced the eight explicit `freematteplanes!` calls.
+    # a re-propagation is a NEW track under an unchanged clip and frame, and the
+    # plane is written unconditionally, so the picture follows it
     alpha2 = zeros(UInt8, 160, 90, 10); alpha2[10:40, 10:30, :] .= 0xff
     clip.mattetrack = MatteTrack(alpha2, clip.src_in, [clip.src_in])
-    clip.effects[end] = VE.Effect(MatteEffect(; strength = 1.0))
-    fresh = copy(VE.chainimage(VE.runchain!(engine, frame, clip, f0)))
-    @test fresh == VE.applymatte!(copy(frame), clip, f0; strength = 1.0)
-    @test fresh != out
+    VE.param(clip.effects[end], :strength).value = 1.0
+    fresh = Ref{Any}(nothing)
+    VE.render(engine, frame, clip, f0) do o; fresh[] = copy(o); end
+    @test fresh[] == VE.applymatte!(copy(frame), clip, f0; strength = 1.0)
+    @test fresh[] != out[]
 
     # outside the analysed range the node renders nothing — not the last plane
-    @test copy(VE.chainimage(VE.runchain!(engine, frame, clip, f0 + 50))) == frame
-    @test !only(cp.planes).active[]
+    outside = Ref{Any}(nothing)
+    VE.render(engine, frame, clip, f0 + 50) do o; outside[] = copy(o); end
+    @test outside[] == frame
 
-    # the compositor's coverage is the chain's own matte binding, so "is this
-    # layer keyed" has ONE answer: where the matte removed the background the
-    # track below shows through, rather than the black the keying painted.
+    # KEYING WRITES COVERAGE, not black: where the matte removed the background the
+    # track below shows through. There is no second coverage image to disagree with
+    # the keying — the alpha is in the pixel the keying wrote.
     base = VE.Clip(src)
     top = VE.Clip(src); top.track = 2
     top.mattetrack = MatteTrack(alpha, top.src_in, [top.src_in])
-    push!(top.effects, VE.Effect(MatteEffect(; strength = 1.0)))
-    red  = fill(VE.RGB{VE.N0f8}(1, 0, 0), src.width, src.height)
-    blue = fill(VE.RGB{VE.N0f8}(0, 0, 1), src.width, src.height)
+    VE.addslot!(top, VE.Effect(MatteEffect(; strength = 1.0)))
+    red  = fill(VE.RGB{VE.N0f8}(1, 0, 0), dims...)
+    blue = fill(VE.RGB{VE.N0f8}(0, 0, 1), dims...)
     eng2 = VE.FxEngine(VE.KA.CPU())
     canvas = Ref{Any}(nothing)
     @test VE.composite(eng2, [base, top], 0, (c, sf) -> c === base ? red : blue;
-                       canvas = (src.width, src.height)) do cv
+                       canvas = dims) do cv
         canvas[] = copy(cv)
     end
     @test canvas[][src.width ÷ 2, src.height ÷ 2] == VE.RGB{VE.N0f8}(0, 0, 1)
     @test canvas[][3, 3] == VE.RGB{VE.N0f8}(1, 0, 0)
+    # ONE graph for the whole frame, one submit
+    @test length(eng2.compositions) == 1
 
-    # every buffer the engine owns comes back to the pool, planes included
+    # every buffer the engine owns comes back to the pool, planes included —
+    # and the planes come back BECAUSE they are transients of the plan, which is
+    # the whole reason there is no store beside it any more
     VE.emptyengine!(engine); VE.emptyengine!(eng2)
-    @test isempty(engine.store.slots) && isempty(engine.plans)
-    @test isempty(eng2.store.slots)
+    @test isempty(engine.compositions) && isempty(engine.layers)
+    @test isempty(eng2.compositions) && isempty(eng2.layers)
 end
 
 @testset "matte reads and propagates in one interleaved pass" begin
@@ -1436,8 +1734,7 @@ end
         # effect + registries
         @test VideoEditor.isneutral(RestoreEffect(0.0))
         @test !VideoEditor.isneutral(RestoreEffect(1.0))
-        @test VideoEditor.op(VideoEditor.effectfromdict(
-                VideoEditor.effectdict(VideoEditor.Effect(RestoreEffect(0.6))))) ==
+        @test VideoEditor.op(packrt(VideoEditor.Effect(RestoreEffect(0.6)))) ==
               RestoreEffect(0.6f0)
         k = VideoEditor.kindbyname(:restore)
         @test [pr.name for pr in k.params] == [:strength]
@@ -1448,11 +1745,12 @@ end
         cur = paramcurve!(clip, RestoreEffect, :strength)
         VideoEditor.setkey!(cur, 0, 0.0)
         VideoEditor.setkey!(cur, 5, 1.0)
-        @test VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 0), RestoreEffect).strength ≈ 0.0f0
-        @test VideoEditor.findeffect(VideoEditor.effectiveclip(clip, 5), RestoreEffect).strength ≈ 1.0f0
+        rslot = VideoEditor.findslot(clip, RestoreEffect)
+        @test VideoEditor.op(rslot, 0).strength ≈ 0.0f0
+        @test VideoEditor.op(rslot, 5).strength ≈ 1.0f0
 
         # the graph builds a restore plane node, sized by what the model returned
-        g = VideoEditor.graphof(VideoEditor.effectiveclip(clip, 5))
+        g = VideoEditor.graphof!(clip, (src.width, src.height))
         rn = g.nodes[findfirst(n -> n isa VideoEditor.PlaneNode{VideoEditor.RestoreOp}, g.nodes)]
         @test rn.shape == (2 * src.width, 2 * src.height)
     finally
@@ -1536,23 +1834,16 @@ end
         @test [(c.rate, c.src_in, c.src_out, c.start) for c in s2.clips] ==
               [(0.5, 4, 50, 7)]
 
-        path = joinpath(mktempdir(), "conform.videoedit.toml")
+        path = joinpath(mktempdir(), "conform.videoedit")
         VE.saveproject(path, s)
         back = VE.loadproject(path)
         @test [(c.rate, c.src_in, c.src_out, c.start) for c in back.clips] ==
               [(0.5, 4, 50, 7)]
         @test VE.cliplength(back.clips[1]) == VE.cliplength(s.clips[1])
-        # a project written before conforming existed holds native clips only.
-        # Edited through the PARSER, not with a regex over the text: a project
-        # file is JSON (`saveproject` uses `JSON.print`; the docstring on
-        # project.jl says why), and this dropped `\nrate = [0-9.]+` — TOML
-        # syntax, which has not been written since. It matched nothing, `rate`
-        # stayed 0.5, and the assertion below was simply false. Nobody saw it
-        # because `interactions.jl` is included at the top of this file and its
-        # testset throws on its known failures, so execution never reached here.
-        d = VE.JSON.parse(read(path, String))
-        delete!(d["clips"][1], "rate")
-        open(io -> VE.JSON.print(io, d, 2), path, "w")
+        # a clip that names no rate is a NATIVE clip — the reader defaults every
+        # field it can, so a script can write a project without spelling out
+        # what it does not care about.
+        editproject!(d -> delete!(d["clips"][1], "rate"), path)
         @test VE.loadproject(path).clips[1].rate == 1.0
     end
 end
@@ -1665,33 +1956,24 @@ end
     @test VE.transformof(c2)[2] == -0.2
     cur = paramcurve!(c2, VE.TransformEffect, :scale)
     VE.setkey!(cur, 0, 1.0); VE.setkey!(cur, 20, 2.0)
-    @test VE.transformof(VE.effectiveclip(c2, 10))[1] ≈ 1.5   # baked at the frame
-    path = joinpath(mktempdir(), "reframe.videoedit.toml")
+    @test VE.transformof(c2, 10)[1] ≈ 1.5    # sampled at the frame
+    path = joinpath(mktempdir(), "reframe.videoedit")
     VE.saveproject(path, seq)
     back = VE.loadproject(path)
     @test VE.transformof(back.clips[end]) == VE.transformof(c2)
     @test VE.transformof(VE.snapshot(seq)[end]) == VE.transformof(c2)
-    # A project written BEFORE the transform became an effect holds a `reframe`
-    # tuple on the clip instead — `withreframe!` is what turns it back into one,
-    # so feed it exactly that and check it arrives. (This used to strip a TOML
-    # `reframe = [...]` line with a regex; project files are JSON, so it matched
-    # nothing and the assertion below was reading a field that no longer exists.)
-    d = VE.JSON.parse(read(path, String))
-    d["clips"][end]["reframe"] = [1.25, 0.1, 0.0]
-    open(io -> VE.JSON.print(io, d, 2), path, "w")
-    @test VE.transformof(VE.loadproject(path).clips[end])[1] ≈ 1.25
-    # …and with NEITHER a `reframe` tuple nor a transform effect, the clip is
-    # placed by the plain fit. Both have to go: this clip carries a serialised
-    # `TransformEffect` from the `settransform` above, and dropping only the
-    # legacy tuple leaves that one answering `transformof`.
-    delete!(d["clips"][end], "reframe")
-    filter!(e -> get(e, "kind", "") != "transform", d["clips"][end]["effects"])
-    open(io -> VE.JSON.print(io, d, 2), path, "w")
+    # …and with no transform effect at all, the clip is placed by the plain fit.
+    # The placement lives in ONE place now — there is no second field on the clip
+    # that could answer `transformof` after the effect is gone.
+    editproject!(path) do d
+        filter!(e -> get(e, "kind", "") != "transform", d["clips"][end]["effects"])
+    end
     @test VE.transformof(VE.loadproject(path).clips[end]) == VE.NEUTRALFRAME
 end
 
-include("scenespec.jl")   # a Makie scene as data: paths, animation, round trip
-include("overlays.jl")
+include("scenespec.jl")   # a scene as a clip's source: the spec, the live scene
+include("overlays.jl")    # …and the stock non-footage clips built from presets
+include("bake.jl")        # pre-rendering a clip's chain to disk
 
 # LAST, and that is the whole point. `interactions.jl` throws at the end of the
 # file on its known failures, which aborts this one — so for as long as it was

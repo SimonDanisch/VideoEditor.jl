@@ -45,8 +45,10 @@ Bump `refresh` to re-pull thumbnails after asynchronous loads.
     bandlo = 0.03
     "Top edge of this clip's band in axis y (0..1)."
     bandhi = 0.97
-    "Number of stacked tracks (thumbnail tiles shrink 1/ntracks so their aspect holds)."
-    ntracks = 1
+    "This lane's share of the whole stack's height. The tile pitch follows the lane a
+    clip is actually drawn in, so a track made taller shows BIGGER frames rather than
+    the same ones stretched — which is the entire point of making it taller."
+    bandshare = 1.0
 end
 
 function Makie.plot!(p::ClipView)
@@ -58,9 +60,9 @@ function Makie.plot!(p::ClipView)
         return state === :selected ? selected : state === :hovered ? hovered : idle
     end
     map!(p, [:timerange, :viewrange, :pixelspersecond, :bandheight, :sourcestart,
-             :thumbs, :thumbsize, :color, :refresh, :ntracks],
-         [:strip, :stripx, :stripvisible]) do trange, vrange, pps, bh, s0, thumbs, tsize, color, _, ntr
-        return composetiles(trange, vrange, pps, bh / max(ntr, 1), s0, thumbs, tsize, to_color(color))
+             :thumbs, :thumbsize, :color, :refresh, :bandshare],
+         [:strip, :stripx, :stripvisible]) do trange, vrange, pps, bh, s0, thumbs, tsize, color, _, share
+        return composetiles(trange, vrange, pps, bh * share, s0, thumbs, tsize, to_color(color))
     end
     # thumbnails inset inside the band (same 0.04/0.94 proportion as the full-height band)
     map!(p, [:bandlo, :bandhi], :stripy) do lo, hi
