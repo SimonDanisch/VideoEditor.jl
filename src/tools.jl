@@ -85,7 +85,8 @@ end
 tooltime(player::Player, n::Integer) = n / player.sequence.framerate
 
 "(lo, hi) y-band of `clip`'s track on the timeline axis."
-toolband(player::Player, clip::Clip) = trackband(clip.track, ntracks(player.sequence))
+toolband(player::Player, clip::Clip) =
+    trackband(player.sequence, clip.track, ntracks(player.sequence))
 
 """
     registertool!(name, label, description; activate, deactivate = ctx -> nothing, panel)
@@ -597,26 +598,66 @@ function loopcard!(ctx::ToolContext, clip::Clip, ref::Integer)
     th = nearestthumb(cache, sec)
     fill3 = RGB{N0f8}(player.timeline.colors.surface)
     img = th === nothing ? fill(fill3, 16, 9) : fitbox(th, 240, 92, fill3)
-    return tooladdcard!(ctx, img;
+    id = tooladdcard!(ctx, img;
         caption = "ref " * timecode(player.sequence, clip.start + ref - 1),
+        # A card's id addresses `cards`, which every tool shares; `refs` is this
+        # tool's own list. They coincided while the loop finder was the only tool
+        # drawing cards, and `st[:refs][cardid]` then indexed the wrong reference
+        # (or past the end) as soon as another card was on the panel. `cardids`
+        # is the map, so `active` means one thing: WHICH REFERENCE.
         onclick = cid -> begin      # clicking a card shows ITS similarity markers
-            st[:active][] = cid
+            i = findfirst(==(cid), st[:cardids])
+            i === nothing && return
+            st[:active][] = i
             toolhighlight!(ctx, cid)
             showloopmarkers!(ctx)
         end,
-        onremove = cid -> removeloopref!(ctx, cid))
+        onremove = cid -> begin
+            i = findfirst(==(cid), st[:cardids])
+            i === nothing || removeloopref!(ctx, i)
+        end)
+    push!(st[:cardids], id)
+    return id
 end
 
-"Re-render every reference card from `refs` (after a removal) and select `select`."
-function refreshloopcards!(ctx::ToolContext; select::Integer = length(ctx.state[:refs]))
+"Re-render every reference card from `refs` and select the `select`-th."
+function refreshloopcards!(ctx::ToolContext; select::Integer = length(ctx.state[:refs]),
+                           clear::Bool = true)
     st = ctx.state
-    cleartoolcards!(ctx.player)
+    clear && cleartoolcards!(ctx.player)
+    empty!(st[:cardids])
     for (clip, ref, _) in st[:refs]
         loopcard!(ctx, clip, ref)
     end
     st[:active][] = clamp(select, 0, length(st[:refs]))
-    st[:active][] == 0 || toolhighlight!(ctx, st[:active][])
+    st[:active][] == 0 || toolhighlight!(ctx, st[:cardids][st[:active][]])
     showloopmarkers!(ctx)
+    return nothing
+end
+
+"""
+The loop finder's card list, drawn from its references.
+
+A BODY, not cards accumulated by `addloopref!` alone: the Effects panel relays out
+whenever the clip's stack changes — and a ▼ cut is exactly that, since it splits
+the clip the tool is working on. Cards built imperatively were wiped by that
+rebuild, so the tool lost its result list the moment it did its own job, and the
+second Find then drew onto a panel that had thrown the first one away.
+"""
+function loopfinderpanel!(ctx::ToolContext)   # `EffectContext` is an alias, defined later
+    player = ctx.player
+    cur = activetool(player)
+    running = cur !== nothing && cur[2].tool === :loopfinder && cur[2].state !== nothing
+    # OFF: the one control that turns it on. The generic action button `fxcard!`
+    # gives a kind with no body cannot serve here — a body decides its own
+    # controls, and this one has two states.
+    running || return (toolaction!(ctx, "Find similar frames",
+                                   () -> activatetool!(player, :loopfinder)); nothing)
+    tctx = cur[2]
+    toolaction!(ctx, "Find similar frames", () -> loopfind!(tctx))
+    # `clear = false`: the rebuild has cleared the list already, and clearing
+    # again here would take out the cards other tools have already drawn.
+    refreshloopcards!(tctx; select = tctx.state[:active][], clear = false)
     return nothing
 end
 
@@ -640,7 +681,7 @@ function addloopref!(ctx::ToolContext, clip::Clip, ref::Integer, sig)
                           n = st[:nhints], exclude = max(round(Int, fps), 2))
     push!(st[:refs], (clip, Int(ref), hints))
     id = loopcard!(ctx, clip, ref)
-    st[:active][] = id
+    st[:active][] = length(st[:refs])
     toolhighlight!(ctx, id)
     showloopmarkers!(ctx)
     setstatus!(player, "Loop finder: ▼ marks frames similar to the selected card — " *
@@ -692,7 +733,8 @@ function activateloopfinder!(ctx::ToolContext)
     st = Dict{Symbol, Any}(:nhints => 6,
                            :sigs => IdDict{Clip, Any}(),
                            :refs => Any[],            # (clip, ref, hints) per card
-                           :active => Ref(0),
+                           :cardids => Int[],         # …and the card each one is drawn as
+                           :active => Ref(0),         # WHICH REFERENCE, not which card
                            :hintpts => Observable(Point2f[]),
                            :hintcols => Observable(RGBAf[]),
                            :refpt => Observable(Point2f[]))
@@ -704,7 +746,9 @@ function activateloopfinder!(ctx::ToolContext)
     foreach(p -> translate!(p, 0, 0, 6), (hp, rp))   # above thumbs, below playhead
     toolplot!(ctx, hp)
     toolplot!(ctx, rp)
-    toolaction!(ctx, "Find similar frames", () -> loopfind!(ctx))
+    # The Find action belongs to the CARD (`loopfinderpanel!`), which is rebuilt
+    # every time the panel is: a control registered here would point into the
+    # layout that existed at activation and be gone with the first edit.
     ontool!(ctx, events(ax.scene).mousebutton) do event
         (event.button == Mouse.left && event.action == Mouse.press) || return Consume(false)
         Makie.is_mouseinside(ax.scene) || return Consume(false)
@@ -781,8 +825,15 @@ function clearfade!(clip::Clip, dir::Symbol)
     filter!(k -> !(k.frame in zone), c.keys)
     if isempty(c.keys)
         prm.curve = nothing
-        slot = findslot(clip, OpacityEffect)
-        slot === nothing || removeslot!(clip, slot.id)
+        # …but the ENTRY stays while it carries the pairing. The pairing lives on
+        # THIS parameter's `input`, so dropping the slot drops it — and `keyfade!`
+        # clears before it re-keys, which made "change a blend's length" forget
+        # which clip it blends from. That is exactly what the note below says
+        # must not happen; the note was right and the code did it anyway.
+        if prm.input === nothing
+            slot = findslot(clip, OpacityEffect)
+            slot === nothing || removeslot!(clip, slot.id)
+        end
     end
     # NB: the pairing is NOT cleared here — `keyfade!` clears before it re-keys, and
     # changing a blend's length must not forget which clip it blends from. Removing
@@ -816,19 +867,51 @@ end
 
 Every blend in the sequence as `(from, into, frames)` clip indices: a clip that
 fades in at its start, paired with the clip it blends away from — the one that was
-MARKED when the blend was made, remembered by id (`Clip.blendfrom`), `0` when that
-clip is gone. Nothing is inferred from positions, so moving, sorting, undo and a
-project reload all keep the pair.
+MARKED when the blend was made.
+
+The pairing is an EDGE on the incoming clip's opacity parameter, pointing at the
+outgoing clip's (see [`ParamInput`](@ref), `op = :pairedwith`). It carries no value
+— the fade is keyed on one side only, because fading both darkens the middle — so
+it is a reference and nothing else, and `0` means that clip is gone. Nothing is
+inferred from positions, so moving, sorting, undo and a project reload all keep
+the pair.
 """
 function blends(seq::Sequence)
     out = Tuple{Int, Int, Int}[]
     for (j, c) in enumerate(seq.clips)
         d = fadeinlength(c)
         d == 0 && continue
-        from = c.blendfrom == 0 ? nothing : findfirst(o -> o.id == c.blendfrom, seq.clips)
-        push!(out, (something(from, 0), j, d))
+        push!(out, (something(blendpartner(seq, c), 0), j, d))
     end
     return out
+end
+
+"""
+    blendpartner(seq, clip) -> Union{Nothing, Int}
+
+Index of the clip `clip` blends away FROM, or `nothing`.
+"""
+function blendpartner(seq::Sequence, clip::Clip)
+    prm = opacityparam(clip)
+    n = prm === nothing ? nothing : prm.input
+    (n === nothing || n.op !== :pairedwith) && return nothing
+    r = only(n.inputs)
+    return r isa ParamRef ? findfirst(o -> o.id == r.clip, seq.clips) : nothing
+end
+
+"""
+    pairblend!(seq, into, from) -> nothing
+    pairblend!(seq, into, ::Nothing) -> nothing
+
+Record (or clear) which clip `into` blends away from.
+"""
+function pairblend!(seq::Sequence, into::Clip, from::Union{Nothing, Clip})
+    prm = opacityparam(into)
+    prm === nothing && return nothing
+    prm.input = from === nothing ? nothing :
+                ParamInput(:pairedwith, ParamRef(:opacity; clip = from.id))
+    bindinputs!(seq)
+    return nothing
 end
 
 """
@@ -852,8 +935,8 @@ function blendclips!(player::Player, a::Clip, b::Clip; seconds::Real = 0.6,
     left, right = a.start <= b.start ? (a, b) : (b, a)
     d = max(min(round(Int, seconds * fps), cliplength(right) ÷ 2), 2)
     snapshot!(player)
-    right.blendfrom = left.id      # the pair YOU marked, remembered by id
-    keyfade!(right, d, :in)
+    keyfade!(right, d, :in)        # …which is what creates the opacity parameter
+    pairblend!(seq, right, left)   # the pair YOU marked, remembered by id
     fit && fitoverlap!(player, left, right, d)   # slide them together in ONE step
     refreshedit!(player)
     seek!(player, clamp(right.start + d ÷ 2, 0, max(seqlength(seq) - 1, 0)))
@@ -1100,8 +1183,7 @@ function refreshblendlist!(ctx::ToolContext)
         (crossing || from === nothing) || push!(actions,
             ("⇄", () -> (markpair!(player, i, j); movetooverlap!(player, from, into, d)),
              "overlap the clips"))
-        push!(actions, ("×", () -> (snapshot!(player); clearfade!(into, :in);
-                                    into.blendfrom = UInt64(0);   # the pair goes with it
+        push!(actions, ("×", () -> (snapshot!(player); removeblend!(player.sequence, into);
                                     refreshedit!(player);
                                     setstatus!(player, "blend removed (Ctrl+Z undoes)")),
                         "remove"))
@@ -1111,6 +1193,28 @@ function refreshblendlist!(ctx::ToolContext)
     isempty(entries) &&
         push!(entries, ("no blends yet — mark two clips, then click Blend clips", Any[]))
     toolrows!(ctx, entries)
+    return nothing
+end
+
+"""
+    removeblend!(seq, into) -> nothing
+
+Take a blend off `into`: its keys, its pairing, and the effect entry that rendered
+it — all three, because to the user they are one thing. A leftover neutral
+`OpacityEffect` is a card for a blend that no longer exists.
+
+`clearfade!` alone cannot do it: it keeps the entry precisely while the pairing is
+still on it, which is what lets a length change re-key without forgetting the
+partner.
+"""
+function removeblend!(seq::Sequence, into::Clip)
+    clearfade!(into, :in)
+    pairblend!(seq, into, nothing)
+    slot = findslot(into, OpacityEffect)
+    slot === nothing && return nothing
+    prm = param(slot, :opacity)
+    (prm === nothing || (prm.curve === nothing && prm.input === nothing)) &&
+        removeslot!(into, slot.id)
     return nothing
 end
 
@@ -1307,6 +1411,7 @@ registereffect!(EffectKind(:loopfinder, "Loop finder";
     make = _ -> LoopFinderEffect(),
     matches = e -> e isa LoopFinderEffect,
     read = _ -> NamedTuple(),
+    body = loopfinderpanel!,
     activate = activateloopfinder!, analysis = true))
 
 registereffect!(EffectKind(:blend, "Blend clips";
@@ -2053,7 +2158,7 @@ function rundepth!(player::Player)
                 # The effect too — see the docstring on why the analysis alone is
                 # not a usable result.
                 findeffect(clip, DepthBlurEffect) === nothing &&
-                    push!(clip.effects, Effect(DepthBlurEffect()))
+                    addslot!(clip, Effect(DepthBlurEffect()))
                 player.jobprogress[] = NaN
                 refreshedit!(player)
                 notify(player.playhead)
@@ -2097,7 +2202,7 @@ function runlook!(player::Player)
             analyzelook!(clip, img)
             put!(player.uiqueue, () -> begin
                 findeffect(clip, LookEffect) === nothing &&
-                    push!(clip.effects, Effect(LookEffect()))
+                    addslot!(clip, Effect(LookEffect()))
                 refreshedit!(player)
                 notify(player.playhead)
                 setstatus!(player, "look applied — Look is keyframable in the inspector")
@@ -2137,12 +2242,15 @@ function runtranscribe!(player::Player)
             caps = transcribe!(seq)
             put!(player.uiqueue, () -> begin
                 player.jobprogress[] = NaN
-                any(o -> o.kind === :captions, seq.overlays) ||
-                    addoverlay!(seq, :captions)
+                # …and a caption CLIP on the track above, if there is none: the
+                # transcript is what a user fixes, the clip is where it is drawn.
+                any(c -> c.source isa SceneSource &&
+                         partbyname(scenespecof(c), :captions) !== nothing,
+                    seq.clips) || addcaptionclip!(seq)
                 refreshedit!(player)
                 notify(player.playhead)
-                setstatus!(player, "captions: $(length(caps)) line(s) — the overlay's " *
-                                   "Y/Size/Opacity are in the inspector")
+                setstatus!(player, "captions: $(length(caps)) line(s) — the caption " *
+                                   "clip's Y/Size are in the inspector")
             end)
         catch e
             bt = catch_backtrace()
@@ -2298,7 +2406,7 @@ function runmatte!(ctx::ToolContext; clip = nothing, seeds = nothing)
             end
             put!(player.uiqueue, () -> begin
                 findeffect(clip, MatteEffect) === nothing &&
-                    push!(clip.effects, Effect(MatteEffect()))
+                    addslot!(clip, Effect(MatteEffect()))
                 cov = mattecoverage(track)
                 player.matteinfo[] = "matte: $(length(track.seeds)) marked frame(s), " *
                                      "$(size(track.alpha, 3)) frames, " *
@@ -2340,8 +2448,8 @@ function removematte!(player::Player)
     col === nothing || col.clip !== clip || cancelmattecollect!(col)
     clip.mattetrack = nothing
     delete!(player.mattemarks, clip.id)
-    i = findfirst(s -> op(s) isa MatteEffect, clip.effects)
-    i === nothing || deleteat!(clip.effects, i)
+    i = findfirst(s -> renderable(s) && op(s) isa MatteEffect, clip.effects)
+    i === nothing || removeslotat!(clip, i)
     player.matteinfo[] = "no matte"
     refreshmattepanel!(player; structure = true)
     notify(player.playhead)
@@ -3227,8 +3335,8 @@ function cancelmattecollect!(col::MatteCollect)
     restorematteeffect!(col)
     col.clip.mattetrack = col.prevtrack
     if !col.hadeffect                      # we added it; take it back off again
-        i = findfirst(s -> op(s) isa MatteEffect, col.clip.effects)
-        i === nothing || deleteat!(col.clip.effects, i)
+        i = findfirst(s -> renderable(s) && op(s) isa MatteEffect, col.clip.effects)
+        i === nothing || removeslotat!(col.clip, i)
     end
     col.ctx.player.matteinfo[] = "marking cancelled"
     notify(col.ctx.player.playhead)
@@ -3468,8 +3576,8 @@ function restorepanel!(ctx::ToolContext)
         loc = editclip(player)
         loc === nothing && return setstatus!(player, "restore: no clip under the playhead")
         clearrestore!(loc[1])
-        i = findfirst(s -> op(s) isa RestoreEffect, loc[1].effects)
-        i === nothing || deleteat!(loc[1].effects, i)
+        i = findfirst(s -> renderable(s) && op(s) isa RestoreEffect, loc[1].effects)
+        i === nothing || removeslotat!(loc[1], i)
         player.restoreinfo[] = "no restoration"
         refreshmattepanel!(player)
         notify(player.playhead)
@@ -3500,7 +3608,7 @@ function runrestore!(ctx::ToolContext)
                                  progress = (d, t) -> (player.jobprogress[] = d / max(t, 1)))
             put!(player.uiqueue, () -> begin
                 findeffect(clip, RestoreEffect) === nothing &&
-                    push!(clip.effects, Effect(RestoreEffect()))
+                    addslot!(clip, Effect(RestoreEffect()))
                 player.restoreinfo[] = "$got frames restored from $(first) (x$(restorescale()))"
                 player.jobprogress[] = NaN
                 refreshmattepanel!(player)

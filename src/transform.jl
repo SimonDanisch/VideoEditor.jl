@@ -26,7 +26,7 @@ function layerquad(player::Player, clip::Clip, srcframe::Integer)
     # the clip AT THIS FRAME: with the transform keyframed, the static effect is
     # not where the picture is — the handles would sit on the base values and stay
     # there while the animation moved underneath them
-    Minv = inv(layermatrix(effectiveclip(clip, srcframe), lay, can))
+    Minv = inv(layermatrix(clip, lay, can, srcframe))
     x, y, w, h = clip.crop
     src = ((x, y), (x + w, y), (x + w, y + h), (x, y + h))
     return [Point2f(begin
@@ -118,7 +118,8 @@ function showtransformgizmo!(player::Player, clip::Union{Nothing, Clip},
     # with nothing to click to put them away.
     sel = fxselected(player)
     slot = clip === nothing || sel === nothing ? nothing :
-           findfirst(s -> (:fx, s.id) == sel && op(s) isa TransformEffect, clip.effects)
+           findfirst(s -> (:fx, s.id) == sel && renderable(s) && op(s) isa TransformEffect,
+                     clip.effects)
     if slot === nothing
         g.scene.visible[] = false
         g.scene.captures_mouse = false
@@ -206,7 +207,7 @@ function starttransformdrag!(player::Player, p)
     # the values the gesture starts from are the EFFECTIVE ones: on a keyframed
     # parameter the static value is not what is on screen, so a drag that started
     # from it jumped the moment it was picked up
-    s, px, py, rot = transformof(effectiveclip(clip, sf))
+    s, px, py, rot = transformof(clip, sf)
     d = sqrt((p[1] - c[1])^2 + (p[2] - c[2])^2)
     player.fxwidgets[:transformdrag] =
         TransformDrag(clip, zone, Point2f(p), c, s, (px, py), rot, max(d, 1e-3),

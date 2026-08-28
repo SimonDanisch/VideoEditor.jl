@@ -13,6 +13,7 @@ effects) in preview and export. Saved with the project.
 function analyzecolor!(clip::Clip; cutoff::Real = 0.5, backend = KA.CPU(), progress = nothing)
     n = srclength(clip)
     n >= 24 || return nothing  # too short to separate flicker from content
+    decodable(clip.source) || return nothing   # a rendered clip has no flicker
     means = Matrix{Float32}(undef, n, 3)
     stds = Matrix{Float32}(undef, n, 3)
     dec = graysource(backend, clip.source)   # GPU decode on a GPU backend

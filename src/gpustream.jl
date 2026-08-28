@@ -490,6 +490,18 @@ function evict!(s::GpuVideoStream)
 end
 
 function Base.close(s::GpuVideoStream)
+    # WAIT FIRST. `unsafe_free!` returns a buffer to the pool immediately, and the
+    # GPU may still be READING these planes — a colour convert or a thumbnail
+    # downscale recorded moments ago. Freeing under an in-flight read faults the
+    # driver, and the crash lands here, in `close`, with nothing naming the
+    # dispatch that was still using it: seen twice as
+    # `signal (11): Segmentation fault … close at gpustream.jl … gputhumbloop`.
+    # Same shape as the buffer-lifetime bug in Lava's own pool.
+    #
+    # BEFORE the decoder too, not only before the planes: the observed crash is in
+    # `close(s.dec)` itself, and a decode session owns device memory the same
+    # dispatches are reading. Draining once, first, covers both.
+    KA.synchronize(s.backend)
     s.dec === nothing || (close(s.dec); s.dec = nothing)
     s.feedgop = 0
     for f in values(s.ring); Lava.unsafe_free!(f.y); Lava.unsafe_free!(f.uv); end

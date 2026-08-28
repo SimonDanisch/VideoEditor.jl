@@ -179,7 +179,7 @@ function tooldefinitions()
                   "crf" => Dict("type" => "integer", "description" => "mp4 quality, default 20"),
                   "fps" => Dict("type" => "integer", "description" => "gif frame rate, default 15"),
                   "loop" => Dict("type" => "integer", "description" => "gif looping: 0 = forever (default), -1 = play once")), ["path"]),
-        tool("save_project", "Save edit metadata as TOML.", Dict("path" => str("output path")), ["path"]),
+        tool("save_project", "Save the edit metadata as a project file.", Dict("path" => str("output path")), ["path"]),
         tool("add_source", "Append a video file as a new clip at the end of the timeline (a differing framerate is conformed to the sequence).",
              Dict("path" => str("video file path")), ["path"]),
     ]
@@ -327,7 +327,7 @@ function calltool(srv::MCPServer, name::String, args)
             clip === nothing && return "no clip at that time"
             seteffect!(clip, ColorEffect(brightness = get(args, "brightness", 0), contrast = get(args, "contrast", 1),
                                          saturation = get(args, "saturation", 1), temperature = get(args, "temperature", 0)))
-            syncsliders!(player, clip)
+            refreshfxrows!(player)
             refreshedit!(player)
             "color set"
         elseif name == "set_blur"
@@ -335,7 +335,7 @@ function calltool(srv::MCPServer, name::String, args)
             clip = clipattime(args["time"])
             clip === nothing && return "no clip at that time"
             seteffect!(clip, BlurEffect(Float32(args["sigma"])))
-            syncsliders!(player, clip)
+            refreshfxrows!(player)
             refreshedit!(player)
             "blur set"
         elseif name == "set_sharpen"
@@ -343,7 +343,7 @@ function calltool(srv::MCPServer, name::String, args)
             clip = clipattime(args["time"])
             clip === nothing && return "no clip at that time"
             seteffect!(clip, SharpenEffect(1.0f0, Float32(args["amount"])))
-            syncsliders!(player, clip)
+            refreshfxrows!(player)
             refreshedit!(player)
             "sharpen set"
         elseif name == "analyze_color"
@@ -391,7 +391,7 @@ function calltool(srv::MCPServer, name::String, args)
             snapshot!(player)
             nt = NamedTuple(pr.name => Float64(get(args, String(pr.name), pr.default)) for pr in p.params)
             seteffect!(clip, p.make(nt))
-            syncsliders!(player, clip)
+            refreshfxrows!(player)
             refreshedit!(player)
             "applied $(p.label)"
         else
@@ -400,6 +400,40 @@ function calltool(srv::MCPServer, name::String, args)
     end
     return textcontent(result)
 end
+
+"""
+    effectinfo(fx) -> Dict
+
+One effect as an MCP client SEES it: what it is and what its parameters are set
+to, flat, with no curve.
+
+Deliberately not the project format. This is a description for a reader, so a
+parameter is one number under its name; the file is a round trip, so it carries
+labels, ranges and every keyframe. They were the same function once, which meant
+neither could change without breaking the other.
+"""
+effectinfo(fx::Effect) = Dict{String, Any}(
+    "kind" => String(fx.kind), "id" => string(fx.id), "enabled" => fx.enabled,
+    "params" => Dict{String, Any}(String(p.name) => jsonvalue(p.value) for p in fx.params))
+
+"""
+    jsonvalue(v) -> JSON-able
+
+A parameter value as something `JSON.print` can write.
+
+One method per kind of value and a fallback that ERRORS, rather than an untyped
+`collect(Float64.(v))` catching everything not a `Real` — that is not dispatch
+but a guess: it happened to work for anything broadcastable and would have failed
+unreadably for anything else.
+"""
+jsonvalue(v::Bool) = v
+jsonvalue(v::Real) = Float64(v)
+jsonvalue(v::Symbol) = String(v)
+jsonvalue(v::GeometryBasics.Vec) = Float64[Float64(x) for x in v]   # Vec2f, Vec3f, …
+jsonvalue(v::Color3) = Float64[red(v), green(v), blue(v)]
+jsonvalue(v::TransparentColor) = Float64[red(v), green(v), blue(v), alpha(v)]
+jsonvalue(v) = error("no `jsonvalue` method for $(typeof(v)) — an MCP client " *
+                     "cannot be shown a parameter of a type nothing converts")
 
 function statedict(player::Player)
     seq = player.sequence
@@ -417,11 +451,11 @@ function statedict(player::Player)
             "track" => clip.track,
             "timeline_start" => clip.start / fps,
             "timeline_end" => clipend(clip) / fps,
-            "source" => clip.source.path,
+            "source" => sourcepath(clip.source),
             "source_in" => clip.src_in / clip.source.framerate,
             "crop" => collect(clip.crop),
             "id" => string(clip.id),
-            "effects" => [effectdict(s) for s in clip.effects],
+            "effects" => [effectinfo(s) for s in clip.effects],
             # keyframed parameters — their values vary ACROSS the clip, so a single
             # frame does not describe it; view_sheet the clip's range to see them
             "animated" => sort!([string(fx.kind, ".", prm.name) for fx in clip.effects
@@ -456,10 +490,9 @@ function renderpreview(player::Player, t::Float64, width::Int)
     end
     # the same graph as preview/export; a private engine on the declared backend —
     # this runs on the MCP task, the player's engine pool belongs to the render thread
-    ec = effectiveclip(clip, srcframe)
     engine = FxEngine(player.analysisbackend)
     try
-        render(engine, scratch, ec, Int(srcframe)) do out
+        render(engine, scratch, clip, Int(srcframe)) do out
             # `preview` is the HOST frame the MCP encodes, and `out` lives on
             # `player.analysisbackend`. `warp!` runs on the source's backend, so
             # the two cannot be spanned in one call — with a GPU analysis backend
@@ -467,11 +500,11 @@ function renderpreview(player::Player, t::Float64, width::Int)
             # GPUCompiler. Crop on the device, then bring the result down.
             b = KA.get_backend(out)
             if typeof(b) === typeof(KA.get_backend(preview))
-                warp!(preview, out, ec.crop)
+                warp!(preview, out, clip.crop)
                 KA.synchronize(b)
             else
                 tmp = KA.allocate(b, eltype(preview), size(preview)...)
-                warp!(tmp, out, ec.crop)
+                warp!(tmp, out, clip.crop)
                 KA.synchronize(b)
                 copyto!(preview, tmp)
             end

@@ -73,6 +73,9 @@ function getthumb(cache::ThumbnailCache, s::Integer)
     end
 end
 
+"A source with no thumbnail cache has no nearest thumbnail."
+nearestthumb(::Nothing, ::Integer; maxdist::Integer = 30) = nothing
+
 "Nearest cached thumbnail to second `s` within `maxdist`, or `nothing`."
 function nearestthumb(cache::ThumbnailCache, s::Integer; maxdist::Integer = 30)
     lock(cache.lock) do

@@ -115,19 +115,20 @@ band on a 1920-wide render, whatever resolution the matte was analyzed at.
     return 1.0f0 - strength * (1.0f0 - a)     # strength 0 = matte off
 end
 
-@kernel function mattealpha_kernel!(out, @Const(alpha), mw::Int32, mh::Int32,
-                                    strength::Float32, feather::Float32,
-                                    cx::Float32, cy::Float32, cw::Float32, ch::Float32)
-    i, j = @index(Global, NTuple)
-    @inbounds begin
-        a = mattealphaat(alpha, i, j, size(out, 1), size(out, 2), mw, mh,
-                         strength, feather, cx, cy, cw, ch)
-        out[i, j] = RGB{N0f8}(unitn0f8(a), unitn0f8(a), unitn0f8(a))
-    end
-end
+# There is no `mattealpha_kernel!` here any more, and no `mattealpha!`.
+#
+# It rendered the matte a SECOND time, into a separate white-on-black coverage
+# image, because the keying below painted the removed background black and the
+# compositor then had no way to tell "black because it was keyed" from "black
+# because it is black". Two renders of one matte, at two places in the frame,
+# which could differ by a frame and once did.
+#
+# A plane carries alpha now. The keying writes coverage where it removes
+# background, the placement resamples colour and coverage together, and the
+# compositor reads the alpha that is already in the pixel.
 
 @kernel function matte_kernel!(buf, @Const(alpha), mw::Int32, mh::Int32,
-                               strength::Float32, feather::Float32, bg::Vec3f,
+                               strength::Float32, feather::Float32,
                                cx::Float32, cy::Float32, cw::Float32, ch::Float32)
     i, j = @index(Global, NTuple)
     @inbounds begin
@@ -137,9 +138,15 @@ end
         # clamps below hold the edge, and those pixels are cropped away anyway.
         a = mattealphaat(alpha, i, j, w, h, mw, mh, strength, feather, cx, cy, cw, ch)
         c = buf[i, j]
-        src = Vec3f(red(c), green(c), blue(c))
-        out = src .* a .+ bg .* (1.0f0 - a)
-        buf[i, j] = RGB{N0f8}(unitn0f8(out[1]), unitn0f8(out[2]), unitn0f8(out[3]))
+        # KEYING IS A WRITE TO ALPHA. It used to mix the removed background
+        # towards a colour — black — which is right when there is nothing under
+        # the layer and wrong the moment there is: the black is OPAQUE, so it
+        # covered the track below and a matte over a background plate showed a
+        # silhouette. The compositor then needed the plane a second time to build
+        # a coverage image and hope the two answers agreed. Coverage in the pixel
+        # is the one answer, and the colour is already multiplied by it.
+        buf[i, j] = premul(eltype(buf), Float32(red(c)), Float32(green(c)),
+                           Float32(blue(c)), a * alphaof(c))
     end
 end
 
@@ -183,48 +190,23 @@ end
     applyplane!(buf, plane, op::MatteOp, clip)
 
 Key `buf` against the matte plane, in place: the subject survives, the background
-goes to `bg`.
+becomes UNCOVERED — alpha zero, and the colour premultiplied to match.
 """
-function applyplane!(buf::AnyRGBFrame, plane, op::MatteOp, clip::Clip;
-                     bg::Vec3f = Vec3f(0, 0, 0))
+function applyplane!(buf::AnyRGBFrame, plane, op::MatteOp, clip::Clip)
     s = clamp(op.strength, 0.0f0, 1.0f0)
     s <= 0.0f0 && return buf
     backend = KA.get_backend(buf)
     cr = clip.crop
     matte_kernel!(backend)(buf, plane, Int32(size(plane, 1)), Int32(size(plane, 2)), s,
-                           clamp(op.feather, 0.0f0, 1.0f0), bg,
+                           clamp(op.feather, 0.0f0, 1.0f0),
                            Float32(cr[1]), Float32(cr[2]), Float32(cr[3]), Float32(cr[4]);
                            ndrange = size(buf))
     return buf
 end
 
-"""
-    mattealpha!(dst, plane, op, clip) -> dst
-
-The matte as a COVERAGE image the size of `dst` (white = keep, black = show what
-is underneath).
-
-This is what makes a matte transparent instead of black. Keying paints the
-removed background with `bg`, which is right when nothing is underneath and
-wrong the moment there is: the black is opaque and covers the track below.
-This and [`applyplane!`](@ref) share [`mattealphaat`](@ref) *and now the plane
-itself* — the compositor is handed the buffer the keying read, so the coverage it
-honours cannot be a frame off the coverage that was keyed.
-"""
-function mattealpha!(dst::AnyRGBFrame, plane, op::MatteOp, clip::Clip)
-    backend = KA.get_backend(dst)
-    cr = clip.crop
-    mattealpha_kernel!(backend)(dst, plane,
-                                Int32(size(plane, 1)), Int32(size(plane, 2)),
-                                clamp(op.strength, 0.0f0, 1.0f0),
-                                clamp(op.feather, 0.0f0, 1.0f0),
-                                Float32(cr[1]), Float32(cr[2]), Float32(cr[3]), Float32(cr[4]);
-                                ndrange = size(dst))
-    return dst
-end
 
 """
-    applymatte!(buf, clip, srcframe; strength, feather, bg)
+    applymatte!(buf, clip, srcframe; strength, feather)
 
 The host-side form: key a HOST buffer straight from the clip's track. A no-op
 when the clip has no matte or the frame is outside it, so scrubbing past the
@@ -235,12 +217,11 @@ In the render path the plane is a graph resource and the node calls
 building a graph for it.
 """
 function applymatte!(buf::AnyRGBFrame, clip::Clip, srcframe::Integer;
-                     strength::Real = 1.0, feather::Real = 0.0,
-                     bg::Vec3f = Vec3f(0, 0, 0))
+                     strength::Real = 1.0, feather::Real = 0.0)
     op = MatteOp(Float32(clamp(strength, 0.0, 1.0)), Float32(clamp(feather, 0.0, 1.0)))
     d = planedata(op, clip, srcframe)
     d === nothing && return buf
-    return applyplane!(buf, reshape(d, planeshape(op, clip)), op, clip; bg)
+    return applyplane!(buf, reshape(d, planeshape(op, clip)), op, clip)
 end
 
 const MATTEWARMED = Ref(false)

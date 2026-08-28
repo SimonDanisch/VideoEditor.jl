@@ -42,7 +42,7 @@ Extract and mmap `source`'s audio (blocking; run on a background thread).
 Returns `nothing` when the source has no audio stream.
 """
 function loadpcm(source::VideoSource)
-    hasaudio(source.path) || return nothing
+    hasaudio(sourcepath(source)) || return nothing
     path = pcmpath(source)
     if !isfile(path)
         tmp = path * ".part"
@@ -89,7 +89,7 @@ function fillaudio!(out::AbstractMatrix{Int16}, seq::Sequence,
         # samples left inside this clip on the timeline
         clipendsample = ceil(Int, clipend(clip) / fps * AUDIORATE)
         span = min(blocklen - pos, max(clipendsample - tsample, 1))
-        track = get(tracks, clip.source.path, nothing)
+        track = get(tracks, sourcepath(clip.source), nothing)
         if track === nothing
             fill!(view(out, :, (pos + 1):(pos + span)), Int16(0))
         else
@@ -114,6 +114,16 @@ function fillaudio!(out::AbstractMatrix{Int16}, seq::Sequence,
     mixnarration!(out, seq, startsample; rate = AUDIORATE)
     return out
 end
+
+"""
+A source with no soundtrack: nothing to extract, and saying so is the whole
+method. `Clip.source` is abstract — a scene renders its frames and has no file to
+pull audio out of — and without this, pressing PLAY on a timeline holding a scene
+clip died with `MethodError: no method matching ensurepcm!(::Player, ::SceneSource)`
+from inside `startaudio!`. Found by opening a real project, not by the suite: no
+test PLAYS a timeline that has a scene on it.
+"""
+ensurepcm!(::Player, ::ClipSource) = nothing
 
 "Ensure `source`'s PCM is loaded (kicks off background extraction once)."
 function ensurepcm!(player::Player, source::VideoSource)

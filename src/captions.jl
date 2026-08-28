@@ -92,8 +92,9 @@ function sequenceaudio(seq::Sequence)
     total > 0 || return (Float32[], AUDIORATE)
     tracks = Dict{String, Union{PCMTrack, Nothing}}()
     for c in seq.clips
-        haskey(tracks, c.source.path) && continue
-        tracks[c.source.path] = loadpcm(c.source)
+        decodable(c.source) || continue          # nothing to hear from a rendered clip
+        haskey(tracks, sourcepath(c.source)) && continue
+        tracks[sourcepath(c.source)] = loadpcm(c.source)
     end
     all(isnothing, values(tracks)) && return (Float32[], AUDIORATE)
     nsamp = ceil(Int, total / seq.framerate * AUDIORATE)
@@ -138,28 +139,50 @@ function transcribe!(seq::Sequence)
     return seq.captions
 end
 
-# The caption overlay. `frame`, `framerate` and `captions` are all in every
-# overlay's state (see `overlaystate`), so it finds its own line rather than being
-# told — which is what keeps the transcript ONE object on the sequence instead of
-# a keyframed text param with a key per spoken word.
-registeroverlay!(:captions, "Captions",
-    [FxParam(:y, "Y"; min = 0.0, max = 1.0, default = 0.12),
-     FxParam(:size, "Size"; min = 0.01, max = 0.2, default = 0.05),
-     FxParam(:opacity, "Opacity"; min = 0.0, max = 1.0, default = 1.0)],
-    function (scene, canvas, state)
-        W, H = canvas
-        Makie.text!(scene, olift(s -> Makie.Point2f(0.5 * W, s.y * H), state);
-                    text = olift(state) do s
-                        fr = s.framerate > 0 ? s.framerate : 25.0
-                        captionat(s.captions, s.frame / fr)
-                    end,
-                    fontsize = olift(s -> Float32(s.size * H), state),
-                    color = olift(s -> fadedcolor(:white, s.opacity), state),
-                    strokecolor = olift(s -> fadedcolor(:black, s.opacity), state),
-                    strokewidth = olift(s -> Float32(0.12 * s.size * H), state),
-                    align = (:center, :center))
-        return nothing
-    end)
+"""
+    captionscene(seq; canvas, y, size) -> Makie.SceneSpec
+
+The transcript as a scene: one text plot whose STRING comes from the sequence's
+captions at the frame being drawn.
+
+The text is not keyframed and never was — a key per spoken word would make the
+transcript unfixable. It is an INPUT: the plot's `text` attribute is driven from
+the caption list by the clip's position, which is the same mechanism a
+cross-dissolve and an audio-reactive number use (see `ParamInput`). Until it is
+bound the clip shows the line at its own first frame.
+"""
+function captionscene(seq::Sequence; canvas::Tuple{Integer, Integer} = (1920, 1080),
+                     y::Real = 0.12, size::Real = 0.05)
+    W, H = canvas
+    fps = seq.framerate > 0 ? seq.framerate : 25.0
+    return pixelscene(Makie.PlotSpec(:Text, [Makie.Point2f(0.5 * W, y * H)];
+                                     text = captionat(seq.captions, 0.0),
+                                     fontsize = Float32(size * H),
+                                     color = Makie.to_color(:white),
+                                     strokecolor = Makie.to_color(:black),
+                                     strokewidth = Float32(0.12 * size * H),
+                                     align = (:center, :center), name = :captions))
+end
+
+"""
+    captiontext!(clip, seq, sf) -> nothing
+
+Put the line spoken at source frame `sf` on a caption clip's text plot.
+
+Called from the source update, so the string is written where every other
+per-frame value is written and the scene the renderer holds open is the one that
+gets it.
+"""
+function captiontext!(clip::Clip, seq::Sequence, sf::Integer)
+    spec = scenespecof(clip)
+    spec === nothing && return nothing
+    part = partbyname(spec, :captions)
+    part === nothing && return nothing
+    fps = seq.framerate > 0 ? seq.framerate : 25.0
+    part.plot.kwargs[:text] = captionat(seq.captions, timelineframe(clip, sf) / fps)
+    return nothing
+end
+
 
 
 """

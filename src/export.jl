@@ -41,11 +41,11 @@ function exportvideo(path::AbstractString, seq::Sequence;
     total = seqlength(seq)
     total > 0 || error("empty sequence")   # before canvassize: it indexes clips[1]
     canvas = something(size, canvassize(seq))
-    wantaudio = audio && any(hasaudio, unique(c.source.path for c in seq.clips))
+    wantaudio = audio && any(hasaudio,
+                             unique(sourcepath(c.source) for c in seq.clips if decodable(c.source)))
     videopath = wantaudio ? tempname() * ".mp4" : path
 
     outbuf = alloccanvas(backend, (canvas[1], canvas[2]))
-    transbuf = allocframe(backend, (canvas[1], canvas[2]))   # incoming side of a transition
     layerbuf = allocframe(backend, (canvas[1], canvas[2]))   # one track layer while compositing
     hostout = zeros(RGB{N0f8}, canvas[1], canvas[2])         # encode staging (download target)
     blackhost = zeros(RGB{N0f8}, canvas[1], canvas[2])       # gap/composite base for device canvases
@@ -62,7 +62,7 @@ function exportvideo(path::AbstractString, seq::Sequence;
                                     target_pix_fmt = pixel_format)
     try
         for n in 0:(total - 1)
-            renderframe!(outbuf, seq, n, readers, engine; scratch = transbuf, black = blackhost)
+            renderframe!(outbuf, seq, n, readers, engine; black = blackhost)
             writeframe!(writer, outbuf, hostout, backend)
             progress === nothing || n % 30 == 0 && progress(n + 1, total)
         end
@@ -229,7 +229,7 @@ function opendecoder(source::VideoSource, backend)
 end
 
 """
-    renderframe!(dest, seq, n, readers, engine; scratch, black) -> dest
+    renderframe!(dest, seq, n, readers, engine; black) -> dest
 
 Timeline frame `n` of `seq`, finished: transition, track composite or single
 clip, every layer through the effect graph under the export policy (`exact`).
@@ -237,27 +237,37 @@ clip, every layer through the effect graph under the export policy (`exact`).
 This is the ONE definition of "what frame `n` looks like" — the encoder writes
 it, and the agent views ([`contactsheet`](@ref), [`framegrab`](@ref)) show it,
 so what an agent sees is by construction what the export produces. `readers`
-caches one decoder per source path; pass `scratch`/`black` canvas-sized buffers
-to avoid per-frame allocation in a loop.
+caches one decoder per source path; pass a canvas-sized `black` to avoid a
+per-frame allocation in a loop.
+
+There is no `scratch` any more: it was the incoming side of a dissolve, which had
+its own compositor — render both sides into host buffers, lerp on the host. A
+dissolve is two layers of the ONE composite now, so nothing here needs a second
+canvas.
 """
 function renderframe!(dest::AnyRGBFrame, seq::Sequence, n::Integer,
                       readers::Dict{String, Any}, engine::FxEngine;
-                      scratch::Union{Nothing, AnyRGBFrame} = nothing,
                       black::Union{Nothing, AbstractMatrix} = nothing)
     tr = transitionat(seq, n)
     sample = tr === nothing ? nothing : transitionsample(seq, tr, n)
     if sample !== nothing
-        left, srcA, right, srcB, p = sample
-        incoming = scratch === nothing ? similar(dest) : scratch
-        rendercanvas!(dest, left, srcA, readers, engine)
-        rendercanvas!(incoming, right, srcB, readers, engine)
-        blend!(dest, dest, incoming, p)
+        left, right, p = sample[1], sample[3], sample[5]
+        # The same one composite the preview runs — see `showtransition!`. Two
+        # renders into host buffers and a host lerp was the dissolve's own
+        # compositor, written twice (here and in the player) for one picture.
+        composite(engine, [left, right], n,
+                  (clip, _) -> get!(() -> opendecoder(clip.source, engine.backend),
+                                    readers, sourcepath(clip.source));
+                  canvas = Base.size(dest), exact = true,
+                  alphafor = (clip, _) -> clip === right ? Float64(p) : nothing) do canvas
+            copyto!(dest, canvas)
+        end || error("dissolve at frame $n could not be rendered")
     elseif ntracks(seq) > 1 && length(clipsat(seq, n)) > 1
         # the export tier of ONE composite (see `composite`): same layer loop the
         # preview runs, only under the exact-decode policy
         composite(engine, clipsat(seq, n), n,
                   (clip, _) -> get!(() -> opendecoder(clip.source, engine.backend),
-                                    readers, clip.source.path);
+                                    readers, sourcepath(clip.source));
                   canvas = Base.size(dest), exact = true) do canvas
             copyto!(dest, canvas)
         end || error("composite at frame $n could not be rendered")
@@ -269,35 +279,30 @@ function renderframe!(dest::AnyRGBFrame, seq::Sequence, n::Integer,
             rendercanvas!(dest, loc[1], loc[2], readers, engine)
         end
     end
-    # Plots go on LAST, over the finished canvas — including over a gap, so a
-    # title can carry a black hold. Unconditional: on a sequence without
-    # overlays it returns without touching a pixel.
-    drawoverlays!(dest, seq.overlays, n; framerate = seq.framerate, captions = seq.captions)
     return dest
 end
 
 """
-Render `clip` at source frame `srcframe` through the SAME effect graph the
-preview uses — only under the export policy (`exact = true`: no nearest-frame
-stand-ins) — then warp its crop into `dest` (a canvas-sized buffer). `readers`
-caches one decoder per source path; the engine pools every working buffer.
+Render `clip` at source frame `srcframe` into `dest` (a canvas-sized buffer)
+through the SAME composite the preview runs — only under the export policy
+(`exact = true`: no nearest-frame stand-ins). `readers` caches one decoder per
+source path; the engine pools every working buffer.
+
+ONE clip is a composite of one. It used to be its own route — render the layer,
+then place it here — with a fast path for "the layer is already the canvas" and a
+`skipopacity` flag for when the caller meant to apply the alpha itself. Three
+statements about how a layer meets a canvas, in a file that is not where that is
+decided.
 """
 function rendercanvas!(dest::AnyRGBFrame, clip::Clip, srcframe::Integer,
-                       readers::Dict{String, Any}, engine::FxEngine;
-                       skipopacity::Bool = false)
-    dec = get!(() -> opendecoder(clip.source, engine.backend), readers, clip.source.path)
-    ec = effectiveclip(clip, srcframe)    # keyframed params baked at this frame
-    skipopacity && (ec = withoutopacity(ec))   # compositing: opacity = layer alpha
-    render(engine, dec, ec, Int(srcframe); exact = true) do layer
-        if ec.crop == (0.0, 0.0, 1.0, 1.0) && neutralframe(ec) &&
-           Base.size(layer) == Base.size(dest)
-            copyto!(dest, layer)          # already exactly the canvas — no resample
-        else
-            fill!(dest, RGB{N0f8}(0, 0, 0))   # whatever the fit doesn't cover is a bar
-            placelayer!(dest, layer, ec)
-            KA.synchronize(KA.get_backend(dest))
-        end
+                       readers::Dict{String, Any}, engine::FxEngine)
+    ok = composite(engine, [clip], timelineframe(clip, srcframe),
+                   (c, _) -> get!(() -> opendecoder(c.source, engine.backend),
+                                  readers, sourcepath(c.source));
+                   canvas = Base.size(dest), exact = true) do canvas
+        copyto!(dest, canvas)
     end
+    ok || error("clip at source frame $srcframe could not be rendered")
     return dest
 end
 

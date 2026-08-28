@@ -128,9 +128,11 @@ does something visible even when the render target is not 4x.
         # This kernel had the checked one, so the restoration compiled on the
         # CPU and could never have run on the GPU tier at all; nothing noticed
         # because nothing had rendered a restored clip on a device.
+        # The restored picture is an ordinary RGB plane — a model's output, fully
+        # covered — so the COVERAGE that survives is the buffer's own.
         src = Vec3f(red(c), green(c), blue(c))
         out = src .+ strength .* (Vec3f(red(r), green(r), blue(r)) .- src)
-        buf[i, j] = RGB{N0f8}(unitn0f8(out[1]), unitn0f8(out[2]), unitn0f8(out[3]))
+        buf[i, j] = topixel(eltype(buf), out[1], out[2], out[3], alphaof(c))
     end
 end
 

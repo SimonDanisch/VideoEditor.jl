@@ -3,7 +3,10 @@
 
 Whether the media file contains at least one audio stream (ffprobe).
 """
-function hasaudio(path::AbstractString)
+# A clip that renders its frames has no file and therefore no soundtrack.
+hasaudio(path::AbstractString) = isempty(path) ? false : hasaudiofile(path)
+
+function hasaudiofile(path::AbstractString)
     out = read(`$(FFMPEG_jll.ffprobe()) -v error -select_streams a -show_entries stream=index -of csv=p=0 $path`,
                String)
     return !isempty(strip(out))
@@ -27,7 +30,7 @@ function muxaudio(rendered::AbstractString, seq::Sequence, outpath::AbstractStri
     inputs = `-i $rendered`
     inputidx = Dict{String, Int}()  # source path → ffmpeg input index
     for clip in clips
-        path = clip.source.path
+        path = sourcepath(clip.source)
         if !haskey(inputidx, path) && hasaudio(path)
             inputidx[path] = length(inputidx) + 1
             inputs = `$inputs -i $path`
@@ -40,7 +43,7 @@ function muxaudio(rendered::AbstractString, seq::Sequence, outpath::AbstractStri
     cursor = 0
     for clip in clips
         clip.start > cursor && push!(branches, silence(clip.start - cursor))
-        idx = get(inputidx, clip.source.path, nothing)
+        idx = get(inputidx, sourcepath(clip.source), nothing)
         if idx === nothing
             push!(branches, silence(cliplength(clip)))
         else

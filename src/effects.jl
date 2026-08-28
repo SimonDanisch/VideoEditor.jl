@@ -104,7 +104,7 @@ the two halves.
 
 Also renders nothing — the fade itself is an `OpacityEffect` curve on each half,
 and `Transition` is what the composite reads. This is the entry in the stack that
-those belong to, and the slot a [`FxLink`](@ref) points at, so the two halves of
+those belong to, and the slot a [`ParamRef`](@ref) points at, so the two halves of
 one blend can find each other.
 """
 struct BlendEffect <: FxOp
@@ -162,14 +162,22 @@ isneutral(e::TransformEffect) =
     e.scale ≈ 1.0 && e.x == 0.0 && e.y == 0.0 && e.rotation == 0.0
 
 """
-    transformof(clip) -> (scale, x, y, rotation°)
+    transformof(clip, frame = 0) -> (scale, x, y, rotation°)
 
-The clip's placement. ONE reader, so "where is this clip" has one answer: the
-`TransformEffect` when it has one, the identity fit otherwise.
+The clip's placement AT `frame`. ONE reader, so "where is this clip" has one
+answer: the `TransformEffect` when it has one, sampled like every other parameter,
+the identity fit otherwise.
+
+Sampled here rather than by handing this an `effectiveclip`: the placement is four
+numbers, and copying the whole clip and its effect stack per frame to read them was
+the largest single thing a frame did that it did not have to.
 """
-transformof(clip::Clip) =
-    (e = findeffect(clip, TransformEffect);
-     e === nothing ? NEUTRALFRAME : (e.scale, e.x, e.y, e.rotation))
+function transformof(clip::Clip, frame::Real = 0)
+    fx = findslot(clip, TransformEffect)
+    fx === nothing && return NEUTRALFRAME
+    e = op(fx, frame)::TransformEffect
+    return (e.scale, e.x, e.y, e.rotation)
+end
 
 "Write one component of the clip's placement, creating the effect if needed."
 function settransform(clip::Clip; scale = nothing, x = nothing, y = nothing, rotation = nothing)
@@ -196,7 +204,8 @@ neutral, in stack order. Disabling a slot ([`Effect`](@ref)`.enabled`) keeps its
 parameters — the inspector's toggle is lossless — while every render path (CPU
 stack, GPU graph, compositor, export) simply skips it.
 """
-liveeffects(clip::Clip) = (op(s) for s in clip.effects if s.enabled && !isneutral(op(s)))
+liveeffects(clip::Clip) =
+    (op(s) for s in clip.effects if renderable(s) && s.enabled && !isneutral(op(s)))
 
 "The slot with `id` on `clip`, or `nothing` — how anything points at ONE entry."
 function findslot(clip::Clip, id::Integer)
@@ -204,8 +213,9 @@ function findslot(clip::Clip, id::Integer)
     return i === nothing ? nothing : clip.effects[i]
 end
 
-# There is no second walker over the stack here. `runchain!` (gpugraph.jl) is
-# the ONE renderer, and it is not GPU-specific: the engine's Mantle device backs
+# There is no second walker over the stack here. `composite` (gpugraph.jl) is
+# the ONE renderer — every frame the editor shows or exports goes through it,
+# one clip or eight — and it is not GPU-specific: the engine's Mantle device backs
 # its transients with host memory on `KA.CPU()` and VRAM through Lava, and the
 # passes run the identical kernels either way. The tier is the engine's backend,
 # a parameter — never a second code path.
@@ -217,86 +227,12 @@ end
 # kept alive by three tests, so the suite was exercising a second definition of
 # every built-in that shipped to nobody. Deleted 2026-08-07.
 
-# ------------------------------------------------------------- serialization
-
-"""
-    effectdict(fx) -> Dict
-
-One effect as project-file data: its kind, and its PARAMETERS — each with its
-value and, if it has one, its curve.
-
-There is nothing type-specific here. This used to be thirteen hand-written
-methods (`effectdict(e::BlurEffect) = ... "sigma" => e.σ ...`) mirrored by a
-`t == "blur" && return BlurEffect(...)` chain on the way back, so adding an
-effect meant writing its parameters down three times: once in its kind, once
-out, once in. The parameters ARE the effect now, so writing them is writing it,
-and a new kind needs no serialization code at all.
-"""
-function effectdict(fx::Effect)
-    d = Dict{String, Any}("kind" => String(fx.kind),
-                          "id" => string(fx.id),
-                          "enabled" => fx.enabled,
-                          "params" => [paramdict(p) for p in fx.params])
-    isempty(fx.links) || (d["links"] = [linkdict(l) for l in fx.links])
-    return d
-end
-
-"One parameter: what it is now, its lane, and its keys when it has any."
-function paramdict(p::Param)
-    d = Dict{String, Any}("name" => String(p.name), "value" => tojson(p.value))
-    p.visible && (d["lane"] = true)
-    isanimated(p) && (d["curve"] = Dict{String, Any}(
-        "interp" => String(p.curve.interp),
-        "frames" => [k.frame for k in p.curve.keys],
-        "values" => [tojson(k.value) for k in p.curve.keys],
-        "eases"  => [String(k.ease) for k in p.curve.keys]))
-    return d
-end
-
-# A parameter value as JSON. Scalars go as themselves; anything with components
-# goes as an array, so a `Vec3f` offset or an `RGBf` colour needs no special case
-# on either side — `fromjson` puts it back into the type the parameter already
-# has, which is the only place that type is known.
-tojson(v::Real) = Float64(v)
-tojson(v) = collect(Float64.(v))
-tojson(v::Colorant) = [Float64(red(v)), Float64(green(v)), Float64(blue(v))]
-
-fromjson(::Type{T}, v) where {T <: Real} = T(v)
-fromjson(::Type{T}, v) where {T} = T(v...)
-fromjson(::Type{T}, v) where {T <: Colorant} = T(v...)
-
-"""
-    effectfromdict(d) -> Effect
-
-`effectdict`'s inverse. The kind supplies the parameter LIST (names, labels,
-ranges and types); the file supplies the values and curves. A parameter the kind
-no longer has is skipped, and one the file does not mention keeps its default —
-so a kind may gain or lose parameters without stranding a project.
-"""
-function effectfromdict(d::AbstractDict)
-    kind = kindbyname(Symbol(d["kind"]))
-    kind === nothing && error("unknown effect kind: $(d["kind"])")
-    fx = Effect(freshid(), Symbol(d["kind"]), get(d, "enabled", true),
-                FxLink[linkfromdict(l) for l in get(d, "links", [])],
-                paramsfor(kind))
-    haskey(d, "id") && (fx = Effect(parse(UInt64, d["id"]), fx.kind, fx.enabled,
-                                    fx.links, fx.params))
-    for pd in get(d, "params", [])
-        prm = param(fx, Symbol(pd["name"]))
-        prm === nothing && continue          # a parameter this kind no longer has
-        T = typeof(prm.value)
-        haskey(pd, "value") && (prm.value = fromjson(T, pd["value"]))
-        get(pd, "lane", false) && (prm.visible = true)
-        haskey(pd, "curve") || continue
-        cd = pd["curve"]
-        eases = get(cd, "eases", fill("linear", length(cd["frames"])))
-        prm.curve = AnimCurve{T}(
-            [Keyframe(Int(f), fromjson(T, v), Symbol(e))
-             for (f, v, e) in zip(cd["frames"], cd["values"], eases)],
-            Symbol(get(cd, "interp", "linear")))
-    end
-    return fx
-end
+# Serialization lives in pack.jl — an effect and its parameters write and read
+# THEMSELVES there, so nothing about the project file appears in this file. What
+# used to be here was thirteen hand-written writers (`effectdict(e::BlurEffect) =
+# ... "sigma" => e.σ ...`) and a `t == "blur" && return BlurEffect(...)` chain
+# back, so adding an effect meant writing its parameters down three times: once
+# in its kind, once out, once in.
 
 
 # ------------------------------------------------------- fixed-stack helpers
@@ -304,13 +240,42 @@ end
 "The clip's effect of type `T`, or `nothing` — a DISABLED slot still answers, so
 the inspector shows a switched-off effect's real parameters."
 function findeffect(clip::Clip, ::Type{T}) where {T <: FxOp}
-    i = findfirst(s -> op(s) isa T, clip.effects)
+    i = findfirst(s -> renderable(s) && op(s) isa T, clip.effects)
     return i === nothing ? nothing : op(clip.effects[i])::T
 end
 
+"""
+    findslot(clip, kind::Symbol) -> Union{Nothing, Effect}
+
+The clip's slot of a named KIND. What a source or a tool reaches for when it needs
+its own entry — the scene's `:scene` — where the type is not the thing that
+identifies it, because the entry may carry data no payload type could hold.
+"""
+function findslot(clip::Clip, kind::Symbol)
+    i = findfirst(s -> s.kind === kind, clip.effects)
+    return i === nothing ? nothing : clip.effects[i]
+end
+
+"""
+    renderable(fx) -> Bool
+
+Whether this entry is a PIXEL OPERATION — something the chain can ask for a
+payload and turn into a pass.
+
+False for an entry that is DATA: the `:scene` effect holds a `SceneSpec` and the
+numbers animating it, and its kind has no `make` to build a payload from them. It
+belongs on the clip (it is what the clip draws, it is saved, it has a card, its
+numbers are keyframed) and it is not a step in the chain.
+"""
+renderable(fx::Effect) = (k = kindbyname(fx.kind); k !== nothing && k.make !== nothing)
+
 "The clip's slot holding an effect of type `T`, or `nothing`."
+# `renderable` first, and it is not an optimisation: an entry that is DATA has no
+# payload to ask for — `op` on the `:scene` entry would try to call a `make` that
+# is deliberately `nothing` — so "is there a Transform on this clip" must not be
+# answered by building every entry's payload and looking at its type.
 function findslot(clip::Clip, ::Type{T}) where {T <: FxOp}
-    i = findfirst(s -> op(s) isa T, clip.effects)
+    i = findfirst(s -> renderable(s) && op(s) isa T, clip.effects)
     return i === nothing ? nothing : clip.effects[i]
 end
 
@@ -326,9 +291,9 @@ Replace the effect in the slot of the same kind (keeping that slot's id, so
 anything pointing at it still points at it) or append a new slot.
 """
 function seteffect!(clip::Clip, e::FxOp)
-    i = findfirst(s -> effectkey(op(s)) == effectkey(e), clip.effects)
+    i = findfirst(s -> renderable(s) && effectkey(op(s)) == effectkey(e), clip.effects)
     if i === nothing
-        push!(clip.effects, Effect(e))
+        addslot!(clip, Effect(e))   # a new entry is a new pass
     else
         setparams!(clip.effects[i], effectkindfor(e).read(e))
         clip.effects[i].enabled = true
@@ -346,8 +311,9 @@ order that was hard-wired into the graph builder before analyses had slots, so i
 stays the default — the user can drag it elsewhere afterwards.
 """
 function prependeffect!(clip::Clip, e::FxOp)
-    i = findfirst(s -> effectkey(op(s)) == effectkey(e), clip.effects)
+    i = findfirst(s -> renderable(s) && effectkey(op(s)) == effectkey(e), clip.effects)
     if i === nothing
+        dirtygraph!(clip)          # a new entry is a new pass
         pushfirst!(clip.effects, Effect(e))
     else
         setparams!(clip.effects[i], effectkindfor(e).read(e))
@@ -358,8 +324,9 @@ end
 
 "Drop every slot holding an effect of type `T` (returns how many went)."
 function removeeffects!(clip::Clip, ::Type{T}) where {T <: FxOp}
-    n = count(s -> op(s) isa T, clip.effects)
-    filter!(s -> !(op(s) isa T), clip.effects)
+    n = count(s -> renderable(s) && op(s) isa T, clip.effects)
+    n == 0 || dirtygraph!(clip)
+    filter!(s -> !(renderable(s) && op(s) isa T), clip.effects)
     return n
 end
 
@@ -375,6 +342,9 @@ disagree. `nothing` removes both.
 """
 function setmotiontrack!(clip::Clip, track)
     clip.motiontrack = track
+    # STRUCTURAL: with no track there is no warp pass at all (see `nodefor`), so
+    # attaching or dropping one changes the graph and not a value in it.
+    dirtygraph!(clip)
     track === nothing ? removeeffects!(clip, StabilizeEffect) :
                         prependeffect!(clip, StabilizeEffect())
     return track
@@ -382,6 +352,7 @@ end
 
 function setcolortrack!(clip::Clip, track)
     clip.colortrack = track
+    dirtygraph!(clip)
     if track === nothing
         removeeffects!(clip, FlickerEffect)
     else
@@ -394,7 +365,7 @@ end
 function removeslot!(clip::Clip, id::Integer)
     i = findfirst(s -> s.id == id, clip.effects)
     i === nothing && return false
-    deleteat!(clip.effects, i)
+    removeslotat!(clip, i)
     return true
 end
 
@@ -446,39 +417,17 @@ isanimated(fx::Effect) = any(isanimated, fx.params)
 is not computed from a frame the previous matte already keyed."
 withoutmatte(clip::Clip) =
     withfields(clip; mattetrack = nothing,
-               effects = filter(s -> !(op(s) isa MatteEffect), clip.effects))
+               effects = filter(s -> !(renderable(s) && op(s) isa MatteEffect), clip.effects))
 
-"`clip` without its opacity effects — compositing reads opacity as the LAYER
-alpha, not a per-pixel fade to black."
-withoutopacity(clip::Clip) =
-    withfields(clip; effects = filter(s -> !(op(s) isa OpacityEffect), clip.effects))
-
-"""
-    effectiveclip(clip, srcframe) -> Clip
-
-The clip as it renders at absolute source frame `srcframe`: a shallow copy with
-every animated parameter overridden by its curve's sampled value (via the
-parameter's `set`). Returns `clip` unchanged when it has no animations — the
-static fast path. The copy shares the source and analysis tracks; only `crop`
-and a copied effect stack are mutated.
-"""
-function effectiveclip(clip::Clip, srcframe::Integer)
-    isanimated(clip) || return clip
-    # own entries (same ids, same on/off) so a sampled value never writes into
-    # the clip the user is editing. The PARAMS are copied; the curves are shared,
-    # because sampling never touches them.
-    # `curves = false`: the copy IS the sampled state, so nothing may re-sample it
-    ec = withfields(clip; effects = [copy(fx; curves = false) for fx in clip.effects])
-    for (i, fx) in enumerate(clip.effects)
-        any(isanimated, fx.params) || continue
-        # THIS entry's parameters, sampled on THIS entry. Resolving a bare name
-        # through a global index instead sent every curve to the FIRST effect of
-        # its kind — two Blurs, one animated radius, and the second stayed at its
-        # static value (measured: [(blur = 12.0,), (blur = 0.0,)]).
-        for p in ec.effects[i].params
-            src = param(fx, p.name)
-            src === nothing || (p.value = valueat(src, srcframe))
-        end
-    end
-    return ec
-end
+# There is no `effectiveclip` here any more.
+#
+# It made a COPY OF THE CLIP per frame — a fresh `Effect` and a fresh `Param` for
+# every entry in the stack — so that the render path could read sampled values off
+# an ordinary clip. That is the shape of the old design showing through: sampling
+# was something you did to a whole clip, in advance, because nothing downstream
+# knew about frames. It does now. `op(fx, frame)` samples one effect,
+# `transformof(clip, frame)` reads the placement, and `update!` writes both into a
+# chain that is already compiled.
+#
+# The copy also carried a graph field that could not be shared, so every frame's
+# clip was a clip nothing had ever rendered.

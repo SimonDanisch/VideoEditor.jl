@@ -264,3 +264,69 @@ registercommand!(:next_edit, "Go to the next edit point"; category = :transport,
     shortcut = "↓", enabled = needsclips, run = p -> jumpedit!(p, 1))
 registercommand!(:prev_edit, "Go to the previous edit point"; category = :transport,
     shortcut = "↑", enabled = needsclips, run = p -> jumpedit!(p, -1))
+
+# ------------------------------------------------------------------ scene clips
+#
+# A title, a lower third, a timecode and the subtitles are CLIPS, so there is no
+# "add an overlay" verb any more — each of these is a preset that builds a
+# `SceneSpec` and puts a clip on the timeline. Adding another is writing a
+# function that returns plots (see overlays.jl) and one line here.
+
+registercommand!(:add_title, "Add a title"; category = :edit,
+    keywords = ["text", "overlay", "caption", "lower third", "graphic", "scene"],
+    run = p -> addsceneclip!(p, scenebuild(:text, canvassize(p.sequence); text = "Title");
+                             label = "title"))
+
+registercommand!(:add_bar, "Add a bar (lower third)"; category = :edit,
+    keywords = ["rectangle", "band", "overlay", "letterbox", "graphic", "scene"],
+    run = p -> addsceneclip!(p, scenebuild(:bar, canvassize(p.sequence)); label = "bar"))
+
+registercommand!(:add_timecode, "Add a timecode"; category = :edit,
+    keywords = ["burn", "tc", "smpte", "overlay", "graphic", "scene"],
+    run = p -> addsceneclip!(p, scenebuild(:timecode, canvassize(p.sequence);
+                                          framerate = p.sequence.framerate);
+                             label = "timecode"))
+
+registercommand!(:add_captions, "Add the captions to the picture"; category = :edit,
+    keywords = ["subtitle", "caption", "transcript", "overlay", "scene"],
+    enabled = p -> isempty(p.sequence.captions) ?
+                   "no transcript yet — run Transcribe first" : true,
+    run = function (p)
+        seq = p.sequence
+        c = addsceneclip!(p, scenebuild(:captions, canvassize(seq)); label = "captions",
+                          seconds = max(seqlength(seq), 1) / max(seq.framerate, 1))
+        c.src_out = max(seqlength(seq), 1)      # the whole timeline, not three seconds
+        refreshedit!(p)
+        return c
+    end)
+
+registercommand!(:add_scene, "Add a 3D scene"; category = :edit,
+    keywords = ["3d", "render", "raytrace", "makie", "mesh", "scene", "animation"],
+    run = p -> addsceneclip!(p, scenebuild(:rig, canvassize(p.sequence)); label = "3D scene"))
+
+# ------------------------------------------------------------------ baking
+
+registercommand!(:bake_clip, "Bake this clip…"; category = :effect,
+    keywords = ["render", "prerender", "cache", "freeze", "raytrace", "bake"],
+    enabled = needsclip,
+    run = p -> openbakemodal!(p))
+
+registercommand!(:bake_toggle, "Use this clip's bake (on/off)"; category = :effect,
+    keywords = ["bake", "prerender", "cache", "toggle"],
+    enabled = function (p)
+        loc = editclip(p)
+        loc === nothing && return "no clip at the playhead"
+        loc[1].bake === nothing && return "this clip has no bake yet"
+        return true
+    end,
+    run = function (p)
+        clip = editclip(p)[1]
+        b = clip.bake
+        b.enabled = !b.enabled
+        setstatus!(p, b.enabled ?
+            "bake on — showing the pre-rendered frames" *
+            (bakestale(clip) ? " (it is OUT OF DATE: the clip has changed since)" : "") :
+            "bake off — rendering through the effect graph")
+        notify(p.playhead)
+        return b.enabled
+    end)
