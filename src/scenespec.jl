@@ -1,6 +1,6 @@
-# A SCENE AS DATA.
+# A scene as data.
 #
-# What a scene clip draws is a Makie SPEC — `S.Scene(; camera = cam3d!, plots =
+# What a scene clip draws is a Makie spec — `S.Scene(; camera = cam3d!, plots =
 # [...])` — and that is the whole model. There is no second description of it here.
 #
 # There used to be one: `ScenePart` with `parent`/`origin`/`axis`/`angle`/`offset`,
@@ -25,7 +25,7 @@ what it would write in Julia. Everything else that JSON already models (numbers,
 strings, bools, arrays) passes through.
 """
 specvalue(x::Symbol) = ":" * String(x)
-# COLOURS ARE NOT SYMBOLS BY THE TIME THEY GET HERE. `PlotSpec` normalises its
+# Colours are no longer symbols by the time they get here: `PlotSpec` normalises its
 # keywords as it is built — `PlotSpec(:Scatter; color = :red)` already holds
 # `RGBA{Float32}(1,0,0,1)`, deliberately, so that spelling a colour two ways
 # yields the same spec. Without a method here that would fall to `string(x)` and
@@ -59,7 +59,7 @@ fromspecvalue(x) = x
 
 Parse `"arm_left.angle"` or `"torso.offset[1]"` into what it addresses.
 
-BY NAME, not by index. A path is what a keyframe curve keys on and what the
+By name, not by index. A path is what a keyframe curve keys on and what the
 project file stores, so it has to survive an edit as well as a round trip — and
 reordering the parts must not silently re-aim every curve in the scene. It is
 also the difference between a path a model can write (`"arm_left.angle"`) and
@@ -82,10 +82,10 @@ scenepath(s::Symbol) = scenepath(String(s))
     dataparams(value) -> Vector{Param}
     datasections(value) -> Vector{NamedTuple}
 
-What a piece of effect DATA contributes to its card.
+What a piece of effect data contributes to its card.
 
 Nothing, for everything — and a scene no longer answers here either. What a scene
-offers depends on the scene that was BUILT, so the card asks the clip's source
+offers depends on the scene that was built, so the card asks the clip's source
 (`sceneattributes`) rather than a value that would have to describe itself in
 advance.
 

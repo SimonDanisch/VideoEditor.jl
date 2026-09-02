@@ -47,25 +47,18 @@ end
 
 include("refactor.jl")   # registry, analyses-as-slots, links, commands
 
-"The curve of `clip`'s `T` effect parameter `name`, created if needed."
-function paramcurve!(clip, ::Type{T}, name::Symbol) where {T}
-    fx = VE.findslot(clip, T)
-    prm = VE.param(fx, name)
-    prm.curve === nothing && (prm.curve = VE.AnimCurve())
-    return prm.curve
-end
+"The curve of `clip`'s `T` effect parameter `name`. A parameter always has one."
+paramcurve!(clip, ::Type{T}, name::Symbol) where {T} =
+    VE.param(VE.findslot(clip, T), name).curve[]
 
-# The curve of a clip's opacity, creating the effect and the curve if needed.
-# `clip.animations[:opacity]` used to be the way in; a curve now belongs to the
-# Param of the effect that renders it, so this is the whole of the change.
+# The curve of a clip's opacity, creating the effect if needed. `clip.animations[:opacity]`
+# used to be the way in; a curve belongs to the Param of the effect that renders it.
 function opacitycurve!(clip)
     VE.findslot(clip, VE.OpacityEffect) === nothing &&
         VE.seteffect!(clip, VE.OpacityEffect(1.0f0))
-    prm = VE.param(VE.findslot(clip, VE.OpacityEffect), :opacity)
-    prm.curve === nothing && (prm.curve = VE.AnimCurve())
-    return prm.curve
+    return VE.param(VE.findslot(clip, VE.OpacityEffect), :opacity).curve[]
 end
-opacitycurve(clip) = (prm = VE.opacityparam(clip); prm === nothing ? nothing : prm.curve)
+opacitycurve(clip) = (prm = VE.opacityparam(clip); prm === nothing ? nothing : prm.curve[])
 
 @testset "parameter values round-trip by TYPE" begin
     # One registration per kind of value — see pack.jl. What this pins is that a
@@ -448,7 +441,7 @@ end
     # …and the curve survived the replacement: the span was the only thing missing
     got = VE.param(fx, Symbol("dot.markersize[1]"))
     @test got.range !== nothing
-    @test VE.isanimated(got) && length(got.curve.keys) == 2
+    @test VE.isanimated(got) && length(got.curve[].keys) == 2
     @test VE.valueat(got, 29) ≈ 20.0
     VE.emptyengine!(engine)
 end
@@ -580,14 +573,14 @@ end
     VE.seteffect!(c, ColorEffect(saturation = 1.8))
     slot = c.effects[end]
     id = slot.id
-    slot.enabled = false
+    slot.enabled[] = false
     # the disabled entry is skipped — the stack itself is not empty, because a
     # curve now belongs to an effect and the fade above put an OpacityEffect here
     @test !any(e -> e isa ColorEffect, VE.liveeffects(c))
     @test VE.findeffect(c, ColorEffect).adj.saturation == 1.8f0   # params survive
     @test VE.findslot(c, id) === slot                             # addressable by id
     s2 = packrt(slot)                                 # project-file roundtrip
-    @test s2.id == id && !s2.enabled && VE.op(s2).adj.saturation == 1.8f0
+    @test s2.id == id && !s2.enabled[] && VE.op(s2).adj.saturation == 1.8f0
     # the file is the PARAMETERS — no per-type writer, no per-type reader
     d = packdict(slot)
     @test d["kind"] == "color"
@@ -602,12 +595,12 @@ end
     @test VE.op(fromdict(d2)).adj.saturation == 1.8f0
     # …and one the file omits keeps the kind's default
     d3 = deepcopy(d); filter!(pd -> pd["name"] != "contrast", d3["params"])
-    @test VE.param(fromdict(d3), :contrast).value ==
-          VE.param(VE.Effect(VE.kindbyname(:color)), :contrast).value
+    @test VE.valueat(VE.param(fromdict(d3), :contrast), 0) ==
+          VE.valueat(VE.param(VE.Effect(VE.kindbyname(:color)), :contrast), 0)
     # an effect whose kind is gone NAMES it rather than loading half an edit
     d4 = deepcopy(d); d4["kind"] = "nosuchkind"
     @test_throws ErrorException fromdict(d4)
-    slot.enabled = true
+    slot.enabled[] = true
 end
 
 @testset "stable identities" begin
@@ -676,7 +669,7 @@ end
 
     # switching the blend OFF keeps its keys and its id; removing it clears the pair
     slot = VE.findslot(seq2.clips[2], VE.OpacityEffect)
-    slot.enabled = false
+    slot.enabled[] = false
     @test isempty(collect(VE.liveeffects(seq2.clips[2])))
     @test VE.blends(seq2) == [(1, 2, 12)]                   # still listed, just off
     VE.removeblend!(seq2, seq2.clips[2])         # what the × action does
@@ -1556,7 +1549,7 @@ end
     # clip's version: it is replaced when the structure changes and never edited,
     # so identity is the whole test.
     g = clip.graph
-    VE.param(clip.effects[end], :strength).value = 0.5
+    VE.setvalue!(VE.param(clip.effects[end], :strength), 0.5, 0)
     half = Ref{Any}(nothing)
     VE.render(engine, frame, clip, f0) do o; half[] = copy(o); end
     @test clip.graph === g
@@ -1567,7 +1560,7 @@ end
     # plane is written unconditionally, so the picture follows it
     alpha2 = zeros(UInt8, 160, 90, 10); alpha2[10:40, 10:30, :] .= 0xff
     clip.mattetrack = MatteTrack(alpha2, clip.src_in, [clip.src_in])
-    VE.param(clip.effects[end], :strength).value = 1.0
+    VE.setvalue!(VE.param(clip.effects[end], :strength), 1.0, 0)
     fresh = Ref{Any}(nothing)
     VE.render(engine, frame, clip, f0) do o; fresh[] = copy(o); end
     @test fresh[] == VE.applymatte!(copy(frame), clip, f0; strength = 1.0)
@@ -1950,9 +1943,9 @@ end
     # scale/position are ordinary animatable params: keyframes, project, undo
     tfx = VE.findslot(c2, VE.TransformEffect)
     @test VE.param(tfx, :scale) !== nothing
-    VE.param(tfx, :scale).value = 1.4
-    @test VE.transformof(c2)[1] == 1.4 && VE.param(tfx, :scale).value == 1.4
-    VE.param(tfx, :x).value = -0.2
+    VE.setvalue!(VE.param(tfx, :scale), 1.4, 0)
+    @test VE.transformof(c2)[1] == 1.4 && VE.valueat(VE.param(tfx, :scale), 0) == 1.4
+    VE.setvalue!(VE.param(tfx, :x), -0.2, 0)
     @test VE.transformof(c2)[2] == -0.2
     cur = paramcurve!(c2, VE.TransformEffect, :scale)
     VE.setkey!(cur, 0, 1.0); VE.setkey!(cur, 20, 2.0)

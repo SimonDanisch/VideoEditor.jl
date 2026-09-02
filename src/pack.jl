@@ -1,6 +1,6 @@
 # How the editor's own types go into a project file.
 #
-# ONE registration per type, and MsgPack does the rest — a `Param` knows how to
+# One registration per type, and MsgPack does the rest: a `Param` knows how to
 # be a map of its fields, an `RGBAf` knows how to be four numbers.
 # What this replaces is a hand-written mirror of the data model: `effectdict`,
 # `paramdict` and a `t == "blur" && return BlurEffect(...)` chain, where every
@@ -9,27 +9,26 @@
 #
 # `Clip` and `Sequence` are still written by hand in project.jl, and should be:
 # a clip holds an open `VideoSource` and four caches, so what goes in the file is
-# a PROJECTION of it and not its fields.
+# a projection of it and not its fields.
 #
 # The format is MessagePack rather than JSON because the bulk of a real project
-# is per-frame ANALYSIS, not the edit — see `saveproject` for what an hour of it
+# is per-frame analysis rather than the edit — see `saveproject` for what an hour
 # costs in each of the three encodings. The short version: 52.4 MB of JSON is
 # 6.5 MB here, and the last factor of two is [`Block`](@ref), which writes a
 # track as its own bytes and reads it back by pointing at them.
 
 # ---------------------------------------------------------------- primitives
 #
-# MsgPack's `msgpack_type` is ONE GLOBAL dispatch table shared by every loaded
-# package, so a registration here is a registration for the whole session. Two
-# consequences, both learned the hard way:
+# MsgPack's `msgpack_type` is one global dispatch table shared by every loaded
+# package, so a registration here is a registration for the whole session:
 #
-#   - Registering a type somebody else already did OVERWRITES their method. A
-#     `Symbol` registration here — which MsgPack handles perfectly well itself —
-#     made the package refuse to precompile.
+#   - Registering a type somebody else already did overwrites their method. A
+#     `Symbol` registration here — which MsgPack handles itself — made the package
+#     refuse to precompile.
 #   - Bonito registers every `Vector{Float32}`, `Vector{Float64}`, … as a raw
-#     extension, and Bonito is in the editor's tree. That is not something this
-#     file can opt out of, so it goes WITH it: `PACKEDELTYPES` below uses
-#     Bonito's tag numbering, and the reader normalises whatever it finds.
+#     extension, and Bonito is in the editor's tree. This file cannot opt out of
+#     that, so it follows it: `PACKEDELTYPES` below uses Bonito's tag numbering,
+#     and the reader normalises whatever it finds.
 #
 # `UInt64` ids: MessagePack has unsigned integers, so they go as themselves
 # rather than as the decimal strings JSON needed to avoid Float64 rounding.
@@ -59,11 +58,10 @@ MsgPack.from_msgpack(::Type{C}, x::AbstractVector) where {C <: Colorant} = C(x..
 """
 The element type per extension tag, at `tag - BLOCKTAG0`.
 
-POSITION IS THE FORMAT, and the positions are not ours to choose: this is
-Bonito's assignment, which it registers into MsgPack's global table for every
-`Vector{Float32}` and friends. Using the same numbering means a project file has
-ONE block encoding and does not change shape depending on which packages a
-session happens to have loaded.
+Position is the format, and the positions are not ours to choose: this is Bonito's
+assignment, which it registers into MsgPack's global table for every
+`Vector{Float32}` and friends. Using the same numbering keeps a project file to one
+block encoding, whatever packages a session has loaded.
 """
 const PACKEDELTYPES = (Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32, Float64)
 const BLOCKTAG0 = Int8(0x10)
@@ -77,13 +75,13 @@ end
 """
     Block(v)
 
-A numeric vector to be written as its own BYTES, whatever else is loaded.
+A numeric vector to be written as its own bytes, whatever else is loaded.
 
-Bonito's registration already does this for a plain `Vector{Float32}` — but
+Bonito's registration already does this for a plain `Vector{Float32}`, but
 VideoEditor does not depend on Bonito, so a session without it would write the
-same track as decimal numbers and a six-times-larger file. The fields where that
-matters are few and known — a stabilization track, a colour track, a LUT — so
-they say so explicitly and the format stops being a function of the environment.
+same track as decimal numbers and a six times larger file. The fields where that
+matters are few and known — a stabilization track, a colour track, a LUT — so they
+say so explicitly and the format stops depending on the environment.
 """
 struct Block{T, V <: AbstractVector{T}}
     values::V
@@ -212,7 +210,7 @@ end
 # saved at all, because there was no branch to add.
 MsgPack.msgpack_type(::Type{<:Effect}) = MsgPack.MapType()
 MsgPack.to_msgpack(::MsgPack.MapType, fx::Effect) =
-    Dict{String, Any}("id" => fx.id, "kind" => String(fx.kind), "enabled" => fx.enabled,
+    Dict{String, Any}("id" => fx.id, "kind" => String(fx.kind), "enabled" => fx.enabled[],
                       "params" => fx.params)
 
 """
@@ -246,9 +244,12 @@ function MsgPack.from_msgpack(::Type{Effect}, d::AbstractDict)
             kind.make === nothing && push!(fx.params, st)
             continue
         end
-        cur.value = st.value
-        cur.visible = st.visible
-        cur.curve = st.curve
+        # Written through the parameter that is already there, so that its label
+        # and range stay the kind's while its state becomes the file's. Converted,
+        # because the kind may have retyped the parameter since the file was
+        # written and the file's own `"T"` is what it was read back as.
+        cur.curve[] = AnimCurve{eltype(cur)}(st.curve[])
+        cur.visible[] = st.visible[]
         cur.input = st.input     # unresolved — `loadproject` binds once the clips exist
     end
     return fx
@@ -274,16 +275,29 @@ paramtypename(::Type{T}) where {T} = findfirst(==(T), PARAMTYPES)
 
 MsgPack.msgpack_type(::Type{<:Param}) = MsgPack.MapType()
 
+"""
+The fields, named — which is also what keeps the view out of the file. `card`
+and `view` are Makie blocks; a serializer that walked the struct would try to
+write a `Slider` into a project.
+
+`"value"` is still written, and is what a curve of one key holds. It is what a
+hand-written effect can say instead of a curve, and what an older reader takes as
+the whole of the parameter.
+"""
 function MsgPack.to_msgpack(::MsgPack.MapType, p::Param{T}) where {T}
     name = paramtypename(T)
     name === nothing && error("Param{$T} cannot be written — add $T to `PARAMTYPES`")
+    c = p.curve[]
     d = Dict{String, Any}("T" => name, "name" => String(p.name), "label" => p.label,
-                          "value" => p.value, "visible" => p.visible)
+                          "value" => c.keys[1].value, "visible" => p.visible[])
     # two scalars, not a vector: a range is always a pair, and as an array it
     # went out through the raw-block path for no gain — and came back as
     # something the reader could not broadcast `Float64` over
     p.range === nothing || (d["lo"] = Float64(p.range[1]); d["hi"] = Float64(p.range[2]))
-    p.curve === nothing || (d["curve"] = p.curve)
+    # A constant is a curve of one key, and writing that key twice — once as
+    # `"value"`, once as a one-key curve — would double the size of a project
+    # whose parameters are mostly untouched.
+    isanimated(p) && (d["curve"] = c)
     p.input === nothing || (d["input"] = p.input)
     return d
 end
@@ -299,8 +313,9 @@ function MsgPack.from_msgpack(::Type{<:Param}, d::AbstractDict)
     curve = haskey(d, "curve") ? MsgPack.from_msgpack(AnimCurve{T}, d["curve"]) : nothing
     range = haskey(d, "lo") ? (Float64(d["lo"]), Float64(d["hi"])) : nothing
     input = haskey(d, "input") ? MsgPack.from_msgpack(ParamInput, d["input"]) : nothing
-    return Param{T}(Symbol(d["name"]), String(get(d, "label", d["name"])), value, curve,
-                    Bool(get(d, "visible", false)), range, input)
+    # `value` seeds the curve when the file carries none — see [`Param`](@ref).
+    return Param(Symbol(d["name"]), String(get(d, "label", d["name"])), value;
+                 curve, visible = Bool(get(d, "visible", false)), range, input)
 end
 
 # No `from_msgpack` for the scalars: MsgPack converts a number to the asked-for

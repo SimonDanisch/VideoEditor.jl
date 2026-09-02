@@ -1,8 +1,47 @@
+# Three names the document needs before the things they stand for exist. Each is
+# a back-reference out of the document into what is looking at it, and each of
+# those is declared files later — a `Player`, and the tool state inside one of its
+# cards. A field left untyped instead would cost every method that reads it its
+# dispatch, which is what `Clip.graph` used to pay.
+
+"""
+The editor a sequence is open in — a [`Player`](@ref), and only that.
+
+A card is built against the EDITOR (its panel, its timeline, its playhead) while
+the effect the card belongs to lives on the clip. Without a way back, every caller
+that adds an effect would have to remember to ask the panel afterwards — which is
+the reconcile pass in another costume.
+
+The reference sits on the [`Sequence`](@ref), one per editor, and a clip reads it
+through the sequence it is in — see [`editorof`](@ref). On the clip it would have
+to be handed out again at every route a clip arrives by, and the one that forgot
+would be a clip whose effects silently have no cards.
+"""
+abstract type Editor end
+
+"""
+The edit a clip belongs to — a [`Sequence`](@ref), and only that.
+
+One direction further than [`Editor`](@ref): a sequence holds a `Vector{Clip}`,
+so a clip cannot name its sequence by its concrete type. It is what
+[`editorof`](@ref) walks through.
+"""
+abstract type Edit end
+
+"""
+The live state of a tool inside a card — a `ToolContext`, and only that.
+
+An effect holds its own so that dropping the card drops the overlay plots, the
+list rows and the listeners the tool put there. One that outlives its card keeps
+firing, and its next redraw builds a widget into a layout whose scene is gone.
+"""
+abstract type ToolState end
+
 """
 Per-source-frame color stabilization corrections (see `analyzecolor!`).
 Keyed by absolute source frame via `src_in`, so tracks survive clip splits.
-`strength` scales the correction toward identity (1 = full fix, 0 = off) at
-APPLY time — adjustable live, no re-analysis needed.
+`strength` scales the correction toward identity (1 = full fix, 0 = off) at apply
+time, so it is adjustable live without re-analysis.
 """
 mutable struct ColorTrack
     const gains::Vector{Vec3f}
@@ -59,7 +98,7 @@ MatteTrack(alpha::Array{UInt8, 3}, src_in::Integer, seeds::AbstractVector{<:Inte
 mattesize(t::MatteTrack) = (size(t.alpha, 1), size(t.alpha, 2))
 
 """
-Per-source-frame DEPTH, keyed absolutely like the other tracks.
+Per-source-frame depth, keyed absolutely like the other tracks.
 
 `depth` is `(w, h, nframes)` of `UInt8`, near = 255, far = 0, normalized per
 frame. Eight bits because nothing here measures distance — it *orders* pixels
@@ -88,11 +127,10 @@ depthsize(t::DepthTrack) = (size(t.depth, 1), size(t.depth, 2))
 Restored frames for one clip, bounded (see `restore.jl`).
 
 Keyed by absolute source frame like the tracks above, and here for the same
-reason the tracks above are: `Clip` has a field of it. Unlike a track it is a
-CACHE — a
-clip's worth of 4x frames is far too much to keep or to save — so `order` is an
-insertion queue that evicts the oldest window past `limit`. A plain LRU would be
-better if playback ever ran backwards, which it does not.
+reason: `Clip` has a field of it. Unlike a track it is a cache — a clip's worth
+of 4x frames is too much to keep or save — so `order` is an insertion queue that
+evicts the oldest window past `limit`. An LRU would be better only if playback
+ran backwards.
 """
 mutable struct RestoreCache
     const frames::Dict{Int, Matrix{RGB{N0f8}}}
@@ -104,42 +142,35 @@ RestoreCache(limit::Integer = 96) =
 
 """
 Source of stable identities for clips and effect slots. Position in a vector and
-`objectid` both die on the first sort, undo or project reload — anything that has
-to POINT at a clip or an effect (a blend at its partner, the inspector at a stack
-entry, MCP at either) needs an id that survives those.
+`objectid` both die on the first sort, undo or project reload, so anything that
+points at a clip or an effect (a blend at its partner, the inspector at a stack
+entry, MCP at either) needs an id that survives them.
 """
 const NEXTID = Threads.Atomic{UInt64}(0)
 freshid() = UInt64(Threads.atomic_add!(NEXTID, UInt64(1)) + 1)
 
 """
-One entry in a clip's effect stack: the effect, a STABLE `id` so anything can
-point at exactly this entry (the panel, an edge, MCP), `enabled` — the honest
-form of what wrapping an effect in `Bypassed` used to express — and the curves of
-ITS OWN parameters. Several entries of the same kind may coexist; they are told
-apart by their id.
+One entry in a clip's effect stack: the effect, a stable `id` so the panel, an
+edge or MCP can point at this entry, `enabled`, and the curves of its own
+parameters. Several entries of one kind may coexist and are told apart by id.
 
-There used to be a `links::Vector{FxLink}` here as well: a reference from one
-SLOT to another, with a role, so a blend could say "this one fades into that
-one". It expressed a relationship between two effects and nothing about what
-flows between them, so nothing could render it — the panel drew the target's
-sliders inline and that was all it ever did. A [`ParamInput`](@ref) on the
-parameter says the thing that actually matters, at the granularity where a value
-lives, and one mechanism then covers the dissolve, a caption fed by the
-transcript, and an audio-reactive number.
+There used to be a `links::Vector{FxLink}` here: a reference from one slot to
+another with a role, so a blend could name its partner. It described a
+relationship between two effects and nothing about what flows between them, so
+nothing could render it. A [`ParamInput`](@ref) on the parameter says it at the
+granularity where a value lives, and covers the dissolve, a caption fed by the
+transcript and an audio-reactive number with one mechanism.
 
-THE CURVES BELONG HERE, not on the clip — and that last sentence is why. `Clip`
-used to carry one flat
-`Dict{Symbol, AnimCurve}` for everything on it, which meant a curve knew only a
-bare name and not which effect it animated. Everything else followed from that:
-a global `key -> ParamSpec` index had to exist to make the name resolvable
-again, `registerparams!` had to fill it at registration, and resolution went
-through `findeffect`, which returns the FIRST effect of a kind.
+The curves belong on the entry rather than on the clip. `Clip` used to carry one
+flat `Dict{Symbol, AnimCurve}`, so a curve knew a bare name and not which effect
+it animated. That required a global `key -> ParamSpec` index, `registerparams!`
+to fill it at registration, and resolution through `findeffect`, which returns
+the first effect of a kind.
 
 Measured on two Blur slots with one keyframe of 12 on `:blur`:
-`[(blur = 12.0,), (blur = 0.0,)]` — the first slot animates, the second silently
-keeps its static value, while each card's SLIDER writes to its own slot
-correctly. The slider and the diamond of the same row pointed at different
-objects.
+`[(blur = 12.0,), (blur = 0.0,)]` — the first animates, the second keeps its
+static value, while each card's slider writes to its own slot. The slider and the
+diamond of one row pointed at different objects.
 
 A curve keyed by the effect's own parameter name on the slot that owns it cannot
 be ambiguous, so none of that machinery is needed: the slot has the effect, the
@@ -149,9 +180,27 @@ involved at any step.
 mutable struct Effect
     const id::UInt64
     const kind::Symbol                  # which kind this is (:blur, :color, …)
-    enabled::Bool
-    const params::Vector{Param}         # ITS parameters, each with its own curve
+    # An Observable because the eye in the card header and the render both read
+    # it: the button's glyph is derived from this rather than written next to the
+    # flag by the click handler.
+    const enabled::Observable{Bool}
+    const params::Vector{Param}         # this entry's parameters, each with its curve
+    # This entry's card in the Effects panel, or `nothing` while it has none.
+    # Here rather than in a per-clip cache the panel keeps: the card is a property
+    # of the effect the way its parameters are, so adding one builds a card,
+    # removing one deletes it, and selecting another clip is a visibility flip.
+    card::Union{Nothing, Makie.Card}
+    # What the tool inside that card is holding — its overlay plots, its list rows
+    # and its listeners (see [`ToolState`](@ref)). `nothing` for a card with no
+    # tool in it, which is most of them.
+    #
+    # Beside `card` because its life IS the card's: a context that outlived one
+    # kept listening, and its next redraw built a row into a layout whose scene
+    # had been freed ("Can only use scenes with PixelCamera as topscene").
+    tool::Union{Nothing, ToolState}
 end
+Effect(id::Integer, kind::Symbol, enabled::Bool, params::Vector{Param}) =
+    Effect(UInt64(id), kind, Observable(enabled), params, nothing, nothing)
 
 """
     op(fx, frame = 0) -> FxOp
@@ -159,13 +208,10 @@ end
 `fx` as the typed payload the render graph dispatches on (`BlurEffect`, …), with
 every parameter sampled at `frame`.
 
-THE PAYLOAD IS A RESULT, NOT A PLACE. It used to be a stored field —
-which made it a second home for a value that the parameters also claimed to own,
-and the two were joined by a name and a global index. Building it on demand
-leaves exactly one place a value can live. The render path is unchanged: it
-still receives a `BlurEffect` and still dispatches on its type, and
-The render path builds one per node per frame from the parameters, which is where
-the values live.
+Built on demand, not stored. As a field it was a second home for a value the
+parameters also owned, the two joined by a name and a global index. The render
+path is unchanged — it receives a `BlurEffect` and dispatches on its type — and
+builds one per node per frame from the parameters.
 """
 function op(fx::Effect, frame::Real = 0)
     k = kindbyname(fx.kind)
@@ -181,36 +227,21 @@ param(fx::Effect, name::Symbol) =
     (i = findfirst(p -> p.name === name, fx.params); i === nothing ? nothing : fx.params[i])
 
 """
-    copy(fx::Effect; id = fx.id, curves = true) -> Effect
+    copy(fx::Effect; id = fx.id) -> Effect
 
-An independent copy of `fx`: its own `Param` objects, so writing a value into one
-cannot reach the other.
+An independent copy of `fx`: its own `Param` objects, with their own curves and
+their own Observables, so writing a value into one cannot reach the other and a
+snapshot does not share listeners with the live entry.
 
-`curves = false` drops the curves entirely, which is what SAMPLING wants: the
-copy carries the value at one frame, and a parameter that still had its curve
-would be re-sampled by `op` at whatever frame that asks for. Measured: the export
-baked opacity 0.1 into every frame of a 0.1→1.0 ramp, because the sampled copy
-kept the curve and `op` read it at frame 0.
+No card comes across. A card belongs to the entry that is on screen, and a copy
+is not on screen — the panel builds one for it if it ever becomes so.
 
-ONE copier, because there were three, and one of them rebuilt the entry from
-`op(fx)` — the payload, which carries a value and no curve. That silently
-dropped every animation into the undo stack; the suite caught it as
-`isanimated(snapshot(seq)[1])` failing.
+The only copier. Of the three there were, one rebuilt the entry from `op(fx)` —
+the payload, which carries a value at one frame and no curve — and so dropped
+every animation into the undo stack.
 """
-function Base.copy(fx::Effect; id::Integer = fx.id, curves::Bool = true)
-    ps = Param[Param{typeof(p.value)}(p.name, p.label, p.value,
-                                      !curves || p.curve === nothing ? nothing :
-                                      AnimCurve(copy(p.curve.keys), p.curve.interp),
-                                      p.visible, p.range,
-                                      # …and its own edge object, unresolved: the
-                                      # ids are what the edge IS, and the copy is
-                                      # about to be placed somewhere the next
-                                      # `bindinputs!` will resolve them against.
-                                      p.input === nothing ? nothing :
-                                      ParamInput(p.input.op, p.input.inputs...))
-               for p in fx.params]
-    return Effect(UInt64(id), fx.kind, fx.enabled, ps)
-end
+Base.copy(fx::Effect; id::Integer = fx.id) =
+    Effect(UInt64(id), fx.kind, fx.enabled[], Param[copyparam(p) for p in fx.params])
 
 """
     paramsfor(kind, values) -> Vector{Param}
@@ -227,20 +258,19 @@ paramsfor(k, values = NamedTuple()) =
 """
     expandparams!(fx) -> fx
 
-Add the parameters `fx`'s own DATA contributes, for every parameter that has
-any.
+Add the parameters `fx`'s own data contributes, for every parameter that has any.
 
-The kind declares a fixed list of scalars; a 3D scene cannot be described that
-way, because what is animatable in it is every number of every object and that
-depends on the scene. So a parameter whose VALUE is structured data contributes
-its own parameters — see `dataparams` — and this is where they join the list.
+The kind declares a fixed list of scalars, which cannot describe a 3D scene: what
+is animatable there is every number of every object. A parameter whose value is
+structured data contributes its own parameters (see `dataparams`), and this is
+where they join the list.
 
 Idempotent, and it never overwrites: a path that already has a parameter keeps
 the one it has, curve and all. That is what lets it run again after a scene is
 edited, adding what is new without disturbing what was keyframed.
 """
 function expandparams!(fx::Effect)
-    for p in copy(fx.params), q in dataparams(p.value)
+    for p in copy(fx.params), q in dataparams(valueat(p, 0))
         param(fx, q.name) === nothing && push!(fx.params, q)
     end
     return fx
@@ -267,7 +297,7 @@ function Effect(id::Integer, payload, enabled::Bool)
 end
 
 """
-A line of synthesized narration: what to say, WHEN to say it (seconds from the
+A line of synthesized narration: what to say, when to say it (seconds from the
 sequence's start), and which voice.
 
 `samples` is a cache of `text`, not an edit — a project file carries the words
@@ -289,7 +319,7 @@ Narration(text::AbstractString, at::Real = 0.0, voice::AbstractString = "af_hear
     Narration(String(text), Float64(at), String(voice), Float32[], 0)
 
 """
-One spoken line: `start` and `stop` in SECONDS from the sequence's beginning, and
+One spoken line: `start` and `stop` in seconds from the sequence's beginning, and
 what was said.
 
 Here rather than in `captions.jl` because `Sequence` has a field of it, and it is
@@ -306,6 +336,84 @@ struct Caption
 end
 
 
+"A node in a clip's render chain: produces one device image from the previous one."
+abstract type FxNode end
+
+"""
+A clip's render as STRUCTURE: which nodes, in which order, and which effect each
+one came from.
+
+THE STRUCTURE, and nothing that changes per frame. Every value a node carries is
+overwritten by [`update!`](@ref) before each run, so what is stored in `nodes` is
+only ever the shape of the thing. `slots` is parallel to `nodes[2:end]` and is how
+`update!` finds the effect to re-read.
+
+Identity is the point: a graph object is REPLACED when the clip's structure
+changes and never edited in place, so `objectid` of it IS the clip's structural
+version. That is what a composition keys on — no fingerprint to compute, no hash
+of the stack per frame, and nothing that can agree by accident.
+
+Declared here rather than in gpugraph.jl, with the nodes it is made of, because
+[`Clip`](@ref) has a field of one. A field left untyped to break an include cycle
+costs every method that reads it its dispatch.
+"""
+struct FxGraph
+    nodes::Vector{FxNode}
+    slots::Vector{Effect}       # parallel to nodes[2:end]
+    dims::Tuple{Int, Int}
+end
+
+"""
+A clip's pre-rendered frames.
+
+`dir` is where they are, `frames` is the source-frame range they cover, `canvas`
+is what they were rendered at. `enabled` is the switch, and what invalidation
+touches: a bake that no longer matches what the clip would render is switched off
+and kept rather than deleted, because the picture may be exactly what was wanted
+and re-rendering costs minutes.
+
+`dirty` is set at the edit, not derived by comparison. There is no fingerprint
+here: nothing walks the effect stack per frame to discover something the edit
+already knew. The one thing that cannot be caught at an edit site is a file
+changing under us — a source video replaced, a mesh re-exported — so the external
+inputs are `stat`ed once on load, and that is the whole of what is checked.
+
+Here rather than in bake.jl for the reason [`FxGraph`](@ref) is here: `Clip` has
+a field of it. What baking DOES is still bake.jl's.
+"""
+mutable struct Bake
+    dir::String
+    frames::UnitRange{Int}
+    canvas::Tuple{Int, Int}
+    enabled::Bool
+    dirty::Bool
+    # mtime+size of every file the render read, as of the bake. Only files: an
+    # edit inside the editor sets `dirty` where it happens.
+    inputs::Dict{String, Tuple{Float64, Int}}
+end
+Bake(dir::AbstractString, frames::UnitRange{Int}, canvas::Tuple{Int, Int}) =
+    Bake(String(dir), frames, canvas, true, false, Dict{String, Tuple{Float64, Int}}())
+
+"""
+What draws one clip on the timeline, while it is in a sequence that is open.
+
+The `ClipView` plot and the three inputs that feed it, held by the clip — the
+same shape as [`ParamView`](@ref), and for the same reason. The timeline used to
+keep five parallel vectors (plots, ranges, source starts, states, sources), grow
+and shrink them to `length(seq.clips)` on every edit and then write each clip by
+INDEX. Every insert, delete and sort had to be reconciled; a plot could end up
+drawing another clip's source, which is why there was a check for exactly that.
+
+Held by the clip, none of it is a question: the plot a clip is drawn by is the
+one it owns, and it goes away with the clip.
+"""
+mutable struct ClipPlot
+    plot::Makie.Plot
+    range::Observable{Tuple{Float64, Float64}}   # (start, stop) in timeline seconds
+    srcstart::Observable{Float64}                # its in-point, in source seconds
+    state::Observable{Symbol}                    # :idle | :hovered | :selected
+end
+
 """
     Clip(source; src_in=0, src_out=source.nframes, start=0)
 
@@ -314,26 +422,25 @@ A non-destructive reference into a source video: frames
 `crop` is a normalized `(x, y, w, h)` rect ((0,0,1,1) = full frame,
 y measured from the top).
 
-`rate` is how many SOURCE frames one TIMELINE frame advances — the conform
-factor for a source that doesn't run at the sequence rate (a 30 fps clip in a
-60 fps timeline has `rate = 0.5` and shows each of its frames twice). It is
-`source.framerate / seq.framerate`, set once when the clip is placed, and it is
-the ONLY place the two frame worlds differ: `src_in`/`src_out` count source
-frames, `start`/[`cliplength`](@ref) count timeline frames, and
-[`sourceframe`](@ref) is the one conversion between them.
+`rate` is how many source frames one timeline frame advances: the conform factor
+for a source that does not run at the sequence rate (a 30 fps clip in a 60 fps
+timeline has `rate = 0.5` and shows each frame twice). It is
+`source.framerate / seq.framerate`, set once when the clip is placed, and the only
+place the two frame worlds differ — `src_in`/`src_out` count source frames,
+`start`/[`cliplength`](@ref) count timeline frames, and [`sourceframe`](@ref) is
+the conversion.
 
-Conforming preserves WALL-CLOCK duration (`srclength/source.framerate` seconds
-either way), which is why everything that works in time — audio, the filmstrip,
-thumbnails — needs no rate at all.
+Conforming preserves wall-clock duration (`srclength/source.framerate` seconds
+either way), so anything working in time — audio, the filmstrip, thumbnails —
+needs no rate at all.
 """
-mutable struct Clip
+mutable struct Clip <: FrameSource
     id::UInt64                  # stable across sorting, undo and save/load
                                 # (settable so a project file restores its own)
-    # ANY source: a file on disk, or a Makie scene that renders its own frames.
-    # A title, a lower third and a 3D animation are clips on a track like
-    # everything else — they trim, they take an effect stack, they composite —
-    # and that is what makes them so rather than a second system beside the
-    # timeline. See `ClipSource`.
+    # Any source: a file on disk, or a Makie scene that renders its own frames. A
+    # title, a lower third and a 3D animation are clips on a track like everything
+    # else — they trim, take an effect stack and composite — rather than a second
+    # system beside the timeline. See `ClipSource`.
     const source::ClipSource
     src_in::Int
     src_out::Int
@@ -348,17 +455,17 @@ mutable struct Clip
     # `split!` drop a clip's restoration silently, since a fresh id follows
     # nothing (see `restorecache` below).
     depthtrack::Union{Nothing, DepthTrack}
-    # A learned colour grade as a (D,D,D,3) table, host-side. Per CLIP, not per
-    # frame: a look that drifted within a shot would be a fault, not a feature
-    # (see `look.jl`). Host-side because it is project-file data and because a
-    # device array would be on the wrong device after `autodetectgpu!`.
+    # A learned colour grade as a (D,D,D,3) table, host-side. Per clip, not per
+    # frame: a look that drifted within a shot would be a fault (see `look.jl`).
+    # Host-side because it is project-file data, and because a device array would
+    # be on the wrong device after `autodetectgpu!`.
     look::Union{Nothing, Array{Float32, 4}}
     # How this clip fills timeline frames its source has no frame for — i.e. what
     # a slowed clip does between source frames. `:sample` repeats the nearest
     # (the default, and what every editor does with no model); `:flow`
     # synthesizes the in-between frame (see `flow.jl`). A property of the clip
-    # like `rate`, not an effect: it decides what the SOURCE is, before any
-    # effect runs, and an effect only ever sees one frame.
+    # like `rate`, not an effect: it decides what the source is, before any effect
+    # runs, and an effect only ever sees one frame.
     timeinterp::Symbol
     # The fourth analysis result, and a field like the other three. It used to be
     # a module global keyed by clip id, which is how `split!` came to drop a
@@ -368,16 +475,41 @@ mutable struct Clip
     restorecache::Union{Nothing, RestoreCache}
     track::Int                  # stacking layer; higher = on top (1 = base)
     rate::Float64               # source frames per timeline frame (1 = native)
-    # This clip's render as STRUCTURE — see `FxGraph`. `nothing` until something
-    # renders it, and set back to `nothing` by `dirtygraph!` when the structure
-    # changes. Nothing about a VALUE is in it: moving a slider or a keyframe
-    # leaves it alone, which is the whole point. Never written to a project file.
-    graph::Any
+    # This clip's render as structure — see `FxGraph`. `nothing` until something
+    # renders it, and reset by `dirtygraph!` when the structure changes. No value
+    # is in it, so moving a slider or a keyframe leaves it alone. Never written to
+    # a project file.
+    graph::Union{Nothing, FxGraph}
     # Pre-rendered frames of this clip's chain, or `nothing` — see bake.jl. An
-    # edit's OUTPUT, not a cache: minutes of raytracing is not something to
-    # recompute silently on the next open, so it is saved with the project.
-    bake::Any
+    # edit's output rather than a cache: minutes of raytracing should not be
+    # recomputed on the next open, so it is saved with the project.
+    bake::Union{Nothing, Bake}
+    # Where this clip's effect cards sit while it is the one being edited — one
+    # row of the Effects panel's stack, built once (see `buildcards!`). `nothing`
+    # until the panel has drawn it.
+    cardlayout::Union{Nothing, GridLayout}
+    # The sequence this clip is in, and through it the editor it is open in, so
+    # that putting an effect on the clip can build that effect's card — see
+    # [`editorof`](@ref). `nothing` for a clip that is in no sequence: one being
+    # built, one in an undo snapshot, one on the clipboard.
+    sequence::Union{Nothing, Edit}
+    # What draws this clip on the timeline, or `nothing` — see [`ClipPlot`](@ref).
+    # Built by `addclip!`, dropped by `removeclip!`, exactly as a card is built by
+    # `addslot!` and dropped by `removeslotat!`.
+    view::Union{Nothing, ClipPlot}
 end
+
+"""
+    editorof(clip) -> Union{Nothing, Editor}
+
+The editor a clip is open in: the one its sequence is open in.
+
+`nothing` where there is no answer — a clip in no sequence, or a sequence no
+player has opened. Both are ordinary (a clip being built, a project read on a
+worker), so every caller handles it rather than asserting.
+"""
+editorof(clip::Clip) = editorof(clip.sequence)
+editorof(::Nothing) = nothing
 
 Clip(source::ClipSource, src_in, src_out, start, crop, rate::Real = 1.0,
      reframe::Union{Nothing, NTuple{<:Any, <:Real}} = nothing) =
@@ -388,7 +520,10 @@ Clip(source::ClipSource, src_in, src_out, start, crop, rate::Real = 1.0,
                       nothing,          # restorecache
                       1, Float64(rate),
                       nothing,          # graph — built on the first render
-                      nothing),         # bake — none until somebody asks
+                      nothing,          # bake — none until somebody asks
+                      nothing,          # cardlayout — until the panel draws it
+                      nothing,          # sequence — until `addclip!` puts it in one
+                      nothing),         # view — …which is also where it is drawn
                  reframe)
 
 function Clip(source::ClipSource; src_in::Integer = 0, src_out::Integer = source.nframes,
@@ -397,9 +532,9 @@ function Clip(source::ClipSource; src_in::Integer = 0, src_out::Integer = source
 end
 
 """
-Fields of a [`Clip`](@ref) whose value decides its render STRUCTURE rather than a
-value inside it: an analysis that is there or is not there (and therefore a pass
-that exists or does not), and how the clip fills frames between source frames.
+Fields of a [`Clip`](@ref) that decide its render structure rather than a value
+inside it: an analysis that is present or absent (and so a pass that exists or
+does not), and how the clip fills frames between source frames.
 """
 const STRUCTURALFIELDS = (:motiontrack, :colortrack, :mattetrack, :depthtrack,
                           :look, :timeinterp)
@@ -407,20 +542,28 @@ const STRUCTURALFIELDS = (:motiontrack, :colortrack, :mattetrack, :depthtrack,
 """
 Writing one of [`STRUCTURALFIELDS`](@ref) drops the clip's compiled structure.
 
-Here rather than at the twenty-odd places that assign them. `clip.mattetrack =
-track` is written by the matte tool, the brush, the collect loop, three undo
-paths and the project reader, and a rule that has to be remembered at each of
-them is a rule that will be missed at one — the symptom being a graph with no
-matte pass under a clip that has a matte, which renders a correct-looking picture
-with the effect silently absent.
+Here rather than at the twenty-odd assignment sites: `clip.mattetrack = track` is
+written by the matte tool, the brush, the collect loop, three undo paths and the
+project reader. Missing it at one leaves a graph with no matte pass under a clip
+that has a matte, which renders a plausible picture with the effect absent.
 """
+const PLACEFIELDS = (:start, :src_in, :src_out, :track, :rate)
+
 function Base.setproperty!(clip::Clip, name::Symbol, x)
     name in STRUCTURALFIELDS && setfield!(clip, :graph, nothing)
-    # The CONVERT the default `setproperty!` would have done. Overloading it
-    # takes that away: `clip.crop = corner` hands a `NTuple{4, Float32}` to a
-    # `NTuple{4, Float64}` field and `setfield!` alone throws a `TypeError` from
-    # inside the crop tool, naming neither the field nor the caller.
-    return setfield!(clip, name, convert(fieldtype(Clip, name), x))
+    # the convert the default `setproperty!` would have done, which overloading
+    # takes away: `clip.crop = corner` hands an `NTuple{4, Float32}` to an
+    # `NTuple{4, Float64}` field, and `setfield!` alone throws a `TypeError` from
+    # inside the crop tool naming neither the field nor the caller
+    r = setfield!(clip, name, convert(fieldtype(Clip, name), x))
+    # …and where it is drawn follows the write, here rather than at the thirty-odd
+    # assignment sites — a trim, a drag, a ripple, a split and an undo all just
+    # write these fields. `sort!` moves nothing and so places nothing.
+    if name in PLACEFIELDS
+        placeclip!(clip)
+        retitle!(clip)   # …the panel header names the span
+    end
+    return r
 end
 
 """
@@ -428,11 +571,15 @@ end
     removeslotat!(clip, i) -> clip
 
 Put an effect on the stack, or take one off. The stack is a `const` field mutated
-in place, so unlike the fields above these cannot be caught by `setproperty!` —
-which is exactly why every caller goes through a named function instead of
-`push!`ing into `clip.effects`.
+in place, so `setproperty!` cannot catch these; every caller goes through a named
+function rather than `push!`ing into `clip.effects`.
 """
-addslot!(clip::Clip, fx::Effect) = (push!(clip.effects, fx); dirtygraph!(clip); fx)
+addslot!(clip::Clip, fx::Effect) =
+    # …and its card, because this is where the entry joins the document and the
+    # clip knows the editor it is open in. Whichever route put the effect here —
+    # the add menu, `seteffect!`, an undo, a project being read — the card comes
+    # with it, and nothing goes looking afterwards for effects that lack one.
+    (push!(clip.effects, fx); buildcardfor!(clip, fx); dirtygraph!(clip); fx)
 
 """
 Every slot off the clip at once.
@@ -441,8 +588,10 @@ Every slot off the clip at once.
 invisible to [`setproperty!`](@ref) and the clip would keep a compiled graph with
 passes for effects that are gone.
 """
-Base.empty!(clip::Clip) = (empty!(clip.effects); dirtygraph!(clip); clip)
-removeslotat!(clip::Clip, i::Integer) = (deleteat!(clip.effects, i); dirtygraph!(clip); clip)
+Base.empty!(clip::Clip) =
+    (foreach(dropcard!, clip.effects); empty!(clip.effects); dirtygraph!(clip); clip)
+removeslotat!(clip::Clip, i::Integer) =
+    (dropcard!(clip.effects[i]); deleteat!(clip.effects, i); dirtygraph!(clip); clip)
 
 """
 Seed a clip's placement from a (scale, x, y[, rotation°]) tuple — the shape a
@@ -481,11 +630,11 @@ conformrate(source::ClipSource, framerate::Real) =
     isapprox(source.framerate, framerate; atol = 0.01) ? 1.0 :
     Float64(source.framerate) / Float64(framerate)
 
-"Frames of SOURCE this clip spans — what every per-source-frame analysis iterates."
+"Frames of source this clip spans — what every per-source-frame analysis iterates."
 srclength(clip::Clip) = clip.src_out - clip.src_in
 
 """
-Frames of TIMELINE this clip occupies — its extent in the edit. Equal to
+Frames of timeline this clip occupies — its extent in the edit. Equal to
 [`srclength`](@ref) on a native clip; `floor` (not `round`) so the last timeline
 frame always maps inside the source range.
 """
@@ -499,9 +648,9 @@ conformed(clip::Clip) = clip.rate != 1.0
 """
     sourceframe(clip, n) -> Int
 
-The source frame showing at timeline frame `n` — the ONE conversion between the
-edit's frame world and the media's. Not clamped: transition handles deliberately
-ask past a clip's own range.
+The source frame showing at timeline frame `n`: the conversion between the edit's
+frame world and the media's. Not clamped, since transition handles ask past a
+clip's own range.
 """
 sourceframe(clip::Clip, n::Integer) =
     clip.rate == 1.0 ? clip.src_in + (Int(n) - clip.start) :
@@ -510,7 +659,7 @@ sourceframe(clip::Clip, n::Integer) =
 """
     sourcephase(clip, n) -> Float64
 
-How far timeline frame `n` sits BETWEEN [`sourceframe`](@ref)`(clip, n)` and the
+How far timeline frame `n` sits between [`sourceframe`](@ref)`(clip, n)` and the
 one after it, in `0..1`.
 
 Exactly the fraction `sourceframe` throws away with its `floor`. It is zero for
@@ -562,41 +711,53 @@ An edited timeline: non-overlapping clips sorted by start. All edits are
 metadata operations on this structure; frames are resolved on demand via
 `locate`. `transitions` overlay cross-dissolves on clip cuts.
 """
-mutable struct Sequence
+mutable struct Sequence <: Edit
     const clips::Vector{Clip}
     framerate::Float64
     const transitions::Vector{Transition}
-    # What is spoken, and when. An EDIT — the transcript
-    # is what a user fixes when the model mishears a word, so it is saved with the
-    # project and restored by undo. Regenerating it is minutes of Whisper, which
-    # is the other half of why it is not a cache.
+    # What is spoken, and when. An edit rather than a cache: a user fixes it when
+    # the model mishears a word, so it is saved with the project and restored by
+    # undo, and regenerating it is minutes of Whisper.
     const captions::Vector{Caption}
-    # Spoken narration mixed OVER the clips, on both the preview and the export.
+    # Spoken narration mixed over the clips, on both the preview and the export.
     # An edit like the captions: the words are saved, the samples are a cache.
     const narration::Vector{Narration}
     # The output resolution, once something has set it — the crop tool does.
     #
-    # `nothing` means "derive it from the first clip", which is what this did
-    # ALWAYS and is a trap: deleting or reordering clips then silently changes the
-    # project's resolution, and cropping clip 2 resized nothing while cropping
-    # clip 1 resized everything. Kept as the fallback so projects written before
-    # this open unchanged.
+    # `nothing` derives it from the first clip, which was the only behaviour and
+    # is a trap: deleting or reordering clips then changes the project's
+    # resolution, and cropping clip 2 resized nothing while cropping clip 1
+    # resized everything. Kept as the fallback so older projects open unchanged.
     canvas::Union{Nothing, Tuple{Int, Int}}
-    # How tall each track is drawn, as a WEIGHT — 1.0 is its equal share, 2.0 is
-    # twice as tall as its neighbours. Not pixels: the timeline still fills the
-    # space it is given, so a resized track keeps its proportion when the window
-    # changes. Saved with the project, because a track somebody made tall to work
-    # on is part of how they have the edit laid out, not a transient view state.
+    # How tall each track is drawn, as a weight: 1.0 is its equal share, 2.0 twice
+    # its neighbours. Not pixels — the timeline fills the space it is given, so a
+    # resized track keeps its proportion when the window changes. Saved with the
+    # project, since a track made tall to work on is part of the layout.
     #
     # Shorter than the track count is normal (and is what every older project
     # reads as): a track with no entry weighs 1.0. See `trackweight`.
     const trackheights::Vector{Float64}
-    # The ONE track filling the whole lane area, hiding the others — 0 for the
-    # normal stacked view. Unlike `trackheights` this is NOT saved: it is a way of
-    # looking at the edit for a minute (double-click a lane), not a property of it,
-    # and a project that opened with everything but one track missing would read as
-    # data loss. See `solotrack!`.
+    # The track filling the whole lane area and hiding the others; 0 for the normal
+    # stacked view. Unlike `trackheights` this is not saved: it is a way of looking
+    # at the edit (double-click a lane), and a project opening with every track but
+    # one missing would read as data loss. See `solotrack!`.
     solo::Int
+    # The editor this sequence is open in — see [`Editor`](@ref). Written once,
+    # when a `Player` opens it, and read by every clip in it. Not saved and not
+    # copied: it is what the document is being looked at through, not part of it.
+    editor::Union{Nothing, Editor}
+
+    function Sequence(clips::Vector{Clip}, framerate::Real,
+                      transitions::Vector{Transition}, captions::Vector{Caption},
+                      narration::Vector{Narration},
+                      canvas::Union{Nothing, Tuple{Int, Int}},
+                      trackheights::Vector{Float64}, solo::Integer)
+        seq = new(clips, Float64(framerate), transitions, captions, narration,
+                  canvas, trackheights, Int(solo), nothing)
+        # the clips handed in join it exactly as a later one does — see `addclip!`
+        foreach(c -> (c.sequence = seq), clips)
+        return seq
+    end
 end
 
 Sequence(clips::Vector{Clip}, framerate::Real) =
@@ -613,6 +774,70 @@ Sequence(clips::Vector{Clip}, framerate::Real, transitions::Vector{Transition},
     Sequence(clips, framerate, transitions, captions, narration, canvas, trackheights, 0)
 Sequence(source::ClipSource) = Sequence([Clip(source)], source.framerate)
 
+editorof(seq::Sequence) = seq.editor
+
+"""
+    addclip!(seq, clip) -> clip
+    addclip!(seq, i, clip) -> clip
+
+Put a clip in the sequence, at the end or at index `i`. The only way one gets
+there.
+
+`push!(seq.clips, clip)` cannot do this: the clip has to learn which sequence it
+is in, because that is how it reaches the editor it is open in (see
+[`editorof`](@ref)), and an effect put on a clip that cannot reach one builds no
+card. There were seven `push!`es and two of them were the paths a user takes most
+— dropping a file in, and pasting.
+"""
+function addclip!(seq::Sequence, clip::Clip)
+    clip.sequence = seq
+    push!(seq.clips, clip)
+    buildclipview!(clip)
+    restack!(seq)
+    return clip
+end
+function addclip!(seq::Sequence, i::Integer, clip::Clip)
+    clip.sequence = seq
+    insert!(seq.clips, i, clip)
+    buildclipview!(clip)
+    restack!(seq)
+    return clip
+end
+
+"""
+    removeclip!(seq, i) -> Clip
+    empty!(seq) -> seq
+
+Take a clip out of the sequence, or all of them. The only way one leaves.
+
+`deleteat!(seq.clips, i)` cannot do this: what the timeline draws the clip with
+belongs to the clip ([`ClipPlot`](@ref)), so it has to go when the clip does —
+the same statement [`removeslotat!`](@ref) makes about a card.
+"""
+function removeclip!(seq::Sequence, i::Integer)
+    clip = seq.clips[i]
+    deleteat!(seq.clips, i)
+    dropclipview!(clip)
+    clip.sequence = nothing
+    prunetransitions!(seq)   # a cut that no longer exists carries no dissolve
+    restack!(seq)
+    return clip
+end
+
+"The stack gained or lost a lane: every clip's band is a function of the count."
+function restack!(seq::Sequence)
+    player = editorof(seq)
+    player === nothing || placetracks!(player.timeline)
+    return nothing
+end
+
+function Base.empty!(seq::Sequence)
+    foreach(dropclipview!, seq.clips)
+    foreach(c -> (c.sequence = nothing), seq.clips)
+    empty!(seq.clips)
+    return seq
+end
+
 "The clip with `id`, or `nothing` — how anything refers to a clip across sorting,
 undo and reloads (indices shift, `objectid` dies on the first copy)."
 function clipbyid(seq::Sequence, id::Integer)
@@ -626,18 +851,17 @@ end
 Resolve every [`ParamInput`](@ref) in the sequence: turn the ids a node is
 written in into the objects [`valueat`](@ref) follows.
 
-Run on every STRUCTURAL change — a project loaded, an undo restored, a clip or an
-effect added or removed — which is exactly when an id can start or stop naming
-something. Editing a value or moving a keyframe changes nothing here.
+Run on every structural change — a project loaded, an undo restored, a clip or an
+effect added or removed — which is when an id can start or stop naming something.
+Editing a value or moving a keyframe changes nothing here.
 
 An edge whose target is gone is left unresolved rather than deleted: the ids are
 what the user wrote, and a clip coming back through undo has to bring the edge
 that pointed at it back with it. Unresolved reads as the parameter's own value.
 
-Cycles are refused at the LAST edge that would close one, so a parameter driven
-in a loop keeps its own value instead of hanging the render. Refused here rather
-than at each read: this runs once per edit, `valueat` runs per parameter per
-frame.
+Cycles are refused at the last edge that would close one, so a parameter driven in
+a loop keeps its own value instead of hanging the render. Refused here rather than
+at each read: this runs once per edit, `valueat` per parameter per frame.
 """
 function bindinputs!(seq::Sequence)
     for clip in seq.clips, fx in clip.effects, p in fx.params
@@ -645,7 +869,7 @@ function bindinputs!(seq::Sequence)
         n === nothing && continue
         n.to = clip
         n.resolved = Any[resolveinput(seq, clip, fx, p, r) for r in n.inputs]
-        n.from = Any[inputclip(seq, clip, r) for r in n.inputs]
+        n.from = Union{Nothing, FrameSource}[inputclip(seq, clip, r) for r in n.inputs]
     end
     for clip in seq.clips, fx in clip.effects, p in fx.params
         drivencycle(p) && (p.input.resolved = Any[nothing for _ in p.input.inputs])
@@ -669,10 +893,10 @@ function resolveinput(seq::Sequence, clip::Clip, fx::Effect, p::Param, r::ParamR
         q = param(slot, r.param)
         return (q === nothing || q === p) ? nothing : q
     end
-    # `effect = 0` is "by NAME on that clip" — across a clip boundary "the same
-    # effect" means nothing, and within one clip a parameter name is unique enough
-    # to be what the user meant. The parameter's OWN effect is tried first, so a
-    # self-reference resolves the way it reads.
+    # `effect = 0` means "by name on that clip": across a clip boundary "the same
+    # effect" names nothing, and within one clip a parameter name is unique enough.
+    # The parameter's own effect is tried first, so a self-reference resolves the
+    # way it reads.
     for slot in (target === clip ? (fx, target.effects...) : (target.effects...,))
         q = param(slot, r.param)
         (q === nothing || q === p) && continue          # nothing drives itself
@@ -685,10 +909,10 @@ resolveinput(::Sequence, ::Clip, ::Effect, ::Param, r::FileRef) =
 resolveinput(seq::Sequence, ::Clip, ::Effect, ::Param, r::ClipRef) = clipbyid(seq, r.clip)
 
 """
-A clip's PICTURE is not a value — it is a transient that exists while a
-composition runs, so it is wired by the graph and never fetched from inside a
-value lookup. Refused loudly rather than silently returning the clip itself, which
-would arrive at a kernel as something it cannot use.
+A clip's picture is not a value but a transient that exists while a composition
+runs, so the graph wires it and a value lookup never fetches it. Refused rather
+than returning the clip itself, which would reach a kernel as something it cannot
+use.
 """
 readinput(::Clip, ::Integer) =
     error("a clip's picture is a graph input, not a value — the composition wires \
@@ -748,7 +972,7 @@ ntracks(seq::Sequence) = isempty(seq.clips) ? 1 : maximum(c.track for c in seq.c
 clipsat(seq::Sequence, n::Integer) =
     sort!([c for c in seq.clips if c.start <= n < clipend(c)]; by = c -> c.track)
 
-"Index of the TOP-most clip containing timeline frame `n`, or `nothing` (gap)."
+"Index of the topmost clip containing timeline frame `n`, or `nothing` (gap)."
 function clipat(seq::Sequence, n::Integer)
     best = nothing; besttrack = typemin(Int)
     for (i, c) in enumerate(seq.clips)
@@ -760,9 +984,9 @@ function clipat(seq::Sequence, n::Integer)
 end
 
 """
-Index of the clip covering frame `n` ON `track` — the lane-aware `clipat`. The
-topmost clip is what the preview renders, but a click (and the inspector behind
-it) must be able to reach the one stacked BELOW it.
+Index of the clip covering frame `n` on `track`: the lane-aware `clipat`. The
+preview renders the topmost clip, but a click (and the inspector behind it) has
+to reach the one stacked below it.
 """
 function clipat(seq::Sequence, n::Integer, track::Integer)
     for (i, c) in enumerate(seq.clips)
@@ -815,9 +1039,8 @@ clamptransition(left::Clip, right::Clip, duration::Integer) =
     2 * max(min(duration ÷ 2, cliplength(left), cliplength(right)), 0)
 
 """
-The dissolve length a one-click blend should use on this cut: 0.6 s, but never
-more than HALF the shorter clip, so each side keeps three quarters of itself
-un-blended. The hard limit ([`clamptransition`](@ref)) allows a dissolve twice
+The dissolve length a one-click blend uses on this cut: 0.6 s, and never more than
+half the shorter clip, so each side keeps three quarters of itself un-blended. The hard limit ([`clamptransition`](@ref)) allows a dissolve twice
 the shorter clip — on short clips (loop cuts!) that swallows both of them whole
 and the timeline is one big bowtie with no clip left to see.
 """
@@ -840,10 +1063,12 @@ function addtransition!(seq::Sequence, at::Integer; duration::Integer, kind::Sym
     if i === nothing
         t = Transition(kind, at, dur)
         push!(seq.transitions, t)
+        drawtransitions!(seq)
         return t
     end
     seq.transitions[i].kind = kind
     seq.transitions[i].duration = dur
+    drawtransitions!(seq)
     return seq.transitions[i]
 end
 
@@ -853,16 +1078,37 @@ function removetransition!(seq::Sequence, at::Integer)
     i === nothing && return nothing
     t = seq.transitions[i]
     deleteat!(seq.transitions, i)
+    drawtransitions!(seq)
     return t
 end
 
 "Drop transitions whose cut no longer exists (after edits that move/merge clips)."
 function prunetransitions!(seq::Sequence)
+    n = length(seq.transitions)
     filter!(seq.transitions) do t
         left, right = transitionclips(seq, t.at)
         left !== nothing && right !== nothing
     end
+    length(seq.transitions) == n || drawtransitions!(seq)
     return seq
+end
+
+"""
+    drawtransitions!(seq) -> nothing
+
+Redraw the cross-dissolve markers, because the LIST of them changed.
+
+The boxes are two shared plots fed by two vectors, so this recomputes both from
+`seq.transitions` — a pure function of the document, not a pass that goes looking
+for what is out of date. It is called where a transition is added, re-keyed,
+removed or pruned, and nowhere else: it used to hang off `relayout!`, and then off
+`placetracks!`, which fires on the STACK's geometry — a fact these markers do not
+depend on (their band is fixed) and which is silent about the one that they do.
+"""
+function drawtransitions!(seq::Sequence)
+    player = editorof(seq)
+    player === nothing || refreshtransitions!(player.timeline)
+    return nothing
 end
 
 """
@@ -872,34 +1118,34 @@ Split the clip containing timeline frame `n` at `n`; the right half is
 returned. No-op at a clip start or in a gap.
 """
 function split!(seq::Sequence, n::Integer, track::Union{Nothing, Integer} = nothing)
-    # `track` names the LANE to cut. Without it `clipat` answers with the topmost
-    # clip at `n`, so pressing S while V2 was selected cut V3 — the selection was
-    # never consulted at all.
+    # `track` names the lane to cut. Without it `clipat` answers with the topmost
+    # clip at `n`, so pressing S with V2 selected cuts V3.
     i = track === nothing ? clipat(seq, n) : clipat(seq, n, Int(track))
     i === nothing && return nothing
     clip = seq.clips[i]
     n == clip.start && return nothing
-    cut = sourceframe(clip, n)            # the cut in SOURCE frames — both halves share it
+    cut = sourceframe(clip, n)            # the cut in source frames; both halves share it
     cut > clip.src_in || return nothing
-    # …and the halves must MEET: on a conformed clip several timeline frames show
-    # the same source frame, so the cut is snapped back to where that frame starts.
-    # Cutting at the raw `n` left the left half one frame short of the right one —
-    # a hole in the timeline that only appears on retimed material.
+    # …and the halves have to meet: on a conformed clip several timeline frames
+    # show the same source frame, so the cut snaps back to where that frame
+    # starts. Cutting at the raw `n` leaves the left half one frame short of the
+    # right, a hole that only appears on retimed material.
     at = clip.start + timelineframes(clip, cut - clip.src_in)
     right = Clip(clip.source, cut, clip.src_out, at, clip.crop, clip.rate)
     right.track = clip.track              # both halves stay on the same stacking layer
-    # …and the blend pairing, which lives on the OPACITY parameter now (an edge
-    # with `op = :pairedwith`) and is copied with the stack below.
+    # …and the blend pairing, which lives on the opacity parameter (an edge with
+    # `op = :pairedwith`) and is copied with the stack below.
     # each half owns its stack: same effects, own slot ids, so the inspector can
     # address one half's entry without touching the other's
-    # …and a DATA entry (the `:scene`) is copied as itself: it has no payload to
+    # …and a data entry (the `:scene`) is copied as itself: it has no payload to
     # rebuild from, and `copy` gives it its own parameters and curves.
-    append!(right.effects,
-            [renderable(s) ? Effect(freshid(), op(s), s.enabled) : copy(s; id = freshid())
-             for s in clip.effects])
-    # keyed by absolute source frame, so both halves stay valid. Assigned
-    # directly: the stack was already copied above, slots and all, so going
-    # through `setmotiontrack!` would prepend a SECOND Stabilize slot.
+    for s in clip.effects
+        addslot!(right, renderable(s) ? Effect(freshid(), op(s), s.enabled[]) :
+                                        copy(s; id = freshid()))
+    end
+    # keyed by absolute source frame, so both halves stay valid. Assigned directly:
+    # the stack was copied above, slots and all, so `setmotiontrack!` would prepend
+    # a second Stabilize slot.
     right.colortrack = clip.colortrack
     right.motiontrack = clip.motiontrack
     right.mattetrack = clip.mattetrack    # ditto — cutting a clip must not lose its matte
@@ -911,19 +1157,17 @@ function split!(seq::Sequence, n::Integer, track::Union{Nothing, Integer} = noth
     # two then share the eviction budget, which is the bargain a shared track
     # makes anyway.
     right.restorecache = clip.restorecache
-    # Keys are absolute-frame, so both halves keep every one — but each half gets
-    # its OWN curve object, or editing one would reach into the other. `fi`/`pi`,
-    # not `i`: `i` is the clip's index in the sequence and `insert!` below needs
-    # it (shadowing it put the right half at the wrong place in the timeline).
+    # Keys are absolute-frame, so both halves keep every one, but each half needs
+    # its own curve object or editing one reaches into the other. `fi`/`pi`, not
+    # `i`: `i` is the clip's index in the sequence and `insert!` below needs it.
     for (fi, fx) in enumerate(clip.effects)
         for (pi, prm) in enumerate(fx.params)
-            prm.curve === nothing && continue
-            right.effects[fi].params[pi].curve =
-                AnimCurve(copy(prm.curve.keys), prm.curve.interp)
+            right.effects[fi].params[pi].curve[] =
+                AnimCurve(copy(prm.curve[].keys), prm.curve[].interp)
         end
     end
     clip.src_out = cut
-    insert!(seq.clips, i + 1, right)
+    addclip!(seq, i + 1, right)   # …and with that the right half is in the editor too
     return right
 end
 
@@ -933,32 +1177,28 @@ end
 An independent copy of `clip` — the same source range, the same effect stack, the
 same analysis — placed at `start` on `track`. Not inserted into any sequence.
 
-**What is copied and what is shared follows [`split!`](@ref) exactly**, because
-the question is the same one: a derived clip reads the same source frames, so
-anything keyed by absolute source frame is correct to share and expensive to
-duplicate.
+What is copied and what is shared follows [`split!`](@ref): a derived clip reads
+the same source frames, so anything keyed by absolute source frame is correct to
+share and expensive to duplicate.
 
-* **Fresh:** the clip `id`, and one `id` per [`Effect`](@ref) with its own copy of
-  the links. Two slots sharing an id would make the inspector and the blend card
-  address both at once. The `Effect` inside a slot is shared and that is safe —
-  every effect is an immutable `struct`, so a parameter change replaces it rather
-  than mutating what the other clip reads.
-* **Shared:** `colortrack`, `motiontrack`, `mattetrack` and `restorecache`. All
-  four are keyed by absolute source frame and the copy covers the same frames, so
-  one analysis indexes correctly from both — and re-running a matte to duplicate
-  it would cost minutes.
-* **Copied:** the animation curves. Keyframes are the one thing you edit per
-  clip, so the two must move independently.
-* **Dropped:** the blend PAIRING. It names another clip by id, and a copy landing
-  somewhere else in the timeline has no business blending away from that clip's
-  partner. `split!` keeps it because its left half genuinely continues the same
-  blend; a copy does not.
+* Fresh: the clip `id`, and one `id` per [`Effect`](@ref) with its own copy of the
+  links. Two slots sharing an id would make the inspector and the blend card
+  address both at once. The `Effect` inside a slot is shared, which is safe —
+  every effect is an immutable `struct`, so a parameter change replaces it.
+* Shared: `colortrack`, `motiontrack`, `mattetrack` and `restorecache`. All four
+  are keyed by absolute source frame and the copy covers the same frames, so one
+  analysis indexes correctly from both; re-running a matte would cost minutes.
+* Copied: the animation curves, which are edited per clip and have to move
+  independently.
+* Dropped: the blend pairing. It names another clip by id, and a copy elsewhere in
+  the timeline is not in that transition. `split!` keeps it because its left half
+  continues the same blend.
 """
 copyclip(clip::Clip; start::Integer = clip.start, track::Integer = clip.track) =
     withfields(clip; id = freshid(), start = Int(start), track = Int(track),
                # Fresh slot ids and copied link vectors: the copy's stack is its
                # own, so unlinking on one must not reach into the other.
-               # …and every parameter's EDGE goes unresolved with it, so the copy's
+               # …and every parameter's edge goes unresolved with it, so the copy's
                # blend pairing points at nothing until `bindinputs!` runs — which
                # is right: a copy is not in the original's transition.
                effects = [copy(fx; id = freshid()) for fx in clip.effects])
@@ -971,9 +1211,9 @@ The left edge shifts `start` and `src_in` together so the content stays anchored
 the right edge moves `src_out`. Clamped to the available source and to the
 neighbours on the same lane.
 
-The edge walks TIMELINE frames while the in/out points count SOURCE frames — on a
-conformed clip those are not the same step, which is why this is one function
-and not arithmetic inlined in the drag handler.
+The edge walks timeline frames while the in/out points count source frames, which
+on a conformed clip is not the same step — hence one function rather than
+arithmetic in the drag handler.
 """
 function trimclip!(seq::Sequence, clip::Clip, i::Integer, side::Symbol, n::Integer)
     if side === :right
@@ -981,11 +1221,10 @@ function trimclip!(seq::Sequence, clip::Clip, i::Integer, side::Symbol, n::Integ
         nxt = nextontrack(seq, clip)
         nxt === nothing || (maxend = min(maxend, nxt.start))
         # `max(…, clip.start + 1)`: a clip is never trimmed out of existence, and
-        # the bound it is clamped against must not invert. It did — the limit used
-        # to come from `seq.clips[i + 1]`, and that list is sorted by (track,
-        # start), so on a stack the "next clip" was usually one on ANOTHER track,
-        # often starting earlier. `src_out` then landed at or before `src_in` and
-        # the clip vanished mid-drag.
+        # the bound it is clamped against must not invert. Taking the limit from
+        # `seq.clips[i + 1]` did invert it — that list is sorted by (track, start),
+        # so on a stack the "next clip" was usually one on another track, often
+        # starting earlier, and `src_out` landed at or before `src_in`.
         newend = clamp(Int(n), clip.start + 1, max(maxend, clip.start + 1))
         clip.src_out = sourceframe(clip, newend)
     else
@@ -1000,7 +1239,7 @@ function trimclip!(seq::Sequence, clip::Clip, i::Integer, side::Symbol, n::Integ
     return clip
 end
 
-"The clip that follows `clip` ON ITS OWN TRACK, or `nothing`."
+"The clip that follows `clip` on its own track, or `nothing`."
 function nextontrack(seq::Sequence, clip::Clip)
     best = nothing
     for c in seq.clips
@@ -1012,7 +1251,7 @@ function nextontrack(seq::Sequence, clip::Clip)
     return best
 end
 
-"The clip that precedes `clip` ON ITS OWN TRACK, or `nothing`."
+"The clip that precedes `clip` on its own track, or `nothing`."
 function prevontrack(seq::Sequence, clip::Clip)
     best = nothing
     for c in seq.clips
@@ -1043,10 +1282,9 @@ function joinclips!(seq::Sequence, n::Integer)
     j === nothing && return nothing
     nxt = seq.clips[j]
     removetransition!(seq, nxt.start)     # a dissolve on the joined cut is gone with it
-    # Carry the right half's keys over, matching by KIND — not by position. The
-    # halves need not have the same stack: only the right one may carry the
-    # effect a curve belongs to, and indexing by position then wrote it onto a
-    # different effect or dropped it (measured: the joined clip lost its fade).
+    # Carry the right half's keys over, matched by kind rather than position: the
+    # halves need not have the same stack, so indexing by position writes a curve
+    # onto a different effect or drops it (the joined clip lost its fade).
     for fx in nxt.effects
         any(isanimated, fx.params) || continue
         i = findfirst(g -> g.kind === fx.kind, c.effects)
@@ -1055,15 +1293,14 @@ function joinclips!(seq::Sequence, n::Integer)
             continue
         end
         for prm in fx.params
-            prm.curve === nothing && continue
+            isanimated(prm) || continue     # a constant is the left half's to keep
             dst = param(c.effects[i], prm.name)
             dst === nothing && continue
-            dst.curve === nothing && (dst.curve = AnimCurve{typeof(dst.value)}())
-            foreach(k -> setkey!(dst.curve, k.frame, k.value, k.ease), prm.curve.keys)
+            foreach(k -> setkey!(dst, k.frame, k.value, k.ease), prm.curve[].keys)
         end
     end
     c.src_out = nxt.src_out
-    deleteat!(seq.clips, j)
+    removeclip!(seq, j)
     return c
 end
 
@@ -1084,16 +1321,14 @@ end
 
 Shift the document-level timings at or after `from` seconds earlier by `by`.
 
-The captions and the narration are pinned to the PICTURE, not to the wall clock.
-`deleteclip!` rippled the clips and left these exactly where they were, so the
-first ripple delete slid every subtitle and every voiceover after the cut out of
-sync with the shot it belonged to — and cutting anything is mostly ripple
-deletes, so this went wrong on essentially the first real edit.
+The captions and the narration are pinned to the picture, not to the wall clock.
+Without this, `deleteclip!` ripples the clips and leaves both where they were, so
+every subtitle and voiceover after the cut goes out of sync with its shot.
 
-Both are REPLACED rather than mutated. `docsnapshot` shares these objects with
+Both are replaced rather than mutated: `docsnapshot` shares these objects with
 every undo step holding them, so shifting one in place would rewrite the history
-that is supposed to put it back. The narration's samples come along: the words
-have not changed, only when they are said.
+meant to put it back. The narration's samples come along — the words have not
+changed, only when they are said.
 """
 function rippledoc!(seq::Sequence, from::Real, by::Real)
     for (i, c) in enumerate(seq.captions)
@@ -1109,18 +1344,19 @@ function rippledoc!(seq::Sequence, from::Real, by::Real)
     return seq
 end
 
-"Delete `clip` ITSELF (by identity — track-safe where a frame is ambiguous)
-with the same ripple semantics."
+"Delete `clip` by identity (track-safe where a frame is ambiguous), with the same
+ripple semantics."
 function deleteclip!(seq::Sequence, clip::Clip; ripple::Bool = true)
     i = findfirst(c -> c === clip, seq.clips)
     i === nothing && return nothing
-    deleteat!(seq.clips, i)
+    removeclip!(seq, i)   # …and with it what the timeline drew it with
+    dropcards!(clip)      # it is out of the document; its panel row goes with it
     if ripple
         len = cliplength(clip)
         for other in seq.clips
             other.start >= clip.start && (other.start -= len)
         end
-        # …and the timings that are NOT on a clip. See `rippledoc!`.
+        # …and the timings that are not on a clip. See `rippledoc!`.
         seq.framerate > 0 &&
             rippledoc!(seq, clip.start / seq.framerate, len / seq.framerate)
     end
@@ -1151,12 +1387,18 @@ withfields(clip::Clip;
            timeinterp = clip.timeinterp, restorecache = clip.restorecache,
            track = clip.track,
            rate = clip.rate, bake = clip.bake) =
-    # NOT the graph. A derived clip is a different clip: it may carry a different
-    # effect stack (`withoutmatte`), and a compiled chain reached through two
-    # clips would be one clip's `update!` writing into the other's passes.
+    # Never the graph: a derived clip may carry a different effect stack
+    # (`withoutmatte`), and a compiled chain reached through two clips would be one
+    # clip's `update!` writing into the other's passes. Never the cards either —
+    # they are built for the clip the panel is showing, and a copy is not it —
+    # and never the sequence: a copy is in none until `addclip!` puts it in one,
+    # and a snapshot that claimed membership would reach a live editor from inside
+    # the undo stack. Never the timeline plot either, for the reason the cards are
+    # not copied: it is drawn for the clip that is in the sequence, and a copy is
+    # not it.
     Clip(id, source, src_in, src_out, start, crop, effects, colortrack, motiontrack,
          mattetrack, depthtrack, look, timeinterp, restorecache, track,
-         rate, nothing, bake)
+         rate, nothing, bake, nothing, nothing, nothing)
 
 "Copy of the edit state for undo/redo. Sources and analysis tracks are shared."
 snapshot(seq::Sequence) =
@@ -1165,15 +1407,139 @@ snapshot(seq::Sequence) =
      for c in seq.clips]
 
 """
+    restoreinto!(into, from) -> into
+
+Overwrite `into`'s edit state with `from`'s, keeping the object.
+
+Matching is by what the document already identifies things with: clips and
+effects by `id`, parameters by `name` within their effect. Anything without a
+counterpart is built fresh; anything the snapshot no longer lists is dropped.
+
+Identity is what the editor's bindings are — a slider holds its `Param`, a
+keyframe lane its curve, a card its clip. Replacing the objects (which is what
+`restore!` used to do) left all 110 rows of the lego project's panel pointing at
+parameters that were no longer in the sequence.
+"""
+function restoreinto!(into::Clip, from::Clip)
+    # NAMED, not derived by excluding what must not travel. A list built as
+    # "every non-const field except these" includes anything added later by
+    # default, so a field like `sequence` or `cardlayout` joins the undo stack
+    # because nobody objected. Written out, a new field is simply not restored
+    # until somebody says it should be — the mistake falls the harmless way, and
+    # it is the same reason `to_msgpack` names an `Effect`'s fields and has
+    # therefore never written a widget into a project file.
+    into.src_in = from.src_in
+    into.src_out = from.src_out
+    into.start = from.start
+    into.crop = from.crop
+    into.colortrack = from.colortrack
+    into.motiontrack = from.motiontrack
+    into.mattetrack = from.mattetrack
+    into.depthtrack = from.depthtrack
+    into.look = from.look
+    into.timeinterp = from.timeinterp
+    into.restorecache = from.restorecache
+    into.track = from.track
+    into.rate = from.rate
+    into.bake = from.bake
+    into.id = from.id
+    # …and not `graph` (the compiled chain, rebuilt on the next render),
+    # `cardlayout`, `sequence` or `view` — the clip keeps the ones it is open with.
+    into.graph = nothing
+    old = Dict{UInt64, Effect}(fx.id => fx for fx in into.effects)
+    empty!(into.effects)
+    # One door, here as everywhere: an effect gets onto a clip through
+    # `addslot!`, which is what makes sure it has a card. This was a bare `push!`,
+    # and undoing the removal of an effect put it back on the clip with no row in
+    # the panel — the panel does not diff, so nothing ever built it, and only
+    # selecting another clip and coming back drew it. An effect that kept its card
+    # keeps it (`addslot!` builds only for one that has none), so a restore does
+    # not churn the rows of everything it did not touch.
+    for fx in from.effects
+        cur = pop!(old, fx.id, nothing)
+        addslot!(into, cur === nothing ? copy(fx) : restoreinto!(cur, fx))
+    end
+    # What the snapshot does not list is gone from the document, and its card goes
+    # with it. Nothing else would ever delete it: the panel builds cards for the
+    # effects a clip has and never diffs them against what is on screen.
+    foreach(dropcard!, values(old))
+    return into
+end
+
+function restoreinto!(into::Effect, from::Effect)
+    into.enabled[] = from.enabled[]
+    old = Dict{Symbol, Param}(p.name => p for p in into.params)
+    empty!(into.params)
+    newrows = false
+    for p in from.params
+        cur = pop!(old, p.name, nothing)
+        # a parameter whose value type changed is a different parameter, its curve
+        # being of the old type — copied rather than converted
+        fresh = cur === nothing || typeof(cur) !== typeof(p)
+        newrows |= fresh
+        push!(into.params, fresh ? copyparam(p) : restoreinto!(cur, p))
+    end
+    # A parameter that came or went makes this a different card — the rows are
+    # built with it, and a copied parameter has no view at all. Dropping it here
+    # is what makes `addslot!` build a fresh one; the card is the effect's, so the
+    # effect is where the call belongs, and `dropcard!` needs no panel to reach
+    # (it asks each plot where it is drawn). A scene clip whose parameters appear
+    # only once it has rendered is the case this is really for.
+    (newrows || !isempty(old)) && dropcard!(into)
+    return into
+end
+
+"""
+Restore one parameter in place, through its Observables.
+
+Written through rather than replaced, so the widgets holding this object keep
+working — and, because the curve is an Observable, so that everything derived
+from it redraws. An undo updates the lane and the ◆ because it writes the same
+node an edit does; there is nothing else to tell.
+"""
+function restoreinto!(into::Param{T}, from::Param{T}) where {T}
+    # …its own curve: the snapshot stays reusable, so a redo restores the same
+    # keys again rather than the ones an edit has moved since.
+    into.curve[] = AnimCurve(copy(from.curve[].keys), from.curve[].interp)
+    into.visible[] = from.visible[]
+    into.input = from.input === nothing ? nothing :
+        ParamInput(from.input.op, from.input.inputs...)
+    return into
+end
+
+"""
+An independent `Param`, on the same terms as [`copy(::Effect)`](@ref): its own
+curve, its own Observables, its own unresolved edge — the ids are the edge, and
+the copy is about to be placed somewhere the next `bindinputs!` resolves them
+against. No view: the widgets belong to the parameter that is on screen.
+"""
+copyparam(p::Param{T}) where {T} =
+    Param{T}(p.name, p.label,
+             Observable(AnimCurve(copy(p.curve[].keys), p.curve[].interp)),
+             Observable(p.visible[]), p.range,
+             p.input === nothing ? nothing : ParamInput(p.input.op, p.input.inputs...),
+             nothing)
+
+"""
 Restore a [`snapshot`](@ref) (the snapshot itself stays reusable).
 
-Structural by definition — the clip list is replaced outright — so the edges are
-re-resolved against what came back. Without that they would still point at the
-`Param` objects of the clips this call just dropped.
+Clips that are still there are restored in place (see [`restoreinto!`](@ref)), so
+an undo does not invalidate what the editor is holding. Only what the snapshot
+adds is built and only what it drops goes away. The edges are re-resolved either
+way: a restored `input` is unresolved by construction.
 """
 function restore!(seq::Sequence, snap::Vector{Clip})
-    empty!(seq.clips)
-    append!(seq.clips, snapshot(Sequence(snap, seq.framerate)))
+    old = Dict{UInt64, Clip}(c.id => c for c in seq.clips)
+    empty!(seq)
+    for c in snap
+        cur = pop!(old, c.id, nothing)
+        addclip!(seq, cur === nothing ?
+                 withfields(c; effects = [copy(fx) for fx in c.effects]) :
+                 restoreinto!(cur, c))
+    end
+    # a clip the snapshot does not have is out of the document, and its cards go
+    # with it — the same statement `restoreinto!` makes about an effect
+    foreach(dropcards!, values(old))
     return bindinputs!(seq)
 end
 
@@ -1204,9 +1570,9 @@ function snappedstart(newstart::Integer, len::Integer, snap::Integer, targets::V
 end
 
 """
-First track at or above `want` where `[at, at + len)` is free — dropping onto an
-occupied spot stacks the clip on the lane above instead of failing (a NEW top
-track always fits, so this always returns ≤ `ntracks + 1`).
+First track at or above `want` where `[at, at + len)` is free, so dropping onto an
+occupied spot stacks the clip on the lane above rather than failing. A new top
+track always fits, so the result is at most `ntracks + 1`.
 """
 function freetrack(seq::Sequence, at::Integer, len::Integer, want::Integer)
     for tr in max(Int(want), 1):(ntracks(seq) + 1)
@@ -1219,8 +1585,8 @@ end
 """
     pushtracksup!(seq) -> seq
 
-Make room for a track UNDERNEATH: every existing clip moves up one lane, so lane
-1 is free for the clip that is about to land there.
+Make room for a track underneath: every existing clip moves up one lane, leaving
+lane 1 free for the clip about to land there.
 """
 function pushtracksup!(seq::Sequence)
     for c in seq.clips
@@ -1232,10 +1598,9 @@ end
 """
     compacttracks!(seq) -> seq
 
-Close gaps in the lane numbering, keeping the order. Inserting a track
-underneath moves everything up, and if the clip that moved DOWN was the only one
-on the old bottom lane, that lane is left empty — an empty lane in the middle of
-a stack is a hole in the timeline nobody asked for.
+Close gaps in the lane numbering, keeping the order. Inserting a track underneath
+moves everything up, and if the clip that moved down was the only one on the old
+bottom lane, that lane is left empty in the middle of the stack.
 """
 function compacttracks!(seq::Sequence)
     used = sort!(unique(c.track for c in seq.clips))

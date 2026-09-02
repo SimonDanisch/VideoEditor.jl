@@ -31,11 +31,10 @@ function analyzemotion!(clip::Clip; mode::Symbol = :similarity, analysis_width::
                         backend = KA.CPU(), progress = nothing)
     mode in (:similarity, :tripod, :perspective, :smooth) ||
         error("mode must be :similarity, :tripod, :perspective or :smooth")
-    # NOTHING TO TRACK in a clip that renders its own frames: there is no file to
+    # Nothing to track in a clip that renders its own frames: there is no file to
     # read grayscale out of. `nothing` like every other "this clip cannot be
     # analysed" answer here (too short, no model), so the caller reports it the
-    # way it already reports those. Without this, pressing Stabilize on a scene
-    # clip — and the card is offered on every clip — died with
+    # same way. Without it, Stabilize on a scene clip died with
     # `MethodError: graysource(::CPU, ::SceneSource)`.
     decodable(clip.source) || return nothing
     mode === :similarity && return similaritypath!(clip; backend, progress)
@@ -101,7 +100,7 @@ end
     limitkeystone!(transforms, W, H; budget=0.05) -> transforms
 
 Sanity-limit the projective terms of a transform series: replace
-single-frame SPIKES (a value deviating hard from its temporal neighbors —
+single-frame spikes (a value deviating hard from its temporal neighbors —
 a fit failure, not camera motion) by the local median, and cap the corner
 displacement keystone may cause at `budget` × the frame diagonal —
 hand-held orientation drift keystones by a few percent at most; anything
@@ -190,12 +189,12 @@ cross-correlation ([`PatchTracker`](@ref) — device kernels, `backend`
 selects CPU or GPU) and fit a trimmed 4-DOF similarity to the surviving
 matches. Per frame the search sits on a constant-velocity prediction and
 spans `searchradius` px (`lostradius` while reacquiring); matches must
-pass `minscore` AND a uniqueness `minmargin` (repetitive texture matches
+pass `minscore` and a uniqueness `minmargin` (repetitive texture matches
 itself well somewhere — only a unique peak is a lock). Fewer than
 `mintemplates` good matches (heavy motion blur, occlusion) coasts instead
 of composing garbage, and the cumulative lock is clamped to `maxscale` /
 `maxangle` — a locked handheld camera neither zooms far nor rolls far.
-Every measurement is against the FIRST frame, so nothing drifts.
+Every measurement is against the first frame, so nothing drifts.
 
 With `point` (source pixels in the first frame), one extra patch pins the
 content under it exactly — object lock: the scene lock removes rotation
@@ -269,7 +268,7 @@ function cameralock!(clip::Clip; point = nothing, window::Integer = 96,
                 anchor = PatchTracker(backend, h1, centers; window, maxradius = reacqradius)
                 fillt = anchor
                 if point !== nothing
-                    # center-weighted: follow the SUBJECT under the click, not
+                    # center-weighted: follow the subject under the click, not
                     # the background ring around it
                     obj = PatchTracker(backend, h1, [(px, py)];
                                        window = ow, maxradius = 2 * searchradius,
@@ -277,7 +276,7 @@ function cameralock!(clip::Clip; point = nothing, window::Integer = 96,
                 end
                 continue
             end
-            # CONSTANT-VELOCITY prediction, applied EVERY frame — including while
+            # constant-velocity prediction, applied every frame — including while
             # lost. Coasting through unmatched (motion-blurred / whip-pan) frames
             # at the last known velocity keeps the search tracking the camera, so
             # the reference patches are reacquired the instant they're matchable

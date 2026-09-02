@@ -1,14 +1,14 @@
 """
 Speech-to-text captions, from `WhisperRunner`.
 
-The fifth JuliaVision model in the editor, and the only one that produces TEXT
+The fifth JuliaVision model in the editor, and the only one that produces text
 rather than pixels — so it lands as an overlay on the sequence rather than an
 effect on a clip. That is also where it belongs semantically: a caption tracks
 what is being said across the whole timeline, and a cut underneath it changes
 nothing about when a word is spoken.
 
 The transcript is stored once on the sequence and the overlay picks the line for
-the frame being rendered. It is NOT baked into per-frame text params, because
+the frame being rendered. It is not baked into per-frame text params, because
 those would have to be keyframed — a thousand keys on a `text` field, unreadable
 and unfixable — and because the transcript is the thing a user edits when the
 model mishears a word.
@@ -41,9 +41,9 @@ function whispertranscribe(samples::AbstractVector{Float32}, rate::Real)
     # as plausible words rather than as an error.
     r = Int(WhisperRunner.SAMPLERATE)
     audio = rate == r ? samples : resampleaudio(samples, rate, r)
-    # `transcribe` returns `(text, segments)` — the whole transcript AND the timed
+    # `transcribe` returns `(text, segments)`: the whole transcript and the timed
     # pieces. Iterating the tuple walks the String first, so every run died on
-    # `s.text` with "type String has no field text". The editor wants the SEGMENTS:
+    # `s.text` with "type String has no field text". The editor wants the segments:
     # a caption needs a start and a stop, which the joined text does not have.
     _, segs = WhisperRunner.transcribe(WHISPER[], audio)
     return [Caption(s.start, s.stop, strip(s.text)) for s in segs if !isempty(strip(s.text))]
@@ -57,7 +57,7 @@ installtranscribe!() = registertranscribe!(whispertranscribe)
 Linear resample. Good enough here and nowhere else: speech recognition is
 band-limited well below where linear interpolation's aliasing lives, and the
 alternative is a filter design nobody would tune. Do not reuse this for audio
-that will be HEARD.
+that will be heard.
 """
 function resampleaudio(x::AbstractVector{Float32}, from::Real, to::Real)
     from == to && return collect(x)
@@ -81,7 +81,7 @@ end
 The timeline's audio as mono Float32, and its rate.
 
 Mixed through [`fillaudio!`](@ref) rather than read from a source, so what gets
-transcribed is what the edit PLAYS: cuts, gaps and clip order included. A caption
+transcribed is what the edit plays: cuts, gaps and clip order included. A caption
 for audio the edit removed is worse than no caption at all.
 
 Extraction is synchronous here, unlike the preview's — `ensurepcm!` spawns and
@@ -112,7 +112,7 @@ end
 
 What is being said at `seconds`, or `""`.
 
-The LAST match wins when segments overlap, which they do at window boundaries:
+The last match wins when segments overlap, which they do at window boundaries:
 the later one is the more recent guess and reads correctly when a word is split
 across two windows.
 """
@@ -142,11 +142,11 @@ end
 """
     captionscene(seq; canvas, y, size) -> Makie.SceneSpec
 
-The transcript as a scene: one text plot whose STRING comes from the sequence's
+The transcript as a scene: one text plot whose string comes from the sequence's
 captions at the frame being drawn.
 
 The text is not keyframed and never was — a key per spoken word would make the
-transcript unfixable. It is an INPUT: the plot's `text` attribute is driven from
+transcript unfixable. It is an input: the plot's `text` attribute is driven from
 the caption list by the clip's position, which is the same mechanism a
 cross-dissolve and an audio-reactive number use (see `ParamInput`). Until it is
 bound the clip shows the line at its own first frame.
@@ -225,7 +225,7 @@ function editcaption!(player::Player, text::AbstractString)
     snapshot!(player)
     old = seq.captions[i]
     seq.captions[i] = Caption(old.start, old.stop, String(text))
-    notify(player.playhead)
+    showplayhead!(player)
     setstatus!(player, "caption updated")
     return true
 end

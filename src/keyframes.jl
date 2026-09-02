@@ -1,5 +1,5 @@
 """
-A keyframe's tangent handle, in the curve's OWN plane: `x` in frames, `y` in the
+A keyframe's tangent handle, in the curve's own plane: `x` in frames, `y` in the
 parameter's value units. Exactly what the user drags — see [`Keyframe`](@ref).
 
 `NOHANDLE` means "this side has no handle", which is what `:linear`, `:smooth`
@@ -14,18 +14,18 @@ hashandle(h::Handle) = !isnan(h[1])
 """
 One control point of an [`AnimCurve`](@ref).
 
-`ease` is the key's kind, and the two BÉZIER kinds are Photoshop's two anchor
-kinds — the vocabulary is deliberate, because the gestures are the same:
+`ease` is the key's kind. The two Bézier kinds are a pen tool's two anchor kinds,
+and the gestures match:
 
   - `:linear` — a corner with no handles: constant velocity into and out of it
-  - `:smooth` — a flat tangent: the value eases in AND out (no handles either)
+  - `:smooth` — a flat tangent: the value eases in and out (no handles either)
   - `:hold`   — a step: the value freezes until the next key
-  - `:bezier` — a SMOOTH ANCHOR: `inhandle`/`outhandle` are kept collinear, so
+  - `:bezier` — a smooth anchor: `inhandle`/`outhandle` are kept collinear, so
     dragging one rotates the other and the curve passes through without a kink
-  - `:corner` — a CORNER ANCHOR: the two handles move independently
+  - `:corner` — a corner anchor: the two handles move independently
 
-`inhandle` reaches BACK toward the previous key (`x <= 0`), `outhandle` reaches
-FORWARD toward the next (`x >= 0`), both relative to this key. A segment is a
+`inhandle` reaches back toward the previous key (`x <= 0`), `outhandle` forward
+toward the next (`x >= 0`), both relative to this key. A segment is a
 cubic Bézier through `a`, `a + a.outhandle`, `b + b.inhandle`, `b`.
 
 Handles shape the curve only where the value is a `Real` — see
@@ -51,11 +51,11 @@ isbezier(k::Keyframe) = k.ease === :bezier || k.ease === :corner
 
 """
 Keyframed animation for a single clip parameter. Control points are `(frame,
-value)` pairs sorted by ABSOLUTE source frame — the same keying as `ColorTrack`
+value)` pairs sorted by absolute source frame — the same keying as `ColorTrack`
 /`MotionTrack`, so a curve survives clip splits — interpolated between keys (see
 [`Keyframe`](@ref) for the kinds) and held flat past the first/last one.
 
-The engine is parameter-agnostic in the VALUE: a key holds a `T`, and how two of
+The engine is agnostic in the value: a key holds a `T`, and how two of
 them blend is [`lerp`](@ref). That is what lets a rotation be a curve of
 quaternions rather than three curves of Euler angles — interpolating a rotation
 component-wise is simply wrong, and decomposing it here would make that the only
@@ -72,10 +72,20 @@ AnimCurve{T}() where {T} = AnimCurve{T}(Keyframe{T}[], :linear)
 AnimCurve() = AnimCurve{Float64}()
 
 """
+The same curve in another value type — what a project file needs when the kind
+has changed a parameter's type since it was written (a `Float32` angle read back
+into a `Float64` one). Keys convert one by one; the handles are already `Float32`
+pairs in the curve's own plane and carry over.
+"""
+AnimCurve{T}(c::AnimCurve) where {T} =
+    AnimCurve{T}([Keyframe{T}(k.frame, convert(T, k.value), k.ease, k.inhandle, k.outhandle)
+                  for k in c.keys], c.interp)
+
+"""
     lerp(a, b, t) -> typeof(a)
 
-Blend two keyframe values. The ONLY thing [`valueat`](@ref) needs to know about
-a parameter's type, so a new animatable type is one method and nothing else.
+Blend two keyframe values: the only thing [`valueat`](@ref) needs to know about a
+parameter's type, so a new animatable type is one method.
 """
 lerp(a::Real, b::Real, t::Real) = a + t * (b - a)
 lerp(a::AbstractVector, b::AbstractVector, t::Real) = a .+ t .* (b .- a)
@@ -83,9 +93,9 @@ lerp(a::Colorant, b::Colorant, t::Real) =
     Makie.lerp_oklab(RGBf(a), RGBf(b), Float32(t))
 
 """
-An IMAGE blends per pixel. Reached through a `:mix` input, never through a curve:
+An image blends per pixel. Reached through a `:mix` input, never through a curve:
 two pictures as keyframe values would sit in the project file and allocate a third
-one per frame, where what the user has is two sources and a number between them.
+per frame, where what the user has is two sources and a number between them.
 """
 lerp(a::AbstractMatrix{<:Colorant}, b::AbstractMatrix{<:Colorant}, t::Real) =
     (size(a) == size(b) ||
@@ -93,10 +103,10 @@ lerp(a::AbstractMatrix{<:Colorant}, b::AbstractMatrix{<:Colorant}, t::Real) =
      lerp.(a, b, Float32(t)))
 
 """
-A MESH blends vertex by vertex, which is only meaningful when the two describe the
+A mesh blends vertex by vertex, which is only meaningful when the two describe the
 same thing in two poses.
 
-Refused otherwise, loudly: interpolating between meshes of different topology is a
+Refused otherwise: interpolating between meshes of different topology is a
 resampling problem with its own cost and its own choices, not this. Silently
 producing something for "a cube becomes a sphere" would produce garbage that looks
 like an animation.
@@ -133,13 +143,13 @@ end
 """
     segmentvalue(curve, a, b, f) -> value
 
-The value between two adjacent keys. **The one place a value type's shape
-matters**, so it is a dispatch and not a branch.
+The value between two adjacent keys, and the one place a value type's shape
+matters, so it is a dispatch rather than a branch.
 
 The generic method is a cubic hermite with unit (linear) or flat (eased) end
 tangents — `m == 1` at a linear corner, `m == 0` at a smooth key, so
 `:smooth`/`:smooth` is exactly smoothstep. `h` is the eased position between the
-keys and [`lerp`](@ref) is what the VALUE type says blending means. `h` may leave
+keys and [`lerp`](@ref) is what the value type says blending means. `h` may leave
 `[0, 1]` at a linear corner, which is the overshoot a hermite is supposed to
 have — every `lerp` is an affine combination, so that carries through unchanged.
 """
@@ -152,11 +162,10 @@ function segmentvalue(c::AnimCurve, a::Keyframe, b::Keyframe, f::Real)
 end
 
 """
-A REAL parameter has a plane, so its keys can carry handles and the segment is
-the cubic Bézier through `a`, `a + a.outhandle`, `b + b.inhandle`, `b` — the
-curve the user sees and drags. Without handles on either end this falls back to
-the tangent model above, so a curve only changes shape once somebody has actually
-touched a handle.
+A real-valued parameter has a plane, so its keys can carry handles and the segment
+is the cubic Bézier through `a`, `a + a.outhandle`, `b + b.inhandle`, `b` — the
+curve the user sees and drags. Without handles on either end it falls back to the
+tangent model above, so a curve changes shape only once a handle is touched.
 """
 function segmentvalue(c::AnimCurve{T}, a::Keyframe{T}, b::Keyframe{T}, f::Real) where {T <: Real}
     p1 = isbezier(a) && hashandle(a.outhandle) ? a.outhandle : NOHANDLE
@@ -169,11 +178,10 @@ function segmentvalue(c::AnimCurve{T}, a::Keyframe{T}, b::Keyframe{T}, f::Real) 
     # Photoshop lets a path loop; an animation curve cannot, so the x components
     # are clamped into the segment. Only x — the y overshoot is the whole point of
     # a handle and stays free.
-    # A SIDE WITHOUT A HANDLE PUTS ITS CONTROL POINT ON THE ANCHOR — a retracted
-    # handle, exactly as in Photoshop, so the curve leaves that end straight at the
-    # other control point. Guarding only the y (and letting `clamp` see the NaN x
-    # of `NOHANDLE`) put a NaN into the solve, and every frame of such a segment
-    # came back as the far endpoint.
+    # A side without a handle puts its control point on the anchor — a retracted
+    # handle — so the curve leaves that end straight at the other control point.
+    # Guarding only the y, and letting `clamp` see `NOHANDLE`'s NaN x, put a NaN
+    # into the solve and returned the far endpoint for every frame of the segment.
     x1 = a.frame + (hashandle(p1) ? clamp(p1[1], 0.0f0, Float32(span)) : 0.0f0)
     x2 = b.frame + (hashandle(p2) ? clamp(p2[1], -Float32(span), 0.0f0) : 0.0f0)
     y0, y3 = Float64(a.value), Float64(b.value)
@@ -224,8 +232,8 @@ function setkey!(c::AnimCurve{T}, frame::Integer, value) where {T}
                 Keyframe(Int(frame), convert(T, value), :linear))
     else
         k = c.keys[i]
-        # replacing a key keeps its kind AND its handles: retyping a value must not
-        # silently straighten a curve somebody shaped
+        # replacing a key keeps its kind and its handles, so retyping a value does
+        # not straighten a curve that was shaped
         c.keys[i] = Keyframe{T}(Int(frame), convert(T, value), k.ease, k.inhandle, k.outhandle)
     end
     return c
@@ -259,8 +267,8 @@ end
 "Set the ease mode of the key at index `i` (`:linear` · `:smooth` · `:hold`)."
 function setease!(c::AnimCurve, i::Integer, mode::Symbol)
     k = c.keys[i]
-    # handles SURVIVE a conversion, as they do in Photoshop: switching an anchor to
-    # a corner and back must give the shape back, not a straight line
+    # handles survive a conversion, so switching an anchor to a corner and back
+    # gives the shape back rather than a straight line
     c.keys[i] = Keyframe(k.frame, k.value, mode, k.inhandle, k.outhandle)
     return c
 end
@@ -298,7 +306,7 @@ end
 Move one handle of key `i` (`side` is `:in` or `:out`), Photoshop's way.
 
 On a `:bezier` anchor the other handle follows: it stays collinear — opposite
-direction — and **keeps its own length**, which is what makes dragging one side
+direction — and keeps its own length, which is what makes dragging one side
 rotate the whole tangent without resizing the other. `couple = false` is
 Alt-dragging: the anchor becomes a `:corner` and only the grabbed side moves.
 """
@@ -354,13 +362,13 @@ end
 
 Replace a densely sampled curve with the few Bézier anchors that reproduce it.
 
-This is what turns a BAKED animation back into an editable one. The lego project
-arrived with a key on every single frame — 181 per parameter, 1267 in all, for
-four sine waves, one straight ramp and one constant. Nobody can steer that: the
-lane is a wall of diamonds and moving one changes a single frame.
+This turns a baked animation back into an editable one. The lego project arrived
+with a key on every frame — 181 per parameter, 1267 in all, for four sine waves,
+one ramp and one constant — where the lane is a wall of diamonds and moving one
+changes a single frame.
 
 Schneider's fit ("An Algorithm for Automatically Fitting Digitized Curves",
-Graphics Gems), specialised to a curve that is a FUNCTION of the frame: anchors
+Graphics Gems), specialised to a curve that is a function of the frame: anchors
 keep their sampled position, the two handle lengths come from a least-squares
 solve against the samples between them, and a run whose worst error exceeds `tol`
 is split at that worst sample and fitted again. `tol` is relative to the
@@ -380,8 +388,8 @@ function simplify!(c::AnimCurve{T}; tol::Real = 0.005, minkeys::Integer = 2) whe
     # fit of a flat run is exact and the recursion never splits — but it would
     # still keep both endpoints.
     if span <= tol * max(abs(maximum(ys)), 1.0)
-        keep = ks[1]
-        empty!(ks); push!(ks, Keyframe{T}(keep.frame, keep.value, :linear))
+        first_ = ks[1]
+        empty!(ks); push!(ks, Keyframe{T}(first_.frame, first_.value, :linear))
         return c
     end
     eps = max(tol * span, 1.0e-9)
@@ -399,18 +407,17 @@ function simplify!(c::AnimCurve{T}; tol::Real = 0.005, minkeys::Integer = 2) whe
     for r in runs
         fitrun!(out, xs, ys, first(r), last(r), eps)
     end
-    # EVERY INTERIOR ANCHOR COMES BACK TWICE — once as the end of a segment,
-    # carrying only its `in`, and once as the start of the next, carrying only its
-    # `out`. They have to be MERGED. Dropping the second (which is what "skip the
-    # duplicate" does) throws away half of every tangent and leaves a curve that
-    # misses its own samples by 92% of their range.
+    # Every interior anchor comes back twice: once as the end of a segment carrying
+    # only its `in`, once as the start of the next carrying only its `out`. They
+    # have to be merged — dropping the duplicate throws away half of every tangent
+    # and leaves a curve that misses its own samples by 92% of their range.
     empty!(ks)
     for (f, v, inh, outh) in out
         if !isempty(ks) && ks[end].frame == f
-            p = ks[end]
-            ks[end] = Keyframe{T}(f, p.value, :bezier,
-                                  hashandle(p.inhandle) ? p.inhandle : inh,
-                                  hashandle(p.outhandle) ? p.outhandle : outh)
+            half = ks[end]
+            ks[end] = Keyframe{T}(f, half.value, :bezier,
+                                  hashandle(half.inhandle) ? half.inhandle : inh,
+                                  hashandle(half.outhandle) ? half.outhandle : outh)
         else
             push!(ks, Keyframe{T}(f, convert(T, v), :bezier, inh, outh))
         end
@@ -442,21 +449,21 @@ end
 """
     fithandles(xs, ys, i, j) -> (t0, t1, a1, a2)
 
-Least squares for the two handle LENGTHS of segment `i:j`, along directions taken
-from the data — Schneider's normal equations, **with the parameterisation fixed
-between rounds**.
+Least squares for the two handle lengths of segment `i:j`, along directions taken
+from the data — Schneider's normal equations, with the parameterisation fixed
+between rounds.
 
 That fixing is the whole difficulty. The residual has to be measured at the
 curve parameter where the Bézier actually reaches the sample's frame, and that
 parameter depends on the lengths being solved for. Solved once against `u`
 guessed from the frame, the system fights itself: measured on a half-sine it
 returned lengths 20% off where 1.3% was available. So it alternates — solve,
-then recompute every `u` with [`beziersolve`](@ref), which is EXACT here because
+then recompute every `u` with [`beziersolve`](@ref), which is exact here because
 x is monotone — and converges in a couple of rounds.
 
 Pinning the handles' x to thirds of the span instead would make x linear in `u`
 and the whole thing one clean linear solve. It is also strictly worse: the curve
-is then a cubic POLYNOMIAL in the frame, and a cubic polynomial cannot follow a
+is then a cubic polynomial in the frame, and a cubic polynomial cannot follow a
 half-sine closer than about 4%. The freedom in the x components is exactly what
 buys the accuracy.
 """
@@ -539,18 +546,28 @@ FxParam(name, label; min = 0.0, max = 1.0, default = min) =
     FxParam(Symbol(name), String(label), Float64(min), Float64(max), Float64(default))
 
 """
-What a parameter can READ FROM: an address that survives sorting, undo and a
+What a parameter can read from: an address that survives sorting, undo and a
 project round trip.
 
 Three kinds, and they are all just inputs — that is the point. A number somewhere
 else in the sequence, a file on disk, another clip's picture. "The texture is that
-video", "the mesh is this STL" and "the opacity is one minus that clip's" are the
+video", "the mesh is that STL" and "the opacity is one minus that clip's" are the
 same statement, so they are the same mechanism.
 
 Ids, not objects: position and `objectid` both die on the first sort or reload.
 [`bindinputs!`](@ref) turns these into the objects that get read.
 """
 abstract type InputRef end
+
+"""
+Something a value's frames can be counted in: a [`Clip`](@ref), and only that.
+
+Abstract because `Clip` is declared a file later — it has effects, which have
+parameters, which have the [`ParamInput`](@ref)s that hold one of these. The
+alternative was an untyped field, which costs [`inputframe`](@ref) its dispatch on
+every read of a driven parameter.
+"""
+abstract type FrameSource end
 
 "Another parameter. `clip`/`effect` of `0` mean the one this input is on."
 struct ParamRef <: InputRef
@@ -570,7 +587,7 @@ FileRef(path::AbstractString) = FileRef(String(path))
 """
 Another clip's finished picture.
 
-Resolved by the GRAPH, not by [`valueat`](@ref): a clip's picture is a transient
+Resolved by the graph, not by [`valueat`](@ref): a clip's picture is a transient
 that exists while a composition runs, and asking for it outside one would mean
 rendering a second clip in the middle of reading a number. So this is the input
 kind that says "an image arrives here" — [`readinput`](@ref) refuses it, and the
@@ -583,46 +600,49 @@ ClipRef(clip::Integer) = ClipRef(UInt64(clip))
 
 """
 Where a parameter's value comes from when it does not come from the parameter
-itself: a small NODE with an operation and one or more inputs.
+itself: a small node with an operation and one or more inputs.
 
-A parameter is `value`, `curve` **or** `input` — a static number, a curve of its
+A parameter is `value`, `curve` or `input`: a static number, a curve of its
 own, or the output of this node. That third case is what a cross-dissolve, a
 caption fed by the transcript, an audio-reactive scale, a texture that is another
 clip and a mesh morph all are, and they are one mechanism rather than five.
 
-A NODE and not a single reference, because a blend needs two things and a factor.
+A node rather than a single reference, because a blend needs two things and a
+factor.
 `:mix` is the reason: it takes `a`, `b` and a numeric `t`, and `t` is an ordinary
 parameter with an ordinary slider and an ordinary curve. That is what keeps the
 keyframe engine numeric — a curve of meshes would put two meshes in the project
-file as keyframe VALUES and allocate one per frame in `valueat`, where what the
+file as keyframe values and allocate one per frame in `valueat`, where what the
 user actually has is two sources and a number between them.
 
 `resolved` is filled by [`bindinputs!`](@ref) at the one moment ids can change
 meaning: a structural edit. It is not a cache that could disagree — nothing else
-reads it. An entry of `nothing` is a DANGLING input, and a node with one reads as
+reads it. An entry of `nothing` is a dangling input, and a node with one reads as
 the parameter's own value rather than failing.
 """
 mutable struct ParamInput
     const op::Symbol
     const inputs::Vector{InputRef}
+    # What each id resolved to: a `Param`, or a file's contents — a mesh, an
+    # image, a LUT. Genuinely open, which is the point of a file input.
     resolved::Vector{Any}
-    # What each resolved input's frames are counted in, and what the READER's
+    # What each resolved input's frames are counted in, and what the reader's
     # are, so a value crossing a clip boundary is converted rather than assumed.
-    from::Vector{Any}
-    to::Any
+    from::Vector{Union{Nothing, FrameSource}}
+    to::Union{Nothing, FrameSource}
 end
 ParamInput(op::Symbol, inputs::InputRef...) =
     ParamInput(op, collect(InputRef, inputs), Any[nothing for _ in inputs],
-               Any[nothing for _ in inputs], nothing)
+               Union{Nothing, FrameSource}[nothing for _ in inputs], nothing)
 
 """
     drives(op) -> Bool
 
-Whether a node of this kind supplies the parameter's VALUE, or only points at
+Whether a node of this kind supplies the parameter's value, or only points at
 another one.
 
 `:pairedwith` is the second case, and it is the whole of what `Clip.blendfrom`
-used to be: "these two are one edit". A cross-dissolve is keyed on ONE side —
+used to be: "these two are one edit". A cross-dissolve is keyed on one side —
 fading both would darken the middle, because the outgoing clip fades against
 nothing while the incoming one only partly covers it — so the pairing genuinely
 carries no value, and saying so is a predicate rather than a second mechanism.
@@ -638,7 +658,7 @@ What the node computes from what its inputs delivered.
 
 `:mix` is [`lerp`](@ref) — the same function a curve uses between two keys, which
 is why a mesh or an image blends here without the engine learning anything new.
-It is evaluated on values that just ARRIVED, never on values that were stored.
+It is evaluated on values that just arrived, never on values that were stored.
 """
 inputvalue(::Val{:copy}, v) = v[1]
 inputvalue(::Val{:invert}, v) = invertvalue(v[1])
@@ -670,22 +690,57 @@ function inputframe(n::ParamInput, i::Integer, frame::Real)
 end
 
 """
-One parameter of one effect: what it is called, what it is now, and — if it is
-animated — its curve.
+What draws one parameter while its card is on screen: the control that sets it,
+the ◆ that keys it, and its curve on the timeline.
 
-THE VALUE AND THE CURVE LIVE TOGETHER, and that is the whole point. They used to
-be a field on a typed effect struct and an entry in a flat `Dict{Symbol,
-AnimCurve}` on the CLIP, joined by a name and a global index. A curve therefore
-knew only a bare name, not which effect it animated, and resolution took the
-first effect of a kind: two Blur entries with one keyframe of 12 rendered
-`[(blur = 12.0,), (blur = 0.0,)]` — the second silently static, while its own
-card's slider wrote to it correctly. Slider and diamond of one row pointed at
-different objects. Holding the parameter itself makes that unsayable.
+On the parameter rather than in a registry keyed by `(effect id, name)`. A
+registry has to be filled when a card is built, emptied when it goes, copied when
+a card set is kept and looked up on every edit — four places to keep in step with
+one truth. Reached from the parameter, an edit that changes a value already holds
+everything that shows it.
 
-`visible` is its lane on the timeline, and it is INDEPENDENT of `curve`: showing
-an empty lane is how you get somewhere to put the first key. Coupling the two —
-which a registry of animated-parameters-only forces — means you must keyframe
-something before you can see where its keyframes would go.
+`control` is `nothing` for a parameter with no widget of its own: one driven down
+a [`ParamInput`](@ref) has no value for a slider to set.
+"""
+mutable struct ParamView
+    control::Union{Nothing, Makie.Block}   # Slider, Menu, Checkbox, colour picker
+    kf::Makie.Button                       # the ◆
+    lane::Makie.Plot                       # its `lanecurve!` on the timeline
+    # What this view registered on observables that outlive it — the lane's
+    # `selectedkey`, derived from the editor's single selection. A `map` leaves
+    # its listener on the source forever, so what a view hooks up it hands back
+    # here and `dropcard!` unhooks. See `derive`.
+    regs::Vector{Observables.ObserverFunction}
+end
+
+"""
+One parameter of one effect: what it is called, and the curve that is its value.
+
+The curve is the value. A parameter is never "a number, or else a curve": a
+constant is a curve with one key, held over the whole clip, so there is one place
+a value lives and `valueat` has one answer to give. A value beside the curve meant
+every edit site had to fork on which of the two was in force and write to a
+different place in each branch, and every reader had to make the same decision.
+
+That it lives on the parameter at all is the older half of the same point. The
+value used to be a field on a typed effect struct and the curve an entry in a flat
+`Dict{Symbol, AnimCurve}` on the clip, joined by a name and a global index. A
+curve therefore knew only a bare name, not which effect it animated, and
+resolution took the first effect of a kind: two Blur entries with one keyframe of
+12 rendered `[(blur = 12.0,), (blur = 0.0,)]` — the second silently static, while
+its own card's slider wrote to it correctly. Slider and diamond of one row pointed
+at different objects.
+
+An `Observable`, because everything that shows a parameter derives from it: the
+lane plot, the ◆, the slider. An edit writes the curve and notifies, and there is
+nothing to refresh. Mutate the `AnimCurve` in place only through the `Param`
+methods below ([`setkey!`](@ref), [`setvalue!`](@ref), …) — they are what
+notifies.
+
+`visible` is its lane on the timeline, independent of the keys: showing an empty
+lane is how you get somewhere to put the first key. Coupling the two — which a
+registry of animated-parameters-only forces — means you must keyframe something
+before you can see where its keyframes would go.
 
 `T` is whatever the parameter IS. A rotation is a curve of quaternions rather
 than three curves of Euler angles, because interpolating a rotation
@@ -695,26 +750,117 @@ know about a type.
 mutable struct Param{T}
     const name::Symbol      # as the EFFECT names it — no global uniqueness needed
     const label::String
-    value::T
-    curve::Union{Nothing, AnimCurve{T}}
-    visible::Bool
-    const range::Any        # (lo, hi) for a number, `nothing` where it means nothing
+    const curve::Observable{AnimCurve{T}}
+    const visible::Observable{Bool}
+    const range::Union{Nothing, Tuple{Float64, Float64}}
     # Where the value comes from when it comes from somewhere else — see
-    # [`ParamInput`](@ref). The third of the three ways a parameter can have a
-    # value, and the reason there is no separate machinery for a cross-dissolve,
-    # a caption bound to the transcript, an audio-reactive number, a texture that
-    # is another clip, or a mesh morph.
+    # [`ParamInput`](@ref). The other way a parameter can have a value, and the
+    # reason there is no separate machinery for a cross-dissolve, a caption bound
+    # to the transcript, an audio-reactive number, a texture that is another clip,
+    # or a mesh morph. Not a curve, because "take that value, through this op" is
+    # not something a curve can say.
     input::Union{Nothing, ParamInput}
+    view::Union{Nothing, ParamView}       # while its card is on screen
 end
-Param(name::Symbol, label::AbstractString, value::T;
-      curve = nothing, visible = false, range = nothing, input = nothing) where {T} =
-    Param{T}(name, String(label), value, curve, visible, range, input)
-
-"Whether `p` is animated — has a curve with at least one key."
-isanimated(p::Param) = p.curve !== nothing && !isempty(p.curve)
 
 """
-Whether `p` is DRIVEN — takes its value from another parameter.
+    Param(name, label, value; curve, visible, range, input) -> Param
+
+`value` seeds the curve's single key — a constant over the clip. An explicit
+`curve` wins, and an empty one is seeded the same way, so the invariant "a
+parameter always has a value" holds however it was built (a project file written
+before this can carry an empty curve).
+"""
+function Param(name::Symbol, label::AbstractString, value::T;
+               curve::Union{Nothing, AnimCurve{T}} = nothing, visible::Bool = false,
+               range = nothing, input = nothing) where {T}
+    c = curve === nothing ? AnimCurve{T}() : curve
+    isempty(c.keys) && push!(c.keys, Keyframe{T}(0, value, :linear))
+    return Param{T}(name, String(label), Observable(c), Observable(visible),
+                    range === nothing ? nothing :
+                    (Float64(range[1]), Float64(range[2])),
+                    input, nothing)
+end
+
+"""
+Whether `p` is animated: more than one key, so its value depends on the frame.
+
+One key is a constant — the shape every parameter starts as — which is why this
+is a count and not "does it have a curve".
+"""
+isanimated(p::Param) = length(p.curve[].keys) > 1
+
+"""
+    isconstant(p::Param) -> Bool
+
+Whether `p` is just one value — the shape every parameter starts as.
+
+The negation of [`isanimated`](@ref), and the discriminator the timeline filters
+on: a constant draws as a straight line across the clip, which says nothing and
+costs a lane. Opening a whole card's lanes used to put two hundred of those on the
+timeline and bury the six curves among them.
+
+Asked of the curve rather than kept beside it. A single key IS "one value", so
+there is nothing a stored flag could say that the keys do not, and nothing to go
+stale when an edit adds the second one.
+"""
+isconstant(p::Param) = !isanimated(p)
+
+"""
+    curvesof(params) -> Vector{Param}
+
+The ones that are actually a curve — what a group's ∿ draws.
+
+A single row's ∿ is not filtered: opening the lane of a constant is how you get
+somewhere to put its first key. Only asking for a whole group means "show me the
+animation", and a group is where the straight lines pile up.
+"""
+curvesof(params) = Param[p for p in params if isanimated(p)]
+
+"""
+A solo on the timeline: only `on`'s lanes are drawn, and `before` is what was
+drawn when it started.
+
+The restore point is taken ONCE, when the solo begins, and kept while the solo
+moves from one row or group to the next — so alt-clicking around a card never
+loses the state you started from. A plain click on an eye ends the solo instead of
+moving it: that is the user picking lanes by hand, and what is on screen is then
+the answer, with nothing left to restore.
+
+`before` covers every parameter of the shown clip, not just the hidden ones,
+because "put it back" has to be able to hide a lane the solo turned on.
+"""
+struct LaneSolo
+    on::Set{Param}
+    before::IdDict{Param, Bool}
+end
+
+"""
+    paramcolor(p::Param) -> RGBf
+
+The colour that stands for `p` wherever it is drawn: its ◆ in the card, and its
+lane on the timeline.
+
+Both used to draw in the editor's accent, so a card of two hundred rows put two
+hundred identical orange curves on the timeline and there was no way to tell which
+row owned which lane.
+
+The colour comes from the name rather than from a counter or a draw: a parameter
+keeps it across a rebuilt card, a reordered stack, a reloaded project and a
+restarted session, which is the whole point of colouring by identity. The hue is
+the name's hash, at a fixed saturation and value chosen to read on the dark panel.
+"""
+paramcolor(p::Param) =
+    RGBf(HSV(360.0 * (hash(p.name) % 1024) / 1024, 0.62, 0.98))
+
+"Whether `p` has a key exactly at source frame `f` — what fills the row's ◆."
+haskeyat(p::Param, f::Integer) = any(k -> k.frame == f, p.curve[].keys)
+
+"What `p` is a parameter OF: the type its keys hold and [`lerp`](@ref) blends."
+Base.eltype(::Param{T}) where {T} = T
+
+"""
+Whether `p` is driven, i.e. takes its value from another parameter.
 
 A parameter with a `:pairedwith` edge is not: it points at another one and keeps
 its own curve. See [`drives`](@ref).
@@ -727,11 +873,10 @@ isdriven(p::Param) =
 
 `p`'s value at `frame` — the one question the whole animation system answers.
 
-Three sources, in order: an EDGE if it has one (the value resolved at the far end
-and mapped through `op`), its CURVE if it has one, its static value otherwise. The
-static value is also the fallback for a curve that exists but is empty and for an
-edge whose target is gone, so clearing the last key — or deleting what drove a
-parameter — leaves it where it was rather than at zero.
+Two sources: an edge if it has one (the value resolved at the far end and mapped
+through `op`), its curve otherwise. An edge whose target is gone reads as the
+curve, so deleting what drove a parameter leaves it where it was rather than at
+zero.
 """
 function valueat(p::Param{T}, frame::Real) where {T}
     n = p.input
@@ -740,7 +885,7 @@ function valueat(p::Param{T}, frame::Real) where {T}
                       length(n.resolved))
         return convert(T, inputvalue(n.op, vals))
     end
-    return isanimated(p) ? something(valueat(p.curve, frame), p.value) : p.value
+    return valueat(p.curve[], frame)::T
 end
 
 """
@@ -749,7 +894,7 @@ end
 What one resolved input delivers at `frame`.
 
 A parameter is read at that frame; a file's contents are what they are and do not
-depend on one. A CLIP's picture is refused here on purpose — it lives as a
+depend on one. A clip's picture is refused here on purpose: it lives as a
 transient inside a running composition, so it is wired by the graph and never
 fetched from inside a value lookup.
 """
@@ -757,41 +902,127 @@ readinput(p::Param, frame::Integer) = valueat(p, frame)
 readinput(x, ::Integer) = x
 # …and the refusal for a `Clip` is in clips.jl, where that type exists.
 
-"Fraction of `p`'s range, clamped to [0,1] — where its value sits in its lane."
-function paramnorm(p::Param, v)
-    p.range === nothing && return 0.5
-    lo, hi = p.range
-    return hi > lo ? clamp((Float64(v) - lo) / (hi - lo), 0.0, 1.0) : 0.5
-end
+"""
+    paramnorm(range, v) -> Float64
+
+Where `v` sits in `range`, clamped to [0,1] — a value as a lane height.
+
+Takes the range rather than the parameter, because the lane plot is given one:
+what the band means is the drawing's business, and a recipe that reached into a
+`Param` for it could not be handed anything else.
+"""
+paramnorm(range::Tuple{Float64, Float64}, v) =
+    range[2] > range[1] ?
+    clamp((Float64(v) - range[1]) / (range[2] - range[1]), 0.0, 1.0) : 0.5
+paramnorm(::Nothing, v) = 0.5
+paramnorm(p::Param, v) = paramnorm(p.range, v)
 
 "Inverse of [`paramnorm`](@ref): a [0,1] lane fraction back to a value."
-function paramdenorm(p::Param, u::Real)
-    p.range === nothing && return p.value
-    lo, hi = p.range
-    return lo + clamp(u, 0.0, 1.0) * (hi - lo)
+paramdenorm(range::Tuple{Float64, Float64}, u::Real) =
+    range[1] + clamp(u, 0.0, 1.0) * (range[2] - range[1])
+paramdenorm(p::Param, u::Real) =
+    # Without a range a fraction means nothing, and there is nothing to invert —
+    # a parameter with no range has no slider and no lane either.
+    p.range === nothing ? valueat(p, 0) : paramdenorm(p.range, u)
+
+# ------------------------------------------------------------- editing a parameter
+#
+# Every one of these mutates `p.curve[]` in place and notifies it. That is the
+# whole reason they exist as methods on `Param` beside the `AnimCurve` ones: an
+# edit site says what it changed, and everything drawn from the curve — the lane,
+# the ◆, the slider — follows because it is derived from that Observable. Nothing
+# refreshes anything.
+
+"""
+    setvalue!(p, value, frame) -> p
+
+Set what `p` is at `frame`.
+
+The one value edit, whatever shape the curve is in: animated, it keys at `frame`;
+constant, the single key takes the new value and stays where it is. Every call
+site used to spell that fork out, and the two halves wrote to different places.
+"""
+function setvalue!(p::Param{T}, value, frame::Integer) where {T}
+    c = p.curve[]
+    if isanimated(p)
+        setkey!(c, frame, value)
+    else
+        movekey!(c, 1, c.keys[1].frame, value)
+    end
+    notify(p.curve)
+    return p
+end
+
+"Insert or replace `p`'s key at `frame` (see [`setkey!`](@ref AnimCurve))."
+setkey!(p::Param, frame::Integer, value) =
+    (setkey!(p.curve[], frame, value); notify(p.curve); p)
+setkey!(p::Param, frame::Integer, value, ease::Symbol) =
+    (setkey!(p.curve[], frame, value, ease); notify(p.curve); p)
+
+"""
+    removekey!(p, frame) -> Bool
+    removekeyat!(p, i) -> Bool
+
+Take a key off `p`. Refused for the last one: a parameter always has a value, and
+a curve with a single key is exactly how a constant is written, so the key before
+last is where animation stops.
+"""
+function removekey!(p::Param, frame::Integer)
+    length(p.curve[].keys) > 1 || return false
+    removekey!(p.curve[], frame) || return false
+    notify(p.curve)
+    return true
+end
+
+function removekeyat!(p::Param, i::Integer)
+    ks = p.curve[].keys
+    length(ks) > 1 || return false
+    deleteat!(ks, i)
+    notify(p.curve)
+    return true
 end
 
 """
-One parameter row of the effects panel, BOUND to its parameter.
+    clearkeys!(p, frame) -> p
 
-A row is not a place a value is pushed to. What it shows — where the slider sits,
-whether the ◆ is filled — is DERIVED from `param` and `playheadframe(player,
-target)`, and re-derived by [`refreshfxrows!`](@ref) whenever either can have
-moved. The other direction is the slider's own handler, which edits the curve.
-
-The row exists so that derivation has one place to happen per on-screen
-parameter. Before it, `paramform!` registered an `on(player.playhead)` per row:
-118 of them on the lego project, none ever unregistered, and a fresh set with
-every card rebuild.
-
-`colors` is the ◆'s three states (a key here / animated / not animated) — the
-panel's palette, carried rather than looked up, because the row is drawn once and
-the refresh runs on every playhead move.
+Collapse `p` to the constant it shows at `frame`: one key, the value it had,
+held over the whole clip. What "clear the keyframes" means when a value is
+always a curve.
 """
-struct ParamRow
-    target::Any                  # the Clip the parameter's frames are counted in
-    param::Param
-    slider::Any                  # its Slider, or `nothing` for a row without one
-    kf::Any                      # the ◆ Button, or `nothing`
-    colors::NTuple{3, Any}
+function clearkeys!(p::Param{T}, frame::Integer) where {T}
+    c = p.curve[]
+    v = convert(T, valueat(p, frame))
+    empty!(c.keys)
+    push!(c.keys, Keyframe{T}(Int(frame), v, :linear))
+    notify(p.curve)
+    return p
 end
+
+"Move `p`'s `i`-th key to `(frame, value)` — see [`movekey!`](@ref AnimCurve)."
+movekey!(p::Param, i::Integer, frame::Integer, value) =
+    (movekey!(p.curve[], i, frame, value); notify(p.curve); p)
+
+"Set the ease mode of `p`'s `i`-th key."
+setease!(p::Param, i::Integer, mode::Symbol) =
+    (setease!(p.curve[], i, mode); notify(p.curve); p)
+
+"Move one handle of `p`'s `i`-th key — see [`sethandle!`](@ref AnimCurve)."
+sethandle!(p::Param, i::Integer, side::Symbol, h::Handle; couple::Bool = true) =
+    (sethandle!(p.curve[], i, side, h; couple); notify(p.curve); p)
+
+"Make `p`'s `i`-th key a smooth anchor / a corner anchor."
+smoothkey!(p::Param, i::Integer) = (smoothkey!(p.curve[], i); notify(p.curve); p)
+cornerkey!(p::Param, i::Integer) = (cornerkey!(p.curve[], i); notify(p.curve); p)
+
+"Bake `p`'s legacy curve-wide ease into its keys — see [`materializeease!`](@ref)."
+materializeease!(p::Param) = (materializeease!(p.curve[]); notify(p.curve); p)
+
+"""
+    simplify!(p; tol) -> p
+
+Refit `p`'s curve to the few Bézier anchors that reproduce it — see
+[`simplify!`](@ref AnimCurve). `tol` is relative to the parameter's own range,
+which is what makes one tolerance mean the same thing for an angle and an offset.
+"""
+simplify!(p::Param; tol::Real = 0.005) =
+    (simplify!(p.curve[]; tol); notify(p.curve); p)

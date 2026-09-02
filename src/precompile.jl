@@ -86,7 +86,7 @@ end
 # frozen cache the workload below fills, before anything asks for a kernel.
 function __init__()
     Lava.use_frozen_kernels(KERNELS_VERSION)
-    # Install the matte propagator HERE, and never from the workload below. The
+    # Install the matte propagator here, and never from the workload below. The
     # workload's closure has already run, so its `modelref` holds a built model —
     # and a built model holds `LavaArray`s whose `VkContext` belongs to the
     # *precompilation* process. `registermatte!` writes a module global, so that
@@ -108,7 +108,9 @@ function __init__()
             registermatte!(MatAnyoneRunner.matanyonepropagator())
         end
     catch err
-        @debug "VideoEditor: no matte propagator registered" exception = err
+        # …said out loud. `@debug` prints nothing by default, so a propagator that
+        # stopped registering would look exactly like one that was never asked for.
+        @warn "VideoEditor: no matte propagator registered" exception = err
     end
     return nothing
 end
@@ -161,7 +163,7 @@ end
                 # …and the disc seed, which is the rect/box path, not a fallback
                 seedmask(clip, [(0.5, 0.5, true), (0.2, 0.2, false)])
 
-                # …and the OTHER half of the matte: propagation. Measured at
+                # …and the other half of the matte: propagation. Measured at
                 # 94.3 s on the first run, 74.4 s of it Julia, and it has to be
                 # traced here rather than in `MatAnyoneRunner` for the same
                 # reason the segmenter is — loading `VideoEditor` invalidates
@@ -169,7 +171,7 @@ end
                 # shapes do not change which methods get inferred, and a 10-step
                 # warmup would only make precompilation slower.
                 #
-                # Driven through `analyzematte!`, NOT by calling `prop` on a
+                # Driven through `analyzematte!` rather than by calling `prop` on a
                 # `Vector` of frames. The editor never hands it one: frames
                 # stream, so what reaches the propagator is a `SubArray` over a
                 # `MatteFrames{typeof(reader)}`, and Julia specializes on that
@@ -177,7 +179,7 @@ end
                 # at runtime — 54 s on the first propagate tick, landing as a
                 # frozen progress bar the moment the user starts a matte.
                 #
-                # The seed sits on the MIDDLE frame so both halves of
+                # The seed sits on the middle frame so both halves of
                 # `propagateboth` are traced: the forward tail, and the reversed
                 # prefix, whose `view(pre, k:-1:1)` is a third container type
                 # again.
@@ -187,7 +189,7 @@ end
                     seed = zeros(UInt8, src.width, src.height)
                     seed[(src.width ÷ 3):(2src.width ÷ 3),
                          (src.height ÷ 3):(2src.height ÷ 3)] .= 0xff
-                    # Deliberately NOT `registermatte!(prop)`: running `prop`
+                    # Deliberately not `registermatte!(prop)`: running `prop`
                     # built its model, and installing it would serialise those
                     # device buffers — and the context they belong to — into the
                     # package image. `__init__` registers a fresh lazy one; the
@@ -200,14 +202,14 @@ end
                 end
 
                 # …and camera stabilization, the one expensive GPU path that was
-                # NOT traced here. Its first run compiles the Lava feature and
+                # Not traced here. Its first run compiles the Lava feature and
                 # flow kernels: `record_demo.jl` warms it off-camera and puts it
                 # at "~30 s on first use", which a user pays as a dead editor on
                 # the first "Stabilize clip" — the same first-click stall the
                 # matte traces above exist to remove. `analyzemotion!` defaults
                 # to `:similarity`, which is what the Camera lock mode runs.
                 #
-                # LAST on purpose. Everything here shares one `try`, so a step
+                # Last on purpose. Everything here shares one `try`, so a step
                 # that throws takes every step after it down with it — and the
                 # matte traces are worth 94 s to a user, against this one's 30.
                 stabclip = Clip(src; src_in = clip.src_in, src_out = clip.src_in + 8)

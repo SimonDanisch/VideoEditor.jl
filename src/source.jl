@@ -7,7 +7,7 @@ keyframes, the effect stack, the placement, compositing — is the same either w
 because a clip only ever asks its source for a frame of a given size at a given
 index.
 
-The four numbers below are the interface, and every source has them as FIELDS
+The four numbers below are the interface, and every source has them as fields
 rather than behind accessors: `width`, `height`, `framerate`, `nframes`. What
 differs is answered by dispatch — [`decodable`](@ref) says whether frames come
 from a decoder at all, and the render graph's source pass is chosen by
@@ -19,7 +19,7 @@ abstract type ClipSource end
     decodable(source) -> Bool
 
 Whether frames of this source come out of a video decoder. False for a source
-that RENDERS its frames, which therefore needs no decode pool, no proxy, no
+that renders its frames, which therefore needs no decode pool, no proxy, no
 thumbnail scan and no reader.
 """
 decodable(::ClipSource) = true
@@ -28,42 +28,42 @@ decodable(::ClipSource) = true
 sourcepath(s::ClipSource) = s.path
 
 """
-A clip whose frames are RENDERED rather than decoded.
+A clip whose frames are rendered rather than decoded.
 
-Holds the FORMAT — how big the frames are, how fast, and how many — and the live
-render state. It deliberately does NOT hold the scene: that is a
+Holds the format — how big the frames are, how fast, and how many — and the live
+render state. It does not hold the scene: that is a
 [`SceneSpec`](@ref) on the clip's `:scene` effect, where it is document data like
 every other parameter, gets saved with the project, and contributes the animatable
 numbers through [`dataparams`](@ref). A source that also held a spec would be a
 second home for it.
 
 `live` is the standing scene and its screen, kept across frames. That is not an
-optimisation detail: rebuilding it per frame meant re-reading ten STL files from
-disk for every frame of a seek (measured: 0.28 s per frame, against 5.1 ms once
-held), and a PROGRESSIVE renderer cannot work at all without it — RayMakie
+optimisation detail: rebuilding it per frame re-read ten STL files from disk for
+every frame of a seek (0.28 s per frame, against 5.1 ms once held), and a
+progressive renderer cannot work at all without it — RayMakie
 accumulates samples into a screen, and a screen thrown away after each frame has
 nothing to accumulate into.
 """
 mutable struct SceneSource <: ClipSource
-    # WHAT IT DRAWS: a Makie spec — `S.Scene(; camera = cam3d!, plots = [...])` for
+    # What it draws: a Makie spec — `S.Scene(; camera = cam3d!, plots = [...])` for
     # a raw scene, a layout spec when the picture wants an axis. The scene itself,
     # not a description of it beside one: what is animatable is read off the scene
     # that gets built (see `sceneattributes`), so there is nothing here that could
     # fall out of step with what is drawn.
     root::Any
-    # THE RIG, when the scene has one: a joint per named plot. A joint is `angle`
+    # The rig, when the scene has one: a joint per named plot. A joint is `angle`
     # and `offset` applied through the plot's `Transformation`, and applying them
     # needs the axis to turn about and the base translation to add to.
     #
     # Not on the plot, though that is where it belongs: Makie validates plot
     # attributes against a closed set, so a `jointaxis` on a `Mesh` is refused.
-    # Owned by whoever BUILT the rig, which is the honest second place — it
-    # describes the rig, not the scene, and nothing else reads it.
+    # Owned by whoever built the rig, which is the next best place: it describes
+    # the rig rather than the scene, and nothing else reads it.
     joints::Dict{Symbol, Any}
     # Where a 3-D scene looks from, once it exists. `cam3d!` places the eye through
-    # `update_cam!` AFTER the scene is realized, and a spec has nowhere to put that.
+    # `update_cam!` after the scene is realized, and a spec has nowhere to put that.
     camera::Any
-    # HOW `root` WAS MADE, as data a project file can hold: `{"kind" => "text",
+    # How `root` was made, as data a project file can hold: `{"kind" => "text",
     # "args" => …}`. A realized spec holds live objects — a rig's
     # `Transformation`s, loaded meshes — so it cannot be written out; the recipe
     # can. A placeholder until scenes serialise themselves; see `buildscene`.
@@ -79,15 +79,15 @@ mutable struct SceneSource <: ClipSource
     # refining while this is unchanged and starts over when it is not — see
     # [`sceneframe!`](@ref).
     at::Int
-    # TWO BACKENDS, ONE SCENE, and that is the whole workflow. Raytracing a frame
-    # costs ~1.2 s at 480x854 and rasterising it costs milliseconds: scrubbing a
-    # timeline at raytracing speed is not editing, and editing against a rasterised
-    # preview and then shipping it is not the picture you wanted. The scene's own
-    # `backend` is what the preview draws with; this is what a BAKE uses.
+    # Two backends, one scene. Raytracing a frame costs ~1.2 s at 480x854 and
+    # rasterising it costs milliseconds: scrubbing at raytracing speed is not
+    # editing, and shipping the rasterised preview is not the picture that was
+    # edited for. The scene's own `backend` draws the preview; this is what a bake
+    # uses.
     # `:auto` means "the same one" — a scene that is fast enough live has nothing
     # to switch to.
     bakewith::Symbol
-    # …and its SETTINGS. A second set, not a second scene: the point of two
+    # …and its settings. A second set, not a second scene: the point of two
     # backends is that the preview is cheap and the final render is not, and "how
     # many samples" is exactly the number that differs between them. Empty means
     # the bake draws with the live settings.
@@ -96,15 +96,15 @@ mutable struct SceneSource <: ClipSource
     # argument because the render happens inside a graph pass, several calls below
     # whoever decided — `bakeclip!` sets it around its loop.
     mode::Symbol                 # :live | :bake
-    # How many samples a PROGRESSIVE renderer has accumulated at `at`. Reset when
+    # How many samples a progressive renderer has accumulated at `at`. Reset when
     # the position moves; grown by `refinescene!` while it holds.
     samples::Int
-    # THE FRAME, ALREADY DRAWN, and which frame it is. A scene draws with GLMakie,
+    # The frame, already drawn, and which frame it is. A scene draws with GLMakie,
     # whose screen belongs to thread 1; the composite runs on whichever thread owns
     # the Lava context, which is the pinned GPU worker. Drawing inside the pass
     # body therefore goes thread 1 → worker → thread 1 → worker for every frame,
     # and the hop back waits for the editor's own renderloop to reach a yield:
-    # measured on the lego project at 22.5 ms of WAITING against 7.3 ms of
+    # measured on the lego project at 22.5 ms of waiting against 7.3 ms of
     # drawing, per frame. `prerender!` fills these in while the caller is still on
     # thread 1; the pass body takes what is here. See [`takepending!`](@ref).
     pending::Any
@@ -137,13 +137,13 @@ end
     VideoSource(path)
 
 Probed metadata for a video file: dimensions, framerate, duration, frame count,
-the keyframe index and the timestamp of EVERY frame (scanned from packet flags,
+the keyframe index and the timestamp of every frame (scanned from packet flags,
 no decoding).
 
 Frame indices are 0-based throughout. `n / framerate` is only the display time of
 frame `n` on constant-rate material — phone clips drop frames (measured on a
 "60 fps" clip: median period 0.0167 s, longest gap 0.2 s), and then the n-th
-DECODED frame and the frame at time `n/60` are different pictures. Analysis reads
+decoded frame and the frame at time `n/60` are different pictures. Analysis reads
 sequentially while the preview seeks by time, so every per-frame track (flicker,
 stabilization) landed on the wrong frame — 11 frames off at frame 100 on that
 clip. `frametimes` makes the mapping exact for both.
@@ -172,8 +172,8 @@ function VideoSource(path::AbstractString)
     nframes = something(counted, npackets > 0 ? npackets : round(Int, duration * fps))
     # containers may claim a track rate the stream doesn't deliver (YouTube mkv
     # remuxes report 29.97 while frames actually arrive at 23.976) — when the
-    # true frame count disagrees with duration × claimed rate, the EFFECTIVE
-    # rate is the one every frame↔time mapping (and the proxy check) must use.
+    # true frame count disagrees with duration × claimed rate, the effective rate
+    # is what every frame↔time mapping (and the proxy check) has to use.
     # Snap it to the nearest standard video rate: count/duration carries the
     # container's rounding noise, and a raw float like 23.975288… later
     # explodes into a 2^47 denominator when converted to ffmpeg's Int32
@@ -192,7 +192,7 @@ end
 """
     scan_packets(path) -> (keyframe_times, frame_times)
 
-Timestamps of every frame in DISPLAY order, plus the subset that are keyframes —
+Timestamps of every frame in display order, plus the subset that are keyframes —
 read from packet flags via ffprobe. Demux only, no decoding, fast even for long
 files. The frame count implied here is authoritative where containers (mkv!)
 carry no `nb_frames`, and the per-frame times are what makes index↔time exact on
@@ -210,7 +210,7 @@ function scan_packets(path::AbstractString)
         push!(times, t)
         occursin('K', parts[2]) && push!(keys, t)
     end
-    # packets arrive in DECODE order (B-frames!); display order is by timestamp
+    # packets arrive in decode order (B-frames); display order is by timestamp
     sort!(times)
     sort!(keys)
     return keys, times

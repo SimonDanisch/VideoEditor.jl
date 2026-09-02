@@ -39,7 +39,7 @@ The clamp here is the check.
 """
 The matte plane sampled bilinearly at plane coordinates `(u, v)`, as 0…1.
 
-Split out of [`mattealphaat`](@ref) because feathering takes SEVERAL taps of the
+Split out of [`mattealphaat`](@ref) because feathering takes several taps of the
 same plane, and a second copy of the interpolation is a second matte.
 """
 @inline function sampleplane(alpha, u::Float32, v::Float32, mw::Int32, mh::Int32)
@@ -60,18 +60,15 @@ end
     d == Int32(0) ? 6.0f0 : (d == Int32(1) || d == Int32(-1) ? 4.0f0 : 1.0f0)
 
 """
-The matte's alpha at one pixel — ONE definition, shared by the two things that
-need it: keying the clip against a background, and telling the compositor how
-much of what is underneath must show through. A second copy of this arithmetic
-is a second matte, and they drift.
+The matte's alpha at one pixel: one definition, shared by keying the clip against
+a background and telling the compositor how much of what is underneath shows
+through. A second copy of this arithmetic is a second matte, and the two drift.
 
-`feather` is a SPATIAL softening: it spreads the sampling footprint across the
-edge, so the transition band widens while the interior stays fully opaque and the
-background stays fully out. It used to be a smoothstep over `[0.5-f, 0.5+f]` in
-alpha space, which at `f = 1` mapped alpha 1 to 0.84 and alpha 0 to 0.16 — the
-subject went translucent and the background bled through everywhere. That is what
-`strength` does, one slider up, so the two controls did the same thing and
-neither one softened an edge.
+`feather` is a spatial softening: it spreads the sampling footprint across the
+edge, so the transition band widens while the interior stays opaque and the
+background stays out. As a smoothstep over `[0.5-f, 0.5+f]` in alpha space it
+mapped alpha 1 to 0.84 and alpha 0 to 0.16 at `f = 1`, which is what `strength`
+does one slider up — so neither control softened an edge.
 
 `feather = 1` reaches ±1/120 of the crop's width — about 32 pixels of transition
 band on a 1920-wide render, whatever resolution the matte was analyzed at.
@@ -79,7 +76,7 @@ band on a 1920-wide render, whatever resolution the matte was analyzed at.
 @inline function mattealphaat(alpha, i, j, w, h, mw::Int32, mh::Int32,
                               strength::Float32, feather::Float32,
                               cx::Float32, cy::Float32, cw::Float32, ch::Float32)
-    # The matte covers the clip's CROP, the buffer is the whole layer: map
+    # The matte covers the clip's crop and the buffer is the whole layer, so map
     # layer normalized coords into the crop rect before sampling.
     un = ((Float32(i) - 0.5f0) / Float32(w) - cx) / cw
     vn = ((Float32(j) - 0.5f0) / Float32(h) - cy) / ch
@@ -90,9 +87,9 @@ band on a 1920-wide render, whatever resolution the matte was analyzed at.
         # the same place and this collapses to the single sample below:
         # continuous, and it can only ever soften.
         #
-        # The reach is a FRACTION OF THE PICTURE, not a texel count. It used to
-        # be `feather * 2` texels of spacing — ±4 texels at full feather — which
-        # made the control mean whatever the analysis happened to be sized at:
+        # The reach is a fraction of the picture, not a texel count. At
+        # `feather * 2` texels of spacing — ±4 texels at full feather — the
+        # control meant whatever the analysis happened to be sized at:
         # `mattereadsize` no longer caps the plane at 480 wide, so the same
         # slider softened a 34-pixel band on the plane it was tuned against and
         # a 4-pixel band on a 4K source. Dividing by 240 keeps the tuned value
@@ -117,11 +114,10 @@ end
 
 # There is no `mattealpha_kernel!` here any more, and no `mattealpha!`.
 #
-# It rendered the matte a SECOND time, into a separate white-on-black coverage
+# It rendered the matte a second time, into a separate white-on-black coverage
 # image, because the keying below painted the removed background black and the
-# compositor then had no way to tell "black because it was keyed" from "black
-# because it is black". Two renders of one matte, at two places in the frame,
-# which could differ by a frame and once did.
+# compositor then could not tell "black because it was keyed" from "black because
+# it is black". Two renders of one matte, which could differ by a frame.
 #
 # A plane carries alpha now. The keying writes coverage where it removes
 # background, the placement resamples colour and coverage together, and the
@@ -133,18 +129,17 @@ end
     i, j = @index(Global, NTuple)
     @inbounds begin
         w, h = size(buf, 1), size(buf, 2)
-        # The matte covers the clip's CROP, `buf` is the whole layer: map layer
-        # normalized coords into the crop rect before sampling. Outside it the
+        # The matte covers the clip's crop and `buf` is the whole layer, so map
+        # layer coords into the crop rect before sampling. Outside it the
         # clamps below hold the edge, and those pixels are cropped away anyway.
         a = mattealphaat(alpha, i, j, w, h, mw, mh, strength, feather, cx, cy, cw, ch)
         c = buf[i, j]
-        # KEYING IS A WRITE TO ALPHA. It used to mix the removed background
-        # towards a colour — black — which is right when there is nothing under
-        # the layer and wrong the moment there is: the black is OPAQUE, so it
+        # Keying is a write to alpha. Mixing the removed background toward black
+        # is right only with nothing under the layer: the black is opaque, so it
         # covered the track below and a matte over a background plate showed a
         # silhouette. The compositor then needed the plane a second time to build
-        # a coverage image and hope the two answers agreed. Coverage in the pixel
-        # is the one answer, and the colour is already multiplied by it.
+        # a coverage image. Coverage in the pixel is the one answer, and the
+        # colour is already multiplied by it.
         buf[i, j] = premul(eltype(buf), Float32(red(c)), Float32(green(c)),
                            Float32(blue(c)), a * alphaof(c))
     end
@@ -163,7 +158,7 @@ passname(::MatteOp) = "matte"
 
 """
 The object whose bytes a matte plane holds: the track. Compared by identity, so a
-re-propagation — which is always a NEW `MatteTrack` under an unchanged clip and
+re-propagation — which is always a new `MatteTrack` under an unchanged clip and
 frame — writes the plane again. This is what replaced eight `freematteplanes!`
 calls scattered through the matte tools, whose job was to drop a device cache
 that a new track had made stale.
@@ -190,7 +185,7 @@ end
     applyplane!(buf, plane, op::MatteOp, clip)
 
 Key `buf` against the matte plane, in place: the subject survives, the background
-becomes UNCOVERED — alpha zero, and the colour premultiplied to match.
+becomes uncovered: alpha zero, with the colour premultiplied to match.
 """
 function applyplane!(buf::AnyRGBFrame, plane, op::MatteOp, clip::Clip)
     s = clamp(op.strength, 0.0f0, 1.0f0)
@@ -208,7 +203,7 @@ end
 """
     applymatte!(buf, clip, srcframe; strength, feather)
 
-The host-side form: key a HOST buffer straight from the clip's track. A no-op
+The host-side form: key a host buffer straight from the clip's track. A no-op
 when the clip has no matte or the frame is outside it, so scrubbing past the
 analyzed range shows the plain frame rather than a hole.
 
@@ -232,16 +227,15 @@ const MATTEWARMED = Ref(false)
 Run the propagator once on a tiny synthetic clip, to pay its first-call cost
 somewhere the user is not waiting.
 
-The first propagation of a session costs ~99 s on the MatAnyone propagator, and
-**none of it is shader compilation** — the SPIR-V disk cache is fully hit (683
-entries in, zero added). It is Julia specializing the graph's execution paths.
+The first propagation of a session costs ~99 s on the MatAnyone propagator, none
+of it shader compilation: the SPIR-V disk cache is fully hit (683 entries in, zero
+added). It is Julia specializing the graph's execution paths.
 
-Most of that is size-independent, but not all: warming at 64x48 absorbed 97.9 s
+Most of that is size-independent, but not all — warming at 64x48 absorbed 97.9 s
 and still left 12.5 s on the first real 240x136 clip, because the
-cooperative-matrix GEMM specializes per tile shape (`Val{BLK}`). So warm at the
-size that will actually be used — `w`/`h` should be `mattereadsize` of the clip
-the tool is about to matte, not a token. The defaults are for the caller that
-has no clip yet and can only choose to load the model at all.
+cooperative-matrix GEMM specializes per tile shape (`Val{BLK}`). So `w`/`h` should
+be `mattereadsize` of the clip about to be matted. The defaults are for a caller
+that has no clip yet and only wants the model loaded.
 
 Returns whether it ran (false when no propagator is installed, or it already has).
 """
@@ -280,12 +274,12 @@ receives the clip's frames at matte resolution and `seeds::Dict{Int,
 Matrix{UInt8}}` (index into `frames` → the user's rough selection, 0/255), and
 returns `(w, h, nframes)` alpha.
 
-`frames` is an **`AbstractVector{Matrix{RGB{N0f8}}}`, not a `Vector`** — what
+`frames` is an `AbstractVector{Matrix{RGB{N0f8}}}` and not a `Vector` — what
 arrives is a `view` of a [`MatteFrames`](@ref), which decodes on index and keeps
 nothing. So a runner must use it as a sequence (`length`, `size(frames[1])`,
-`frames[k]`) and must NOT `collect` it: that materialises the whole clip and puts
-back the 763 MB, plus the two-phase progress bar, that streaming removed. Index
-FORWARD — the readers are sequential decoders and random access costs a seek.
+`frames[k]`) and must not `collect` it: that materialises the whole clip and puts
+back the 763 MB, and the two-phase progress bar, that streaming removed. Index
+forward — the readers are sequential decoders and random access costs a seek.
 
 This is the seam a model runner plugs into. VideoEditor deliberately does not
 depend on one: the editor owns the track, the UI and the render path, and the
@@ -317,7 +311,7 @@ A segmenter is a plain function passed to [`seedmask`](@ref), and the editor's i
 different one to use a different model.
 
 A separate seam from [`registermatte!`](@ref), because they answer different
-questions. A propagator carries a mask through a clip; it does **not** find one —
+questions. A propagator carries a mask through a clip; it does not find one —
 measured on both this implementation and PyTorch's, MatAnyone's matte tracks its
 seed (IoU against the seed 0.95 falling to 0.82 across a clip) rather than
 segmenting the subject. So the quality of the whole matte is decided by the seed,
@@ -391,7 +385,7 @@ end
 """
 The clip's frames at matte resolution, decoded when asked for and not before.
 
-**Nothing here caches a clip.** The propagator says what it does per frame and
+Nothing here caches a clip: the propagator says what it does per frame and
 this hands it one; indexing decodes that frame and keeps nothing, so a
 propagation costs one frame of memory rather than all of them. It used to
 build the whole `Vector` up front, which on the birds clip (869 frames at
@@ -403,7 +397,7 @@ honestly.
 contract — `length`, `size(frames[1])`, `frames[k]` — so a streaming source
 drops in without every model runner learning a new protocol.
 
-Indexing is expected to walk FORWARD: the readers are sequential decoders and
+Indexing is expected to walk forward: the readers are sequential decoders and
 random access costs a seek. [`propagateboth`](@ref) is arranged around that.
 """
 struct MatteFrames{F} <: AbstractVector{Matrix{RGB{N0f8}}}
@@ -418,14 +412,14 @@ Base.IndexStyle(::Type{<:MatteFrames}) = IndexLinear()
 function Base.getindex(fs::MatteFrames, i::Int)
     @boundscheck 1 <= i <= fs.n || throw(BoundsError(fs, i))
     f = fs.readframe(fs.src_in + i - 1)
-    # A reader asked for the matte's width resized ON THE DEVICE before the
-    # download, so there is normally nothing left to do — but `readframe` is the
-    # caller's, and one that hands back the full layer still has to work. Then
-    # `downscale` is the fallback, not the plan.
+    # A reader asked for the matte's width resizes on the device before the
+    # download, so there is normally nothing left to do. `readframe` is the
+    # caller's though, and one that hands back the full layer still has to work,
+    # which is what `downscale` is for here.
     #
-    # Either way the result is a FRESH matrix: `framereader` reuses one host
-    # buffer, so handing that straight to a consumer that keeps a frame across
-    # iterations would alias. `copy` is the price of the contract.
+    # Either way the result is a fresh matrix: `framereader` reuses one host
+    # buffer, so handing that to a consumer that keeps a frame across iterations
+    # would alias.
     size(f) == (fs.mw, fs.mh) ? copy(f) : downscale(f, fs.mw, fs.mh)
 end
 
@@ -459,9 +453,9 @@ function analyzematte!(clip::Clip, readframe, seeds::Dict{Int, <:AbstractMatrix}
     n > 0 || error("cannot matte an empty clip")
     isempty(seeds) && error("matting needs at least one marked frame")
     mw, mh = mattereadsize(clip, maxside)
-    # Frames are FETCHED, not collected. Reading and propagating interleave, so
-    # there is one phase to report and no share to tune between two — which is
-    # what `decodeshare` existed for and why it is gone.
+    # Frames are fetched, not collected: reading and propagating interleave, so
+    # there is one phase to report and no share to tune between two (which is what
+    # `decodeshare` was for).
     frames = MatteFrames(readframe, clip.src_in, n, mw, mh)
     localseeds = Dict{Int, Matrix{UInt8}}()
     for (sf, m) in seeds
@@ -478,7 +472,7 @@ function analyzematte!(clip::Clip, readframe, seeds::Dict{Int, <:AbstractMatrix}
 end
 
 """
-Progress reporting into the propagator, as ONE type.
+Progress reporting into the propagator, as one type.
 
 The propagator takes a `progress` callback, and Julia specializes its whole body
 on that callback's type — so a closure over the caller's UI state made every
@@ -506,15 +500,13 @@ end
 """
     propagateboth(prop, frames, seeds, mw, mh, n, progress) -> alpha
 
-Propagate a seed over the WHOLE clip: forward from it, and backward over what
+Propagate a seed over the whole clip: forward from it, and backward over what
 comes before.
 
 The propagator is causal — it carries a memory forward, one frame at a time — so
 handed a clip whose seed sits in the middle it can only answer for the frames
-after it, and every earlier frame comes back empty. Empty alpha is not "no
-matte", it is a matte that keeps NOTHING: the first half of the clip goes black,
-which is exactly what it looks like when somebody marks a subject halfway in and
-then cuts at the mark.
+after it, and every earlier frame comes back empty. Empty alpha is not "no matte"
+but a matte that keeps nothing, so the first half of the clip goes black.
 
 So the prefix is propagated as its own sequence, reversed — same model, same
 seed, running backwards in time — and the two halves are stitched at the seed.
@@ -527,16 +519,14 @@ function propagateboth(prop, frames::AbstractVector, seeds::Dict{Int, <:Abstract
     # — the seed frame is propagated by both halves — and reporting it against
     # `n` used to walk the bar slightly past its own end on a mid-clip seed.
     tail, head = n - k + 1, k
-    # ONE type, whatever the caller's callback is — see [`MatteProgress`](@ref).
-    # Passing `nothing` here instead would be a second specialization again.
+    # One type, whatever the caller's callback is — see [`MatteProgress`](@ref).
+    # Passing `nothing` here would be a second specialization.
     step = MatteProgress(progress, Ref(0), head + tail)
     if k > 1
-        # The prefix is the one part that cannot stream: it is propagated
-        # BACKWARDS and the readers are sequential decoders, so asking for
-        # frames k, k-1, … 1 in that order is a seek per frame. Decode it
-        # forwards — which they are good at — and hand the model a reversed
-        # view. That buffers `k` frames, not `n`, and nothing at all when the
-        # seed is on the first frame, which is the ordinary case.
+        # The prefix is the one part that cannot stream: it propagates backwards,
+        # and asking sequential decoders for frames k, k-1, … 1 is a seek per
+        # frame. Decode forwards and hand the model a reversed view — that buffers
+        # `k` frames rather than `n`, and none at all for a seed on frame 1.
         pre = [frames[j] for j in 1:k]
         back = prop(view(pre, k:-1:1), Dict(k - sf + 1 => m for (sf, m) in seeds if sf <= k);
                     progress = step)
@@ -593,11 +583,10 @@ before this.
 the clip has no matte, or when `srcframe` is outside it — a repair has nothing to
 repair in either case.
 
-**Not recorded as a seed.** A seed is an INPUT the propagator runs from; this is
-an OUTPUT written after the fact. Adding it to `track.seeds` would mean the next
-full analysis propagates from a frame the user painted, which is a different and
-much stronger claim than "this one frame should look like this". See
-[`repairedframes`](@ref) for what does remember them.
+Not recorded as a seed: a seed is an input the propagator runs from, this is an
+output written after the fact. In `track.seeds` it would make the next full
+analysis propagate from a painted frame, which claims more than "this one frame
+should look like this". See [`repairedframes`](@ref) for what does remember them.
 """
 function repairframe!(clip::Clip, srcframe::Integer, mask::AbstractMatrix)
     t = clip.mattetrack
@@ -676,9 +665,9 @@ propagator, so previewing at 480 and propagating at the layer's 756 shows a matt
 that tracks the subject differently from the one the user ends up with. That is
 the second implementation this function exists to avoid, in a slower disguise.
 
-Cost is NOT one frame of propagation throughput — measured on a 756x960 layer,
-a warm call is 5.74 s against propagation's 0.44 s/frame, because a one-frame
-call pays the propagator's per-sequence setup in full. Raising the resolution is
+Cost is not one frame of propagation throughput: on a 756x960 layer a warm call
+is 5.74 s against propagation's 0.44 s/frame, because a one-frame call pays the
+propagator's per-sequence setup in full. Raising the resolution is
 the small part of that: capping to a 480 short side gives 5.10 s warm, and the
 cold first call is 52.8 s either way (it is loading MatAnyone, not sizing it).
 The 5 s of setup, not the resolution, is what a faster live preview would have
@@ -758,11 +747,11 @@ end
 Several objects in one selection: each group is one object's points, gets its own
 segmenter call, and the masks are unioned.
 
-Grouping is the CALLER's, because it is the user's. SAM 2 reads several positive
-points as several hints about ONE object — that is what makes refinement work —
-so nothing in a flat list of clicks says whether two of them mean "also this bird"
-or "no, more like this". Only the person clicking knows, so they say it (the
-matte card's `+ object`), and each group is then an ordinary single-object call.
+Grouping is the caller's, because it is the user's: SAM 2 reads several positive
+points as several hints about one object, which is what makes refinement work, so
+a flat list of clicks cannot say whether two of them mean "also this bird" or "no,
+more like this". The matte card's `+ object` is where that is said, and each group
+is then an ordinary single-object call.
 """
 function seedmask(clip::Clip, frame::AbstractMatrix{<:RGB},
                   groups::AbstractVector{<:AbstractVector{<:Tuple{<:Real, <:Real, Bool}}};
@@ -802,10 +791,10 @@ click rather than a restart — which is the correction users actually reach for
 when one disc swallows an arm or the floor next to it.
 """
 function seedmask(clip::Clip, points::AbstractVector{<:Tuple{<:Real, <:Real, Bool}};
-                  radius::Real = 0.06)   # of frame width: points are placed several at a
-                                       # time, so a disc large enough to hit the
-                                       # subject from ONE click would swallow the
-                                       # background between them
+                  radius::Real = 0.06)   # of frame width: points are placed several
+                                       # at a time, so a disc large enough to hit
+                                       # the subject from one click would swallow
+                                       # the background between them
     sw, sh = clip.source.width, clip.source.height
     m = zeros(UInt8, sw, sh)
     r = max(1, round(Int, radius * sw))
@@ -835,11 +824,11 @@ matte is sampled back up to the layer when applied, so anything smaller is an
 edge reconstructed from fewer samples than the layer can show; MatAnyone's own
 entry points all default to `max_size = -1`, no limit, for the same reason.
 Downscaling is also not a quality dial: the propagator is causal, so changing its
-input resolution changes what it TRACKS. Measured on the birds clip, 640 wide
+input resolution changes what it tracks. Measured on the birds clip, 640 wide
 diverged into a matte with a 57 px transition band where 480 gave 35 px and the
 layer's own 756 gave 25.6 px — not an ordering, a different answer.
 
-A cap applies to the SHORT side, as upstream's does. Capping width instead made
+A cap applies to the short side, as upstream's does. Capping width instead made
 one setting mean two resolutions: 480 wide is a 480 short side on a portrait clip
 and 270 on a landscape one, a 1.8x swing in what the model sees from nothing but
 how the camera was held.
@@ -858,9 +847,8 @@ mattereadsize(frame::AbstractMatrix, maxside::Union{Nothing,Integer}) =
 
 How big this clip's alpha will be — `width * height * srclength` bytes.
 
-Reported rather than enforced. It grows with the SHOT: 3.5 GB a minute at 1080p,
-17 GB for five. Worth showing on the button that spends it, which is why the
-matte card prints it past a gigabyte.
+Reported rather than enforced. It grows with the shot — 3.5 GB a minute at 1080p,
+17 GB for five — so the matte card prints it past a gigabyte.
 """
 mattebytes(clip::Clip, maxside::Union{Nothing,Integer} = nothing) =
     (sz = mattereadsize(clip, maxside); sz[1] * sz[2] * max(srclength(clip), 0))
@@ -876,16 +864,15 @@ const MATTEINRAM = 256 * 2^20
 """
 Where this process keeps its file-backed matte buffers.
 
-**Not `mktempdir()`.** That follows `TMPDIR`, and `/tmp` here is a tmpfs — RAM
-with a path. Backing an "avoid holding gigabytes resident" buffer with RAM is
-exactly backwards, and writing a 4 GB alpha into it filled the filesystem and
-took the shell down with it. The Julia depot's scratch space is on real disk,
-which is the only property this needs.
+Not `mktempdir()`: that follows `TMPDIR`, and `/tmp` here is a tmpfs, so backing a
+buffer meant to keep gigabytes off the heap with RAM is backwards — writing a 4 GB
+alpha into it filled the filesystem. The Julia depot's scratch space is on real
+disk, which is the only property this needs.
 
-A per-process subdirectory, and NOT one `prunecache!` manages: that one deletes
-least-recently-used files to stay under a budget, and pulling the file out from
-under a LIVE mapping is not a risk worth taking. `atexit` removes it; a crash
-leaves one behind, which `clearmattescratch!` sweeps on the next start.
+A per-process subdirectory, and not one `prunecache!` manages: that deletes
+least-recently-used files to stay under a budget, which could pull the file out
+from under a live mapping. `atexit` removes it; a crash leaves one behind, which
+`clearmattescratch!` sweeps on the next start.
 """
 const MATTESCRATCH = Ref{String}("")
 
@@ -906,9 +893,8 @@ Delete matte buffers left by processes that are no longer running, returning how
 many bytes went.
 
 A mapping's backing file is only garbage once its process is gone, so the sweep
-is keyed on the PID in the directory name rather than on age — an
-age-based prune would eventually delete the file under a long-running session's
-own live matte.
+is keyed on the PID in the directory name rather than on age: an age-based prune
+would eventually delete the file under a long-running session's own live matte.
 """
 function clearmattescratch!()
     root = cachedir("matte_alpha")
@@ -972,7 +958,7 @@ every frame of the clip once, in order, which is exactly what a sequential
 decoder is good at, and it keeps the analysis off the single-writer Vulkan queue
 that the preview is using to stay responsive.
 
-**The default is NO cap and nothing in the editor passes one**, so what the model
+The default is no cap and nothing in the editor passes one, so what the model
 reads is the clip's whole cropped source — full resolution, no resample anywhere
 on this path. That is deliberate: the matte's edge is the product, and a matte
 reconstructed from fewer samples than the layer can show is a worse edge, not a
@@ -981,7 +967,7 @@ dial at all here.
 
 `maxside` therefore exists for one case that has not come up: a clip too slow to
 matte at all. When it does bite it caps the short side and the resize happens
-**on the device, before the download** — a host-side one would pull the full
+on the device, before the download — a host-side one would pull the full
 layer across the bus and throw most of it away (756x960 is 2.18 MB a frame to
 produce 878 KB, plus a host resize, 869 times). `areadownscale!` is the same
 kernel the thumbnail worker downloads through, for the same reason.

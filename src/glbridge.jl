@@ -13,17 +13,17 @@
 # context current. `presentgpu!` does a synchronous round-trip per frame —
 # ~7 ms at 1080p, strictly less than the CPU path it replaces (~15 ms).
 #
-# Error policy: a GPU render error is a BUG, not a mode. Playback pauses
-# LOUDLY (status + logged backtrace) and the render backend stays what the
+# Error policy: a GPU render error is a bug, not a mode. Playback pauses with a
+# status line and a logged backtrace, and the render backend stays what the
 # config declared — no silent CPU continuation, no error-driven switching.
 # There is no CPU tier. A present during a long job queues behind it on the
 # single-writer worker; it does not take a second path.
 
 "Per-resolution GPU presentation state (see `presentgpu!`). The shared image is
-DOUBLE-BUFFERED: GLMakie's render loop runs as a concurrent task, so blitting
-into the texture it is currently sampling tears — visible as a glitched frame
-whenever consecutive frames differ strongly (a stabilization warp!). Each
-present blits into the texture GLMakie is NOT showing, then swaps."
+double-buffered: GLMakie's render loop runs as a concurrent task, so blitting into
+the texture it is sampling tears — visible whenever consecutive frames differ
+strongly, as under a stabilization warp. Each present blits into the texture
+GLMakie is not showing, then swaps."
 mutable struct GPUPreview
     width::Int
     height::Int
@@ -60,10 +60,10 @@ end
 
 The preview image's GL render object, or `nothing` when there is none to talk to.
 
-A CLOSED window keeps its plots but empties its render cache, so the lookup that
-swaps the preview texture threw a bare `KeyError` — which surfaced as "GPU render
-ERROR, playback paused" for what is simply a window that is gone. Presenting into
-a closed screen is a no-op, not a failure.
+A closed window keeps its plots but empties its render cache, so the lookup that
+swaps the preview texture threw a bare `KeyError`, reported as "GPU render error,
+playback paused" for a window that is simply gone. Presenting into a closed screen
+is a no-op, not a failure.
 """
 function previewrobj(player::Player)
     scr = player.screen
@@ -77,7 +77,7 @@ end
 Whether the Vulkan images are actually IMPORTED as GL textures — i.e. whether a
 present can reach the screen through the GPU tier at all.
 
-**Not the same question as [`gpuready`](@ref)**, which says the decode and effect
+Not the same question as [`gpuready`](@ref), which says the decode and effect
 side is device-resident. The import additionally needs the GL context and the
 Vulkan device to be the same card. Under a software GL — Xvfb with `llvmpipe`,
 which is what a headless test run gets — an NVIDIA memory handle cannot be
@@ -119,22 +119,22 @@ function rungpusync(f::Function, w::GPUWorker)
     # true and says nothing about which wait.
     #
     # A job legitimately takes seconds (a cold shader compile, a first scene), so
-    # the bound is generous. What matters is that it EXISTS: an error names the
+    # the bound is generous. What matters is that there is one: an error names the
     # queue that stopped, and the editor lives to show it.
     t0 = time()
     while !isready(done)
-        # …and the message SAYS WHICH of the three it is, because they need
-        # different fixes and "the queue stopped" named none of them: a dead task
-        # (something escaped the job loop), a full queue (jobs posted faster than
-        # they run), or a live task still inside one job (a driver wait, or a job
-        # that needs thread 1 while thread 1 is here waiting for it).
+        # …and the message says which of the three it is, since they need
+        # different fixes: a dead task (something escaped the job loop), a full
+        # queue (jobs posted faster than they run), or a live task still inside
+        # one job (a driver wait, or a job that needs thread 1 while thread 1 is
+        # here waiting for it).
         time() - t0 > GPUWAIT && error(
             "the GPU worker did not answer within $(GPUWAIT)s — " * stalldump(w) *
-            (istaskfailed(w.task) ? "its task FAILED: $(sprint(showerror, Base.task_result(w.task)))" :
-             istaskdone(w.task) ? "its task has EXITED, so nothing drains the queue any more" :
+            (istaskfailed(w.task) ? "its task failed: $(sprint(showerror, Base.task_result(w.task)))" :
+             istaskdone(w.task) ? "its task has exited, so nothing drains the queue any more" :
              "its task is alive and still inside a job") *
             ". Queued: $(Base.n_avail(w.jobs)) of $(w.jobs.sz_max), channel " *
-            (isopen(w.jobs) ? "open" : "CLOSED") * ", worker thread " *
+            (isopen(w.jobs) ? "open" : "closed") * ", worker thread " *
             "$(Threads.threadid(w.task)). Every frame goes through here, so the " *
             "editor would otherwise simply stop with nothing to look at.")
         sleep(0.001)
@@ -150,8 +150,8 @@ end
 Write every task's stack to a file and name it, when the GPU worker has stopped
 answering.
 
-"Its task is alive and still inside a job" is a diagnosis one step short of
-useful: it says the worker is wedged, not WHERE. The worker is pinned and the
+"Its task is alive and still inside a job" says the worker is wedged, not where.
+The worker is pinned and the
 rest of the process is still running, so `jl_print_task_backtraces` can walk it
 — the same call that named the layout cascade behind the editor's freeze. It
 writes ~3000 lines, which belongs in a file rather than in an exception message,
@@ -181,13 +181,11 @@ end
 """
 How long [`rungpusync`](@ref) waits for the GPU worker before giving up.
 
-Finite, because the alternative is an editor that stops with nothing to look at.
-But long enough for a COLD COMPILE, which is the part 30 s got wrong: the first
-matte on a clip reaches SAM 2, whose first `coopmat_gemm!` launch has to be code-
-generated, and the stack dump from that timeout was `jl_compile_codeinst_now` in
-LLVM's `AsmPrinter`, not a driver wait. Two GUI tests failed on it every run. A
-deadline that fires on a legitimate first render is worse than the freeze it
-guards against — it turns a slow frame into a lost one.
+Finite, because the alternative is an editor that stops with nothing to look at,
+but long enough for a cold compile. At 30 s it fired on the first matte of a clip:
+that reaches SAM 2, whose first `coopmat_gemm!` launch has to be code-generated,
+and the stack dump showed `jl_compile_codeinst_now` in LLVM's `AsmPrinter` rather
+than a driver wait. Two GUI tests failed on it every run.
 
 Kept well above what a cold `Player` + SAM 2 path costs here (see the frozen
 kernel cache: the same route was ~97 s before it existed).
@@ -249,31 +247,27 @@ function setupgpupreview!(player::Player, gp::GPUPreview, W::Integer, H::Integer
 
     # GL side: import both fds and swap the preview plot's texture (main thread)
     screen = player.screen
-    # THROUGH GLMakie, NEVER `GLFW.MakeContextCurrent` DIRECTLY. GLMakie tracks
-    # which context is current in a process-global (`ShaderAbstractions.
-    # ACTIVE_OPENGL_CONTEXT`), and `switch_context!(x)` is documented as "a noop if
-    # `x` is already current" — it believes that global. Switching behind its back
-    # leaves the global naming a context that is no longer the real one, and the
-    # next switch to it does NOTHING. With a second GL context in the process — a
-    # scene clip renders into its own `Screen` — that meant the scene drew its own
-    # vertex arrays while the EDITOR's context was current: a SIGSEGV inside
-    # `glDrawElements`, in a screen that had nothing to do with this call, one or
-    # two frames later. Reproducible in two clip switches; 12/12 clean with
-    # `gpupreview = false`, which is simply the path that does not come through
-    # here.
+    # Through GLMakie, never `GLFW.MakeContextCurrent` directly. GLMakie tracks the
+    # current context in a process-global (`ShaderAbstractions.ACTIVE_OPENGL_CONTEXT`)
+    # and `switch_context!(x)` is a no-op if `x` is already current by that global.
+    # Switching behind its back leaves the global naming a context that is no longer
+    # the real one, so the next switch to it does nothing. With a second GL context
+    # in the process — a scene clip renders into its own `Screen` — the scene then
+    # drew its vertex arrays while the editor's context was current: a SIGSEGV in
+    # `glDrawElements`, in an unrelated screen, one or two frames later.
     GLMakie.GLAbstraction.gl_switch_context!(screen.glscreen)
     getfn(n) = GLMakie.GLFW.GetProcAddress(n)
     GL = GLMakie.ModernGL
     robj = previewrobj(player)
     robj === nothing && error("the preview window is gone — cannot set up the GPU chain")
     old = robj.uniforms[:image]
-    gp.origtex === nothing && (gp.origtex = old)   # re-setups see OUR texture here
+    gp.origtex === nothing && (gp.origtex = old)   # re-setups see our own texture here
     empty!(gp.gltex)
     for (fd, allocsize) in fds
         mo = Ref{UInt32}(0)
         ccall(getfn("glCreateMemoryObjectsEXT"), Cvoid, (Int32, Ptr{UInt32}), 1, mo)
         ccall(getfn("glMemoryObjectParameterivEXT"), Cvoid, (UInt32, UInt32, Ptr{Int32}),
-              mo[], 0x9581, Ref{Int32}(1))                       # DEDICATED = TRUE
+              mo[], 0x9581, Ref{Int32}(1))                       # DEDICATED = true
         ccall(getfn("glImportMemoryFdEXT"), Cvoid, (UInt32, UInt64, UInt32, Int32),
               mo[], UInt64(allocsize), 0x9586, Int32(fd))        # consumes the fd
         texid = Ref{UInt32}(0)
@@ -283,7 +277,7 @@ function setupgpupreview!(player::Player, gp::GPUPreview, W::Integer, H::Integer
         ccall(getfn("glTexStorageMem2DEXT"), Cvoid,
               (UInt32, Int32, UInt32, Int32, Int32, UInt32, UInt64),
               GL.GL_TEXTURE_2D, 1, GL.GL_RGBA8, W, H, mo[], UInt64(0))
-        # single mip level: the default MIN filter would leave the texture incomplete
+        # single mip level: the default min filter would leave the texture incomplete
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
         GL.glGetError() == 0 || error("GL import of the shared texture failed")
@@ -317,7 +311,7 @@ function presentgpu!(player::Player, clip::Clip, srcframe::Integer;
     try
         # source = the streaming decoder (disk→VRAM) or a decoded CPU frame (one upload)
         src = stream !== nothing ? stream : source !== nothing ? source : player.frame[]
-        # the CANVAS, not the layer: a clip's crop, reframe and rotation are baked
+        # the canvas, not the layer: a clip's crop, reframe and rotation are baked
         # in by the composite's "place" pass here, exactly as the export bakes
         # them — it is the same `composite` call, differing only in `sourcefor`
         W, H = canvassize(player.sequence)
@@ -354,7 +348,7 @@ end
 """
     streamed(player, clips) -> Bool
 
-Whether this stack can go down the zero-copy path: every layer that DECODES has
+Whether this stack can go down the zero-copy path: every layer that decodes has
 a GPU stream ready.
 
 `!decodable` first, and that is the fix it carries: a scene clip decodes nothing
@@ -363,7 +357,7 @@ frame it was on. One scene in the stack pushed the WHOLE composite onto the CPU
 present — canvas read back to the host, then Makie's image→texture path, ~2 MB a
 frame — while the identical timeline without it stayed on the blit. Measured on
 the lego project: 12.1 fps with the scene, 32.6 without, and 9.4 with the scene
-BAKED, which is what proved the cost was the path and not the drawing.
+baked, which is what put the cost on the path rather than the drawing.
 """
 streamed(player::Player, clips) =
     all(c -> !decodable(c.source) || haskey(player.gpucache, readerkey(player.sequence, c)),
@@ -393,7 +387,7 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer;
         prerenderscenes!(clips, n)
         ok = runowned(player) do
             composite(player.engine, clips, n,
-                      # only a DECODING layer is asked; a scene brings its own
+                      # only a decoding layer is asked; a scene brings its own
                       (clip, _) -> get(player.gpucache, readerkey(player.sequence, clip), nothing);
                       canvas = (W, H), applytracks = player.applytracks[],
                       playing = player.playing[], chunks = chunks) do canvas
@@ -415,7 +409,7 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer;
 end
 
 """
-Advance `stream`'s decode toward frame `n` WITHOUT rendering or presenting: the
+Advance `stream`'s decode toward frame `n` without rendering or presenting: the
 settle path (a parked playhead) refines a cold seek across a few of these calls
 while the last exact image stays on screen. Returns `false` when the decode
 errored — the caller then falls through to the CPU lane, which decodes it exactly.
@@ -436,13 +430,13 @@ end
 
 """
 Advance every layer of a multi-track composite toward timeline frame `n`; `true`
-once they are ALL exactly decoded. A composite blends the layers into one image,
+once they are all exactly decoded. A composite blends the layers into one image,
 so a single stand-in among them dates the whole frame.
 """
 function primecomposite!(player::Player, clips::Vector{Clip}, n::Integer)
     ready = true
     for clip in clips
-        # a layer that DECODES has a stream; a scene renders its own frames and
+        # a layer that decodes has a stream; a scene renders its own frames and
         # has none — see `streamed`. Indexing blind threw a `KeyError` naming the
         # whole `SceneSource` the moment a scene reached this path.
         stream = get(player.gpucache, readerkey(player.sequence, clip), nothing)
@@ -461,7 +455,7 @@ end
 Point the preview plot back at its OWN texture before a CPU `frame`-notify present
 (scrub thumbnails, gap fills, the CPU fallback lane). GLMakie's notify-upload writes
 into the texture the render object currently holds — uploading linear CPU pixels
-into the imported optimal-tiled EXTERNAL texture shreds the on-screen image. The
+into the imported optimal-tiled external texture shreds the on-screen image. The
 next GPU present swaps the external texture back in. No-op on CPU-only players.
 """
 function showcpuframe!(player::Player)
@@ -478,7 +472,7 @@ end
 const GPU_STREAM_CAPACITY = 120
 
 """
-Open a stream for one CLIP under its [`readerkey`](@ref) — its source when clips
+Open a stream for one clip under its [`readerkey`](@ref): its source when clips
 can share a read head, its own id when they cannot. Two clips of one file that
 overlap further apart than the ring each get a stream, so neither has to seek.
 """
@@ -490,7 +484,8 @@ Open a streaming GPU decoder ([`GpuVideoStream`]) over `source` so its clips pla
 back purely on the GPU — Vulkan-Video decode into a bounded VRAM ring, no CPU
 decode or per-frame upload. A no-op (playback stays on the CPU decode path) unless
 the GPU preview is live and the stream is hardware-decodable at the display size.
-Cheap — demux + `mmap` + GOP index only; frames decode on demand. Call it off the
+Cheap: demux, `mmap` and the GOP index only, with frames decoded on demand. Call
+it off the
 UI thread; playback uses the CPU path until the stream is ready.
 """
 function preloadgpu!(player::Player, source::VideoSource; key = source)
@@ -599,7 +594,7 @@ function startmezzanine!(player::Player, source::VideoSource)
         delete!(jobs, source.path)          # the file is there now; retries may re-run
         delete!(get!(() -> Set{String}(), player.fxwidgets, :gpuprobed), source.path)
         preloadgpu!(player, source)         # opens ON the mezzanine (cache path)
-        player.playing[] || put!(player.uiqueue, () -> notify(player.playhead))
+        player.playing[] || put!(player.uiqueue, () -> showplayhead!(player))
     catch e
         player.jobprogress[] = NaN
         setstatus!(player, "mezzanine transcode failed: $(sprint(showerror, e))")
@@ -622,7 +617,9 @@ function autodetectgpu!(player::Player)
         rungpusync(player) do
             Lava.vk_context().video_decode_available
         end
-    catch
+    catch e
+        # a silent false here is how GPU decode gets demoted to the CPU unnoticed
+        @warn "GPU decode probe failed — staying on the CPU" exception = (e, catch_backtrace())
         false
     end
     capable || return nothing
@@ -637,7 +634,7 @@ function autodetectgpu!(player::Player)
     end
     setstatus!(player, "GPU playback on — hardware decode + effects on the GPU")
     # re-present on the MAIN thread (GL context is main-thread-owned; this runs off it)
-    player.playing[] || put!(player.uiqueue, () -> notify(player.playhead))
+    player.playing[] || put!(player.uiqueue, () -> showplayhead!(player))
     return nothing
 end
 

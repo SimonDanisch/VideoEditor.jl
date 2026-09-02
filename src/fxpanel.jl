@@ -1,14 +1,16 @@
-# The Effects panel — ONE list of cards for the selected clip.
+# The Effects panel: one list of cards for the selected clip.
 #
 # What this replaces: an Inspector that listed "effects" and a Tools dock that
 # listed "tools", with two card builders, two sets of widget helpers and a line
 # between them nobody could draw. Blur was an effect; Stabilize was a tool; both
 # are things you put on a clip and see in the render.
 #
-# Cards are `Makie.Card`s, so folding, selecting and FILTERING never rebuild
-# anything: they set an attribute and the layout closes up. The stack is rebuilt
-# only when the clip's set of effects changes — which is also when a rebuild is
-# the honest answer, because there is a different card in it.
+# Nothing here rebuilds. A card belongs to its effect (`Effect.card`) and a row's
+# widgets belong to their parameter (`Param.view`), so adding an effect builds one
+# card, removing one deletes it, and switching clips hides one set and shows
+# another. What it replaces: a signature over the whole stack, compared on every
+# playhead move, driving a teardown-and-rebuild that a per-clip cache then had to
+# make affordable.
 
 """
 What a card body is built against: the player, the slot the card belongs to, and
@@ -24,10 +26,10 @@ const EffectContext = ToolContext
 """
     fxfilter(player) -> Observable{String}
 
-The Effects panel's filter query. Lives on the player because the palette and
-MCP can set it too ("show me the color effects").
+The Effects panel's filter query. On the panel because the palette and MCP can set
+it too ("show me the color effects").
 """
-fxfilter(player::Player) = player.fxwidgets[:fxquery]::Observable{String}
+fxfilter(player::Player) = player.fxpanel.query
 
 "Does `kind` match the filter `q`? Its label, its description or any parameter label."
 function kindmatches(kind::EffectKind, q::AbstractString)
@@ -43,62 +45,12 @@ end
 # `EffectKind`.
 kindmatches(::Nothing, q::AbstractString) = isempty(q)
 
-
-"""
-    CardSet
-
-A CLIP'S OWN CARDS, kept so that going back to it does not build them again.
-
-Building is Makie `Block` construction — a parameter row is a label, a slider, a
-grid and three buttons, about 5 ms each — so the lego project's scene clip cost
-**3.2 to 3.6 seconds every time it was selected**, measured, not once. Nothing
-about those widgets goes stale in between: they are bound to a clip and an
-effect, and `refreshfxrows!` derives what they show from the playhead.
-
-So each clip gets a sub-layout of the card stack that is ITS cards, built once.
-Leaving the clip hides them; coming back shows them again and swaps in the
-registries the rest of the panel reads. `sig` is what the cards were built from —
-[`effsig`](@ref) and [`docsig`](@ref) — so adding an effect still rebuilds, into
-the same sub-layout.
-
-**Not a cache.** There is no eviction policy and no bound, because there is
-nothing to bound: a clip's cards exist exactly as long as the clip does, and the
-sequence says which clips those are. Anything keyed to a clip that is gone is
-dropped when the next stack is put away.
-
-**A stack per sub-layout, never shared cells.** The first attempt let two stacks
-share `stackgl`'s cells, on the reasoning that a hidden `Card` reports zero height
-so only one of them has a size. True of the LAYOUT, and it says nothing about the
-render objects, so it was not worth relying on.
-"""
-mutable struct CardSet
-    const layout::GridLayout
-    const slot::Int
-    sig::Any
-    const cards::Vector{Makie.Card}
-    const kinds::Vector{Union{Nothing, EffectKind}}
-    const rows::Vector{ParamRow}
-    const sliders::Dict{Tuple{UInt64, Symbol}, Makie.Slider}
-    const tips::Vector{Pair{Any, String}}
-end
-
-"""
-Off switch for [`CardSet`](@ref): with it off the cards go straight into the
-shared stack and are deleted on every change, the way they were before.
-
-Not a tuning knob — a CONTROL. It is how "the editor segfaults when you switch
-clips" was shown to be nothing to do with keeping cards: three runs each way,
-three crashes each way. An off switch that still changes the structure would have
-proved nothing, so this one really does take the old path.
-"""
-const KEEPCARDS = Ref(true)
-
 """
 Build the Effects panel into `gridpos`.
 
-Layout, top to bottom: the title with the keyframe-curve toggle, which clip is
-being edited, "+ Add effect…", the filter box, then the card stack, then the
-global before/after button. Everything below the title scrolls.
+Layout, top to bottom: the title with the keyframe overview, "+ Add effect…", the
+filter box, which clip is being edited, the bake row, then the card stack, then
+the tool-only cards. Everything below the title scrolls.
 """
 function buildfxpanel!(player::Player, gridpos, uicolors)
     fxscroll = Subfigure(gridpos; scroll_speed = 70, scrollbar_size = 9,
@@ -106,22 +58,20 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
                          scrollbar_thumb_color = Makie.lerp_oklab(RGBf(Makie.to_color(uicolors.background)),
                                                                   RGBf(1, 1, 1), 0.34),
                          scrollbar_thumb_color_active = uicolors.accent)
-    player.fxwidgets[:fxscroll] = fxscroll
     player.fxwidgets[:uicolors] = uicolors   # tool card bodies draw in the editor's palette
     wiretoolcards!(player)
     panel = GridLayout(fxscroll[1, 1]; valign = :top)
     head = GridLayout(panel[1, 1])
     Label(head[1, 1], "Effects"; font = :bold, halign = :left, tellwidth = false)
-    # The EYE bypasses the whole stack — the compare-with-the-original button
-    # that used to sit at the bottom of the panel, as a 24px toggle instead of a
-    # full-width bar. Same idea as the per-card eye, one level up.
+    # The eye bypasses the whole stack: the compare-with-the-original toggle,
+    # the per-card eye one level up.
     headflat = (buttoncolor = (:transparent, 0.0), strokewidth = 0, cornerradius = 4,
                 buttoncolor_hover = uicolors.accent_subtle,
                 buttoncolor_active = uicolors.accent, width = 26, height = 22,
                 halign = :right)
     eyeb = Button(head[1, 2]; label = map(a -> a ? "◉" : "○", player.applytracks),
                   headflat...)
-    on(_ -> (player.applytracks[] = !player.applytracks[]; notify(player.playhead)),
+    on(_ -> (player.applytracks[] = !player.applytracks[]; showplayhead!(player)),
        eyeb.clicks)
     on(player.applytracks; update = true) do on_
         eyeb.buttoncolor[] = on_ ? uicolors.surface : uicolors.accent
@@ -129,34 +79,31 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     end
     tips = get(player.fxwidgets, :tips, nothing)
     tips === nothing || (tips[eyeb] = "Bypass every effect on this clip")
-    # ◆ OPENS the animated-parameter overview rather than being an opaque
-    # all-or-nothing toggle (Simon, 2026-07-31: "what is this button doing?").
+    # ◆ opens the animated-parameter overview rather than toggling all lanes.
     kfb = Button(head[1, 3]; label = "◆", headflat...)
     tips === nothing || (tips[kfb] = "Animated parameters on this clip")
     on(_ -> openkeyframes!(player), kfb.clicks)
-    # the keyframe-curve overlay toggle configures the timeline overlay that the
-    # cards' ◆ accessories feed, so it belongs to this panel's head
 
     # ---------------------------------------------------------------- add menu
-    # Directly under the title: adding and finding an effect are what the panel
-    # is FOR, so they come before anything describing what is already there.
-    # Effects AND the tool-only kinds. The panel shows what the user PUT there and
-    # nothing else, so a clip with no effects has an empty stack; a tool that is
-    # not a clip effect still has to be findable, and this searchable menu is
-    # where you look. Selecting one opens its card instead of adding an effect.
+    # Directly under the title, before anything describing the current stack.
+    # Lists effects and the tool-only kinds: the stack shows only what the user
+    # put there, so a tool that is not a clip effect is reachable only here.
+    # Selecting one opens its card instead of adding an effect.
     menuopts() = vcat([(k.label, k.name) for k in addablekinds()],
                       [(k.label, k.name) for k in toolonlykinds()])
-    # The menu is the ONLY way to reach a tool-only kind now, so what it offers is
-    # a fact worth asserting on rather than reading off the widget's internals.
+    # The menu is the only way to reach a tool-only kind, so its options are
+    # exposed for the tests to assert on rather than read off the widget.
     player.fxwidgets[:fxmenuopts] = menuopts
     addmenu = Menu(panel[2, 1]; prompt = "+  Add effect…", default = nothing,
                    searchable = true, search_placeholder = "type to filter…",
                    options = menuopts(), tellwidth = false)
-    # EFFECTS is a GLOBAL registry, so this listener outlives the player unless it
-    # is taken off again — see `:fxglobalobs` below.
-    menuobs = on(EFFECTS.version) do _
-        addmenu.options[] = menuopts()
-    end
+    # A kind registered at run time changes what can be ADDED, and nothing else:
+    # the cards on screen describe effects that are already there. This is the one
+    # thing that still listens to the registry — it used to drive a rebuild of the
+    # whole stack. `EFFECTS` is module-level, so the listener outlives the player
+    # unless taken off again; `close` does that (see `Player.globallisteners`).
+    push!(player.globallisteners,
+          on(_ -> (addmenu.options[] = menuopts()), EFFECTS.version))
     on(addmenu.selection) do sel
         sel === nothing && return
         addmenu.i_selected[] = 0     # back to the prompt; re-fires with nothing
@@ -175,7 +122,6 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
 
     # ------------------------------------------------------------------ filter
     query = Observable("")
-    player.fxwidgets[:fxquery] = query
     filterrow = GridLayout(panel[3, 1])
     filterbox = Textbox(filterrow[1, 1]; placeholder = "filter effects…", width = Makie.Relative(1.0),
                         tellwidth = false, reset_on_defocus = false)
@@ -187,21 +133,21 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
                        color = uicolors.text_muted, tellwidth = false)
     player.fxwidgets[:fxfilterbox] = filterbox
 
-    # …and which clip this all applies to labels the stack, right above it
-    target = map(player.playhead, player.timeline.selected) do n, _
-        loc = editclip(player)
-        loc === nothing && return "▸ no clip at the playhead"
-        c = loc[1]; i = something(findfirst(x -> x === c, player.sequence.clips), 0)
-        fps = player.sequence.framerate
-        "▸ clip $i · $(basename(sourcepath(c.source))) ($(timestring(c.start / fps))–$(timestring(clipend(c) / fps)))"
-    end
-    Label(panel[4, 1], target; halign = :left, fontsize = 11, color = uicolors.accent,
+    # …and which clip this all applies to labels the stack, right above it. Its
+    # text names the clip's SPAN, so it follows three different facts: which clip
+    # is selected, where the playhead is, and the clip's own in/out. The third one
+    # is not an observable, so the write says it — see `retitle!`, called from
+    # `Clip`'s `setproperty!`. Deriving from the first two alone left the header
+    # reading the pre-split length after every cut.
+    title = Observable(cliptitle(player))
+    player.fxwidgets[:cliptitle] = title
+    onany((_...) -> retitle!(player), player.playhead, player.timeline.selected)
+    Label(panel[4, 1], title; halign = :left, fontsize = 11, color = uicolors.accent,
           tellwidth = false)
 
-    # THE BAKE, one row, for every clip. Not a scene feature: an expensive stack on
-    # ordinary footage is worth pre-rendering for the same reason, so the state
-    # ("no bake" / "in use" / "out of date") and the way to change it belong where
-    # the clip's effects are, not in a dialog you have to know exists.
+    # One bake row per clip, for scenes and ordinary footage alike: the state
+    # ("no bake" / "in use" / "out of date") and the way to change it belong with
+    # the clip's effects rather than in a separate dialog.
     bakerow = GridLayout(panel[5, 1])
     bakelabel = Label(bakerow[1, 1], ""; halign = :left, fontsize = 10,
                       color = uicolors.text_muted, tellwidth = false)
@@ -217,9 +163,9 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
         loc = editclip(player)
         clip = loc === nothing ? nothing : loc[1]
         b = clip === nothing ? nothing : clip.bake
-        # Both buttons stay put. A `Button` has no `visible` here, and hiding one
-        # would move the row's layout under the reader anyway; the LABEL says what
-        # there is to do, and the command refuses with a reason when there is none.
+        # Both buttons stay put: hiding one would move the row's layout while it
+        # is being read. The label says what there is to do, and the command
+        # refuses with a reason when there is nothing.
         bakelabel.text[] =
             clip === nothing ? "" :
             b === nothing ? "no bake — the graph renders every frame" :
@@ -234,296 +180,24 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     on(_ -> refreshbake(), player.playhead)
     refreshbake()
 
-    # `measurable!`: a GridLayout with no content has no determinable height, and
-    # ONE such row makes the whole panel indeterminable — which stretches it to
-    # fill the dock (rows then share the slack, so a short panel floats in the
-    # middle) AND leaves `Subfigure.contentsize` at zero, so a long list never
-    # gets a scrollbar. Both symptoms, one cause.
-    stackgl = measurable!(GridLayout(panel[6, 1]; valign = :top, default_rowgap = 0))
+    # `measurable!`: a row with no content has no determinable height, and one such
+    # row makes the whole panel indeterminable. That stretches it to fill the dock
+    # (rows share the slack, so a short panel floats in the middle) and leaves
+    # `Subfigure.contentsize` at zero, so a long list gets no scrollbar.
+    #
+    # Row 0 as well as row 1: that is where `showemptystate!` puts its labels, and
+    # taking them away again left the row behind with nothing in it.
+    stackgl = measurable!(GridLayout(panel[6, 1]; valign = :top, default_rowgap = 0), 0, 1)
+    colsize!(stackgl, 1, Makie.Relative(1.0))
+    # …and below the clip's own effects, the tools that are not clip effects. Its
+    # own layout, because those cards belong to the panel rather than to any clip:
+    # the crop scope and the transcript stay put when the playhead crosses a cut.
+    toolgl = measurable!(GridLayout(panel[7, 1]; valign = :top, default_rowgap = 0))
+    colsize!(toolgl, 1, Makie.Relative(1.0))
 
-    # The live cards, in stack order, and the contexts their bodies built into.
-    cards = Card[]
-    # `nothing` is allowed: a card may have no `EffectKind` behind it.
-    # `kindmatches` has a method for that; this vector being narrowed to
-    # `EffectKind` is what threw when the first such card appeared.
-    cardkinds = Union{Nothing, EffectKind}[]
-    bodyctxs = EffectContext[]
-    strays = Any[]        # blocks that are not cards (the empty state), to delete on rebuild
-    player.fxwidgets[:fxcards] = cards
-    player.fxwidgets[:fxcardkinds] = cardkinds
-
-    # ------------------------------------------------------------ kept stacks
-    # See [`CardSet`](@ref): one sub-layout of `stackgl` per CLIP, kept and toggled
-    # rather than rebuilt. Rows come from a free list, so a dropped clip gives its
-    # row back and the outer grid never grows past the clips being kept.
-    stacks = Dict{Any, CardSet}()       # clip id (or `:noclip`) → its cards
-    livekey = Ref{Any}(nothing)         # which clip the cards on screen belong to
-    livesig = Ref{Any}(nothing)         # …and what they were built from
-    livegl = Ref{Any}(nothing)          # …and the sub-layout they are built into
-    liveslot = Ref(0)
-    freeslots = Int[]
-    lastslot = Ref(0)
-    takeslot!() = isempty(freeslots) ? (lastslot[] += 1) : pop!(freeslots)
-    stackkey(clip) = clip === nothing ? :noclip : clip.id
-
-    "Hide the cards the query rules out, in one relayout. Never rebuilds."
-    function applyfilter()
-        q = query[]
-        shown = 0
-        gl = livegl[] === nothing ? stackgl : livegl[]
-        filter_cards!(gl, cards) do card
-            i = findfirst(c -> c === card, cards)::Int
-            keep = kindmatches(cardkinds[i], q)
-            keep && (shown += 1)
-            keep
-        end
-        countlabel.text[] = isempty(q) ? "" :
-            "$shown of $(length(cards)) shown · Esc clears"
-        return
-    end
-    on(_ -> applyfilter(), query)
-
-    "Take the tooltips of the stack that is leaving, so nothing hovers a hidden button."
-    function taketips!()
-        fxtips = get(player.fxwidgets, :fxtips, nothing)
-        alltips = get(player.fxwidgets, :tips, nothing)
-        (fxtips === nothing || alltips === nothing) && return Pair{Any, String}[]
-        kept = Pair{Any, String}[b => alltips[b] for b in fxtips if haskey(alltips, b)]
-        foreach(b -> delete!(alltips, b), fxtips)
-        empty!(fxtips)
-        return kept
-    end
-
-    "Give the live stack its own row of `stackgl` and a layout to build into."
-    function newstack!()
-        liveslot[] = takeslot!()
-        livegl[] = GridLayout(stackgl[liveslot[], 1])
-        return livegl[]
-    end
-
-    "Throw the live stack away for good, and give its row back."
-    function dropstack!()
-        foreach(Makie.delete!, cards)
-        foreach(Makie.delete!, strays)
-        gl = livegl[]
-        if gl !== nothing
-            gc = Makie.GridLayoutBase.gridcontent(gl)
-            gc === nothing || Makie.GridLayoutBase.remove_from_gridlayout!(gc)
-            push!(freeslots, liveslot[])
-        end
-        livegl[] = nothing; liveslot[] = 0
-        return nothing
-    end
-
-    "Delete a kept clip's cards and give its row back."
-    function dropset!(set::CardSet)
-        foreach(Makie.delete!, set.cards)
-        gc = Makie.GridLayoutBase.gridcontent(set.layout)
-        gc === nothing || Makie.GridLayoutBase.remove_from_gridlayout!(gc)
-        push!(freeslots, set.slot)
-        return nothing
-    end
-
-    "Hide the live stack and keep it as `key`'s, so going back is a visibility flip."
-    function keepstack!(key, sig)
-        set = CardSet(livegl[], liveslot[], sig, copy(cards), copy(cardkinds),
-                      copy(player.fxrows), copy(player.fxsliders), taketips!())
-        filter_cards!(_ -> false, set.layout, cards)
-        stacks[key] = set
-        livegl[] = nothing; liveslot[] = 0
-        # A CLIP'S CARDS LIVE AS LONG AS THE CLIP. No eviction policy, no bound:
-        # the sequence says which clips exist, so the ones that no longer do are
-        # simply gone, and nothing else can accumulate.
-        alive = Set{Any}(c.id for c in player.sequence.clips)
-        push!(alive, :noclip)
-        for (k, s) in stacks
-            k in alive && continue
-            delete!(stacks, k)
-            dropset!(s)
-        end
-        return nothing
-    end
-
-    "Put a filed stack back on screen."
-    function restorestack!(set::CardSet)
-        livegl[] = set.layout; liveslot[] = set.slot
-        append!(cards, set.cards); append!(cardkinds, set.kinds)
-        append!(player.fxrows, set.rows); merge!(player.fxsliders, set.sliders)
-        fxtips = get(player.fxwidgets, :fxtips, nothing)
-        alltips = get(player.fxwidgets, :tips, nothing)
-        if fxtips !== nothing && alltips !== nothing
-            for (b, txt) in set.tips
-                alltips[b] = txt
-                push!(fxtips, b)
-            end
-        end
-        # …only undoing the blanket hide. Which cards the FILTER wants is
-        # `applyfilter`'s call, and it runs in `finishstack!` right after.
-        filter_cards!(_ -> true, set.layout, cards)
-        return nothing
-    end
-
-    """
-    What both routes end with: a stack is on screen, so say what it is bound to,
-    redraw the lanes from that, honour the filter, and derive what the rows show.
-    Shared because a RESTORED stack owes the reader exactly what a built one does.
-    """
-    function finishstack!(clip, keepscroll)
-        # WHAT THE CARDS ARE BOUND TO — the one answer to "which clip and which
-        # effects are being edited". The timeline lanes read this instead of
-        # asking `editclip` themselves: a card's sliders and its keyframe lane
-        # belong to the same (clip, effect), so they must not be able to disagree
-        # about which one that is.
-        player.fxwidgets[:fxbound] =
-            clip === nothing ? nothing : (clip, Effect[fx for fx in clip.effects])
-        # …and redraw the lanes from it, HERE, rather than leaving them to the
-        # playhead handler: both run on a playhead move and the order between
-        # them is not fixed, so the lanes would show the previous card set.
-        let f = get(player.fxwidgets, :kfrefresh, nothing)
-            f === nothing || f()
-        end
-        colsize!(stackgl, 1, Makie.Relative(1.0))
-        livegl[] === nothing || colsize!(livegl[], 1, Makie.Relative(1.0))
-        applyfilter()          # a rebuild must honour the filter that is showing
-        # The rows show whatever value they were BUILT (or last refreshed) with.
-        # Deriving them here rather than waiting for the next playhead move is what
-        # makes a freshly drawn card show the frame you are on.
-        refreshfxrows!(player)
-        fxscroll.scroll[] = keepscroll
-        # …and again once the layout has settled: `contentsize` is recomputed from
-        # the layout's bbox, which may land after this call returns, and the clamp
-        # that runs with it would undo the line above.
-        put!(player.uiqueue, () -> (fxscroll.scroll[] = keepscroll))
-        return nothing
-    end
-
-    lastsig = Ref{Any}(:init)
-    function rebuildstack(; force::Bool = false)
-        force && (lastsig[] = :force)
-        # NOBODY IS LOOKING: skip the whole teardown and rebuild. The stack is
-        # rebuilt on every clip boundary, which during playback is every cut — and
-        # paying ~30 ms for cards behind a hidden dock is a stutter bought for
-        # nothing. `opendock!` forces a rebuild when the panel comes back, so this
-        # cannot leave stale cards on screen; `lastsig` is deliberately NOT updated
-        # here, so the catch-up rebuild still sees a changed signature.
-        if player.dockopen[] !== :effects && !force
-            return
-        end
-        loc = editclip(player)
-        clip = loc === nothing ? nothing : loc[1]
-        sig = (effsig(clip), docsig(player.sequence, clip))
-        sig == lastsig[] && return
-        lastsig[] = sig
-
-        # Emptying the layout drops `contentsize` to zero for an instant, and the
-        # Subfigure clamps the scroll to fit — so adding an object, or a card
-        # appearing, threw the reader back to the top of the list. Put it back
-        # after; the Subfigure re-clamps if the list really did get shorter.
-        keepscroll = fxscroll.scroll[]
-        key = stackkey(clip)
-
-        # THE CARDS ON SCREEN: keep them for their clip, or throw them away.
-        # Keepable means the stack owns nothing outside its own cards — a tool
-        # context draws into the panel's SCENE, and an empty state is not worth
-        # keeping — see [`CardSet`](@ref).
-        if KEEPCARDS[] && livekey[] !== nothing && !isempty(cards) && isempty(bodyctxs) && isempty(strays)
-            keepstack!(livekey[], livesig[])
-        else
-            foreach(cleartoolcontext!, bodyctxs); empty!(bodyctxs)
-            haskey(player.fxwidgets, :toolpanels) && empty!(player.fxwidgets[:toolpanels])
-            # the ? tips point at buttons this rebuild is about to delete, and the
-            # hover loop walks every entry — a stale one is a phantom hover target
-            taketips!()
-            # the image cards a body added (loop references, matte marks) are plots in
-            # the panel's SCENE, not in its layout — rebuilding the layout leaves them
-            # drawn, floating over whatever replaced them
-            cleartoolcards!(player)
-            dropstack!()
-            # the shared stack only needs reclaiming when the cards went into it
-            KEEPCARDS[] || Makie.trim!(stackgl)
-        end
-        empty!(cards); empty!(cardkinds); empty!(strays)
-        # …and the rows, which are the bindings between the widgets and their
-        # parameters. `paramform!` fills this again as the cards go back up; a kept
-        # stack carries its own copy and puts it back.
-        empty!(player.fxrows); empty!(player.fxsliders)
-        livekey[] = key; livesig[] = sig
-
-        # ALREADY BUILT FOR THIS CLIP, and still describing it? Then showing it is
-        # the whole of the work.
-        kept = get(stacks, key, nothing)
-        if kept !== nothing
-            delete!(stacks, key)
-            if kept.sig == sig
-                restorestack!(kept)
-                finishstack!(clip, keepscroll)
-                return
-            end
-            # its clip gained or lost an effect: the cards are wrong, the row is free
-            dropset!(kept)
-        end
-        # OFF MEANS OFF: with the feature disabled the cards go straight into the
-        # shared stack the way they always did, so the two paths can be compared on
-        # the same session. An off switch that still changes the structure is not a
-        # control, it is a second experiment.
-        mine = KEEPCARDS[] ? newstack!() : stackgl
-
-        # rows the empty state consumed, so the tool cards below start clear of it
-        skip = 0
-        # The empty state is only empty if NOTHING else is going in the stack. It
-        # used to key on the clip alone, so a 3D scene's card appeared directly
-        # under the words "No effects on this clip."
-        if clip === nothing
-            append!(strays, emptystate!(mine, 1, "No clip at the playhead.",
-                        "Move the playhead onto a clip to give it effects.", uicolors))
-            skip = 1
-        elseif isempty(clip.effects)
-            append!(strays, emptystate!(mine, 1, "No effects on this clip.",
-                        "Add one above, or press Ctrl+P.", uicolors))
-            skip = 1
-        else
-            for slot in clip.effects
-                card, ctx = fxcard!(player, mine, length(cards) + 1, clip, slot, uicolors)
-                push!(cards, card)
-                push!(cardkinds, kindofslot(slot))
-                if ctx !== nothing
-                    push!(bodyctxs, ctx)
-                    get!(() -> Dict{Symbol, Any}(), player.fxwidgets, :toolpanels)[ctx.tool] = ctx
-                end
-            end
-        end
-        # …and UNDER them, the tools that are not clip effects at all — see
-        # `toolonlycard!`. Outside the `isempty(clip.effects)` branch on purpose:
-        # the crop and the transcript are reachable on a clip with no effects on
-        # it, which is exactly when somebody is most likely to want the crop.
-        if clip !== nothing
-            for kind in opentools(player)
-                card, ctx = toolonlycard!(player, mine, length(cards) + 1 + skip,
-                                          kind, uicolors)
-                push!(cards, card)
-                push!(cardkinds, kind)
-                push!(bodyctxs, ctx)
-                get!(() -> Dict{Symbol, Any}(), player.fxwidgets, :toolpanels)[ctx.tool] = ctx
-            end
-        end
-        finishstack!(clip, keepscroll)
-        return
-    end
-    player.fxwidgets[:fxlistrefresh] = rebuildstack
-    on(_ -> rebuildstack(), player.playhead)
-    # A kind whose card body has live content (the matte's marks, its object bars,
-    # its preview thumbnails) asks for a rebuild by bumping the registry version.
-    # That used to be the Tools dock's cue; it is this panel's now, and losing it
-    # is why the matte stopped showing anything after the first mark.
-    stackobs = on(_ -> rebuildstack(force = true), EFFECTS.version)
-    # Both of these hang off a global registry, so a closed player keeps reacting
-    # to every effect-registry bump for the rest of the process. That is not a
-    # slow leak, it is a live fault: the dead player's handler `put!`s onto its
-    # closed `uiqueue` and throws, and `notify` abandons the remaining listeners —
-    # so the LIVE player's panel silently stops rebuilding, and its Matte card
-    # loses the button that was about to be clicked. `close` takes them off again.
-    player.fxwidgets[:fxglobalobs] = Any[menuobs, stackobs]
-    rebuildstack()
+    player.fxpanel = FxPanel(fxscroll, stackgl, toolgl, query, countlabel, uicolors)
+    on(_ -> applyfilter!(player), query)
+    showclip!(player)
 
     # Esc clears the filter — the one key everyone tries first.
     on(events(player.fig).keyboardbutton; priority = 26) do ev
@@ -537,7 +211,7 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
 
     merge!(player.fxwidgets, Dict{Symbol, Any}(
         :addeffect => addmenu, :compare => eyeb, :bypassall => eyeb,
-        :fxapplyfilter => applyfilter,
+        :fxapplyfilter => () -> applyfilter!(player),
         # "take me to this effect" — the Stabilize controls used to live in a
         # dock of their own, and this is what replaced knowing that
         :showkind => (name::Symbol) -> showkind!(player, name),
@@ -547,20 +221,379 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     return panel
 end
 
+# ---------------------------------------------------------------- card ownership
+
+"""
+    showclip!(player[, clip]) -> nothing
+
+Show `clip`'s cards and hide whatever was up before.
+
+The whole of "the selection changed": a clip's cards live as long as the clip, so
+this is a visibility flip, plus a build for effects that have no card yet — one
+just added, or one an undo brought back. Nothing is compared against the screen.
+
+`clip` defaults to [`editclip`](@ref)'s, which is what the panel is FOR: the
+selected clip, else the one under the playhead.
+"""
+function showclip!(player::Player, clip::Union{Nothing, Clip} = selectedclip(player))
+    panel = player.fxpanel
+    panel === nothing && return nothing
+    old = player.shownclip
+    old === clip && return nothing
+    # A solo is a temporary view of the clip being edited, so leaving it ends the
+    # solo — while `old` is still the shown one, or the restore would be applied to
+    # the wrong clip's parameters and `old`'s lanes would stay hidden for good.
+    unsolo!(player)
+    old === nothing || setcardsvisible!(player, old, false)
+    player.shownclip = clip
+    keep = panel.scroll.scroll[]
+    if clip !== nothing
+        # the panel always says which stabilization this clip carries
+        player.stabinfo[] = stabdescription(clip.motiontrack)
+        buildcards!(player, clip)
+        setcardsvisible!(player, clip, true)
+    end
+    showemptystate!(player, clip)
+    applyfilter!(player)
+    # Filling or emptying the layout moves `contentsize`, and the Subfigure clamps
+    # the scroll to fit — so a card appearing threw the reader back to the top of
+    # the list. Put it back; the Subfigure re-clamps if the list really did get
+    # shorter. Twice, because `contentsize` is recomputed from the layout's bbox
+    # and that can land after this call returns.
+    panel.scroll.scroll[] = keep
+    put!(player.uiqueue, () -> (panel.scroll.scroll[] = keep))
+    return nothing
+end
+
+"""
+    stackrow!(panel, clip) -> Int
+
+The row of the card stack `clip`'s cards live in.
+
+A clip keeps its row for as long as the panel does, so an undo that brings a
+deleted clip back builds into the row it had. One row per clip that has ever been
+selected, which is bounded by the clips in the project.
+
+The row is anchored as it is minted: a clip that leaves the document takes its
+sub-layout out of the stack ([`dropcards!`](@ref)) and would otherwise leave an
+empty row behind — see [`measurable!`](@ref) for what that costs.
+"""
+stackrow!(panel::FxPanel, clip::Clip) =
+    get!(panel.rows, clip.id) do
+        r = (panel.lastrow += 1)
+        measurable!(panel.stack, (1:r)...)
+        return r
+    end
+
+"""
+    buildcards!(player, clip) -> nothing
+
+Give every effect of `clip` a card, for the ones that have none.
+
+Usually nothing to do: cards are built once and kept. An effect added by
+[`addeffect!`](@ref) gets its card there; this covers the ones that arrive another
+way — a project loaded, an undo restoring an effect that was removed, a scene clip
+whose parameters appear only once it has rendered.
+"""
+function buildcards!(player::Player, clip::Clip)
+    panel = player.fxpanel
+    if clip.cardlayout === nothing
+        # `measurable!` from the start: a clip with no effects has an empty
+        # sub-layout, and an empty row is what takes the panel's height away.
+        clip.cardlayout = measurable!(GridLayout(panel.stack[stackrow!(panel, clip), 1];
+                                                 valign = :top, default_rowgap = 0))
+        colsize!(clip.cardlayout, 1, Makie.Relative(1.0))
+    end
+    any(fx -> fx.card === nothing, clip.effects) || return nothing
+    # One layout pass for the whole stack instead of one per block. `cardlayout`
+    # hangs in the stack, so blocking the parent stops the chain below it.
+    # Measured on the lego scene: 3062 → 2633 ms, 1450 → 1225 MB.
+    Makie.GridLayoutBase.with_updates_suspended(panel.stack) do
+        for fx in clip.effects
+            fx.card === nothing && buildcard!(player, clip, fx)
+        end
+    end
+    placelanes!(player.timeline, clip)   # the lanes those rows just created
+    return nothing
+end
+
+"""
+    buildcard!(player, clip, fx) -> Card
+
+Build `fx`'s card into `clip`'s row of the stack, and hang it on the effect.
+
+Its row in that layout is the effect's position in the stack, so reordering the
+stack is a row write rather than a rebuild.
+"""
+function buildcard!(player::Player, clip::Clip, fx::Effect)
+    panel = player.fxpanel
+    # An effect has ONE card. Overwriting `fx.card` would leave the old one
+    # undeletable and still drawing — and still taking clicks, at the very
+    # rectangle its replacement occupies.
+    fx.card === nothing || dropcard!(fx)
+    clip.cardlayout === nothing && buildcards!(player, clip)
+    row = something(findfirst(s -> s === fx, clip.effects), length(clip.effects))
+    # …and this row can be emptied again, by `dropcard!` — anchor it, so removing
+    # the effect above another one does not cost the panel its scrollbar.
+    measurable!(clip.cardlayout, (1:row)...)
+    card, ctx = fxcard!(player, clip.cardlayout, row, clip, fx, panel.uicolors)
+    fx.card = card
+    # …and the tool's state hangs on the effect beside its card, so `dropcard!`
+    # takes it down with the card rather than leaving it listening.
+    fx.tool = ctx
+    ctx === nothing ||
+        (get!(() -> Dict{Symbol, Any}(), player.fxwidgets, :toolpanels)[ctx.tool] = ctx)
+    return card
+end
+
+"""
+    derive(f, obs) -> (derived, registration)
+
+An Observable computed from `obs`, together with the registration that feeds it.
+
+`map(f, obs)` hands back only the Observable, so nothing can ever unhook it: the
+widget it feeds is deleted and the listener stays on `obs` for the rest of the
+session, recomputing a label for a button that is gone. Every derived widget
+attribute over an observable that outlives the widget goes through this instead,
+and the registration goes wherever that widget's lifetime is written down —
+`blockscene.deregister_callbacks` for a card, [`ParamView`](@ref) for a lane.
+
+`map` is right where the source dies with the widget (a local Observable, a
+button's own state); it is only the ones reaching up to the player, the effect or
+the parameter that leak.
+"""
+function derive(f, obs::Observable)
+    out = Observable(f(obs[]))
+    return out, on(o -> (out[] = f(o)), obs)
+end
+
+"""
+    cliptitle(player) -> String
+
+What the Effects panel says it is aimed at: which clip, from which file, and the
+span it covers.
+"""
+function cliptitle(player::Player)
+    c = selectedclip(player)
+    c === nothing && return "▸ no clip selected"
+    i = something(findfirst(x -> x === c, player.sequence.clips), 0)
+    fps = player.sequence.framerate
+    return "▸ clip $i · $(basename(sourcepath(c.source))) " *
+           "($(timestring(c.start / fps))–$(timestring(clipend(c) / fps)))"
+end
+
+"""
+    retitle!(player) -> nothing
+    retitle!(clip) -> nothing
+
+Say again what the panel is aimed at.
+
+The clip form is what a write to a clip's in/out calls, and only when that clip is
+the one on screen: a span is not an observable, so nothing would recompute the
+header otherwise, and it went on reading the pre-split length after every cut.
+"""
+function retitle!(player::Player)
+    t = get(player.fxwidgets, :cliptitle, nothing)
+    t === nothing && return nothing
+    s = cliptitle(player)
+    t[] == s || (t[] = s)
+    return nothing
+end
+
+function retitle!(clip::Clip)
+    player = editorof(clip)
+    (player === nothing || selectedclip(player) !== clip) && return nothing
+    return retitle!(player)
+end
+
+"""
+    buildcardfor!(clip, fx) -> nothing
+
+Give `fx` a card, if `clip` is open in an editor and is the one on screen.
+
+Called from [`addslot!`](@ref), where an effect joins the document. A clip that is
+in no editor — one being built, one in an undo snapshot, one on the clipboard —
+has no panel to build into and no card to build; a clip that is not the one being
+shown gets its cards when it becomes so ([`showclip!`](@ref)).
+"""
+function buildcardfor!(clip::Clip, fx::Effect)
+    # One that already has a card is being re-seated, not added — a restore
+    # rebuilds `clip.effects` in the snapshot's order and hands every entry back
+    # through `addslot!`. Rebuilding here would throw away the cards of everything
+    # the undo did not touch, along with their fold state.
+    fx.card === nothing || return nothing
+    player = editorof(clip)
+    (player === nothing || player.shownclip !== clip) && return nothing
+    buildcard!(player, clip, fx)
+    placelanes!(player.timeline, clip)
+    showemptystate!(player, clip)
+    applyfilter!(player)
+    return nothing
+end
+
+"""
+    rebuildcard!(player, clip, fx) -> nothing
+
+Build `fx`'s card again — for the two edits that change what a row IS rather than
+what it shows: binding a parameter to an input takes its slider away, and cutting
+the edge gives it back.
+"""
+function rebuildcard!(player::Player, clip::Clip, fx::Effect)
+    dropcard!(fx)
+    buildcard!(player, clip, fx)
+    placelanes!(player.timeline, clip)
+    applyfilter!(player)
+    return nothing
+end
+
+"""
+    dropcard!(fx) -> nothing
+
+Delete `fx`'s card and everything its rows drew: the widgets, and every
+parameter's lane on the timeline.
+
+Called where an effect leaves the document — taken off the stack, or dropped by an
+undo — because that is the only moment at which its drawing becomes meaningless.
+"""
+function dropcard!(fx::Effect)
+    for p in fx.params
+        v = p.view
+        v === nothing && continue
+        # from wherever it is drawn — the plot knows, which is what lets this be
+        # said from `clips.jl`, where an effect leaves the document and no panel
+        # is in reach
+        Makie.delete!(Makie.parent_scene(v.lane), v.lane)
+        foreach(Observables.off, v.regs)   # …and what the lane derived, see `derive`
+        p.view = nothing
+    end
+    # Before the card: the context's rows and controls are blocks inside it, and
+    # its listeners fire on the playhead and the selection. Left behind, one of
+    # them redraws its list into a layout whose scene has just been freed.
+    cleartoolcontext!(fx.tool)
+    fx.tool = nothing
+    fx.card === nothing || Makie.delete!(fx.card)
+    fx.card = nothing
+    return nothing
+end
+
+"""
+    dropcards!(clip) -> nothing
+
+Delete every card of `clip` and take its sub-layout out of the stack.
+
+Called where the clip leaves the document — deleted, or dropped by an undo — for
+the reason [`dropcard!`](@ref) is: that is the moment its drawing stops meaning
+anything. Takes no player, so `clips.jl` can say it at the two places that know.
+"""
+function dropcards!(clip::Clip)
+    foreach(dropcard!, clip.effects)
+    clip.cardlayout === nothing && return nothing
+    gc = Makie.GridLayoutBase.gridcontent(clip.cardlayout)
+    gc === nothing || Makie.GridLayoutBase.remove_from_gridlayout!(gc)
+    clip.cardlayout = nothing
+    return nothing
+end
+
+"Show or hide every card of `clip`, in one relayout."
+setcardsvisible!(player::Player, clip::Clip, on::Bool) =
+    (clip.cardlayout === nothing ||
+         filter_cards!(_ -> on, clip.cardlayout, cardsof(clip));
+     nothing)
+
+"The cards of `clip`'s effects that have been built."
+cardsof(clip::Clip) = Card[fx.card for fx in clip.effects if fx.card !== nothing]
+
+"""
+    applyfilter!(player) -> nothing
+
+Hide the cards the query rules out, in one relayout per stack. Never rebuilds.
+"""
+function applyfilter!(player::Player)
+    panel = player.fxpanel
+    panel === nothing && return nothing
+    q = panel.query[]
+    clip = player.shownclip
+    shown = 0
+    total = 0
+    if clip !== nothing && clip.cardlayout !== nothing
+        fxs = [fx for fx in clip.effects if fx.card !== nothing]
+        total += length(fxs)
+        filter_cards!(clip.cardlayout, Card[fx.card for fx in fxs]) do card
+            i = findfirst(fx -> fx.card === card, fxs)::Int
+            keep = kindmatches(kindofslot(fxs[i]), q)
+            keep && (shown += 1)
+            keep
+        end
+    end
+    if !isempty(panel.toolcards)
+        names = collect(keys(panel.toolcards))
+        total += length(names)
+        filter_cards!(panel.tools, Card[panel.toolcards[n] for n in names]) do card
+            i = findfirst(n -> panel.toolcards[n] === card, names)::Int
+            keep = kindmatches(kindbyname(names[i]), q)
+            keep && (shown += 1)
+            keep
+        end
+    end
+    panel.countlabel.text[] = isempty(q) ? "" : "$shown of $total shown · Esc clears"
+    return nothing
+end
+
+"""
+    showemptystate!(player, clip) -> nothing
+
+Say what there is instead of a stack: no clip at the playhead, or a clip with no
+effects on it.
+
+Built and thrown away rather than kept, because it is two `Label`s and it says one
+of exactly three things — one of which is nothing at all, when there are cards to
+look at. The symbol it last said is what stops it being rebuilt on every playhead
+move.
+"""
+function showemptystate!(player::Player, clip::Union{Nothing, Clip})
+    panel = player.fxpanel
+    want = clip === nothing ?
+           (:noclip, "No clip at the playhead.",
+            "Move the playhead onto a clip to give it effects.") :
+           isempty(clip.effects) ?
+           (:noeffects, "No effects on this clip.", "Add one above, or press Ctrl+P.") :
+           nothing
+    said = get(player.fxwidgets, :emptystate, nothing)
+    said === (want === nothing ? nothing : want[1]) && return nothing
+    for b in panel.empty
+        b isa GridLayout ?
+            (gc = Makie.GridLayoutBase.gridcontent(b);
+             gc === nothing || Makie.GridLayoutBase.remove_from_gridlayout!(gc)) :
+            Makie.delete!(b)
+    end
+    empty!(panel.empty)
+    player.fxwidgets[:emptystate] = want === nothing ? nothing : want[1]
+    want === nothing && return nothing
+    # Row 0: above the clips' rows, whichever of them exist. The box goes into
+    # `empty` with its labels — leaving it behind would stack one dead layout per
+    # trip through here.
+    box = GridLayout(panel.stack[0, 1]; alignmode = Makie.Outside(4, 4, 10, 10))
+    push!(panel.empty, box,
+          Label(box[1, 1], want[2]; halign = :left, fontsize = 12,
+                color = panel.uicolors.text, tellwidth = false),
+          Label(box[2, 1], want[3]; halign = :left, fontsize = 11,
+                color = panel.uicolors.text_muted, tellwidth = false))
+    return nothing
+end
+
 "The scene a card's image plots are drawn into — the Effects panel's own."
-contentscene(player::Player) = player.fxwidgets[:fxscroll].scene
+contentscene(player::Player) = player.fxpanel.scroll.scene
 
 """
 Make the tool cards clickable.
 
 A card built by `tooladdcard!` is a picture in this panel's scroll scene plus a
-frame Block — not a Button — so nothing about it takes a click by itself. The
-Tools dock used to dispatch that, and it went with the dock: every loop reference
-card was inert, `onclick` was registered and never called once, and the only way
-to select a reference was to make a new one.
+frame Block, not a Button, so it takes no click by itself. The Tools dock used to
+dispatch that; without it every loop-reference card was inert and `onclick` was
+never called.
 
-BELOW the default priority, so the × Button inside a card's own header still wins
-its press; the hit test is the frame's computed bbox, topmost card first.
+Below the default priority, so the × Button in a card's own header still wins its
+press. The hit test is the frame's computed bbox, topmost card first.
 """
 function wiretoolcards!(player::Player)
     on(events(player.fig).mousebutton; priority = -1) do event
@@ -589,9 +622,8 @@ end
 Run a kind's `body` with its card slots pointed at `gridpos`.
 
 A body says `toolaction!(ctx, ...)`, `toolrows!(ctx, ...)`, `tooladdcard!(ctx, ...)`
-and each lands in a named slot. Those slots used to be cells of the Tools dock;
-now they are cells of this card, which is the whole point — the same body code
-builds into the Effects panel with nothing changed but where it points.
+and each lands in a named slot. The slots were cells of the Tools dock and are now
+cells of this card, so the same body code builds into the Effects panel.
 
 The slots are made `measurable!` because a GridLayout with no content has no
 determinable height, and one such slot hides the height of everything above it —
@@ -606,100 +638,24 @@ function withtoolslots!(build::Function, player::Player, ctx::EffectContext, gri
     slots[1][ctx.tool] = measurable!(GridLayout(gl[1, 1]))
     slots[2][ctx.tool] = measurable!(GridLayout(gl[2, 1]))
     cards[1][ctx.tool] = measurable!(GridLayout(gl[3, 1]))
-    # …and one BELOW the cards, for the action that acts on the whole list. "Apply
-    # matte to clip" printed above the list of marked frames read as a control for
-    # something further up; an action goes under what it consumes.
+    # …and one below the cards, for the action that acts on the whole list: "Apply
+    # matte to clip" above the marked frames reads as a control for something
+    # further up.
     slots[3][ctx.tool] = measurable!(GridLayout(gl[4, 1]))
-    # The four slots sit flush. GridLayout's default rowgap is 16, and three gaps
-    # between four slots is ~48 px of empty band under every tool card's header —
-    # paid whether or not the slot below it holds anything, which for most tools
-    # is three times out of four. The CONTENT provides its own separation (a card
-    # has padding, stacked actions have their own gap), so the slots do not need
-    # to. Not zero: a few pixels still reads as "these are different areas".
+    # The four slots sit nearly flush. GridLayout's default rowgap of 16 is ~48 px
+    # of empty band under every tool card's header, paid whether or not the slots
+    # below hold anything. The content separates itself (a card has padding,
+    # stacked actions have their own gap); a few pixels still marks the areas.
     rowgap!(gl, 4)
     build()
     return gl
 end
 
-"The panel's resting state: what is here, and what to do about it."
-function emptystate!(gl, row::Integer, title::AbstractString, hint::AbstractString, uicolors)
-    # a ROW, not a hardcoded 1: the tool-only cards share this stack, and an empty
-    # state pinned to row 1 sat underneath the first of them
-    box = GridLayout(gl[row, 1]; alignmode = Makie.Outside(4, 4, 10, 10))
-    return [Label(box[1, 1], title; halign = :left, fontsize = 12, color = uicolors.text,
-                  tellwidth = false),
-            Label(box[2, 1], hint; halign = :left, fontsize = 11, color = uicolors.text_muted,
-                  tellwidth = false)]
-end
-
-"""
-    docsig(seq, clip) -> Tuple
-
-The part of the rebuild signature that is NOT on the clip's effect stack.
-
-`effsig` reads the clip and only the clip, which was right while the panel showed
-clip effects and nothing else. It now also hosts the tool-only cards — Narration,
-Transcript, Crop, Time interpolation — and those read the SEQUENCE. Without this
-the signature never changed when they did, `rebuildstack` returned early, and a
-narration line you had just typed did not appear on the card that added it.
-
-Deliberately cheap: this runs on every playhead move. Captions hash by value
-(small immutable structs), narration by its fields rather than by `hash(nar)` —
-a `Narration` carries its rendered SAMPLES, and hashing a minute of audio on
-every frame change would be a real cost for a summary that never needed it.
-"""
-docsig(seq, clip) =
-    (length(seq.captions), hash(seq.captions), seq.canvas,
-     Tuple((n.text, n.at, n.voice, isempty(n.samples)) for n in seq.narration),
-     clip === nothing ? nothing : (clip.timeinterp, clip.rate, clip.crop),
-     # …and WHETHER THE SCENE HAS BEEN BUILT. What a scene clip offers comes from
-     # the realized scene (`sceneattributes`), which does not exist until the clip
-     # has rendered once — and the panel is built when the Player is, which is
-     # before that. Without this the card was drawn empty at startup and never
-     # again, because nothing else in the signature changes when the scene
-     # appears: opening the lego project showed a "Scene" card with none of its
-     # seven animated parameters on it.
-     scenebuilt(clip))
-
-"""
-Whether this clip's scene is realized yet — `false` for anything that is not a
-scene clip, so it is a constant for every other card and cannot cause a rebuild.
-
-`objectid` of the live scene rather than a bare `true`: switching backend or
-canvas replaces it, and the rows come from the new one.
-"""
-scenebuilt(::Nothing) = false
-scenebuilt(clip::Clip) = scenebuilt(clip.source)
-scenebuilt(::ClipSource) = false
-scenebuilt(src::SceneSource) = src.live === nothing ? UInt(0) : objectid(src.live)
-
-"""
-The signature that decides whether the card stack still describes the clip: which
-slots, in which order, enabled or not, and which parameters are animated. Folding,
-selecting and filtering are NOT in it — they are card attributes now, and changing
-one must not throw the panel away.
-"""
-effsig(clip) = clip === nothing ? nothing :
-    (clip.id,
-     # `renderable` FIRST, and short-circuiting: a data entry (the `:scene`) has
-     # no payload, so asking `op` for one calls a `make` that is deliberately
-     # `nothing`. Its kind is its identity.
-     Tuple((s.id, s.enabled,
-            renderable(s) ? nameof(typeof(op(s))) : s.kind,
-            renderable(s) && op(s) isa PluginEffect ? op(s).name : :_) for s in clip.effects),
-     # which parameters are animated, which are DRIVEN, and which lanes are open —
-     # all three change what the cards show, and none is on the effect's identity
-     # above. A driven parameter has no slider, so binding one is a rebuild.
-     Tuple((fx.id, Tuple(p.name for p in fx.params if isanimated(p)),
-            Tuple(p.name for p in fx.params if p.input !== nothing),
-            Tuple(p.name for p in fx.params if p.visible)) for fx in clip.effects))
-
 """
     addeffect!(player, name) -> Bool
 
-Put effect kind `name` on the clip under the playhead, at its defaults. The one
-place that adds an effect — the menu, the palette and MCP all come through here,
-so they cannot drift apart.
+Put effect kind `name` on the clip under the playhead, at its defaults, and build
+its card. The menu, the palette and MCP all come through here.
 """
 function addeffect!(player::Player, name::Symbol)
     loc = editclip(player)
@@ -714,11 +670,35 @@ function addeffect!(player::Player, name::Symbol)
     end
     clip = loc[1]
     snapshot!(player)
-    addslot!(clip, Effect(k.make(defaults(k))))
-    selectfxcard!(player, (:fx, clip.effects[end].id))
+    fx = addslot!(clip, Effect(k.make(defaults(k))))
+    # …and this clip's cards are the ones on screen, the new entry's included: an
+    # effect without a card is exactly what `showclip!` builds. Calling
+    # `buildcard!` here as well built a SECOND card for the same effect and
+    # overwrote `fx.card` with it — the first was then unreachable and undeletable,
+    # while its widgets kept their mouse handlers and kept claiming clicks at the
+    # rectangle the live card now occupies. A `Menu` so orphaned swallowed the
+    # release that would have opened the live one.
+    showclip!(player, clip)
+    showemptystate!(player, clip)
+    applyfilter!(player)
+    selectfxcard!(player, (:fx, fx.id))
     setstatus!(player, "added $(k.label) — tune it below (Ctrl+Z removes)")
-    notify(player.playhead)      # rebuilds the stack + re-presents
+    showplayhead!(player)
     return true
+end
+
+"""
+    removeeffect!(player, clip, fx) -> nothing
+
+Take `fx` off `clip` and delete its card — the inverse of [`addeffect!`](@ref).
+"""
+function removeeffect!(player::Player, clip::Clip, fx::Effect)
+    removeslot!(clip, fx.id)
+    dropcard!(fx)
+    showemptystate!(player, clip)
+    applyfilter!(player)
+    showplayhead!(player)
+    return nothing
 end
 
 """
@@ -727,8 +707,8 @@ end
 Bring effect kind `name` into view on the clip at the playhead: open the Effects
 panel, add the effect if it is not there yet, unfold its card and select it.
 
-The one way to say "put me where this effect is" — the palette uses it, MCP uses
-it, and the tests use it instead of knowing which dock something lives in.
+The single entry point for "put me where this effect is": the palette, MCP and
+the tests use it instead of knowing which dock something lives in.
 """
 function showkind!(player::Player, name::Symbol)
     opendock!(player, :effects)
@@ -746,10 +726,16 @@ function showkind!(player::Player, name::Symbol)
     slot = findfirst(s -> renderable(s) && k.matches !== nothing && k.matches(op(s)),
                      clip.effects)
     slot === nothing && return false
-    id = clip.effects[slot].id
-    selectfxcard!(player, (:fx, id))
-    i = findfirst(c -> c.title[] == k.label, player.fxwidgets[:fxcards])
-    i === nothing || (player.fxwidgets[:fxcards][i].open = true)
+    fx = clip.effects[slot]
+    # …and its card is up. "Bring this into view" has to mean the card exists: the
+    # effect may have been on the clip all along with its card never built (the
+    # dock was closed) or dropped and not yet replaced (an undo). Its body's
+    # widgets are what the caller is about to reach for, and a card that is not
+    # there leaves them pointing at the deleted one.
+    showclip!(player, clip)
+    fx.card === nothing && return false
+    selectfxcard!(player, (:fx, fx.id))
+    fx.card.open = true
     return true
 end
 
@@ -758,38 +744,104 @@ end
 
 The tool-only cards the user has actually opened, in registration order.
 
-They used to ALL render, always. That put four cards on every clip whether or
-not anyone wanted them — Simon: "for a clip without effects that should be
-empty, discovery works via the searchable menu." So the panel now shows what was
-put there and nothing else, and the menu is how a tool that is not a clip effect
-gets found.
+Rendering all of them put four cards on every clip. The panel shows what was put
+there and nothing else; the searchable menu is how a tool that is not a clip
+effect is found.
 """
-function opentools(player::Player)
-    open = get!(() -> Set{Symbol}(), player.fxwidgets, :opentools)
-    return filter(k -> k.name in open, toolonlykinds())
-end
+opentools(player::Player) =
+    player.fxpanel === nothing ? EffectKind[] :
+    filter(k -> haskey(player.fxpanel.toolcards, k.name), toolonlykinds())
 
 """
     opentool!(player, name) -> nothing
 
-Put a tool-only card on the panel (the menu's answer to "add" for a kind that is
-not a clip effect), and select it so it is where the eye already is.
+Put a tool-only card on the panel — the menu's "add" for a kind that is not a clip
+effect. Already open, it stays as it is.
 """
 function opentool!(player::Player, name::Symbol)
-    push!(get!(() -> Set{Symbol}(), player.fxwidgets, :opentools), name)
+    panel = player.fxpanel
     k = kindbyname(name)
-    setstatus!(player, k === nothing ? "opened $(name)" :
-                       "$(k.label) — its × closes it again")
-    r = get(player.fxwidgets, :fxlistrefresh, nothing)
-    r === nothing || r(force = true)
+    if k === nothing || haskey(panel.toolcards, name)
+        setstatus!(player, k === nothing ? "no tool named “$(name)”" :
+                           "$(k.label) is already open")
+        return nothing
+    end
+    placetoolcard!(player, k)
+    setstatus!(player, "$(k.label) — its × closes it again")
     return nothing
 end
 
-"Take a tool-only card off the panel again."
-function closetool!(player::Player, name::Symbol)
-    delete!(get!(() -> Set{Symbol}(), player.fxwidgets, :opentools), name)
-    r = get(player.fxwidgets, :fxlistrefresh, nothing)
-    r === nothing || r(force = true)
+"""
+    placetoolcard!(player, kind) -> Card
+
+Build `kind`'s card into the panel's tool row and record it.
+
+A fixed row per kind — its place in the registry — so opening or closing one does
+not move the others.
+"""
+function placetoolcard!(player::Player, kind::EffectKind)
+    panel = player.fxpanel
+    row = something(findfirst(x -> x.name === kind.name, toolonlykinds()), 1)
+    # …its × empties this row again, and the rows of the kinds before it in the
+    # registry were never filled in the first place.
+    measurable!(panel.tools, (1:row)...)
+    card, ctx = toolonlycard!(player, panel.tools, row, kind, panel.uicolors)
+    panel.toolcards[kind.name] = card
+    get!(() -> Dict{Symbol, Any}(), player.fxwidgets, :toolpanels)[ctx.tool] = ctx
+    applyfilter!(player)
+    return card
+end
+
+"Delete a tool-only card and everything its body drew. `false` if it was not open."
+function droptoolcard!(player::Player, name::Symbol)
+    panel = player.fxpanel
+    panel === nothing && return false
+    card = get(panel.toolcards, name, nothing)
+    card === nothing && return false
+    delete!(panel.toolcards, name)
+    ctx = get(get(player.fxwidgets, :toolpanels, Dict{Symbol, Any}()), name, nothing)
+    ctx === nothing || cleartoolcontext!(ctx)
+    Makie.delete!(card)
+    # The row is empty now, and the layout has to be told: deleting a block takes
+    # it out of the grid but leaves the layout reporting the height it had, so the
+    # panel kept 34 px of nothing under the stack for every card ever closed.
+    Makie.GridLayoutBase.update!(panel.tools)
+    return true
+end
+
+"Take a tool-only card off the panel again, with everything its body drew."
+closetool!(player::Player, name::Symbol) =
+    (droptoolcard!(player, name) && applyfilter!(player); nothing)
+
+"""
+    rebuildtoolcard!(player, name) -> nothing
+
+Build tool `name`'s card again, for an edit that changes what the card IS rather
+than what it shows — the crop card's scope toggle and its size readout, and a
+tool being switched on or off ([`activatetool!`](@ref)).
+
+Either kind of card: a tool-only one on the panel, or the card of the tool's own
+slot on the shown clip (the loop finder's, the matte's). A no-op when neither is
+up.
+
+The state change really is a different card and not a different label: the loop
+finder's one action reads "Find similar frames" in both states, but off it turns
+the tool ON and running it adds another reference frame — which of the two the
+button carries is decided where the body is built. Cards are built once and kept,
+so nothing else would ever replace it, and the card built while the tool was off
+went on offering to turn it on: the second "Find" switched the tool back off.
+"""
+function rebuildtoolcard!(player::Player, name::Symbol)
+    if droptoolcard!(player, name)
+        k = kindbyname(name)
+        k === nothing || placetoolcard!(player, k)
+        return nothing
+    end
+    clip = player.shownclip
+    clip === nothing && return nothing
+    fx = findslot(clip, name)
+    fx === nothing && return nothing
+    rebuildcard!(player, clip, fx)
     return nothing
 end
 
@@ -798,13 +850,11 @@ end
 
 Whether a tool-only card starts unfolded.
 
-Open when the tool HAS something to show — narration lines, a transcript, a clip
-that is actually retimed — and folded otherwise. Making these four render at all
-was the fix for them being invisible; leaving all four permanently expanded on
-every clip was the over-correction, and turned the panel into a scroll of things
-you are mostly not using. Folded still shows the header, so nothing is hidden.
+Open when the tool has something to show — narration lines, a transcript, a
+retimed clip — and folded otherwise, which still shows the header. All four
+expanded on every clip fills the panel with cards that are mostly empty.
 
-Crop is never open by default: it is a tool you reach for, not a thing you read.
+Crop is never open by default: it is reached for, not read.
 """
 function toolcardopen(kind, player::Player)
     seq = player.sequence
@@ -818,24 +868,23 @@ function toolcardopen(kind, player::Player)
 end
 
 """
-    toolonlycard!(player, stackgl, row, kind, uicolors) -> (card, ctx)
+    toolonlycard!(player, toolgl, row, kind, uicolors) -> (card, ctx)
 
-A card for a kind that is NOT a clip effect — it has a body and no `make`.
+A card for a kind that is not a clip effect: a body and no `make`.
 
-`rebuildstack` builds its cards from `clip.effects`, which is right for
-everything that IS one: Blur, Matte, Stabilize all reach the panel because their
-effect sits on the clip. A kind with no `make` can never get there, so
-`registertool!` — whose whole job is registering exactly that shape — produced
+The card stack is built from `clip.effects`, which covers Blur, Matte and
+Stabilize — their effect sits on the clip. A kind with no `make` never gets there,
+so `registertool!` — whose whole job is registering exactly that shape — produced
 panels that could not appear. It went unused after the Tools dock was removed,
 which is why nothing noticed until four of them were written against it.
 
 These are the project- and sequence-level tools (the crop scope, the transcript,
-the narration, the retime mode). They belong under the clip's effects, not
-inside them, and they have no slot, no bypass eye and no keyframes — which is
-why this is its own builder rather than another branch through `fxcard!`.
+the narration, the retime mode). They belong under the clip's effects, not inside
+them, and they have no slot, no bypass eye and no keyframes — which is why this is
+its own builder rather than another branch through `fxcard!`.
 """
-function toolonlycard!(player::Player, stackgl, row::Integer, kind, uicolors)
-    card = Card(stackgl[row, 1]; title = kind.label,
+function toolonlycard!(player::Player, toolgl, row::Integer, kind, uicolors)
+    card = Card(toolgl[row, 1]; title = kind.label,
                 selected = false,
                 open = toolcardopen(kind, player),
                 backgroundcolor = Makie.lerp_oklab(RGBf(Makie.to_color(uicolors.background)),
@@ -853,7 +902,6 @@ function toolonlycard!(player::Player, stackgl, row::Integer, kind, uicolors)
                       labelcolor = uicolors.text_muted, flat...)
         tips = get(player.fxwidgets, :tips, nothing)
         tips === nothing || (tips[help] = wraptext(kind.description, 46))
-        push!(get!(() -> Any[], player.fxwidgets, :fxtips), help)
     end
     # …and a × like every other card has. A card the menu can open has to be
     # closable from the card, not only by finding the menu entry again.
@@ -878,26 +926,34 @@ end
 toolonlykinds() = filter(k -> k.body !== nothing && k.make === nothing, effectkinds())
 
 """
-The kind behind a stack entry: recognised from its PAYLOAD where it has one, and
-by name where it does not.
+The kind behind a stack entry: from its payload where it has one, by name where it
+does not.
 
-A data entry (the `:scene`) has no payload to recognise — that is what
-[`renderable`](@ref) says — so asking `effectkindfor(op(slot))` would try to build
-one. Its name is the answer, and its name is what it was registered under.
+A data entry (the `:scene`) has no payload — see [`renderable`](@ref) — so
+`effectkindfor(op(slot))` would try to build one. Its registered name is the
+answer.
 """
 kindofslot(slot::Effect) =
     renderable(slot) ? effectkindfor(op(slot)) : kindbyname(slot.kind)
 
 """
-One card: the effect's name in the header, its enable toggle and remove ×
-in the accessory, its parameters and its own body inside.
+One card: the effect's name in the header, its enable toggle and remove × in the
+accessory, its parameters and its own body inside.
+
+What the header shows is derived — the selection highlight from
+`player.fxselection`, the eye from `fx.enabled` — so selecting a card or bypassing
+an effect is a write, not a rebuild of the stack.
 """
 function fxcard!(player::Player, stackgl, row::Integer, clip::Clip, slot::Effect, uicolors)
     kind = kindofslot(slot)
     title = kind === nothing ? String(slot.kind) : kind.label
     key = (:fx, slot.id)
-    card = Card(stackgl[row, 1]; title,
-                selected = fxselected(player) == key,
+    # Derived, and unhooked with the card: `player.fxselection` and `slot.enabled`
+    # both outlive it, and `map` would leave a listener on each per card ever
+    # built. Measured before this: 20 rebuilds of one card left 20 listeners on
+    # `fxselection` and 40 on `enabled`.
+    selected, selreg = derive(s -> s == key, player.fxselection)
+    card = Card(stackgl[row, 1]; title, selected,
                 backgroundcolor = Makie.lerp_oklab(RGBf(Makie.to_color(uicolors.background)),
                                                    RGBf(1, 1, 1), 0.075),
                 headercolor = uicolors.surface,
@@ -905,52 +961,57 @@ function fxcard!(player::Player, stackgl, row::Integer, clip::Clip, slot::Effect
                 strokecolor = uicolors.border,
                 selectioncolor = uicolors.select,
                 titlecolor = uicolors.text)
+    push!(card.blockscene.deregister_callbacks, selreg)
     on(_ -> selectfxcard!(player, key), card.headerclicks)
 
     acc = GridLayout(card_accessory(card))
-    # FLAT: no fill, no stroke, just the glyph with a hover tint. The header
-    # already has a background and, when selected, an outline — a button drawing
-    # a third box inside that reads as clutter (Simon: "this looks bad").
+    # Flat: no fill, no stroke, the glyph with a hover tint. The header already
+    # has a background and, when selected, an outline; a button drawing a third
+    # box inside those reads as clutter.
     flat = (buttoncolor = (:transparent, 0.0), strokewidth = 0, cornerradius = 3,
             buttoncolor_hover = uicolors.accent_subtle,
             buttoncolor_active = uicolors.accent, height = 20)
-    # WHAT IT DOES, on hover. The tool descriptions are instructions ("CLICK the
-    # subject, right-click marks what is NOT it, then Enter") — real information,
-    # but printed in the card they cost a third of its height and pushed the
-    # controls out of sight. A ? in the title bar keeps them one hover away, on
-    # every effect card that has one.
+    # The description on hover: the tool descriptions are instructions, and printed
+    # in the card they cost a third of its height and push the controls out of
+    # sight. A ? in the title bar keeps them one hover away.
     if kind !== nothing && !isempty(kind.description)
-        help = Button(acc[1, 1]; label = "?", width = 18, fontsize = 11,
+        help = Button(acc[1, 2]; label = "?", width = 18, fontsize = 11,
                       labelcolor = uicolors.text_muted, flat...)
         tips = get(player.fxwidgets, :tips, nothing)
         tips === nothing || (tips[help] = wraptext(kind.description, 46))
-        push!(get!(() -> Any[], player.fxwidgets, :fxtips), help)
     end
-    # An EYE, not a toggle: the same gesture and the same glyph as the panel's
-    # bypass-everything eye, so "is this applied" reads identically at both levels.
-    eye = Button(acc[1, 2]; label = slot.enabled ? "◉" : "○", width = 22,
-                 fontsize = 12, flat...)
+    # The same glyph and gesture as the panel's bypass-everything eye, so "is this
+    # applied" reads the same at both levels. Glyph and colour are both derived
+    # from the flag the RENDER reads, so there is one answer to "is this on".
+    eyeglyph, eyereg = derive(e -> e ? "◉" : "○", slot.enabled)
+    eyetint, tintreg = derive(e -> e ? uicolors.text : uicolors.text_muted, slot.enabled)
+    append!(card.blockscene.deregister_callbacks, (eyereg, tintreg))
+    eye = Button(acc[1, 3]; label = eyeglyph, labelcolor = eyetint,
+                 width = 22, fontsize = 12, flat...)
     on(eye.clicks) do _           # off keeps the parameters; every render path skips it
         snapshot!(player)
-        slot.enabled = !slot.enabled
-        eye.label[] = slot.enabled ? "◉" : "○"
-        eye.labelcolor[] = slot.enabled ? uicolors.text : uicolors.text_muted
-        notify(player.playhead)
+        slot.enabled[] = !slot.enabled[]
+        showplayhead!(player)
     end
-    eye.labelcolor[] = slot.enabled ? uicolors.text : uicolors.text_muted
     player.fxwidgets[Symbol(:fxeye_, slot.id)] = eye
-    rm = Button(acc[1, 3]; label = "×", width = 20, fontsize = 13,
+    rm = Button(acc[1, 4]; label = "×", width = 20, fontsize = 13,
                 labelcolor = uicolors.text_muted, flat...)
     colgap!(acc, 2)
     on(rm.clicks) do _
         snapshot!(player)
-        removeslot!(clip, slot.id)
+        removeeffect!(player, clip, slot)
         setstatus!(player, "removed $title (Ctrl+Z restores)")
-        notify(player.playhead)
     end
     player.fxwidgets[Symbol(:fxremove_, slot.id)] = rm
 
-    kind === nothing && return card, nothing
+    # A kind the registry no longer knows has no parameters to mint, so its ∿ can
+    # be built here — everything below only applies to a kind that IS known.
+    kind === nothing &&
+        (player.fxwidgets[Symbol(:fxlane_, slot.id)] =
+             laneeye!(player, acc[1, 1], slot.params, uicolors,
+                      card.blockscene.deregister_callbacks;
+                      width = 20, fontsize = 12, flat...);
+         return card, nothing)
     # A card whose action is running says so — the highlight the Tools dock used
     # to put on its header.
     on(activetoolname(player); update = true) do a
@@ -962,26 +1023,34 @@ function fxcard!(player::Player, stackgl, row::Integer, clip::Clip, slot::Effect
     # grouping gets one section per group and a filter box over them. For the ten
     # kinds that declare a flat list of scalars it is exactly the rows it always
     # drew.
-    # ASK WHAT THERE IS TO SHOW, do not assume it is already on the entry. For the
-    # ten kinds that declare scalars, `paramsections` hands back exactly those. For
-    # a SCENE the rows come from the realized scene and the parameters are MADE
-    # from them — so a freshly inserted scene clip has an empty `params` and a card
-    # full of rows, and `isempty(slot.params)` skipped the build that would have
-    # created them. "Add a bar" put a clip on the timeline whose card was blank.
+    # Ask `paramsections` what there is to show rather than reading `slot.params`.
+    # For the ten kinds that declare scalars it hands back exactly those; for a
+    # scene the rows come from the realized scene and the parameters are made from
+    # them, so a freshly inserted scene clip has empty `params` and a full card.
+    # Testing `isempty(slot.params)` skipped the build that creates them.
     secs = paramsections(clip, slot)
     isempty(secs) ||
         (r += 1; sectionform!(player, card[r, 1], clip, slot, uicolors; sections = secs))
+    # The whole card's lanes, in the header's leftmost accessory cell. Not an ◉/○:
+    # that pair means "is this effect applied" two buttons to the right, and in the
+    # panel's own header — see `laneeye!`.
+    #
+    # AFTER `paramsections`, which is what MINTS a scene clip's parameters: built
+    # before it, this hung its listeners on an empty list, and the ∿ then reported
+    # the state from before the last click.
+    player.fxwidgets[Symbol(:fxlane_, slot.id)] =
+        laneeye!(player, acc[1, 1], slot.params, uicolors,
+                 card.blockscene.deregister_callbacks;
+                 width = 20, fontsize = 12, flat...)
     ctx = nothing
-    # SLOTS FOR EVERY KIND ON THE STACK, body or no body. A body is one way to
-    # fill them; the other is a tool that builds its cards while it runs — the
-    # loop finder pushes a reference card per Find, from an analysis that ends
-    # long after the panel was drawn. Without slots `toolcard!` has nowhere to
-    # build and returns 0, which is a tool that reports a result nobody can see.
+    # Slots for every kind on the stack, body or no body: a tool can also build
+    # cards while it runs — the loop finder pushes a reference card per Find, from
+    # an analysis that ends long after the panel was drawn. Without slots
+    # `toolcard!` has nowhere to build and returns 0.
     if kind.body !== nothing || kind.activate !== nothing
         ctx = EffectContext(player, kind.name)
         r += 1
-        # the body builds into the CARD, next to the parameters it belongs with —
-        # not into a slot in some other panel
+        # the body builds into the card, next to the parameters it belongs with
         ctx.state = nothing
         withtoolslots!(player, ctx, card[r, 1]) do
             kind.body === nothing && return
@@ -993,15 +1062,13 @@ function fxcard!(player::Player, stackgl, row::Integer, clip::Clip, slot::Effect
             end
         end
     end
-    # An action button ONLY for a kind with NO body of its own. A body decides
-    # what its actions are and when to offer them — `mattepanel!` shows "Mark
-    # subject" only while there is nothing marked yet — and a generic button
-    # underneath it is worse than redundant: `activatetool!` TOGGLES, so pressing
-    # it during a marking session ended the session and dropped the points.
+    # An action button only for a kind with no body of its own. A body decides what
+    # its actions are and when to offer them (`mattepanel!` shows "Mark subject"
+    # only while nothing is marked), and `activatetool!` toggles, so a generic
+    # button underneath ends a marking session and drops its points.
     #
-    # (The earlier rule, "unless the body registered callbacks", missed this:
-    #  `mattecard!` builds plain Buttons rather than `toolaction!`s, so it
-    #  registers none and looked to this test like a body with no actions.)
+    # Testing "unless the body registered callbacks" instead misses `mattecard!`,
+    # which builds plain Buttons rather than `toolaction!`s and so registers none.
     if kind.activate !== nothing && kind.body === nothing
         r += 1
         act = Button(card[r, 1]; label = actionlabel(kind), tellwidth = false,
@@ -1031,117 +1098,274 @@ actionlabel(kind::EffectKind) =
     kind.name === :loopfinder ? "Find similar frames" : "Run $(kind.label)"
 
 """
-The parameter rows: a `ParamForm` with the Premiere ◀ ◆ ▶ trio per parameter.
+    showvalue!(control, value) -> nothing
 
-Nothing here listens to the playhead. Each row is registered as a
-[`ParamRow`](@ref) and [`refreshfxrows!`](@ref) derives what it shows — the
-slider's position, the ◆'s state — from the parameter and the playhead, from the
-single listener that owns that job. A row per listener is what this used to do,
-and none of them were ever taken off again.
+Put `value` on the widget that shows it. A no-op where a parameter has no widget
+— a driven one shows the edge's value and owns nothing.
 
-The value handler receives the WHOLE form tuple on every fire, so only parameters
-whose own slider moved since the last one may act — anything else is a synced echo
-(scrubbing keeps animated sliders on their curves, quantized to the slider step),
-and treating those as edits stamped keyframes on parameters nobody touched.
+Dispatch rather than a type test at the call site, and no cast: each method takes
+the parameter's own value and converts what its widget needs.
+"""
+showvalue!(::Nothing, value) = nothing
+showvalue!(sl::Makie.Slider, value) = (Makie.set_close_to!(sl, value); nothing)
+showvalue!(cb::Makie.Checkbox, value) = (cb.checked[] = Bool(value); nothing)
+function showvalue!(m::Makie.Menu, value)
+    i = findfirst(o -> o === value || o == value, Makie.to_value(m.options))
+    i === nothing || (m.i_selected[] = i)
+    return nothing
+end
+
+"""
+    wireedit!(player, target, p, control, derived) -> nothing
+
+Let `control` edit `p` — while the user has hold of it.
+
+The gesture is the DRAG, not the value: moving a slider from code changes its
+value too, and a row that edited on that would write its own display back into
+the curve it came from. Registrations go into `derived`, so they come off with
+the card.
+"""
+function wireedit!(player::Player, target, p::Param, sl::Makie.Slider, derived)
+    push!(derived, on(sl.value) do v
+        sl.dragging[] || return nothing        # …not a gesture, just the display
+        isdriven(p) && return nothing          # its value comes down an edge
+        editparam!(player, target, p, v; frame = playheadframe(player, target))
+    end)
+    return nothing
+end
+
+function wireedit!(player::Player, target, p::Param, cb::Makie.Checkbox, derived)
+    push!(derived, on(cb.checked) do v
+        isdriven(p) || editparam!(player, target, p, v;
+                                  frame = playheadframe(player, target))
+    end)
+    return nothing
+end
+
+wireedit!(::Player, target, ::Param, ::Any, derived) = nothing
+
+"""
+    laneeye!(player, gridpos, p::Param, uicolors, sink; kw...) -> Button
+    laneeye!(player, gridpos, params::Vector{Param}, uicolors, sink; kw...) -> Button
+
+The ∿ that draws or hides lanes on the timeline: click toggles, alt-click solos —
+see [`sololanes!`](@ref).
+
+One glyph for one question, asked at three levels: a row, a section of a card, a
+whole card. ◉/○ is deliberately not reused for it, although the overview modal
+did: that pair already means "is this effect applied", in the card's header and in
+the panel's, and a second eye meaning something else in the same header is how a
+header stops being readable.
+
+A row's ∿ takes the parameter's own colour while its lane is drawn — what the lane
+and the ◆ draw in — so the row says which of the curves down there is its own. A
+group's ∿ is accent while it is the solo, the text colour while any of its lanes
+are drawn, and muted when none is: pressing it has to say whether it did anything.
+
+`sink` is where the registration goes, i.e. wherever the button's lifetime is
+written down: a card's `deregister_callbacks`, or the form's `derived`.
+"""
+function laneeye!(player::Player, gridpos, p::Param, uicolors, sink; kw...)
+    tint, reg = derive(v -> v ? paramcolor(p) : uicolors.text_muted, p.visible)
+    push!(sink, reg)
+    return buildlaneeye!(player, gridpos, p, tint,
+                         "$(p.label) on the timeline · alt-click: only this lane"; kw...)
+end
+
+function laneeye!(player::Player, gridpos, params::Vector{Param}, uicolors, sink; kw...)
+    want = Set{Param}(params)
+    tint = Observable{Any}(uicolors.text_muted)
+    function restate()
+        s = player.lanesolo[]
+        tint[] = s !== nothing && s.on == want ? uicolors.accent :
+                 any(q -> q.visible[], params) ? uicolors.text : uicolors.text_muted
+        return nothing
+    end
+    # One registration per parameter, rather than a single `onany` over all of
+    # them: a scene card's group is two hundred parameters wide, and `onany` would
+    # specialise a closure on a two-hundred-element tuple.
+    push!(sink, on(_ -> restate(), player.lanesolo))
+    for q in params
+        push!(sink, on(_ -> restate(), q.visible))
+    end
+    restate()
+    n = length(curvesof(params))
+    return buildlaneeye!(player, gridpos, params, tint,
+                         "$n curve$(n == 1 ? "" : "s") of $(length(params)) on the timeline · " *
+                         "alt-click: only these"; kw...)
+end
+
+"""
+    buildlaneeye!(player, gridpos, target, tint, tip; kw...) -> Button
+
+The ∿ button itself, once its colour has been worked out. `target` is a `Param`
+for a row and a `Vector{Param}` for a group, and that is what decides — by
+dispatch, in [`togglelanes!`](@ref) and [`sololanes!`](@ref) — whether the gesture
+is filtered to the curves.
+"""
+function buildlaneeye!(player::Player, gridpos, target, tint::Observable,
+                       tip::AbstractString; kw...)
+    eye = Button(gridpos; label = "∿", labelcolor = tint, kw...)
+    tips = get(player.fxwidgets, :tips, nothing)
+    tips === nothing || (tips[eye] = tip)
+    # Alt is read at the click rather than carried by it: a Button reports that it
+    # was pressed and nothing about the keyboard, and the modifier is the whole
+    # difference between "hide this" and "show only this".
+    on(_ -> ispressed(player.fig, Keyboard.left_alt | Keyboard.right_alt) ?
+            sololanes!(player, target) : togglelanes!(player, target),
+       eye.clicks)
+    return eye
+end
+
+"""
+The parameter rows: a `ParamForm` with the Premiere ◀ ◆ ▶ trio per parameter, and
+each parameter's curve on the timeline.
+
+Everything a row SHOWS is derived from `p.curve` and the playhead: the ◆'s glyph
+and colour, the slider's position, and the lane. Nothing is pushed into a row, so
+there is no refresh pass over the rows on screen.
+
+The other direction is the form's own handler, which edits the curve. A slider
+notification is a gesture exactly when the slider DISAGREES with the document at
+this frame — so a sync, which moves it to that value, reports nothing by
+construction. There is no flag saying "this write was not a gesture", nothing to
+silence, and no baseline to keep in step.
 """
 function paramform!(player::Player, pos, target, fx::Effect, uicolors;
                     params::Vector{Param} = fx.params, labels = p -> p.label,
                     labelcolor = uicolors.text, widgetwidth = 104, labelwidth = 80)
-    # THE PARAMETERS OF THIS ENTRY. Not a kind's declared list resolved through a
-    # global index — `fx.params` are the objects themselves, so a row writes to
-    # the parameter it is drawn for and two entries of one kind cannot collide.
-    # The ROW LABEL, which is not always the parameter's own: inside a section
-    # that already says `torso`, a row reading `torso · Angle` spends a third of
-    # the card's width saying it again. The full label is what a timeline lane
-    # and the ◆ overview show, where there is no heading above it to say which
-    # object it belongs to.
+    # This entry's own parameters: `fx.params` are the objects themselves, not a
+    # kind's declared list resolved through an index, so a row writes to the
+    # parameter it is drawn for and two entries of one kind cannot collide.
+    # The row label is not always the parameter's own: inside a section headed
+    # `torso`, a row reading `torso · Angle` repeats it. The full label is what a
+    # timeline lane and the ◆ overview show, where there is no heading.
     fieldsym(p) = Symbol(labels(p))
     frame() = playheadframe(player, target)
     spec = NamedTuple(fieldsym(p) => (Float64(valueat(p, frame())),
                                       Makie.Between(p.range[1], p.range[2]))
                       for p in params)
     kfbuttons = Dict{Symbol, Any}()
+    # What a row derives from the PLAYHEAD, which outlives every card on it. The
+    # handles are kept so they can come off with the form's scene below — `map`
+    # returns the Observable and not the registration, so a derived label built
+    # that way holds its row alive for the rest of the session.
+    derived = Observables.ObserverFunction[]
     accessory = (field, gp) -> begin
         p = params[findfirst(q -> fieldsym(q) === field, params)]
         acc = GridLayout(gp)
-        prevb = Button(acc[1, 1]; label = "◀", width = 16, fontsize = 8,
+        # Whether this row's curve is on the timeline at all — first in the trio's
+        # row because it decides whether there is anything down there to walk.
+        laneb = laneeye!(player, acc[1, 1], p, uicolors, derived;
+                         width = 16, height = 22, fontsize = 11)
+        # Fixed width and height: a Button sizes itself from its label, so ◇ → ◆
+        # reported a new size and relaid out the panel — 85 ms and 34 MB per
+        # character change. Pinned, the write is the glyph and nothing else.
+        prevb = Button(acc[1, 2]; label = "◀", width = 16, height = 22, fontsize = 8,
                        labelcolor = uicolors.text_muted)
-        kf = Button(acc[1, 2]; label = "◇", width = 22, labelcolor = uicolors.text_muted)
-        nextb = Button(acc[1, 3]; label = "▶", width = 16, fontsize = 8,
+        # What the ◆ says is a view of (this curve, this frame): a key sitting
+        # here, a curve with none here, or a value arriving down an edge — in
+        # which case it offers the only edit there is, cutting the edge.
+        # …in the parameter's OWN colour, the one its lane draws in, so a curve on
+        # the timeline can be traced back to the row that owns it.
+        own = paramcolor(p)
+        function kfglyph(c, n)
+            isdriven(p) && return ("⇥", own)
+            animated = length(c.keys) > 1
+            here = animated && any(k -> k.frame == sourceframe(target, n), c.keys)
+            return (here ? "◆" : "◇",
+                    here ? own :
+                    animated ? uicolors.text : uicolors.text_muted)
+        end
+        kfstate = Observable(kfglyph(p.curve[], player.playhead[]))
+        append!(derived, onany((c, n) -> (kfstate[] = kfglyph(c, n)),
+                               p.curve, player.playhead))
+        kf = Button(acc[1, 3]; label = map(first, kfstate),
+                    labelcolor = map(last, kfstate), width = 22, height = 22)
+        nextb = Button(acc[1, 4]; label = "▶", width = 16, height = 22, fontsize = 8,
                        labelcolor = uicolors.text_muted)
         colgap!(acc, 1)
-        # ◀ ▶ walk this parameter's keys; ◆ keys it — EXCEPT when it is driven from
-        # somewhere else, where its value is not this parameter's to author. Then
-        # the middle button is the one thing there is to do about that: cut the
-        # edge and keep the value it was showing.
+        # ◀ ▶ walk this parameter's keys and ◆ keys it, except when it is driven
+        # from elsewhere: its value is not this row's to author, so the middle
+        # button cuts the edge and keeps the value it was showing.
         on(_ -> gotokey!(player, target, p, -1), prevb.clicks)
         on(kf.clicks) do _
-            isdriven(p) ? unbindinput!(player, target, p) : togglekey!(player, target, p)
+            isdriven(p) ? unbindinput!(player, target, fx, p) :
+                          togglekey!(player, target, p)
         end
         on(_ -> gotokey!(player, target, p, 1), nextb.clicks)
         kfbuttons[fieldsym(p)] = kf
         player.fxwidgets[Symbol(:kfacc_, fx.id, :_, p.name)] = (prevb, kf, nextb)
+        player.fxwidgets[Symbol(:kflane_, fx.id, :_, p.name)] = laneb
         acc
     end
-    # `width = nothing` + a flexible widget column: the row FOLLOWS THE PANEL.
-    # With three fixed columns it was 25 px wider than the card that holds it, so
-    # the card's scene cut the ◆ in half and the ▶ never appeared at all — the
-    # keyframe trio was a duo, and nothing in the layout said so.
-    # THE ROW HAS TO FIT THE CARD'S SCENE, and 80 + 104 + 56 + 2 gaps = 256 does,
-    # inside the 268 px it draws into. It used to ask for 88 + 132 + 62 = 298: the
-    # row kept its width, hung over the edge, and the scene cut it off mid-widget —
-    # the ◆ was sliced in half and the ▶ of the keyframe trio never appeared at all.
-    # Nothing in the layout reports an overflow, which is why it survived this long.
+    # `width = nothing` plus a flexible widget column, so the row follows the
+    # panel. The row has to fit the card's scene: 80 + 104 + 73 + 2 gaps = 273
+    # inside the 356 px it draws into. At 88 + 132 + 62 = 298 the row kept its
+    # width, hung over the edge and the scene cut it off mid-widget — the ◆ sliced
+    # in half, the ▶ missing. Nothing in the layout reports an overflow.
     #
-    # A flexible widget column does NOT fix it: the form then fills its CELL, and
-    # the cell is ten pixels wider than the scene that draws it (the card hands out
-    # more than it paints — see the note in `Subfigure`). 56 is what the trio
-    # measures: 16 + 22 + 16 plus two 1 px gaps.
+    # A flexible widget column alone does not fix it: the form then fills its
+    # cell, which is ten pixels wider than the scene that draws it (the card hands
+    # out more than it paints — see the note in `Subfigure`). 73 is what the ∿ and
+    # the trio measure: 16 + 16 + 22 + 16 plus three 1 px gaps.
     pf = Makie.ParamForm(pos, spec, accessory; labelwidth = labelwidth,
                          widgetwidth = widgetwidth,
-                         accessorywidth = 56, rowgap = 4, halign = :left,
+                         accessorywidth = 73, rowgap = 4, halign = :left,
                          labelcolor = labelcolor)
-    for p in params                             # scrub-sync registry
+    for p in params
         w = get(pf.widgets, fieldsym(p), nothing)
-        w isa Slider && (player.fxsliders[(fx.id, p.name)] = w)
-        # THE BINDING. One row, registered once, refreshed from one listener.
-        push!(player.fxrows,
-              ParamRow(target, p, w isa Slider ? w : nothing,
-                       get(kfbuttons, fieldsym(p), nothing),
-                       (uicolors.accent, uicolors.text, uicolors.text_muted)))
+        bindparamview!(player, target, p, w isa Makie.Block ? w : nothing,
+                       kfbuttons[fieldsym(p)])
     end
-    # SEEDED, not `nothing`. A slider has 100 steps across its range, so building
-    # one for a value that does not land on a step reports the nearest one — and
-    # with an empty baseline the handler below read that as a gesture and wrote it
-    # back. Opening a card silently edited it: a camera at 80.0 in a scene 520
-    # units across came back 83.2, every parameter at once, before anyone touched
-    # anything. What the form reports at construction is where the widgets START;
-    # only a change from there is an edit.
-    lastvals = Ref{Any}(pf.graph[:values][])
-    on(pf.graph[:values]) do vals
-        prevvals = lastvals[]; lastvals[] = vals
-        player.fxsyncing[] && return           # sync: just refresh the baseline
-        for p in params
-            v = Float64(vals[fieldsym(p)])
-            moved = v != Float64(prevvals[fieldsym(p)])
-            moved || continue
-            # A DRIVEN parameter's value is not this row's to set — it comes down
-            # an edge. The refresh puts the slider straight back; dragging it is
-            # how you find out the parameter is bound, and ◆ is how you unbind it.
-            isdriven(p) && continue
-            if time() - player.lastslidersnap > 1.5    # one undo entry per gesture
-                snapshot!(player); player.lastslidersnap = time()
-            end
-            # animated: the slider writes a KEY at the playhead; otherwise it
-            # moves the static value. Same object either way.
-            isanimated(p) ? setkey!(p.curve, frame(), v) : (p.value = v)
-            # …and the clip's bake no longer describes what it renders. Said at
-            # the EDIT, which is the only place that knows.
-            target isa Clip && bakedirty!(target)
-        end
-        player.playing[] || notify(player.playhead)
+    # What a row SHOWS, per row: its own slider follows its own curve and the
+    # playhead. Two named inputs, one derivation, no pass over the card and no
+    # listener whose arity comes from the data.
+    #
+    # And what a row WRITES hangs on the DRAG, not on the value: a sync moves the
+    # widget and notifies, which is harmless because nothing edits on a value
+    # change. That is what replaced `display_value!`, `update_silent!` and the
+    # baseline they were measured against — there is nothing to silence when a
+    # notification was never mistaken for an intent.
+    for p in params
+        ctrl = p.view === nothing ? nothing : p.view.control
+        ctrl === nothing && continue
+        append!(derived, onany(p.curve, player.playhead) do c, _
+            showvalue!(ctrl, valueat(c, frame()))
+        end)
+        wireedit!(player, target, p, ctrl, derived)
     end
+    append!(pf.blockscene.deregister_callbacks, derived)
     return pf
+end
+
+"""
+    bindparamview!(player, clip, p, control, kf) -> ParamView
+
+Hang `p`'s widgets on it, and put its curve on the timeline.
+
+The lane is created here, next to the row it belongs with, so that showing a
+parameter and drawing its curve are one act. `visible` is the parameter's own
+flag, `selectedkey` is derived from the editor's single selection, the colour is
+[`paramcolor`](@ref) — the same one its ◆ draws in — and the placement comes from
+[`placelanes!`](@ref): the clip's own, pushed where the timeline places everything
+else it draws.
+"""
+function bindparamview!(player::Player, clip, p::Param, control, kf::Makie.Button)
+    # …through `derive`, not `map`: `player.selectedkey` outlives every lane ever
+    # drawn on it, and the registration has to come off with this one.
+    selkey, reg = derive(s -> s !== nothing && s[1] === p ? s[2] : 0,
+                         player.selectedkey)
+    lane = lanecurve!(player.timeline.axis, p.curve;
+                      valuerange = p.range,
+                      viewrange = player.timeline.viewrange,
+                      pixelspersecond = player.timeline.pps,
+                      visible = p.visible,
+                      selectedkey = selkey,
+                      color = paramcolor(p))
+    translate!(lane, 0, 0, 3)          # over the filmstrip, under the playhead
+    p.view = ParamView(control, kf, lane, Observables.ObserverFunction[reg])
+    return p.view
 end
 
 # --------------------------------------------------- parameters, in sections
@@ -1149,15 +1373,14 @@ end
 """
     paramsections(target, fx) -> Vector{NamedTuple{(:label, :detail, :params)}}
 
-How a card GROUPS its parameters.
+How a card groups its parameters.
 
-ONE unnamed group by default — a Blur has one parameter and a heading over it is
-noise. A SCENE clip is the other case: its groups come from the scene that was
-built (one per named plot), and its parameters are minted the first time they are
-asked for.
+One unnamed group by default: a Blur has one parameter and a heading over it is
+noise. A scene clip is the other case — its groups come from the scene that was
+built (one per named plot), and its parameters are minted on first use.
 
-LAZY, and that is the point: what a scene offers depends on the scene, so the
-panel asks it when the card is opened rather than keeping a description of it
+Asked lazily: what a scene offers depends on the scene, so the panel asks when the
+card is opened rather than keeping a description of it
 around to consult. A parameter that already exists — read from the project file,
 or made when the card was last open — is reused, so its curve is never lost.
 """
@@ -1172,11 +1395,11 @@ end
 """
     sceneparamsections(target, fx) -> Vector{NamedTuple} | nothing
 
-The sections a SCENE clip's card shows, or `nothing` when this is not one.
+The sections a scene clip's card shows, or `nothing` when the target is not one.
 
-`nothing` rather than an empty list, so "not a scene" and "a scene with nothing in
-it yet" stay different answers — the second is what you get before the clip has
-rendered once, and it should read as "not built yet", not as "has no parameters".
+`nothing` rather than an empty list, so "not a scene" and "a scene not built yet"
+stay different answers; the second is what a clip returns before it has rendered
+once.
 """
 sceneparamsections(::Any, ::Effect) = nothing
 
@@ -1195,10 +1418,9 @@ end
 
 The parameter for one scene attribute, made if it is not there yet.
 
-MADE HERE and kept on the effect, which is what gives a keyframe somewhere to live
-that outlasts the scene: a project is loaded long before anything is rendered, and
-its curves have to be waiting when the scene is finally built. A parameter that
-already exists is returned untouched — its curve is the edit.
+Kept on the effect, so a keyframe outlives the scene: a project is loaded long
+before anything is rendered and its curves have to be waiting when the scene is
+built. An existing parameter is returned untouched — its curve is the edit.
 """
 function sceneparam!(fx::Effect, row)
     v = Float64(row.value)
@@ -1213,28 +1435,25 @@ end
 """
     withspan!(fx, i, span, label) -> Param
 
-The `i`-th parameter, guaranteed to have a range and the scene's own label —
-REPLACED if it had neither, because both fields are `const`.
+The `i`-th parameter, guaranteed to have a range and the scene's own label. Both
+fields are `const`, so it is replaced when it has neither.
 
 A project written while scenes were overlays stored a parameter's curve but no
-span: there was no slider to size. Every one of the lego project's seven animated
-scene parameters comes back that way, and a row without a range has no widget to
-build — `paramform!` reads `p.range[1]` and dies with
-`getindex(::Nothing, ::Int64)` from inside the card builder, which is how opening
-that project met a "Scene" card with nothing on it.
+span, there being no slider to size — all seven of the lego project's animated
+scene parameters load that way. A row without a range has no widget to build:
+`paramform!` reads `p.range[1]` and throws `getindex(::Nothing, ::Int64)` inside
+the card builder.
 
-The LABEL comes across too, for the same reason: the file stored the path
-(`torso.offset[2]`) where the scene knows the name (`torso · Offset Y`), so the
-seven parameters someone actually animated were the seven reading like machine
-output, right next to two hundred reading like a UI.
+The label comes across for the same reason: the file stores the path
+(`torso.offset[2]`) where the scene knows the name (`torso · Offset Y`).
 
-The curve, the value and any edge come across untouched: the span and the name
-are the only things missing, and the built scene is what knows both.
+The curve and any edge come across untouched — the span and the name are the only
+things missing, and the built scene knows both.
 """
 function withspan!(fx::Effect, i::Integer, span, label::AbstractString)
     p = fx.params[i]
     p.range === nothing || return p
-    fresh = Param(p.name, label, p.value; curve = p.curve, visible = p.visible,
+    fresh = Param(p.name, label, valueat(p, 0); curve = p.curve[], visible = p.visible[],
                   range = span, input = p.input)
     fx.params[i] = fresh
     return fresh
@@ -1243,8 +1462,8 @@ end
 """
     sectionform!(player, gridpos, target, fx, uicolors) -> blocks
 
-The parameter area of a card: plain rows when there is one group, and a FILTER
-BOX over a list of collapsible sections when there is more than one.
+The parameter area of a card: plain rows for one group, a filter box over a list
+of collapsible sections for more.
 
 The sections are `Card`s with their chrome turned off — no border, no fill, a
 short header — because that is what a section is, and because it means the filter
@@ -1271,6 +1490,7 @@ function sectionform!(player::Player, gridpos, target, fx::Effect, uicolors;
     nparams = sum(length(sec.params) for sec in secs)
 
     cards = Card[]
+    eyes = Makie.Button[]
     for (i, sec) in enumerate(secs)
         title = isempty(sec.detail) ? sec.label : "$(sec.label)   ·   $(sec.detail)"
         card = Card(stack[i, 1]; title, open = false,
@@ -1281,18 +1501,25 @@ function sectionform!(player::Player, gridpos, target, fx::Effect, uicolors;
                     titlefont = :regular, titlesize = 11, titleoffset = 6,
                     titlecolor = uicolors.text_muted,
                     bodypadding = (10, 2, 4, 2), spacing = 2)
-        # A FOLDED SECTION COSTS NOTHING once the card is big enough to care. Its
-        # rows are then built the first time it is opened rather than when the
-        # panel is drawn: a scene's card carries one section per object and the
-        # lego project has 229 parameters across them, all folded, and building
-        # every widget anyway was 7 of the 9 seconds a panel rebuild took. Nothing
-        # reads a row that is not on screen — `fxrows` is only walked by
-        # `refreshfxrows!`, and `fxsliders` is looked up by key.
+        # One object's lanes as a group: on a scene clip a section IS a plot, which
+        # is the unit you want off the timeline while you work on another one.
+        push!(eyes,
+              laneeye!(player, card_accessory(card), sec.params, uicolors,
+                       card.blockscene.deregister_callbacks;
+                       width = 18, height = 16, fontsize = 10,
+                       buttoncolor = (:transparent, 0.0), strokewidth = 0,
+                       cornerradius = 3,
+                       buttoncolor_hover = uicolors.accent_subtle,
+                       buttoncolor_active = uicolors.accent))
+        # Above `lazyabove` a folded section builds its rows the first time it is
+        # opened rather than when the panel is drawn. A scene's card carries one
+        # section per object — 229 parameters on the lego project, all folded —
+        # and building them anyway was 7 of the 9 seconds a rebuild took. A row
+        # that does not exist draws nothing and derives nothing.
         #
-        # Below `lazyabove` the whole card is built at once, because there the
-        # deferral buys nothing and costs a real property: every row exists as soon
-        # as the card does, which is what an ordinary effect's card has always
-        # promised (a graphic's rows are asserted on directly).
+        # Below that threshold the whole card is built at once, so every row
+        # exists as soon as the card does (a graphic's rows are asserted on
+        # directly).
         built = Ref(false)
         function buildrows!()
             built[] && return nothing
@@ -1300,14 +1527,14 @@ function sectionform!(player::Player, gridpos, target, fx::Effect, uicolors;
             paramform!(player, card[1, 1], target, fx, uicolors;
                        params = sec.params, labels = q -> chopprefix(q.label, sec.label * " · "),
                        labelwidth = 84, widgetwidth = 124)
-            # …and they show the frame the playhead is ON, same as a rebuild does
-            refreshfxrows!(player)
+            # …and the lanes those rows just created get the clip's placement
+            target isa Clip && placelanes!(player.timeline, target)
             return nothing
         end
         on(o -> o && buildrows!(), card.open)
-        # ANIMATED SECTIONS OPEN THEMSELVES. A scene has more objects than fit on
-        # a screen and all of them start folded, so the ones you are actually
-        # working on would be the ones you have to go and find.
+        # animated sections open themselves: a scene has more objects than fit on
+        # screen and all start folded, so the ones being worked on would have to
+        # be hunted for
         any(isanimated, sec.params) && (card.open = true)
         (nparams <= lazyabove || card.open[]) && buildrows!()
         push!(cards, card)
@@ -1322,8 +1549,8 @@ function sectionform!(player::Player, gridpos, target, fx::Effect, uicolors;
             keep = isempty(q) || occursin(q, lowercase(sec.label)) ||
                    occursin(q, lowercase(sec.detail)) ||
                    any(p -> occursin(q, lowercase(p.label)), sec.params)
-            # A section the query singled out OPENS: filtering to one object and
-            # then having to unfold it is two gestures for one intent.
+            # a section the query singled out opens, so filtering to one object is
+            # one gesture rather than two
             keep && !isempty(q) && (card.open = true)
             keep && (shown += length(sec.params))
             keep
@@ -1335,7 +1562,7 @@ function sectionform!(player::Player, gridpos, target, fx::Effect, uicolors;
     end
     on(_ -> apply(), box.stored_string)
     apply()
-    player.fxwidgets[Symbol(:fxsections_, fx.id)] = (; box, cards, sections = secs, apply)
+    player.fxwidgets[Symbol(:fxsections_, fx.id)] = (; box, cards, eyes, sections = secs, apply)
     return Any[gl]
 end
 
@@ -1347,20 +1574,13 @@ count_shown(cards) = count(c -> c.visible[], cards)
 """
     buildkeyframemodal!(player, uicolors)
 
-The animated-parameter overview: one entry per keyframed parameter of the clip
-under the playhead, in the colour its curve is drawn in on the timeline.
+The animated-parameter overview: one entry per parameter of the selected effect,
+each with its own eye for whether its lane is drawn.
 
-A modal rather than a strip in the panel, because it answers a question you ask
-occasionally ("what is animated here?") and it needs a list's worth of room —
-inline it just sat between the clip line and the cards looking like neither.
+A modal rather than a strip in the panel: it answers an occasional question and
+needs a list's worth of room.
 
-The interactions are Makie's `Legend`, not ours:
-
-  * left-click an entry — hide THAT parameter's curve and its ◆ markers
-  * right-click — hide every one
-  * middle-click — bring them all back
-
-Rebuilt on open, so it always describes the clip you are looking at.
+Rebuilt on open, so it always describes the effect you are looking at.
 """
 function buildkeyframemodal!(player::Player, uicolors)
     modal = Modal(player.fig; title = "Animated parameters", min_size = (300, 200))
@@ -1368,39 +1588,40 @@ function buildkeyframemodal!(player::Player, uicolors)
     hint = Label(body[1, 1], ""; halign = :left, fontsize = 10,
                  color = uicolors.text_muted, tellwidth = false)
     holder = GridLayout(body[2, 1])
-    legend = Ref{Any}(nothing)
 
     function refresh()
-        legend[] === nothing || (Makie.delete!(legend[]); legend[] = nothing)
         foreach(Makie.delete!, get!(() -> Any[], player.fxwidgets, :kflanerows))
         empty!(player.fxwidgets[:kflanerows])
+        # …and what those rows derived from `Param.visible`, which outlives them.
+        # The rows used to be built with `map`, so every open left one listener per
+        # parameter on the clip behind.
+        regs = get!(() -> Observables.ObserverFunction[], player.fxwidgets, :kflaneregs)
+        foreach(Observables.off, regs)
+        empty!(regs)
         sel = selectedeffect(player)
         if sel === nothing
             hint.text[] = "Select an effect card to see its parameter lanes."
             return
         end
-        clip, fx = sel
+        _, fx = sel
         nanim = count(isanimated, fx.params)
-        nopen = count(p -> p.visible, fx.params)
+        nopen = count(p -> p.visible[], fx.params)
         hint.text[] = "$(length(fx.params)) parameter$(length(fx.params) == 1 ? "" : "s") · " *
                       "$nanim animated · $nopen lane$(nopen == 1 ? "" : "s") shown\n" *
-                      "a lane can be shown BEFORE it has keyframes — that is where you put the first"
-        # ONE ROW PER PARAMETER, each with its own eye. Showing a lane is not the
-        # same question as animating it, so the two are separate controls.
+                      "a lane can be shown before it has keyframes — that is where the first one goes"
+        # one row per parameter, each with its own eye: showing a lane and
+        # animating it are separate questions
         for (i, p) in enumerate(fx.params)
             row = GridLayout(holder[i, 1])
-            eye = Button(row[1, 1]; label = p.visible ? "◉" : "○", width = 24,
-                         buttoncolor = (:transparent, 0.0), strokewidth = 0)
+            # The same ∿ and the same gesture as the row in the card, so that
+            # "show me only this one" is one thing to learn and works wherever a
+            # parameter is listed.
+            laneeye!(player, row[1, 1], p, uicolors, regs;
+                     width = 24, buttoncolor = (:transparent, 0.0), strokewidth = 0)
             Label(row[1, 2], p.label; halign = :left, tellwidth = false,
                   color = isanimated(p) ? uicolors.text : uicolors.text_muted)
-            Label(row[1, 3], isanimated(p) ? "$(length(p.curve.keys)) keys" : "static";
+            Label(row[1, 3], isanimated(p) ? "$(length(p.curve[].keys)) keys" : "static";
                   halign = :right, fontsize = 10, color = uicolors.text_muted)
-            on(eye.clicks) do _
-                p.visible = !p.visible
-                eye.label[] = p.visible ? "◉" : "○"
-                f = get(player.fxwidgets, :kfrefresh, nothing); f === nothing || f()
-                notify(player.playhead)
-            end
             push!(player.fxwidgets[:kflanerows], row)
         end
         return

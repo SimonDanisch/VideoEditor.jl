@@ -7,7 +7,7 @@ is reused for every clip — the timeline just creates one `ClipView` per
 clip and feeds shared view observables.
 
 Tiles are anchored at the clip start and clamped to its extent (they never
-cross a cut). The visible tiles are composed into **one** image (film-strip
+cross a cut). The visible tiles are composed into one image (film-strip
 style, partial tail tile sliced), so each clip costs two draw calls
 regardless of zoom.
 

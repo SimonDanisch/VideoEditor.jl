@@ -94,8 +94,8 @@ function smoothslowmo!(player::Player)
     snapshot!(player)
     on = clip.timeinterp !== :flow
     settimeinterp!(clip, on ? :flow : :sample)
-    refreshedit!(player)
-    notify(player.playhead)
+    redraw!(player)
+    showplayhead!(player)
     setstatus!(player, if !on
             "smooth slow motion off — frames repeat again"
         elseif clip.rate >= 1.0

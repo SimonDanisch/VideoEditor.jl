@@ -9,7 +9,7 @@ thumbnails ever needs decoding.
 The UI pushes wanted seconds via `request!` (visible range, ascending);
 the worker decodes them (forward-decode when close, seek when far — same
 policy as the playback worker), downscales, and sets `dirty` so the UI
-knows to refresh. Eviction is LRU above `maxthumbs`.
+knows to refresh. Eviction is least-recently-used above `maxthumbs`.
 """
 mutable struct ThumbnailCache
     const source::VideoSource
@@ -64,7 +64,7 @@ function request!(cache::ThumbnailCache, seconds::Vector{Int})
     return nothing
 end
 
-"Thumbnail for exactly second `s`, or `nothing`. Touches the LRU stamp."
+"Thumbnail for exactly second `s`, or `nothing`. Touches the eviction stamp."
 function getthumb(cache::ThumbnailCache, s::Integer)
     lock(cache.lock) do
         thumb = get(cache.thumbs, s, nothing)
@@ -120,7 +120,7 @@ function gputhumbloop(cache::ThumbnailCache)
     stream = dev = thumbdev = nothing
     ok = try
         # `long`: cold this compiles decode + convert + downscale — warm them all
-        # HERE so the per-thumb jobs below stay bounded and presents interleave
+        # here, so the per-thumb jobs below stay bounded and presents interleave
         cache.gpurun() do
             stream = openstream(LavaBackend(), source.path, source.width, source.height;
                                 vrambudget = 2^30)
@@ -146,7 +146,7 @@ function gputhumbloop(cache::ThumbnailCache)
                 continue
             end
             n = clamp(frameindex(source, Float64(s)), 0, source.nframes - 1)
-            # decode in LATENCY-BOUNDED jobs (≤ ~90 ms each) so playback presents
+            # decode in latency-bounded jobs (≤ ~90 ms each) so playback presents
             # interleave with the thumbnail's GOP decode on the shared worker
             while cache.running[] && !cache.gpurun(() -> (frameat!(stream, n); hasframe(stream, n)))
             end
@@ -165,9 +165,12 @@ function gputhumbloop(cache::ThumbnailCache)
     catch e
         @error "GPU thumbnail worker died" exception = (e, catch_backtrace())
     finally
+        # the worker may be what died, so a close that fails has to say so rather
+        # than leave a VRAM ring to the finalizer in silence
         try
             cache.gpurun() do; close(stream); nothing; end
-        catch
+        catch e
+            @error "closing the GPU thumbnail stream failed" exception = (e, catch_backtrace())
         end
     end
     return nothing
@@ -179,7 +182,7 @@ function thumbloop(cache::ThumbnailCache)
     scratch = RGBFrame(undef, source.width, source.height)
     scratch_hw = PermutedDimsArray(scratch, (2, 1))
     position = -1  # frame index the reader will produce next, -1 = unknown
-    # Whether `scratch` has EVER been filled. It starts as `undef`, so storing it
+    # Whether `scratch` has ever been filled. It starts as `undef`, so storing it
     # before the first successful `read!` publishes uninitialized memory — see the
     # guard below, which is what the timeline's black leading tile was.
     filled = false
@@ -202,7 +205,7 @@ function thumbloop(cache::ThumbnailCache)
             end
             # `stop!` flips `running` to hand this source over to the GPU worker,
             # and `setgpurun!` does exactly that a moment after a Player is built —
-            # right on top of this loop's FIRST request. Losing that race used to
+            # right on top of this loop's first request. Losing that race used to
             # publish the still-`undef` `scratch` as second 0's thumbnail: the
             # timeline's leading tile came out black, or streaked with whatever
             # was in the memory, and stayed that way for the whole session because
@@ -210,7 +213,7 @@ function thumbloop(cache::ThumbnailCache)
             # bug and is not one — every frame here decodes correctly; the loop
             # simply stored a frame it had not read.
             #
-            # `position > n` with `filled` already true is NOT this case: a repeat
+            # `position > n` with `filled` already true is not this case: a repeat
             # request for a second already in `scratch` legitimately reads nothing
             # and stores the frame it holds.
             cache.running[] || break

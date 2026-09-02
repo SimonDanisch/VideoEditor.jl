@@ -45,7 +45,8 @@ swscale does."
 function video_is_bt601(path::AbstractString)
     cs = try
         strip(read(pipeline(`$(FFMPEG_jll.ffprobe()) -v error -select_streams v:0 -show_entries stream=color_space -of default=noprint_wrappers=1:nokey=1 $path`), String))
-    catch
+    catch e
+        e isa ProcessFailedException || rethrow()   # no tag to read: BT.601, as below
         "unknown"
     end
     return !occursin("bt709", cs)
@@ -89,7 +90,10 @@ function gpu_decodable(backend, path::AbstractString)
     try
         gpu_decode_luma(backend, path; maxframes = 1)
         return true
-    catch
+    catch e
+        # "no" is a normal answer for an unsupported profile, but it is also what a
+        # broken decoder says, so the reason goes with it
+        @warn "GPU decode unavailable for $(basename(path)) — using the CPU" exception = (e, catch_backtrace())
         return false
     end
 end

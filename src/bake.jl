@@ -1,44 +1,18 @@
-# PRE-RENDERING A CLIP.
+# Pre-rendering a clip.
 #
 # Baking used to belong to the 3D scene, because the scene was the only thing slow
 # enough to need it: raytracing a frame costs ~1.2 s at 480x854 and scrubbing a
 # timeline at that rate is not editing. But a heavy effect stack on ordinary
 # footage is slow for the same reason and wants the same thing, and the mechanism
-# — on or off, one kept version, invalidation that DISABLES rather than deletes —
+# — on or off, one kept version, invalidation that disables rather than deletes —
 # has nothing scene-shaped about it.
 #
 # So it is a property of a clip. `get_frame!` reads the bake when it is on and
-# covers the frame, and runs the graph otherwise. What a SOURCE contributes is
+# covers the frame, and runs the graph otherwise. What a source contributes is
 # render settings: a video contributes none, a scene contributes which backend and
 # at what quality, one set for the live preview and one for the bake.
 
-"""
-A clip's pre-rendered frames.
-
-`dir` is where they are; `frames` is the source-frame range they cover; `canvas`
-is what they were rendered at. `enabled` is the switch, and it is what
-INVALIDATION touches — a bake that no longer matches what the clip would render is
-switched off and kept, not deleted, because the user may have wanted exactly that
-picture and re-rendering it costs minutes.
-
-`dirty` is set at the EDIT, not derived by comparison. There is no fingerprint
-here: nothing walks the effect stack per frame to discover something the edit
-already knew. The one thing that cannot be caught at an edit site is a file
-changing under us — a source video replaced, a mesh re-exported — so the external
-inputs are `stat`ed once on load, and that is the whole of what is checked.
-"""
-mutable struct Bake
-    dir::String
-    frames::UnitRange{Int}
-    canvas::Tuple{Int, Int}
-    enabled::Bool
-    dirty::Bool
-    # mtime+size of every file the render read, as of the bake. Only files: an
-    # edit inside the editor sets `dirty` where it happens.
-    inputs::Dict{String, Tuple{Float64, Int}}
-end
-Bake(dir::AbstractString, frames::UnitRange{Int}, canvas::Tuple{Int, Int}) =
-    Bake(String(dir), frames, canvas, true, false, Dict{String, Tuple{Float64, Int}}())
+# `Bake` is declared in clips.jl, where `Clip` has a field of one.
 
 """
     bakedirty!(clip) -> clip
@@ -48,11 +22,10 @@ Say that what `clip` renders has changed, so its bake no longer describes it.
 Called from [`dirtygraph!`](@ref) — the same edits that change the structure change
 the picture — and from the value edits that do not (a slider, a keyframe).
 
-It switches the bake OFF and DELETES NOTHING. Off, because a bake that no longer
-describes the clip is a wrong picture, and shipping one silently is the failure
-this whole mechanism exists to avoid. Kept, because the frames may be exactly what
-the user wanted and re-rendering them costs minutes — `dirty` stays set, the panel
-says so, and switching it back on is one click.
+Switches the bake off and deletes nothing. Off, because a bake that no longer
+describes the clip is a wrong picture. Kept, because the frames may be exactly
+what was wanted and re-rendering costs minutes — `dirty` stays set, the panel says
+so, and switching it back on is one click.
 """
 function bakedirty!(clip::Clip)
     b = clip.bake
@@ -65,7 +38,7 @@ end
 """
     externalinputs(clip) -> Dict{String, Tuple{Float64, Int}}
 
-Every FILE this clip's render reads, with its mtime and size: the source video,
+Every file this clip's render reads, with its mtime and size: the source video,
 and any mesh a scene loads.
 
 The only thing a bake cannot know from the edit history. Everything else that
@@ -125,7 +98,7 @@ function bakedframe(clip::Clip, sf::Integer)
     Int(sf) in b.frames || return nothing
     f = bakeframefile(b, sf)
     isfile(f) || return nothing
-    # In the PLANE's format whatever the file turned out to be, because the source
+    # In the plane's format whatever the file turned out to be, because the source
     # pass copies this straight into a device buffer and an element type that only
     # usually matches is one that fails on somebody else's PNG.
     return PlanePixel.(PNGFiles.load(f))
@@ -136,11 +109,11 @@ end
 
 Render every frame of `frames` through the clip's own chain and write it out.
 
-A NEW DIRECTORY, always, and the old one goes only once this has finished: a bake
-interrupted half way must not be able to leave the clip with a version that is
-neither the old one nor a whole new one. Exactly one version is kept — a history
-of bakes is disk nobody asked for, and the thing you actually want back is the
-edit, which undo has.
+Always a new directory, and the old one goes only once this has finished, so a
+bake interrupted half way cannot leave the clip with a version that is neither
+the old one nor a complete new one. Exactly one version is kept: a history of
+bakes is disk nobody asked for, and what one wants back is the edit, which undo
+has.
 """
 function bakeclip!(clip::Clip, engine::FxEngine;
                    frames::UnitRange{Int} = clip.src_in:(clip.src_out - 1),
@@ -148,19 +121,18 @@ function bakeclip!(clip::Clip, engine::FxEngine;
                    dir::AbstractString = mktempdir(; cleanup = false),
                    sourcefor = (c, sf) -> c.source,
                    progress = nothing)
-    # A CANVAS RESIZES THE SOURCE, it does not give the bake a size of its own.
-    # There is one size a clip renders at, so the bake and the preview cannot end
-    # up disagreeing about it — and for a decoder there is nothing to change.
+    # A canvas resizes the source rather than giving the bake a size of its own,
+    # so the bake and the preview cannot disagree about the one size a clip renders
+    # at. For a decoder there is nothing to change.
     canvas === nothing || resize!(clip.source, canvas)
     can = (clip.source.width, clip.source.height)
-    # It is the CLIP's picture, not its placement: the crop, the fit, the reframe
+    # It is the clip's picture, not its placement: the crop, the fit, the reframe
     # and the rotation happen where the layer meets the sequence canvas, and baking
     # those in would have the compositor apply them twice.
-    # STAGE, then swap into place. Not "write to a fresh name and keep it": the
-    # bake's home is derived from the project path and the clip id on every load
-    # (`adoptbakes!`), so a bake that ended up living under some other name is one
-    # the next open cannot find — it would fall silently back to rendering, which
-    # is the failure a bake exists to prevent, arriving as "it got slow again".
+    # Stage, then swap into place, rather than writing to a fresh name and keeping
+    # it: the bake's home is derived from the project path and the clip id on every
+    # load (`adoptbakes!`), so a bake living under another name is one the next open
+    # cannot find, and it falls back to rendering.
     staging = dir * ".part"
     ispath(staging) && rm(staging; force = true, recursive = true)
     mkpath(staging)
@@ -169,7 +141,7 @@ function bakeclip!(clip::Clip, engine::FxEngine;
     for sf in frames
         src = decodable(clip.source) ? sourcefor(clip, sf) : clip.source
         src === nothing && error("bake: frame $sf of the source is not available")
-        # THE PLANE, coverage included: a baked scene that came back opaque would
+        # The plane, coverage included: a baked scene that came back opaque would
         # hide the clip underneath it.
         renderplane(engine, src, clip, sf; exact = true) do img
             PNGFiles.save(bakeframefile(fresh, sf), collect(img))
@@ -178,7 +150,7 @@ function bakeclip!(clip::Clip, engine::FxEngine;
         progress === nothing || progress(n, length(frames))
     end
     fresh.inputs = externalinputs(clip)
-    # …and only NOW is the old one replaceable: a bake interrupted half way has
+    # …and only now is the old one replaceable: a bake interrupted half way has
     # written nothing but its staging directory.
     old = clip.bake
     ispath(dir) && rm(dir; force = true, recursive = true)
@@ -198,7 +170,7 @@ bakeclipdir(path::AbstractString, id::Integer) = joinpath(bakedir(path), string(
 
 """
 A bake as the project file holds it: where, what it covers, whether it is on, and
-what it read. The FRAMES are not in the file — they are next to it, one PNG each,
+what it read. The frames are not in the file but next to it, one PNG each,
 under a directory named for the clip.
 """
 bakedict(b::Bake) = Dict{String, Any}(
@@ -229,8 +201,8 @@ Ctrl+S was written to `/tmp`, recorded in the file as if it were beside it, and
 was gone by the next open: `adoptbakes!` derives the directory from the project
 path, so it would have looked somewhere that had never held anything.
 
-MOVED, not copied: there is exactly one version of a bake, and leaving a second
-copy in `/tmp` is a copy nobody will ever delete.
+Moved, not copied: there is one version of a bake, and a second copy left in
+`/tmp` is one nobody deletes.
 """
 function savebakes(path::AbstractString, seq::Sequence)
     for clip in seq.clips
@@ -253,9 +225,8 @@ end
 Point every clip's bake at this project's bake directory, and check the files it
 read.
 
-Called on load. A bake whose inputs moved is switched OFF and kept: the frames are
-still there, still openable, and the user decides whether the picture they show is
-the one they want.
+Called on load. A bake whose inputs moved is switched off and kept: the frames are
+still there and still openable, and the user decides whether to use them.
 """
 function adoptbakes!(path::AbstractString, seq::Sequence)
     for clip in seq.clips
@@ -269,8 +240,8 @@ end
 
 # ---------------------------------------------------------------- the modal
 #
-# What a bake needs settling before it runs: how big, which frames, and — from the
-# SOURCE — anything about HOW it renders. A video source contributes nothing; a
+# What a bake needs settled before it runs: how big, which frames, and from the
+# source anything about how it renders. A video source contributes nothing; a
 # scene contributes which renderer draws the bake, which is the whole point of
 # baking a scene (rasterise while you edit, raytrace what you ship).
 #
@@ -281,7 +252,7 @@ end
 """
     bakesettings!(source, gridpos, uicolors) -> apply
 
-Draw the settings this SOURCE contributes to a bake, and return `apply()`.
+Draw the settings this source contributes to a bake, and return `apply()`.
 
 Nothing for a file: what a decoder produces is not a choice.
 """
@@ -297,7 +268,7 @@ function bakesettings!(src::SceneSource, gridpos, uicolors)
     menu = Menu(gl[1, 2]; options = opts, default = opts[something(i, 1)][1],
                 width = 180, tellwidth = false)
     # A path tracer is minutes per frame and a rasteriser is milliseconds, which is
-    # the whole reason a scene has two: this says which one the FINAL picture uses.
+    # the whole reason a scene has two: this says which one the final picture uses.
     return () -> (src.bakewith = menu.selection[]; nothing)
 end
 
@@ -322,7 +293,7 @@ function openbakemodal!(player::Player)
     have = b === nothing ? "" :
            "\nIt has one already: frames $(first(b.frames))–$(last(b.frames)) at " *
            "$(b.canvas[1])×$(b.canvas[2]), $(b.enabled ? "in use" : "switched off")" *
-           (bakestale(clip) ? " · OUT OF DATE — the clip changed since" : "")
+           (bakestale(clip) ? " · out of date — the clip changed since" : "")
     Label(body[1, 1], "Pre-render this clip's effect graph to disk. While the bake is on, " *
                       "the clip shows those frames instead of running the graph." * have;
           halign = :left, justification = :left, fontsize = 11,
@@ -358,7 +329,7 @@ function openbakemodal!(player::Player)
         canvas = (max(num(wbox, W0), 2), max(num(hbox, H0), 2))
         dir = bakedirfor(player, clip)
         status.text[] = "baking $(hi - lo + 1) frame(s)…"
-        # ON THE ENGINE'S THREAD, like every other render: the plan's context has
+        # On the engine's thread, like every other render: the plan's context has
         # one owning thread and a bake is the same graph the preview runs.
         runanalysis(player) do
             src = clip.source
@@ -373,7 +344,7 @@ function openbakemodal!(player::Player)
             end
             put!(player.uiqueue, () -> begin
                 status.text[] = "done — the clip is showing its bake"
-                notify(player.playhead)
+                showplayhead!(player)
             end)
         end
     end
@@ -386,9 +357,9 @@ Where this clip's bake goes: beside the project when there is one, a temp
 directory otherwise — an unsaved edit still gets to bake, it just does not survive
 the session.
 
-A FRESH directory every time (`.new`, swapped in by `bakeclip!` once it finishes),
-because a bake interrupted half way must not leave the clip with a version that is
-neither the old one nor a whole new one.
+A fresh directory every time (`.new`, swapped in by `bakeclip!` once it finishes),
+so a bake interrupted half way cannot leave the clip with a version that is
+neither the old one nor a complete new one.
 """
 function bakedirfor(player::Player, clip::Clip)
     player.projectpath === nothing && return mktempdir(; cleanup = false)

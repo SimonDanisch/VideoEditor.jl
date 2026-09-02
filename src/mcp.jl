@@ -300,26 +300,26 @@ function calltool(srv::MCPServer, name::String, args)
         elseif name == "split_at"
             snapshot!(player)
             split!(seq, attime(args["time"]))
-            refreshedit!(player)
+            redraw!(player)
             statedict(player)
         elseif name == "delete_clip_at"
             snapshot!(player)
             deleteclip!(seq, attime(args["time"]))
             player.playhead[] = clamp(player.playhead[], 0, max(seqlength(seq) - 1, 0))
-            refreshedit!(player)
+            redraw!(player)
             statedict(player)
         elseif name == "move_clip"
             snapshot!(player)
             clip = seq.clips[Int(args["clip"])]
             ok = moveclip!(seq, clip, round(Int, Float64(args["start_time"]) * seq.framerate))
-            refreshedit!(player)
+            redraw!(player)
             ok ? statedict(player) : "move rejected: would overlap another clip"
         elseif name == "set_crop"
             snapshot!(player)
             clip = clipattime(args["time"])
             clip === nothing && return "no clip at that time"
             clip.crop = (Float64(args["x"]), Float64(args["y"]), Float64(args["w"]), Float64(args["h"]))
-            refreshedit!(player)
+            redraw!(player)
             "crop set"
         elseif name == "set_color"
             snapshot!(player)
@@ -327,24 +327,21 @@ function calltool(srv::MCPServer, name::String, args)
             clip === nothing && return "no clip at that time"
             seteffect!(clip, ColorEffect(brightness = get(args, "brightness", 0), contrast = get(args, "contrast", 1),
                                          saturation = get(args, "saturation", 1), temperature = get(args, "temperature", 0)))
-            refreshfxrows!(player)
-            refreshedit!(player)
+            redraw!(player)
             "color set"
         elseif name == "set_blur"
             snapshot!(player)
             clip = clipattime(args["time"])
             clip === nothing && return "no clip at that time"
             seteffect!(clip, BlurEffect(Float32(args["sigma"])))
-            refreshfxrows!(player)
-            refreshedit!(player)
+            redraw!(player)
             "blur set"
         elseif name == "set_sharpen"
             snapshot!(player)
             clip = clipattime(args["time"])
             clip === nothing && return "no clip at that time"
             seteffect!(clip, SharpenEffect(1.0f0, Float32(args["amount"])))
-            refreshfxrows!(player)
-            refreshedit!(player)
+            redraw!(player)
             "sharpen set"
         elseif name == "analyze_color"
             clip = clipattime(args["time"])
@@ -362,7 +359,7 @@ function calltool(srv::MCPServer, name::String, args)
                 # hide the warp's replicate borders, like the GUI's Stabilize
                 W, H = clip.source.width, clip.source.height
                 newcrop = cropintersect(oldcrop, bordercrop(clip.motiontrack, W, H))
-                put!(player.uiqueue, () -> (clip.crop = newcrop; refreshedit!(player)))
+                put!(player.uiqueue, () -> (clip.crop = newcrop; redraw!(player)))
             catch e
                 @error "motion analysis failed" exception = (e, catch_backtrace())
             end
@@ -391,8 +388,7 @@ function calltool(srv::MCPServer, name::String, args)
             snapshot!(player)
             nt = NamedTuple(pr.name => Float64(get(args, String(pr.name), pr.default)) for pr in p.params)
             seteffect!(clip, p.make(nt))
-            refreshfxrows!(player)
-            refreshedit!(player)
+            redraw!(player)
             "applied $(p.label)"
         else
             Dict("isError" => true, "message" => "unknown tool $name")
@@ -413,8 +409,9 @@ labels, ranges and every keyframe. They were the same function once, which meant
 neither could change without breaking the other.
 """
 effectinfo(fx::Effect) = Dict{String, Any}(
-    "kind" => String(fx.kind), "id" => string(fx.id), "enabled" => fx.enabled,
-    "params" => Dict{String, Any}(String(p.name) => jsonvalue(p.value) for p in fx.params))
+    "kind" => String(fx.kind), "id" => string(fx.id), "enabled" => fx.enabled[],
+    "params" => Dict{String, Any}(String(p.name) => jsonvalue(valueat(p, 0))
+                                  for p in fx.params))
 
 """
     jsonvalue(v) -> JSON-able

@@ -11,6 +11,29 @@ using VideoEditor.Makie: Keyboard, Mouse, KeyEvent, MouseButtonEvent, Point2f
 # stand-in for the global index that used to answer this. Adds the effect when
 # the clip has none, because these tests animate a parameter to see what happens
 # and used to get the effect for free from `setparam!`.
+# The timeline holds the selected clip's ID, not its index — an index silently
+# comes to mean another clip the moment anything is inserted, deleted or sorted.
+# These translate for the beats below, which are written in indices because that
+# is how a reader thinks about "the second clip".
+sel!(pl, i::Integer) = (pl.timeline.selected[] = pl.sequence.clips[i].id; nothing)
+sel!(pl, c::VE.Clip) = (pl.timeline.selected[] = c.id; nothing)
+selidx(pl) = findfirst(c -> c.id == pl.timeline.selected[], pl.sequence.clips)
+markidxs(pl) = sort(filter(!isnothing,
+                           [findfirst(c -> c.id == id, pl.sequence.clips)
+                            for id in pl.timeline.selection[]]))
+mark!(pl, is...) = (pl.timeline.selection[] =
+                        UInt64[pl.sequence.clips[i].id for i in is]; nothing)
+
+# A slider MOVED BY THE USER. `set_close_to!` alone is the display path — the
+# editor edits on the drag, not on the value, so a test that wants an edit has to
+# say it was one. That is what these beats always meant.
+function dragslider!(sl, value)
+    sl.dragging[] = true
+    Makie.set_close_to!(sl, value)
+    sl.dragging[] = false
+    return nothing
+end
+
 const OWNER = Dict(:brightness => VE.ColorEffect, :contrast => VE.ColorEffect,
                    :saturation => VE.ColorEffect, :temperature => VE.ColorEffect,
                    :sharpen => VE.SharpenEffect, :opacity => VE.OpacityEffect,
@@ -28,18 +51,27 @@ function tparam(clip, name::Symbol)
 end
 function tcurve!(clip, name::Symbol)
     pr = tparam(clip, name)
-    pr.curve === nothing && (pr.curve = VE.AnimCurve())
-    pr.visible = true          # keying a parameter opens its lane, as ◆ does
-    return pr.curve
+    pr.visible[] = true        # keying a parameter opens its lane, as ◆ does
+    return pr.curve[]
 end
-tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing : pr.curve)
-# The slider a parameter's row is bound to. Keyed by (slot id, param) because a
-# clip can carry two slots of the same kind — a name alone names two widgets.
+tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing : pr.curve[])
+# The slider a parameter's row is bound to. Reached through the parameter, which
+# holds its own widgets — a clip can carry two slots of one kind, and a name alone
+# would name two of them.
+# What the panel is showing: the titles of the cards that are up. A card belongs
+# to its effect, so this is a walk over the shown clip's stack plus the tool-only
+# cards — there is no list of cards to read.
+cardtitles(player) =
+    vcat(player.shownclip === nothing ? String[] :
+         [Makie.to_value(fx.card.title) for fx in player.shownclip.effects
+          if fx.card !== nothing],
+         [Makie.to_value(c.title) for c in values(player.fxpanel.toolcards)])
+
 function tslider(player, clip, name::Symbol)
     for fx in clip.effects
-        VE.param(fx, name) === nothing && continue
-        w = get(player.fxsliders, (fx.id, name), nothing)
-        w === nothing || return w
+        pr = VE.param(fx, name)
+        (pr === nothing || pr.view === nothing) && continue
+        pr.view.control isa Makie.Slider && return pr.view.control
     end
     return nothing
 end
@@ -113,7 +145,7 @@ end
             # work on used to jump the playhead, so every edit began with a scrub
             # back. The playhead must sit exactly where the drag above left it.
             press(tlx(1.0))
-            @test tl.selected[] == 1
+            @test selidx(p) == 1
             @test p.playhead[] == 75
             moveto(tlx(0.5))         # …and it stays put however far the press wanders
             @test p.playhead[] == 75
@@ -121,7 +153,7 @@ end
             release()
 
             seekpick(1.0)            # back to a defined state for the beats below
-            @test p.playhead[] == 30 && tl.selected[] == 1
+            @test p.playhead[] == 30 && selidx(p) == 1
         end
 
         @testset "crop tool keeps orientation" begin
@@ -202,7 +234,7 @@ end
             keypress(Keyboard.x)
             @test length(p.sequence.clips) == 1
             @test VE.seqlength(p.sequence) == 60
-            @test length(tl.clipplots) == 1            # plot reconciled away
+            @test count(c -> c.view !== nothing, p.sequence.clips) == 1   # …and the joined clip's plot went with it
             # the view follows the shrunken sequence (no dead space)
             @test maximum(ax.finallimits[])[1] <= 2.0 * 1.05
         end
@@ -242,8 +274,8 @@ end
             # "we should CLIP/Resize the clip WHERE WE DRAG"). The model was already
             # right — it was the strip that kept drawing the old head under a
             # shrinking band, which reads as the FAR end being cut instead.
-            @test p.timeline.clipranges[1][][1] ≈ clip.start / p.sequence.framerate
-            @test p.timeline.clipstarts[1][] ≈ clip.src_in / clip.source.framerate
+            @test clip.view.range[][1] ≈ clip.start / p.sequence.framerate
+            @test clip.view.srcstart[] ≈ clip.src_in / clip.source.framerate
             release()
             sleep(0.8)
             @test clip.src_in == 15
@@ -256,7 +288,7 @@ end
             # the next clip, so a clipat-based hit test missed these
             moveto(tlx(1.5))                      # exactly on the right edge
             @test !isempty(p.timeline.edgeline[])
-            @test p.timeline.hovered[] == 1       # edge hover brightens its clip
+            @test p.timeline.hovered[] == p.sequence.clips[1].id   # edge hover brightens its clip
             moveto(tlx(1.5 + VE.edgezone(p.timeline) / 2))  # just past the end
             @test !isempty(p.timeline.edgeline[])
             moveto(tlx(1.0))                      # interior: no handle
@@ -285,7 +317,7 @@ end
             keypress(Keyboard.z)
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
             @test length(p.sequence.clips) == 1
-            @test length(p.timeline.clipplots) == 1
+            @test count(c -> c.view !== nothing, p.sequence.clips) == 1
         end
 
         @testset "cut prefetch" begin
@@ -330,7 +362,7 @@ end
 
             VE.addsource!(p, testvideo2)                   # place it: the multi-source beats
             @test length(p.sequence.clips) == nclips + 1
-            @test length(tl.clipplots) == nclips + 1
+            @test count(c -> c.view !== nothing, p.sequence.clips) == nclips + 1
             added = p.sequence.clips[end]
             @test added.source.width == 480
             @test added.start == 45                # appended at the sequence end
@@ -364,7 +396,7 @@ end
             keypress(Keyboard.z)
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.release)
             @test length(p.sequence.clips) == nclips
-            @test length(tl.clipplots) == nclips
+            @test count(c -> c.view !== nothing, p.sequence.clips) == nclips
         end
 
         @testset "object-lock pick flow" begin
@@ -456,7 +488,7 @@ end
             # old promise — "the card stays put, it is a tool" — belonged to the
             # Tools dock, which every tool shared and nothing owned.
             @test VE.findslot(clip, VE.StabilizeEffect) === nothing
-            @test findfirst(c -> c.title[] == "Stabilize", p.fxwidgets[:fxcards]) === nothing
+            @test !("Stabilize" in cardtitles(p))
             # …and asking for it again brings it back, on a clean clip: Remove
             # then SAYS there is nothing rather than doing damage.
             stabopen()
@@ -572,7 +604,7 @@ end
             while !isempty(p.sequence.clips)
                 VE.deleteclip!(p.sequence, p.sequence.clips[1].start)
             end
-            VE.relayout!(p.timeline)
+            VE.placetracks!(p.timeline)
             @test isempty(p.sequence.clips)
             @test VE.saveproject!(p) === nothing         # Ctrl+S path: refuses politely
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
@@ -674,7 +706,7 @@ end
             @test waitfor(() -> p.refining[] == false; s = 20)
             @test p.playhead[] == target
             p.playhead[] = head0
-            VE.refreshedit!(p)
+            VE.redraw!(p)
         end
 
         @testset "the pill row is tall enough for its pills" begin
@@ -701,7 +733,7 @@ end
             # pixel.
             clip = p.sequence.clips[1]
             snap0 = VE.docsnapshot(p)
-            p.timeline.selected[] = 1
+            sel!(p, 1)
             p.playhead[] = clip.start
             clip.mattetrack = VE.MatteTrack(fill(0x00, 32, 24, 20), clip.src_in)
             empty!(VE.matterepairs(p, clip))
@@ -724,7 +756,7 @@ end
             empty!(VE.matterepairs(p, clip))
             clip.mattetrack = nothing
             VE.docrestore!(p, snap0)
-            VE.refreshedit!(p)
+            VE.redraw!(p)
         end
 
         @testset "the DNN kernels actually compile on the GPU" begin
@@ -801,24 +833,25 @@ end
             seq = p.sequence
             snap0 = VE.docsnapshot(p)
             head0 = p.playhead[]
-            p.timeline.selected[] = 1
+            sel!(p, 1)
             VE.copyclips!(p)
             @test !isempty(p.clipboard)
             p.playhead[] = VE.clipend(seq.clips[1])
             n = VE.pasteclips!(p)
             @test n == 1
             @test length(seq.clips) == 2
-            i = p.timeline.selected[]
-            @test 1 <= i <= length(seq.clips)
-            # …and it is the NEW one, found by identity after the sort reorders
-            @test seq.clips[i].start == head0 + VE.cliplength(seq.clips[1]) ||
-                  seq.clips[i] !== seq.clips[1]
-            @test i in p.timeline.selection[]
+            # the selection names a clip, so there is nothing to find: the sort
+            # that follows a paste cannot move what it points at
+            pasted = VE.selectedclip(p)
+            @test pasted !== nothing
+            @test pasted.start == head0 + VE.cliplength(seq.clips[1]) ||
+                  pasted !== seq.clips[1]
+            @test pasted.id in p.timeline.selection[]
 
             empty!(p.clipboard)
             VE.docrestore!(p, snap0)
             p.playhead[] = head0
-            VE.refreshedit!(p)
+            VE.redraw!(p)
             @test waitfor(() -> length(p.sequence.clips) == 1)
         end
 
@@ -921,14 +954,14 @@ end
             # the filmstrip follows the LANE, not the stack: a taller track shows
             # bigger frames instead of the same ones pulled tall
             i = findfirst(c -> c.track == 1, seq.clips)
-            i === nothing || @test tl.clipplots[i].bandshare[] > 0.5
+            i === nothing || @test seq.clips[i].view.plot.bandshare[] > 0.5
 
             # Hand the document back as found. NOT with one Ctrl+Z: grabbing the
             # grip snapshots first (`onedit`), so the top of the undo stack is the
             # resize, not the track move — one undo would leave the clip up here.
             VE.settrackheight!(seq, 1, 1.0)
             foreach(c -> (c.track = 1), seq.clips)
-            VE.refreshedit!(p); VE.relayout!(tl); sleep(0.2)
+            VE.redraw!(p); VE.placetracks!(tl); sleep(0.2)
             @test VE.ntracks(seq) == 1
         end
 
@@ -958,9 +991,22 @@ end
             @test VE.trackedgeat(seq, 0.475, 2) === nothing   # no divider to grab
 
             # THE CONDITION ON THE WHOLE FEATURE: the strip still scrubs
+            # From a known other place, not from wherever the last beat left the
+            # playhead: the double-click above is a LANE gesture and no longer
+            # moves it, so `head0` could already be the frame this seeks to.
+            # …and with the zoom put back: soloing relayouts, which resets the
+            # x-limits, and `tlx` reads them live — both seconds below then landed
+            # past the right edge and read as the same frame.
+            # …with the zoom put back, since soloing relayouts and `tlx` reads the
+            # limits live, and with the double-click window cleared around each
+            # press: two presses inside it are a double-click on the AXIS, which
+            # resets the limits instead of scrubbing.
+            Makie.limits!(ax, 0.0, 4.0, 0.0, VE.AXISTOP); sleep(0.5)
+            seek(3.0); sleep(0.5)
             head0 = p.playhead[]
-            seek(1.0)
+            seek(1.0); sleep(0.3)
             @test p.playhead[] != head0
+            @test p.playhead[] == round(Int, 1.0 * p.sequence.framerate)
             @test seq.solo == 2                      # …and scrubbing did not undo the solo
 
             press(pos); release(); press(pos); release(); sleep(0.2)   # …and back
@@ -968,7 +1014,7 @@ end
             @test VE.trackband(seq, 2, 2)[2] ≈ VE.TRACKTOP
 
             foreach(c -> (c.track = 1), seq.clips)   # hand the document back as found
-            VE.refreshedit!(p); VE.relayout!(tl); sleep(0.2)
+            VE.redraw!(p); VE.placetracks!(tl); sleep(0.2)
             @test VE.ntracks(seq) == 1
         end
 
@@ -987,7 +1033,7 @@ end
             nfx = length(clip.effects)
             @test nfx > 0
             n0 = length(seq.clips)
-            tl.selected[] = 1
+            sel!(p, 1)
             sleep(0.3)
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_control, Keyboard.press)
             keypress(Keyboard.c)
@@ -1007,13 +1053,13 @@ end
             @test all(a.id != b.id for a in pasted.effects, b in clip.effects)
             # editing the copy's stack must not touch the original's — the slot
             # is mutable, so this is exactly what a shared slot would leak through
-            pasted.effects[1].enabled = false
-            @test clip.effects[1].enabled
+            pasted.effects[1].enabled[] = false
+            @test clip.effects[1].enabled[]
 
             empty!(p.clipboard)
             VE.docrestore!(p, snap0)
             p.playhead[] = head0
-            VE.refreshedit!(p)
+            VE.redraw!(p)
             @test waitfor(() -> length(p.sequence.clips) == n0)
         end
 
@@ -1277,7 +1323,7 @@ end
             @test seq.canvas === nothing
 
             p.playhead[] = head0
-            VE.refreshedit!(p)
+            VE.redraw!(p)
             @test waitfor(() -> length(p.sequence.clips) == 1)
         end
 
@@ -1288,7 +1334,7 @@ end
             seq.canvas = nothing
             clip = seq.clips[1]
             p.playhead[] = clip.start
-            VE.refreshedit!(p)
+            VE.redraw!(p)
             W, H = size(p.frame[])
             @test W > 0 && H > 0
 
@@ -1333,7 +1379,7 @@ end
             VE.usetool!(p, :none)
             VE.docrestore!(p, snap0)
             p.playhead[] = head0
-            VE.refreshedit!(p)
+            VE.redraw!(p)
             @test waitfor(() -> length(p.sequence.clips) == 1)
         end
 
@@ -1358,7 +1404,7 @@ end
             # End to end: picking a ratio reshapes the framing NOW, and the canvas
             # follows in :canvas scope. Even-pixel rounding is why this is rtol and
             # not equality.
-            p.timeline.selected[] = 1
+            sel!(p, 1)
             p.playhead[] = clip.start
             VE.setcropscope!(p, :canvas)
             VE.setcropaspect!(p, 9 / 16)
@@ -1379,51 +1425,46 @@ end
             VE.usetool!(p, :none)
             VE.docrestore!(p, snap0)
             p.playhead[] = head0
-            VE.refreshedit!(p)
+            VE.redraw!(p)
             @test waitfor(() -> length(p.sequence.clips) == 1)
         end
 
-        @testset "the panel rebuilds when the SEQUENCE changes, not just the clip" begin
-            # `effsig` reads the CLIP and only the clip, which was right while the
-            # panel showed clip effects and nothing else. It now hosts Narration,
-            # Transcript, Crop and Time interpolation, which read the SEQUENCE — so
-            # the signature never changed when they did, `rebuildstack` returned
-            # early, and a narration line you had just typed did not appear on the
-            # card that added it. A screenshot found this; no assertion did.
+        @testset "a sequence-level edit reaches the card that shows it" begin
+            # The panel used to notice this through a signature over the clip AND
+            # the document, compared on every playhead move: Narration, Transcript,
+            # Crop and Time interpolation read the SEQUENCE, the clip-only
+            # signature was blind to them, and a narration line you had just typed
+            # did not appear on the card that added it. A screenshot found that; no
+            # assertion did.
+            #
+            # A tool card is a singleton the panel owns, so the edit says what it
+            # changed: `rebuildtoolcard!`. What has to hold is that the card shows
+            # the line — and that a card which is not open is not conjured up.
             seq = p.sequence
-            clip = seq.clips[1]
             empty!(seq.captions); empty!(seq.narration)
-            before = VE.docsig(seq, clip)
+            VE.closetool!(p, :narration)
+            @test !("Narration" in cardtitles(p))
+            VE.dropnarration!(p, 1)                     # nothing there: a no-op
+            @test !("Narration" in cardtitles(p))       # …and it opens nothing
 
-            push!(seq.captions, VE.Caption(0.0, 1.0, "hello"))
-            @test VE.docsig(seq, clip) != before        # a caption is a change…
-            empty!(seq.captions)
-            @test VE.docsig(seq, clip) == before
-
+            VE.opentool!(p, :narration); sleep(0.2)
+            @test "Narration" in cardtitles(p)
+            card0 = p.fxpanel.toolcards[:narration]
             push!(seq.narration, VE.Narration("hi", 0.0))
-            @test VE.docsig(seq, clip) != before        # …so is a narration line
-            empty!(seq.narration)
-
-            seq.canvas = (640, 360)
-            @test VE.docsig(seq, clip) != before        # …and so is the canvas
-            seq.canvas = nothing
-            @test VE.docsig(seq, clip) == before
-
-            # …while the clip-only signature is blind to every one of them, which
-            # is precisely why it could not be the whole answer.
-            e = VE.effsig(clip)
-            push!(seq.captions, VE.Caption(0.0, 1.0, "hello"))
-            push!(seq.narration, VE.Narration("hi", 0.0))
-            seq.canvas = (640, 360)
-            @test VE.effsig(clip) == e
-            empty!(seq.captions); empty!(seq.narration); seq.canvas = nothing
+            VE.dropnarration!(p, 1); sleep(0.2)         # …which rebuilds the card
+            @test p.fxpanel.toolcards[:narration] !== card0
+            @test isempty(seq.narration)
+            VE.closetool!(p, :narration)
+            @test !("Narration" in cardtitles(p))
         end
 
-        @testset "a hidden panel skips rebuilds but is never stale" begin
-            # `rebuildstack` runs on EVERY playhead change and tears the stack
-            # down on every clip boundary — during playback, that is every cut,
-            # paid for cards behind a closed dock. Skipping while hidden is only
-            # safe if coming back rebuilds, which is the failure this guards.
+        @testset "a hidden panel is never stale" begin
+            # The stack used to be torn down and rebuilt on every clip boundary —
+            # during playback, that is every cut, paid for cards behind a closed
+            # dock — so it skipped the work while hidden, and skipping is only safe
+            # if coming back catches up. Cards belong to their clips now and
+            # nothing goes stale, but which clip is SHOWN still follows the
+            # playhead, and that is what this guards.
             seq = p.sequence
             snap0 = VE.docsnapshot(p)
             head0 = p.playhead[]
@@ -1431,24 +1472,24 @@ end
             c2 = VE.copyclip(base; start = VE.clipend(base))
             VE.seteffect!(c2, VE.BlurEffect(3.0f0))       # …so its stack DIFFERS
             push!(seq.clips, c2)
-            VE.refreshedit!(p)
+            VE.redraw!(p)
 
             VE.opendock!(p, :effects)
-            p.timeline.selected[] = 1
+            sel!(p, 1)
             p.playhead[] = base.start
-            @test waitfor(() -> !("Blur" in [c.title[] for c in p.fxwidgets[:fxcards]]))
+            @test waitfor(() -> !("Blur" in cardtitles(p)))
 
             # close, move onto the OTHER clip while nothing is watching, reopen
             VE.opendock!(p, :none)
-            p.timeline.selected[] = 2
+            sel!(p, 2)
             p.playhead[] = c2.start + 1
             VE.opendock!(p, :effects)
-            @test waitfor(() -> "Blur" in [c.title[] for c in p.fxwidgets[:fxcards]])
+            @test waitfor(() -> "Blur" in cardtitles(p))
 
             deleteat!(seq.clips, findfirst(c -> c === c2, seq.clips))
             VE.docrestore!(p, snap0)
             p.playhead[] = head0
-            VE.refreshedit!(p)
+            VE.redraw!(p)
             @test waitfor(() -> length(p.sequence.clips) == 1)
         end
 
@@ -1461,12 +1502,12 @@ end
             # searchable menu." So the panel shows what was put there, and the
             # menu is how a tool that is not a clip effect gets found.
             VE.opendock!(p, :effects)
-            p.timeline.selected[] = 1
+            sel!(p, 1)
             clip = p.sequence.clips[1]
             p.playhead[] = clip.start
-            VE.refreshedit!(p)
-            p.fxwidgets[:fxlistrefresh]()
-            titles() = [c.title[] for c in p.fxwidgets[:fxcards]]
+            VE.redraw!(p)
+            VE.showclip!(p)
+            titles() = cardtitles(p)
             @test isempty(VE.opentools(p))
             for gone in ("Crop", "Transcript", "Narration", "Time interpolation")
                 @test !(gone in titles())
@@ -1583,7 +1624,7 @@ end
             empty!(seq.captions); empty!(seq.narration)
             VE.docrestore!(p, snap0)
             p.playhead[] = head0
-            VE.refreshedit!(p)
+            VE.redraw!(p)
             @test waitfor(() -> length(p.sequence.clips) == 1)
         end
 
@@ -1599,7 +1640,7 @@ end
             VE.mattemarks(p, left)[left.src_in] = fill(0x22, 8, 6)
             VE.matterepairs(p, left)[left.src_in + 1] = fill(0x33, 8, 6)
 
-            p.timeline.selected[] = 1
+            sel!(p, 1)
             p.playhead[] = left.start + VE.cliplength(left) ÷ 2
             VE.split!(p)
             @test length(seq.clips) == 2
@@ -1612,7 +1653,7 @@ end
             empty!(VE.mattemarks(p, left)); empty!(VE.matterepairs(p, left))
             VE.docrestore!(p, snap0)
             p.playhead[] = head0
-            VE.refreshedit!(p)
+            VE.redraw!(p)
             @test waitfor(() -> length(p.sequence.clips) == 1)
         end
 
@@ -1623,7 +1664,7 @@ end
             # rebuilt from the seeds and silently discarded every fix.
             clip = p.sequence.clips[1]
             snap0 = VE.docsnapshot(p)
-            p.timeline.selected[] = 1
+            sel!(p, 1)
             p.playhead[] = clip.start
             clip.mattetrack = VE.MatteTrack(fill(0x00, 8, 6, 40), clip.src_in)
             empty!(VE.matterepairs(p, clip))
@@ -1673,7 +1714,7 @@ end
             # the case the repair flow was built for.
             clip = p.sequence.clips[1]
             snap0 = VE.docsnapshot(p)
-            p.timeline.selected[] = 1
+            sel!(p, 1)
             p.playhead[] = clip.start
             clip.mattetrack = VE.MatteTrack(fill(0x00, 8, 6, 40), clip.src_in)
             VE.showkind!(p, :matte)
@@ -1683,7 +1724,7 @@ end
             @test !isempty(pctx.callbacks)
             clip.mattetrack = nothing
             VE.docrestore!(p, snap0)
-            VE.refreshedit!(p)
+            VE.redraw!(p)
         end
 
         @testset "the new actions are reachable from the keyboard" begin
@@ -1823,7 +1864,7 @@ end
             # `repairmatteat!` repairs the clip being EDITED, and `editclip` wants
             # it selected with the playhead inside it — the same precondition every
             # other clip operation has.
-            p.timeline.selected[] = 1
+            sel!(p, 1)
             p.playhead[] = clip.start; sleep(0.2)
             @test VE.repairmatteat!(p, fill(0xff, 8, 6))
             reps = VE.matterepairs(p, clip)
@@ -1876,7 +1917,7 @@ end
             # `pickfocus!` acts on the clip being EDITED, so select it — otherwise
             # it declines for the wrong reason ("no clip under the playhead") and
             # the test passes or fails on the wrong branch.
-            p.timeline.selected[] = 1
+            sel!(p, 1)
             p.playhead[] = clip.start
             VE.pickfocus!(p)
             @test p.onpick === nothing
@@ -1963,7 +2004,7 @@ end
                 VE.opendock!(p, k); sleep(0.1)
             end
             sleep(0.2)
-            @test p.fxwidgets[:fxscroll].scene.visible[]
+            @test p.fxpanel.scroll.scene.visible[]
             @test p.fxwidgets[:addeffect].blockscene.visible[]
             @test p.fxwidgets[:compare].blockscene.visible[]
         end
@@ -2072,16 +2113,18 @@ end
             VE.setkey!(tcurve!(clip, :brightness), fkey, tparam(clip, :brightness).range[2])
             VE.setkey!(tcurve!(clip, :sharpen), fkey, tparam(clip, :sharpen).range[1])
             VE.togglekey!(p, VE.editclip(p)[1], tparam(VE.editclip(p)[1], :brightness))          # focus = brightness
-            notify(p.playhead); sleep(0.3)
+            VE.showplayhead!(p); sleep(0.3)
+            # …asked of the LANE, the way `markerpix` is. Modelling the geometry a
+            # second time here got the two-argument `trackband`, which knows
+            # nothing about per-track heights: right on a single track and wrong
+            # the moment there are two, which is a failure that would point at the
+            # product rather than at this arithmetic.
             curvepos(key, sf) = begin                # figure pixel on `key`'s curve at SOURCE frame sf
-                ntr = VE.ntracks(p.sequence)
-                lo, hi = VE.trackband(clip.track, ntr)
-                g = min(0.02, VE.trackspan(ntr) * 0.15); lo += g; hi -= g
-                inset = 0.12 * (hi - lo); lo += inset; hi -= inset
                 pr = tparam(clip, key)
-                v = VE.valueat(pr, sf)
-                y = lo + (hi - lo) * clamp(VE.paramnorm(pr, v), 0.0, 1.0)
-                t = (clip.start + (sf - clip.src_in)) / p.sequence.framerate
+                pr.view === nothing && (VE.showclip!(p, clip); sleep(0.3))
+                lane = pr.view.lane
+                y = VE.laney(lane.band[], lane.valuerange[], VE.valueat(pr, sf))
+                t = VE.seconds(lane.framemap[], sf)
                 lims = ax.finallimits[]; vp = ax.scene.viewport[]
                 Point2f(vp.origin[1] + (t - minimum(lims)[1]) /
                             (maximum(lims)[1] - minimum(lims)[1]) * vp.widths[1],
@@ -2120,15 +2163,19 @@ end
             seekpick(2.0); sleep(0.2)   # playhead onto the clip
             clip = VE.locate(p.sequence, p.playhead[])[1]
             fps = p.sequence.framerate
+            # …asked of the LANE, not modelled a second time here: where a curve is
+            # drawn is the lane plot's own answer (`band`, `valuerange`,
+            # `framemap`, pushed by `placelanes!`). Recomputing it from
+            # `trackband` got the two-argument method, which knows nothing about
+            # per-track heights, so the y was off wherever a track was resized.
             markerpix(key, sf) = begin               # figure pixel of `key`'s curve at source frame sf
-                ntr = VE.ntracks(p.sequence)
-                lo, hi = VE.trackband(clip.track, ntr)
-                g = min(0.02, VE.trackspan(ntr) * 0.15); lo += g; hi -= g
-                inset = 0.12 * (hi - lo); lo += inset; hi -= inset
                 pr = tparam(clip, key)
-                v = VE.valueat(pr, sf)
-                y = lo + (hi - lo) * clamp(VE.paramnorm(pr, v), 0.0, 1.0)
-                t = (clip.start + (sf - clip.src_in)) / fps
+                # a marker has a pixel only while its row is on screen — that is
+                # what owns the lane it is drawn on
+                pr.view === nothing && (VE.showclip!(p, clip); sleep(0.3))
+                lane = pr.view.lane
+                y = VE.laney(lane.band[], lane.valuerange[], VE.valueat(pr, sf))
+                t = VE.seconds(lane.framemap[], sf)
                 lims = ax.finallimits[]; vp = ax.scene.viewport[]
                 Point2f(vp.origin[1] + (t - minimum(lims)[1]) /
                             (maximum(lims)[1] - minimum(lims)[1]) * vp.widths[1],
@@ -2141,25 +2188,32 @@ end
                 return p.fxwidgets[Symbol(:kfacc_, fx.id, :_, :contrast)]
             end
 
-            # --- ◆ starts animating: first key at the playhead, label flips ◇ → ◆ ---
+            # --- ◆ starts animating: a key at the playhead, label flips ◇ → ◆ ---
+            # A parameter is ALWAYS a curve, so a constant is one key and animating
+            # it takes a second: the value it held is anchored at the clip's first
+            # frame and the playhead gets the key that was asked for.
             @test !VE.isanimated(tparam(clip, :contrast))
             @test Makie.to_value(trio()[2].label) == "◇"
             notify(trio()[2].clicks); sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             f1 = VE.playheadframe(p, clip)
-            @test [k.frame for k in tcurve!(clip, :contrast).keys] == [f1]
+            @test [k.frame for k in tcurve!(clip, :contrast).keys] == [clip.src_in, f1]
             @test Makie.to_value(trio()[2].label) == "◆"
             # --- scrub off the key (◇), slider writes a second key (◆ again) ---
             seekpick(2.8); sleep(0.3)
             @test Makie.to_value(trio()[2].label) == "◇"
-            ghost0 = sum(length(q.curve.keys) for fx in clip.effects for q in fx.params
+            ghost0 = sum(length(q.curve[].keys) for fx in clip.effects for q in fx.params
                           if VE.isanimated(q) && q.name !== :contrast; init = 0)
-            Makie.set_close_to!(tslider(p, VE.editclip(p)[1], :contrast), 1.6); sleep(0.4)
+            dragslider!(tslider(p, VE.editclip(p)[1], :contrast), 1.6); sleep(0.4)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             f2 = VE.playheadframe(p, clip)
-            @test length(tcurve!(clip, :contrast).keys) == 2
-            # a gesture on ONE slider must not stamp ghost keys on other animated params
-            @test sum(length(q.curve.keys) for fx in clip.effects for q in fx.params
+            @test length(tcurve!(clip, :contrast).keys) == 3   # anchor + f1 + this one
+            # a gesture on ONE slider must not stamp ghost keys on other animated
+            # params — and a SCRUB must not either: every slider follows its curve
+            # as the playhead moves, and a sync that read as a gesture would key
+            # the whole card at every frame
+            @test [k.frame for k in tcurve!(clip, :contrast).keys][end] == f2
+            @test sum(length(q.curve[].keys) for fx in clip.effects for q in fx.params
                           if VE.isanimated(q) && q.name !== :contrast; init = 0) == ghost0
             @test Makie.to_value(trio()[2].label) == "◆"
             # --- ◀ ▶ jump between keys ---
@@ -2167,11 +2221,11 @@ end
             @test VE.playheadframe(p, VE.locate(p.sequence, p.playhead[])[1]) == f1
             notify(trio()[3].clicks); sleep(0.3)
             @test VE.playheadframe(p, VE.locate(p.sequence, p.playhead[])[1]) == f2
-            # --- ◆ ON a key removes it; removing the last key un-animates ---
+            # --- ◆ ON a key removes it; the last one left is the constant again ---
             notify(trio()[2].clicks); sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
-            @test [k.frame for k in tcurve!(clip, :contrast).keys] == [f1]
-            notify(trio()[1].clicks); sleep(0.3)     # ◀ back onto the remaining key
+            @test [k.frame for k in tcurve!(clip, :contrast).keys] == [clip.src_in, f1]
+            notify(trio()[1].clicks); sleep(0.3)     # ◀ back onto a remaining key
             notify(trio()[2].clicks); sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             @test !VE.isanimated(tparam(clip, :contrast))
@@ -2180,7 +2234,7 @@ end
             # --- rebuild a 2-key ramp for the gesture checks ---
             notify(trio()[2].clicks); sleep(0.3)                    # key at f1'
             seekpick(2.8); sleep(0.2)
-            Makie.set_close_to!(tslider(p, VE.editclip(p)[1], :contrast), 1.6); sleep(0.4)
+            dragslider!(tslider(p, VE.editclip(p)[1], :contrast), 1.6); sleep(0.4)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             ka, kb = (k.frame for k in tcurve!(clip, :contrast).keys)
 
@@ -2215,19 +2269,31 @@ end
 
             # --- Alt-click with no animated curve nearby only hints ---
             saved = copy(clip.effects); empty!(clip)
-            notify(p.playhead); sleep(0.2)
+            VE.showplayhead!(p); sleep(0.2)
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.press)
             seekpick((clip.start + (mid - clip.src_in)) / fps)   # same clip, no curves
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.release)
             sleep(0.2)
             @test !VE.isanimated(clip)                         # nothing invented
-            foreach(fx -> VE.addslot!(clip, fx), saved); notify(p.playhead); sleep(0.2)
+            foreach(fx -> VE.addslot!(clip, fx), saved); VE.showplayhead!(p); sleep(0.2)
 
             # --- right-click ◆ → per-KEY ease: smoothing kb flattens ITS tangent ---
             clip = VE.locate(p.sequence, p.playhead[])[1]
             c = tcurve!(clip, :contrast)
-            ka, kb = (k.frame for k in c.keys)
-            va, vb = (k.value for k in c.keys)
+            # The two frames this beat eases between, keyed rather than taken from
+            # whatever is there: a parameter's anchor key sits at the clip's FIRST
+            # frame, and with the clip at t=0 that is the axis' own left edge —
+            # x = 16.0 in a viewport that starts at 16. No right-click reaches it.
+            # …through the PARAM, not the curve: the curve method mutates in place
+            # and tells nobody, so the lane goes on drawing the ◆ where it used to
+            # be while `markerpix` reports where it now is, and the click misses.
+            prc = tparam(clip, :contrast)
+            len = clip.src_out - clip.src_in
+            VE.setkey!(prc, clip.src_in + len ÷ 3, 0.8)
+            VE.setkey!(prc, clip.src_in + (2 * len) ÷ 3, 1.6)
+            sleep(0.2)
+            ka, kb = c.keys[end - 1].frame, c.keys[end].frame
+            va, vb = c.keys[end - 1].value, c.keys[end].value
             fq = ka + (kb - ka) ÷ 4
             tq = (fq - ka) / (kb - ka)
             rc = markerpix(:contrast, kb)
@@ -2247,7 +2313,7 @@ end
             ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.release)
             sleep(0.2)
             notify(p.fxwidgets[:kfmenubtn3].clicks); sleep(0.2)    # "Hold until the next key"
-            @test c.keys[1].ease === :hold
+            @test c.keys[end - 1].ease === :hold
             @test VE.valueat(c, fq) == va
             @test VE.valueat(c, kb) == vb                          # the next key still lands
             # --- and Clear-all makes the parameter static again ---
@@ -2270,11 +2336,11 @@ end
             sf0 = VE.playheadframe(p, clip)
             VE.setkey!(tcurve!(clip, :contrast), sf0, 0.2)
             VE.setkey!(tcurve!(clip, :contrast), clip.src_out - 1, 1.9)
-            notify(p.playhead); sleep(0.3)
+            VE.showplayhead!(p); sleep(0.3)
             @test VE.valueat(tparam(clip, :contrast), sf0) ≈ 0.2 atol = 1.0e-6
             @test VE.valueat(tparam(clip, :contrast), clip.src_out - 1) ≈ 1.9 atol = 1.0e-6
-            (tparam(clip, :contrast).curve = nothing)                    # leave the state clean
-            notify(p.playhead); sleep(0.2)
+            VE.clearkeys!(tparam(clip, :contrast), sf0)    # leave the state clean
+            VE.showplayhead!(p); sleep(0.2)
         end
 
         @testset "stacked tracks: only the EDITED clip's lanes take a gesture" begin
@@ -2292,7 +2358,7 @@ end
             savedanims = copy(base.effects); empty!(base)
             c2 = VE.split!(p.sequence, base.start + (VE.clipend(base) - base.start) ÷ 2)
             c2.start = base.start; c2.track = base.track + 1
-            VE.refreshedit!(p); sleep(0.3)
+            VE.redraw!(p); sleep(0.3)
             w = min(VE.clipend(base), VE.clipend(c2)) - base.start
             fA = base.start + w ÷ 3
             fB = base.start + 2w ÷ 3
@@ -2302,9 +2368,8 @@ end
             seekpick(overt); sleep(0.3)     # playhead over the stack
 
             # whichever clip the cards are bound to is the one with lanes
-            bound = p.fxwidgets[:fxbound]
-            @test bound !== nothing
-            edited = bound[1]
+            edited = p.shownclip     # whose cards are up is whose lanes are drawn
+            @test edited !== nothing
             other = edited === c2 ? base : c2
             oparam = edited === c2 ? tparam(c2, :opacity) : tparam(base, :temperature)
             xparam = other === c2 ? tparam(c2, :opacity) : tparam(base, :temperature)
@@ -2324,29 +2389,31 @@ end
             end
 
             # Alt-click the edited clip's lane: its key lands, the other clip is untouched
-            ne, nx = length(oparam.curve.keys), length(xparam.curve.keys)
+            ne, nx = length(oparam.curve[].keys), length(xparam.curve[].keys)
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.press)
             press(lanepix(edited, oparam, overt)); release()
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.release)
             sleep(0.3)
-            @test length(oparam.curve.keys) == ne + 1
-            @test length(xparam.curve.keys) == nx
+            @test length(oparam.curve[].keys) == ne + 1
+            @test length(xparam.curve[].keys) == nx
 
             # …and the other clip's band takes nothing at all — it has no lanes
-            ne2 = length(oparam.curve.keys)
+            ne2 = length(oparam.curve[].keys)
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.press)
             press(lanepix(other, xparam, overt)); release()
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.release)
             sleep(0.3)
-            @test length(xparam.curve.keys) == nx        # nothing keyed there
-            @test length(oparam.curve.keys) == ne2       # …and nothing leaked back
+            @test length(xparam.curve[].keys) == nx        # nothing keyed there
+            @test length(oparam.curve[].keys) == ne2       # …and nothing leaked back
 
-            # a ◆ of the edited clip is still draggable
-            k1 = oparam.curve.keys[1]
-            f0 = k1.frame
+            # a ◆ of the edited clip is still draggable — the one the Alt-click
+            # just made, not `keys[1]`: a parameter's anchor key sits at the
+            # clip's FIRST frame, which here is the axis' own left edge, and no
+            # press reaches it.
+            f0 = oparam.curve[].keys[end].frame
             mpix = lanepix(edited, oparam, (edited.start + (f0 - edited.src_in)) / fps)
             press(mpix); moveto(mpix .+ Point2f(-40, 0)); release(); sleep(0.3)
-            @test any(k -> k.frame < f0, oparam.curve.keys)
+            @test !any(k -> k.frame == f0, oparam.curve[].keys)   # it left the frame it was on
 
             # restore the timeline: unstack the half and join it back onto base
             empty!(base)
@@ -2355,7 +2422,7 @@ end
             c2.start = VE.clipend(base)
             @test VE.joinclips!(p.sequence, base.start) !== nothing
             foreach(fx -> VE.addslot!(base, fx), savedanims)
-            VE.refreshedit!(p); notify(p.playhead); sleep(0.3)
+            VE.redraw!(p); VE.showplayhead!(p); sleep(0.3)
         end
 
         @testset "slider writes keys while playing (live keying)" begin
@@ -2365,13 +2432,14 @@ end
             clip = VE.locate(p.sequence, p.playhead[])[1]
             farm = tcurve!(clip, :contrast).keys[1].frame
             VE.play!(p); sleep(0.5)                    # playhead advancing
-            Makie.set_close_to!(tslider(p, VE.editclip(p)[1], :contrast), 1.8)
+            dragslider!(tslider(p, VE.editclip(p)[1], :contrast), 1.8)
             sleep(0.2); VE.pause!(p); sleep(0.2)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             ks = tcurve!(clip, :contrast).keys
             @test any(k -> k.frame > farm && abs(k.value - 1.8) < 0.02, ks)
-            (tparam(clip, :contrast).curve = nothing)        # leave the state clean
-            notify(p.playhead); sleep(0.2)
+            VE.clearkeys!(tparam(clip, :contrast), VE.playheadframe(p, clip))
+
+            VE.showplayhead!(p); sleep(0.2)
         end
 
         @testset "GUI tools: loop hints + blend" begin
@@ -2411,12 +2479,17 @@ end
             @test length(p.sequence.clips) == nclips0 + 1
             @test VE.seqlength(p.sequence) == nbefore
             @test VE.activetoolname(p)[] === :loopfinder
-            # Find adds a SECOND reference card (signatures cached — instant)
-            seekpick(1.0)               # another playhead frame
+            # Find adds a SECOND reference card, on the SAME clip: the playhead
+            # moves inside it and the selection stays put. Selecting the other
+            # half of the ▼ cut would bring ITS cards up — the split copied the
+            # loop-finder slot, so that half has a card and a context of its own,
+            # and `ctx` here would be the one nobody is looking at.
+            lfclip = p.shownclip
+            @test lfclip !== nothing
+            VE.seek!(p, lfclip.start + (VE.clipend(lfclip) - lfclip.start) ÷ 3); sleep(0.3)
             lfpanel().callbacks[1]()                 # the panel's Find action
-            # the clip under t=1.0 may be an UNCACHED split half (the ▼ cut position
-            # is content-driven) — the Find then runs a fresh async analysis; wait
-            # for the card like the first Find did instead of a fixed sleep
+            # the Find may run a fresh async analysis — wait for the card like the
+            # first Find did instead of a fixed sleep
             lfcards() = filter(c -> c.tool === :loopfinder, p.fxwidgets[:toolcards][3])
             @test waitfor(() -> length(lfcards()) == 2; s = 25)
             cards = lfcards()
@@ -2464,7 +2537,7 @@ end
             @test length(pctx().rows) == 1              # "no blends yet" placeholder
             @test pctx().state[:fit]                    # "move clips to fit" is the default
 
-            tl.selection[] = [1, 2]; sleep(0.2)
+            mark!(p, 1, 2); sleep(0.2)
             VE.activatetool!(p, :blend); sleep(0.5)     # clicking the header blends
             @test VE.activetoolname(p)[] === :none      # and hands the slot straight back
             @test isempty(p.sequence.transitions)       # NOT a transition
@@ -2479,7 +2552,7 @@ end
 
             # the length control works on a SINGLE selected clip, live, and the
             # overlap follows it
-            tl.selection[] = Int[]; tl.selected[] = 2; sleep(0.3)
+            tl.selection[] = UInt64[]; sel!(p, 2); sleep(0.3)
             @test VE.selectedblend(p) !== nothing
             VE.setblendlength!(pctx(), 1.0); sleep(0.4)
             @test VE.fadeinlength(c2) == round(Int, 1.0 * fps)
@@ -2491,13 +2564,13 @@ end
             # the blend IS an effect entry: switch it off (keys stay), then remove it
             slot = VE.findslot(c2, VE.OpacityEffect)
             @test slot !== nothing
-            slot.enabled = false
+            slot.enabled[] = false
             # …and no OPACITY is applied any more. Not `isempty`: stabilization is
             # an effect too now, so a clip that was stabilized earlier in this
             # session still has its Stabilize slot in the stack.
             @test !any(e -> e isa VE.OpacityEffect, VE.liveeffects(c2))
             @test VE.isanimated(tparam(c2, :opacity))          # the curve is untouched
-            slot.enabled = true
+            slot.enabled[] = true
 
             # the pair survives a move and an undo — nothing is re-derived
             start0, track0 = c2.start, c2.track
@@ -2521,7 +2594,7 @@ end
 
             # × clears keys, effect entry and the pair together
             VE.removeblend!(p.sequence, c2)              # what × does
-            VE.refreshedit!(p); sleep(0.2)
+            VE.redraw!(p); sleep(0.2)
             # …asserted BEFORE anything asks for the parameter: `tparam` CREATES
             # the effect when the clip has none, so reading it here would put back
             # exactly what this beat is about.
@@ -2531,12 +2604,12 @@ end
             @test isempty(VE.blends(p.sequence))
             # restore for the following beats
             c2.start, c2.track = start0, track0
-            VE.refreshedit!(p); sleep(0.2)
+            VE.redraw!(p); sleep(0.2)
             for _ in 1:6
                 VE.undo!(p)
             end
-            tl.selection[] = Int[]
-            VE.refreshedit!(p); sleep(0.2)
+            tl.selection[] = UInt64[]
+            VE.redraw!(p); sleep(0.2)
         end
 
         @testset "the playhead can be placed while playing" begin
@@ -2568,7 +2641,7 @@ end
             upper.track = 2
             upper.start = lower.start + VE.cliplength(lower) ÷ 2   # overlap the lower one
             empty!(upper); empty!(lower)
-            VE.refreshedit!(p); sleep(0.3)
+            VE.redraw!(p); sleep(0.3)
             over = upper.start + 5                                  # both clips cover this
             VE.seek!(p, over); sleep(0.3)
             # /AXISTOP: the axis runs to 1.12 (the scrub strip lives above the
@@ -2580,21 +2653,21 @@ end
             @test VE.locate(p.sequence, over)[1] === upper          # the preview shows the top clip
 
             press(lanepos(over / fps, 1)); release(); sleep(0.3)    # click the LOWER lane
-            @test tl.selected[] == 1
+            @test selidx(p) == 1
             @test VE.editclip(p)[1] === lower                       # …and that is what you edit
             VE.togglekey!(p, VE.editclip(p)[1], tparam(VE.editclip(p)[1], :opacity)); sleep(0.2)
             @test VE.isanimated(tparam(lower, :opacity))
             @test !VE.isanimated(tparam(upper, :opacity))                 # the key went to the RIGHT clip
 
             press(lanepos(over / fps, 2)); release(); sleep(0.3)    # click the upper lane
-            @test tl.selected[] == 2
+            @test selidx(p) == 2
             @test VE.editclip(p)[1] === upper
             VE.togglekey!(p, VE.editclip(p)[1], tparam(VE.editclip(p)[1], :opacity)); sleep(0.2)
             @test VE.isanimated(tparam(upper, :opacity))
 
             empty!(upper); empty!(lower)      # restore for later beats
             upper.track, upper.start = track0, start0
-            VE.refreshedit!(p); sleep(0.2)
+            VE.redraw!(p); sleep(0.2)
             VE.undo!(p); VE.undo!(p); VE.undo!(p); sleep(0.2)       # two keyframe snapshots + the split
             tl.selected[] = 0
         end
@@ -2607,14 +2680,15 @@ end
             c1 = p.sequence.clips[1]; c2 = p.sequence.clips[2]
             fps = p.sequence.framerate
             seekpick((c1.start + VE.cliplength(c1) / 2) / fps)
-            @test tl.selected[] == 1
+            @test selidx(p) == 1
             ph = p.playhead[]
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_shift, Keyboard.press)
             pick((c2.start + VE.cliplength(c2) / 2) / fps)   # MARKING is a lane click
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_shift, Keyboard.release)
             sleep(0.2)
-            @test sort(tl.selection[]) == [1, 2]     # both marked…
-            @test tl.clipstates[1][] === :selected && tl.clipstates[2][] === :selected
+            @test markidxs(p) == [1, 2]     # both marked…
+            @test p.sequence.clips[1].view.state[] === :selected &&
+                  p.sequence.clips[2].view.state[] === :selected
             @test p.playhead[] == ph                 # …and marking didn't scrub
             deleteat!(p); sleep(0.2)                 # X deletes the whole set
             @test isempty(p.sequence.clips)
@@ -2811,12 +2885,11 @@ end
     @test true
 end
 
-# `EFFECTS` is a global registry and the effects panel puts two listeners on its
-# `version`. A closed player used to keep both, which is not a slow leak but a
-# live fault: the corpse's handler `put!`s onto its own closed `uiqueue` and
-# throws, `notify` abandons the rest of the listener list, and the LIVE player's
-# panel silently stops rebuilding — which is how a Matte card lost the "Apply
-# matte to clip" button a walkthrough was about to click.
+# `EFFECTS` is a global registry and the add menu listens to its `version`, so a
+# newly registered kind can be added. A closed player used to keep that listener,
+# which is not a slow leak but a live fault: the corpse's handler `put!`s onto its
+# own closed `uiqueue` and throws, `notify` abandons the rest of the listener list,
+# and the LIVE player's menu silently stops following the registry.
 @testset "a closed player lets go of the global effect registry" begin
     n0 = length(VE.EFFECTS.version.listeners)
     p1 = Player(testvideo; gpupreview = false)
@@ -2829,9 +2902,11 @@ end
     p2 = Player(testvideo; gpupreview = false)
     try
         sleep(1.0)
-        VE.EFFECTS.version[] += 1     # the bump the matte panel does; must not throw
+        VE.EFFECTS.version[] += 1     # a kind registered at run time; must not throw
         sleep(0.3)
-        @test length(p2.fxwidgets[:fxcards]) == 0   # panel still live and rebuilding
+        # the live menu still follows the registry — and the bump does NOT touch
+        # the cards, which describe effects that are already on the clip
+        @test !isempty(Makie.to_value(p2.fxwidgets[:addeffect].options))
     finally
         close(p2)
     end
@@ -2845,40 +2920,310 @@ end
 # playhead handler is not merely garbage: it holds the row it was built for, so a
 # slider that is no longer on screen keeps writing values on every frame.
 #
-# A displayed value is DERIVED from (parameter, position) now, out of one listener
-# for the whole panel (`refreshfxrows!`). What has to hold is that the count does
-# not grow — asserted by rebuilding, not by reading the code, because "nothing
-# registers here" is exactly the kind of claim that stops being true quietly.
-@testset "the panel does not leak playhead handlers" begin
+# A row still derives from the playhead — that is how a slider follows a curve —
+# but the listener is tied to its card's scene, so deleting the card takes it off
+# (`free(::Scene)` deregisters). What has to hold is that the count does not grow:
+# asserted by doing the things that build cards, not by reading the code, because
+# "this one comes off again" is exactly the kind of claim that stops being true
+# quietly.
+# A card comes into being where its effect does — WHATEVER route the effect took.
+# `addslot!` is one door; the undo restore was the other one, and it was a bare
+# `push!` into `clip.effects`: the effect came back, its row did not. Invisible to
+# every test here because selecting another clip and coming back builds it, and
+# because the panel never diffs what it has drawn against the document — which is
+# the whole point, and the reason a missed build stays missed.
+@testset "undo puts a removed effect's card back with it" begin
+    p = Player(testvideo; gpupreview = false)
+    try
+        sleep(1.5)
+        VE.opendock!(p, :effects)
+        sel!(p, 1); sleep(0.6)
+        clip = VE.selectedclip(p)
+        VE.addslot!(clip, VE.Effect(VE.ColorEffect()))
+        VE.addslot!(clip, VE.Effect(VE.BlurEffect(1.0f0))); sleep(0.5)
+        cards(c) = count(fx -> fx.card !== nothing, c.effects)
+        @test cards(clip) == 2
+        VE.snapshot!(p)
+        VE.removeslotat!(clip, 2); VE.redraw!(p); sleep(0.4)
+        @test length(clip.effects) == 1 && cards(clip) == 1
+        VE.undo!(p); sleep(0.8)
+        clip = VE.selectedclip(p)
+        @test length(clip.effects) == 2
+        @test cards(clip) == 2                 # …the row is back, not just the effect
+        @test length(cardtitles(p)) == 2
+    finally
+        close(p)
+    end
+end
+
+# It measured `player.playhead` alone, so it held for exactly the observable the
+# fix had been written for. Every other one a card derives from — the editor's
+# key selection, the card selection, the effect's own enabled flag — went on
+# collecting a listener per card built, because `map` hands back the Observable
+# and not the registration. Counting one of them was the same mistake as counting
+# none: the promise is that a card takes nothing with it, not that it takes no
+# playhead handler with it.
+# What a green suite did NOT say, three times running: that an editor you have
+# just opened is coherent. Every bug of 2026-09-02 — no selection so no cards, a
+# clip drawn at (0,0), an axis fitted to a half-finished split — passed a suite
+# that asserted on values while nobody asked whether the thing on screen made
+# sense. These are the assertions, and they run after the edits most likely to
+# break them.
+"Invariants of an open editor. Asserts; writes nothing."
+function editorfaults(p)
+    s = p.sequence; bad = String[]
+    for (i, c) in enumerate(s.clips)
+        c.view === nothing && (push!(bad, "clip $i has no view"); continue)
+        c.view.range[] == (0.0, 0.0) && push!(bad, "clip $i placed at (0,0)")
+    end
+    isempty(s.clips) || p.timeline.selected[] != 0 || push!(bad, "nothing selected")
+    sc = p.shownclip
+    sc === nothing && !isempty(s.clips) && push!(bad, "no clip in the panel")
+    sc === nothing || all(fx -> fx.card !== nothing, sc.effects) ||
+        push!(bad, "shown clip has an effect with no card")
+    p.timeline.axis.finallimits[].widths[1] + 1.0e-6 >= VE.seqduration(s) ||
+        push!(bad, "axis narrower than the sequence")
+    # …and the panel can still say how tall it is. One empty row anywhere under it
+    # makes the answer `nothing`, `Subfigure.contentsize` reads zero from that, and
+    # a list twice the height of the dock draws without a scrollbar. Nothing about
+    # the cards themselves looks wrong when this happens, which is why it went
+    # unnoticed: the rows are all there, you just cannot reach them.
+    pn = p.fxpanel
+    pn === nothing ||
+        Makie.GridLayoutBase.determinedirsize(pn.scroll.layout,
+                                              Makie.GridLayoutBase.Row()) !== nothing ||
+        push!(bad, "the effects panel has no determinable height — no scrollbar")
+    return bad
+end
+
+@testset "an open editor is coherent" begin
+    p = Player(testvideo; gpupreview = false)
+    try
+        sleep(1.5)
+        VE.opendock!(p, :effects); sleep(0.3)
+        @test editorfaults(p) == String[]          # …straight after opening
+        clip = VE.selectedclip(p)
+        VE.addslot!(clip, VE.Effect(VE.ColorEffect())); sleep(0.4)
+        @test editorfaults(p) == String[]          # …with an effect on it
+        VE.snapshot!(p); VE.split!(p.sequence, 60); VE.redraw!(p); sleep(0.4)
+        @test length(p.sequence.clips) == 2
+        @test editorfaults(p) == String[]          # …after a split
+        VE.undo!(p); sleep(0.6)
+        @test editorfaults(p) == String[]          # …and after undoing it
+    finally
+        close(p)
+    end
+end
+
+# The scrollbar went missing and nothing else did: every card was there, at the
+# right height, and a thousand pixels of them were simply unreachable. It takes one
+# empty row under the panel to do it, and three different edits leave one behind —
+# the empty-state labels being taken away, an effect removed from the middle of a
+# stack, and a tool card opened at its own place in the registry, which creates the
+# rows of every kind listed before it.
+@testset "every panel edit leaves a height to scroll by" begin
+    p = Player(testvideo; gpupreview = false)
+    try
+        sleep(1.5)
+        VE.opendock!(p, :effects); sleep(0.4)
+        clip = VE.selectedclip(p)
+        panelheight() =
+            Makie.GridLayoutBase.determinedirsize(p.fxpanel.scroll.layout,
+                                                  Makie.GridLayoutBase.Row())
+        @test panelheight() !== nothing            # …with the empty state up
+        for e in (VE.ColorEffect(), VE.BlurEffect(1.0f0), VE.SharpenEffect(2.0f0, 0.4f0))
+            VE.addslot!(clip, VE.Effect(e))
+        end
+        sleep(0.6)
+        @test length(clip.effects) == 3
+        @test panelheight() !== nothing            # …with a stack of cards
+        VE.removeeffect!(p, clip, clip.effects[2]); sleep(0.5)
+        @test panelheight() !== nothing            # …with the MIDDLE row emptied
+        for k in VE.toolonlykinds()
+            VE.opentool!(p, k.name); sleep(0.3)
+            @test panelheight() !== nothing        # …and each tool row it skipped
+        end
+        for k in VE.toolonlykinds()
+            VE.droptoolcard!(p, k.name); sleep(0.3)
+            @test panelheight() !== nothing        # …and each one closed again
+        end
+        @test editorfaults(p) == String[]
+    finally
+        close(p)
+    end
+end
+
+# Two hundred lanes in the editor's accent are two hundred lanes you cannot tell
+# apart, and no lane can be traced back to the row that owns it.
+@testset "a parameter's colour is its own, and its lane draws in it" begin
+    p = Player(testvideo; gpupreview = false)
+    try
+        sleep(1.5)
+        VE.opendock!(p, :effects); sleep(0.4)
+        clip = VE.selectedclip(p)
+        VE.addslot!(clip, VE.Effect(VE.ColorEffect())); sleep(0.6)
+        fx = VE.findslot(clip, VE.ColorEffect)
+        bright, sat = VE.param(fx, :brightness), VE.param(fx, :saturation)
+        @test VE.paramcolor(bright) != VE.paramcolor(sat)
+        # from the name, so a rebuilt card draws the same parameter the same colour
+        @test VE.paramcolor(bright) == VE.paramcolor(VE.Param(:brightness, "b", 0.0))
+        @test bright.view !== nothing
+        own = Makie.to_color(VE.paramcolor(bright))
+        @test Makie.to_color(bright.view.lane.color[]) == own
+        # …and the ◆ of a keyed row says which lane is its own
+        VE.togglekey!(p, clip, bright); sleep(0.4)
+        @test Makie.to_color(bright.view.kf.labelcolor[]) == own
+    finally
+        close(p)
+    end
+end
+
+# A scene clip carries two hundred parameters, so "which curves am I editing" has
+# to be one gesture. The ∿ is it: click draws or hides a lane, alt-click leaves
+# only that one and alt-click again puts the rest back as they were.
+@testset "the ∿ draws a lane, and alt-click leaves only it" begin
+    p = Player(testvideo; gpupreview = false)
+    try
+        sleep(1.5)
+        VE.opendock!(p, :effects); sleep(0.4)
+        clip = VE.selectedclip(p)
+        VE.addslot!(clip, VE.Effect(VE.ColorEffect())); sleep(0.7)
+        fx = VE.findslot(clip, VE.ColorEffect)
+        ev = Makie.events(p.fig)
+        eye(q) = p.fxwidgets[Symbol(:kflane_, fx.id, :_, q.name)]
+        tap!(b) = (notify(b.clicks); sleep(0.35))
+        alttap!(b) = (ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.press);
+                       tap!(b);
+                       ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.release);
+                       sleep(0.2))
+        drawn() = Set(q.name for q in fx.params if q.visible[])
+
+        bright, sat = VE.param(fx, :brightness), VE.param(fx, :saturation)
+        # A hidden lane is really hidden. `LaneCurve` declared `visible` but never
+        # passed it to the five plots it draws with, so every curve ever opened
+        # stayed on the timeline for the rest of the session — which is the whole
+        # point of the eye, and nothing asserted on it.
+        @test !bright.visible[]
+        @test !any(c -> c.visible[], bright.view.lane.plots)
+        tap!(eye(bright))
+        @test bright.visible[]
+        @test all(c -> c.visible[], bright.view.lane.plots)
+
+        tap!(eye(sat))
+        @test drawn() == Set([:brightness, :saturation])
+        alttap!(eye(sat))
+        @test drawn() == Set([:saturation])                 # …only this one
+        alttap!(eye(sat))
+        @test drawn() == Set([:brightness, :saturation])    # …and back as it was
+
+        # A GROUP draws the CURVES and leaves the constants alone: a card's worth
+        # of straight lines says nothing and buries the curves among them. Only
+        # `brightness` is animated here.
+        VE.seek!(p, 15); sleep(0.3)
+        VE.togglekey!(p, clip, bright); sleep(0.4)
+        @test VE.isanimated(bright) && VE.isconstant(sat)
+        cardeye = p.fxwidgets[Symbol(:fxlane_, fx.id)]
+        uic = p.fxwidgets[:uicolors]
+        tap!(cardeye)
+        @test isempty(drawn())                          # any drawn → hide them all
+        @test cardeye.labelcolor[] == uic.text_muted    # …and the ∿ says so
+        tap!(cardeye)
+        @test drawn() == Set([:brightness])             # …the one curve, not all four
+        @test cardeye.labelcolor[] == uic.text
+        alttap!(cardeye)
+        @test cardeye.labelcolor[] == uic.accent        # …accent while it is the solo
+
+        # …and leaving the clip ends the solo instead of leaving its lanes hidden
+        alttap!(eye(bright))
+        @test drawn() == Set([:brightness])
+        VE.showclip!(p, nothing); sleep(0.4)
+        @test p.lanesolo[] === nothing
+    finally
+        close(p)
+    end
+end
+
+# Folding a card culled the content of the panel it sits in from positions the
+# layout had not finished moving: the wrong cards ended up hidden, a hidden card
+# takes no clicks, and the next click went nowhere. Scrolling one pixel put it
+# right — which is what made folding read as unreliable rather than broken.
+@testset "folding a card leaves what is on screen clickable" begin
+    p = Player(testvideo; gpupreview = false)
+    try
+        sleep(1.5)
+        VE.opendock!(p, :effects); sleep(0.4)
+        clip = VE.selectedclip(p)
+        VE.addslot!(clip, VE.Effect(VE.ColorEffect())); sleep(0.7)
+        fx = VE.findslot(clip, VE.ColorEffect)
+        card = fx.card
+        sl = VE.param(fx, :brightness).view.control
+        @test Makie.receives_events(sl.blockscene)
+        for _ in 1:3
+            card.open = false; sleep(0.5)
+            @test !Makie.receives_events(sl.blockscene)   # folded away, and inert
+            card.open = true; sleep(0.6)
+            @test Makie.receives_events(sl.blockscene)    # …and back, with no scroll
+        end
+
+        # The fold gesture is dead over the accessory BUTTONS, and only over them.
+        # Excluding the whole cell they sit in left a quarter of the title bar
+        # doing nothing.
+        hb = card.header.layoutobservables.computedbbox[]
+        y = hb.origin[2] + hb.widths[2] / 2
+        @test !Makie.over_content(card.header, Point2f(hb.origin[1] - 40, y))
+        eye = p.fxwidgets[Symbol(:fxeye_, fx.id)]
+        eb = eye.layoutobservables.computedbbox[]
+        @test Makie.over_content(card.header,
+                                 Point2f(eb.origin[1] + eb.widths[1] / 2,
+                                         eb.origin[2] + eb.widths[2] / 2))
+    finally
+        close(p)
+    end
+end
+
+@testset "the panel does not leak handlers" begin
     p = Player(testvideo; gpupreview = false)
     try
         sleep(1.5)
         VE.opendock!(p, :effects)
         VE.seek!(p, 15); sleep(0.5)
-        clip = VE.locate(p.sequence, p.playhead[])[1]
+        # SELECTED, not "under the playhead": cards are built for the clip the
+        # panel is aimed at, and the playhead does not aim it (see `editclip`).
+        sel!(p, 1); sleep(0.3)
+        clip = VE.selectedclip(p)
         for e in (VE.ColorEffect(saturation = 1.2), VE.BlurEffect(1.0f0),
                   VE.SharpenEffect(2.0f0, 0.4f0), VE.OpacityEffect(0.9f0))
             VE.addslot!(clip, VE.Effect(e))
         end
-        VE.refreshedit!(p); sleep(0.8)
-        nl() = length(p.playhead.listeners)
-        @test length(p.fxwidgets[:fxcards]) == 4      # …so there is something to leak
-        @test !isempty(p.fxrows)
+        VE.redraw!(p); sleep(0.8)
+        fx1 = clip.effects[1]
+        nl() = (length(p.playhead.listeners), length(p.selectedkey.listeners),
+                length(p.fxselection.listeners), length(fx1.enabled.listeners))
+        @test length(cardtitles(p)) == 4          # …so there is something to leak
         base = nl()
 
-        refresh = p.fxwidgets[:fxlistrefresh]
+        # a card built again — what binding a parameter to an input does — must
+        # leave no listener behind
         for _ in 1:20
-            refresh(force = true)                     # the full teardown + rebuild
+            VE.rebuildcard!(p, clip, clip.effects[1])
             sleep(0.03)
         end
         @test nl() == base
 
-        # …and the way it happens in use: the stack rebuilds at every clip
-        # boundary, which during playback is every cut.
-        VE.split!(p.sequence, 45); VE.refreshedit!(p); sleep(0.3)
+        # …and the way it happens in use: another clip is selected, so its cards
+        # come up and this one's go away. Neither builds a listener that outlives
+        # its card. (Selecting, not seeking — the playhead does not change which
+        # clip the panel shows, so scrubbing back and forth would prove nothing.)
+        VE.split!(p.sequence, 45); VE.redraw!(p); sleep(0.3)
+        # One round trip FIRST: the right half's cards are built the first time it
+        # is selected and then kept (hidden, not dropped), so its rows' listeners
+        # are part of the baseline. What must not happen is that the count keeps
+        # climbing — a card rebuilt per switch, or a row that never came off.
+        sel!(p, 2); sleep(0.3)
+        sel!(p, 1); sleep(0.3)
         atcut = nl()
         for k in 1:20
-            VE.seek!(p, isodd(k) ? 15 : 60)
+            sel!(p, isodd(k) ? 1 : 2)
             sleep(0.03)
         end
         sleep(0.3)
@@ -2908,12 +3253,12 @@ end
         # headless, and opaque enough that "did it draw" is not a judgement call
         VE.seek!(p, 0)
         @test VE.runcommand!(p, :add_bar)
-        c = p.sequence.clips[p.timeline.selected[]]   # the command selects what it made
+        c = VE.selectedclip(p)                        # the command selects what it made
         @test c isa Clip
         @test c.source isa VE.SceneSource
         @test c.track > 1                       # its own lane, over the footage
         c.src_out = 120                          # …across the frame we look at
-        VE.refreshedit!(p)
+        VE.redraw!(p)
         VE.seek!(p, n); sleep(0.8)
         drawn = copy(p.frame[])
         # SAME timeline frame on both sides — comparing two different frames of a
@@ -2932,26 +3277,27 @@ end
 
         # …and the card the scene gets is the ordinary one, with rows on it. What a
         # scene offers comes from the REALIZED scene, which does not exist when the
-        # panel is first built — so the rebuild signature has to notice that it now
-        # does, or the card is drawn empty once and never again.
+        # panel is first built — so its card is built when the clip is first shown,
+        # after it has rendered, rather than drawn empty once and never again.
         VE.opendock!(p, :effects)
-        p.timeline.selected[] = findfirst(x -> x === c, p.sequence.clips)
-        VE.refreshedit!(p); sleep(0.8)
+        sel!(p, c)
+        VE.redraw!(p); sleep(0.8)
+        fx = VE.findslot(c, :scene)
+        rows() = fx === nothing ? 0 : count(q -> q.view !== nothing, fx.params)
         # `waitfor` belongs to the big UI testset above; this one is standalone
         for _ in 1:40
-            isempty(p.fxrows) || break
+            rows() > 0 && break
             sleep(0.25)
         end
-        @test !isempty(p.fxrows)
-        @test !isempty(p.fxsliders)
-        fx = VE.findslot(c, :scene)
+        @test rows() > 0
+        @test any(q -> q.view !== nothing && q.view.control isa Makie.Slider, fx.params)
         @test fx !== nothing && !isempty(fx.params)
         @test all(q -> q.range !== nothing, fx.params)   # every row is buildable
 
         # removing it puts the frame back exactly — the composite is not cumulative
-        p.timeline.selected[] = 1
+        sel!(p, 1)
         VE.deleteclip!(p.sequence, c; ripple = false)
-        VE.refreshedit!(p)
+        VE.redraw!(p)
         VE.seek!(p, n); sleep(0.8)
         @test copy(p.frame[]) == bare
     finally

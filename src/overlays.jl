@@ -1,4 +1,4 @@
-# THERE ARE NO OVERLAYS. There are clips.
+# There are no overlays any more, only clips.
 #
 # What used to be here was a parallel timeline: `Sequence.overlays`, a list of
 # `Overlay`s drawn over the finished canvas by a pass of their own. It had its own
@@ -13,7 +13,7 @@
 # A title IS a clip. It occupies a span on a track, it has an in point and an out
 # point, it takes an effect stack, it composites with an opacity, its numbers are
 # keyframed. The only thing that made it different was that it drew instead of
-# decoding, and that is a property of its SOURCE (see `SceneSource`).
+# decoding, which is a property of its source (see `SceneSource`).
 #
 # So this file is what is left: the stock things you can put on a timeline that
 # are not footage, each as a function returning a `SceneSpec`. A preset, not a
@@ -27,7 +27,8 @@ fadedcolor(c, α::Real) = (col = Makie.to_color(c);
 """
     pixelscene(plots...; kw...) -> Makie.SceneSpec
 
-A scene whose coordinates ARE canvas pixels — what every 2-D graphic here wants.
+A scene whose coordinates are canvas pixels, which is what every 2-D graphic here
+wants.
 
 `campixel!`, so a position of `(960, 540)` is that pixel and a font size of `72` is
 72 pixels. Authoring against the canvas rather than against fractions of it is the
@@ -86,7 +87,7 @@ end
 """
     timecodescene(; canvas, x, y, size, color, framerate) -> Makie.SceneSpec
 
-A running timecode. The TEXT is what changes per frame, and it is not a number, so
+A running timecode. The text changes per frame and is not a number, so
 it does not come from a curve — it is written per frame from the clip's own
 position (see `timecodetext!`).
 """
@@ -170,7 +171,7 @@ end
 The scene a project file's `"build"` entry describes, plus what drives it.
 
 `joints` and `camera` are empty for everything but a rig: a title has plots and
-nothing else. They come back HERE rather than being fished out afterwards, because
+nothing else. They come back here rather than being fished out afterwards, because
 they are made while the scene is made and there is no second place that knows both.
 """
 plainscene(root) = (root = root, joints = Dict{Symbol, Any}(), camera = nothing)
@@ -219,7 +220,7 @@ Now it is one way to make a scene, callable from scene code like any other mesh
 loader, and what the panel offers comes from the plots it produced.
 
 The parent chain is the rig: rotating `arm_left` carries `hand_left` with it. A
-part with an origin sits at its pivot; one without must UNDO its parent's
+part with an origin sits at its pivot; one without has to undo its parent's
 translation, because its mesh is already in world coordinates and would otherwise
 inherit it twice — that is what made the hands float beside the figure.
 """
@@ -241,7 +242,7 @@ function rigscene(d::AbstractDict)
         origin = Vec3f(Tuple(get(pd, "origin", (0.0, 0.0, 0.0))))
         base = any(!=(0), origin) ? origin :
                -Vec3f(Makie.transformation(parent).translation[])
-        # THE DESCRIPTION's own words: which way the part turns and where it
+        # The description's own words: which way the part turns and where it
         # starts. What it is turned TO is a parameter, not this.
         joints[name] = RigJoint(Vec3f(Tuple(get(pd, "axis", (0.0, 0.0, 1.0)))), base)
         Makie.translate!(trans, base)
@@ -268,7 +269,7 @@ end
 """
     partmesh(arg) -> arg
 
-A plot argument that names a FILE, loaded. Anything else passes through.
+A plot argument that names a file, loaded. Anything else passes through.
 
 A rig's parts are meshes on disk (`"lego_arm_left.stl"`), and a spec holds what a
 plot is given — so the string has to become geometry somewhere. `FileIO.load`
@@ -277,7 +278,7 @@ format twice.
 """
 function partmesh(x::AbstractString)
     isfile(x) && return Makie.FileIO.load(x)
-    # A BARE NAME is one of Makie's own assets — that is where the lego figure's
+    # A bare name is one of Makie's own assets — that is where the lego figure's
     # parts come from, and a project written against them carries the name and not
     # a path, which is right: the path is this machine's, the name is the asset's.
     asset = Makie.assetpath(x)
@@ -303,10 +304,10 @@ end
 # An overlay was a span on the timeline with an effect on it, drawn over the
 # finished canvas. That is a clip on the track above the footage, and this is the
 # whole of the conversion: the span becomes the clip's extent, the effect comes
-# across as it is (ids, values, curves and all), and what the overlay DREW becomes
+# across as it is (ids, values, curves and all), and what the overlay drew becomes
 # the scene the clip's source renders.
 #
-# Keys move from TIMELINE frames to SOURCE frames, which for a clip starting at
+# Keys move from timeline frames to source frames, which for a clip starting at
 # the overlay's start and running at rate 1 differ by exactly `start` — so a curve
 # is shifted, not reinterpreted.
 
@@ -362,7 +363,7 @@ function clipfromoverlay(d::AbstractDict, seq::Sequence)
     kind = Symbol(get(d, "kind", ""))
     start = Int(get(d, "start", 0))
     stop = Int(get(d, "stop", start + 90))
-    # The canvas the overlay was DRAWN at — which is the sequence's, derived from
+    # The canvas the overlay was drawn at, which is the sequence's, derived from
     # the clips when the file does not state one. Falling back to a default here
     # gave a migrated scene a 1920x1080 source over a 640x1138 project, and the
     # placement then fitted the whole thing into a corner.
@@ -370,7 +371,7 @@ function clipfromoverlay(d::AbstractDict, seq::Sequence)
     ed = get(d, "effect", nothing)
     settings = Dict{String, Any}(get(d, "settings", Dict{String, Any}()))
     stored = Param[]
-    # An overlay's effect held its parameters; a scene's also held the SPEC, as a
+    # An overlay's effect held its parameters; a scene's also held the spec, as a
     # `Param{SceneSpec}`. There is no such parameter type any more — the scene is
     # the source's — so its entry is taken as the dict it was written as, which is
     # exactly the rig recipe `buildscene` wants. Read from the raw entry rather
@@ -384,7 +385,8 @@ function clipfromoverlay(d::AbstractDict, seq::Sequence)
             push!(stored, MsgPack.from_msgpack(Param, pd))
         end
     end
-    vals = Dict{String, Any}(String(p.name) => p.value for p in stored if p.value isa Real)
+    vals = Dict{String, Any}(String(p.name) => valueat(p, 0)
+                             for p in stored if eltype(p) <: Real)
     build = overlaybuild(kind, settings, vals, canvas, seq.framerate)
     build === nothing && return nothing
     clip = sceneclip(buildscene(build); start, frames = max(stop - start, 1), canvas,
@@ -404,9 +406,10 @@ function clipfromoverlay(d::AbstractDict, seq::Sequence)
     # this clip starts at `start` and runs at rate 1 — so the two differ by exactly
     # that offset. A shift, not a reinterpretation.
     for q in stored
-        q.curve === nothing || (q.curve = AnimCurve{typeof(q.value)}(
-            [Keyframe{typeof(q.value)}(k.frame - start, k.value, k.ease, k.inhandle, k.outhandle)
-             for k in q.curve.keys], q.curve.interp))
+        c = q.curve[]
+        q.curve[] = AnimCurve{eltype(q)}(
+            [Keyframe{eltype(q)}(k.frame - start, k.value, k.ease, k.inhandle, k.outhandle)
+             for k in c.keys], c.interp)
         push!(fx.params, q)
     end
     return clip

@@ -125,7 +125,8 @@ function cudaffmpeg()
     sys === nothing && return nothing
     try
         occursin("cuda", read(`$sys -hide_banner -hwaccels`, String)) ? sys : nothing
-    catch
+    catch e
+        e isa ProcessFailedException || rethrow()   # an ffmpeg that will not answer
         nothing
     end
 end

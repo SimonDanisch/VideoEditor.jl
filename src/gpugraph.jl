@@ -1,17 +1,17 @@
 # A GPU effect graph: a clip's render — source → tracks → effect stack — as a
-# MANTLE graph, executed from a cached plan so there is ZERO per-frame
-# allocation after warm-up and every intermediate is a transient the placer can
-# alias. The whole thing is free functions + multiple dispatch.
+# Mantle graph, executed from a cached plan, so after warm-up there is no
+# per-frame allocation and every intermediate is a transient the placer can
+# alias. The whole thing is free functions and multiple dispatch.
 #
-# Two layers, so most effects are NOT kernels:
-#   • the CALLBACK layer — a `Pointwise`/`Stencil` effect is a pure function mapped
+# Two layers, so most effects are not kernels:
+#   • the callback layer: a `Pointwise`/`Stencil` effect is a pure function mapped
 #     by a framework-owned kernel (`GPUFiltering.pointwise!`/`stencil!`), and the
-#     SAME function runs the CPU stack and the GPU graph. This is what plugins use.
-#   • the NODE layer — an `FxNode` + a `chainpass!` for ops that own a specialized
-#     kernel or multiple passes (decode, motion warp, separable blur, blend). This
-#     is the escape hatch.
+#     same function runs the CPU stack and the GPU graph. This is what plugins use.
+#   • the node layer: an `FxNode` plus a `chainpass!`, for ops that own a
+#     specialized kernel or several passes (decode, motion warp, separable blur,
+#     blend). The escape hatch.
 #
-# Every node becomes ONE `custom!` pass, because the bodies are multi-launch or
+# Every node becomes one `custom!` pass, because the bodies are multi-launch or
 # host-branching (a decode, a model call, a separable blur with a scratch buffer)
 # and `dispatch!` expresses exactly one kernel. The pass declares what it touches
 # (`use`); the graph derives lifetimes and barriers from that and stays out of
@@ -39,34 +39,32 @@ framesize(s::ClipSource) = (s.width, s.height)           # a source that renders
 
 Change the size a source delivers, where that is a thing it has.
 
-A scene renders at whatever it is asked for, so its size is a FORMAT — a document
-property, like a clip's rate. A decoder delivers the frames it has and this is a
-no-op on it: the chain's buffers are sized by the decode, and asking for anything
-else would be a resample dressed up as a render.
+A scene renders at whatever it is asked for, so its size is a format: a document
+property like a clip's rate. A decoder delivers the frames it has and this is a
+no-op on it — the chain's buffers are sized by the decode, and asking for another
+size would be a resample dressed as a render.
 
-This is what the bake modal's canvas field edits. It is the same number the
-preview renders at, so a bake cannot end up at a size the preview will not use —
-there is one size, not one per consumer.
+This is what the bake modal's canvas field edits, and the same number the preview
+renders at, so a bake cannot land at a size the preview will not use.
 """
 Base.resize!(s::ClipSource, ::Tuple{Integer, Integer}) = s
 
 """
     decodesource(source, frame; playing, served, exact) -> what the source pass reads
 
-Get the frame BEFORE the plan runs. `frameat!` is latency-bounded: under a scrub
+Get the frame before the plan runs. `frameat!` is latency-bounded: under a scrub
 it serves the nearest already-decoded frame rather than `frame` and reports which
-through `served`, and every per-frame result — a stabilization warp, a matte
-plane — has to be sampled at THAT index or it lands on a different picture and
-the preview jerks while the decode catches up.
+through `served`. Every per-frame result — a stabilization warp, a matte plane —
+has to be sampled at that index, or it lands on a different picture and the
+preview jerks while the decode catches up.
 
-This used to be the first thing the source pass body did, which meant `served`
-was not settled until the plan was already running: the decode's own submits
-landed in the middle of the plan's recording, and a plane upload had nowhere in
-the schedule to go. Out here it is settled before `run!`, so the planes are
-written at the position the graph reserved for them.
+This used to be the first thing the source pass body did, so `served` was not
+settled until the plan was already running: the decode's own submits landed in
+the middle of the plan's recording and a plane upload had nowhere in the schedule
+to go. Out here it is settled before `run!`.
 
-`exact` is the EXPORT policy — precisely `frame`, cost what it may — and it
-cannot serve anything else, so it leaves `served` alone.
+`exact` is the export policy — precisely `frame`, cost what it may — and cannot
+serve anything else, so it leaves `served` alone.
 """
 decodesource(s::GpuVideoStream, frame::Integer; playing::Bool = false,
              served = nothing, exact::Bool = false, chunks::Integer = 5) =
@@ -89,7 +87,7 @@ into; by the time any body runs it holds the frame the source really delivered.
 mutable struct FxState
     source::Any
     decoded::Any                      # what `decodesource` handed back
-    # The frame AFTER `decoded`, and how far between them this timeline frame
+    # The frame after `decoded`, and how far between them this timeline frame
     # sits. Both are only set for a clip whose time interpolation is `:flow`;
     # `phase == 0` means this frame lands exactly on a source frame and nothing
     # has to be synthesized.
@@ -97,13 +95,13 @@ mutable struct FxState
     # A pre-rendered picture for this frame, or `nothing` — see bake.jl. When it
     # is there the source pass hands it straight on and every other pass is
     # inactive: the bake already has them applied. Per frame, because a bake
-    # covers a RANGE and the clip is scrubbed in and out of it.
+    # covers a range and the clip is scrubbed in and out of it.
     baked::Any
     phase::Float64
     clip::Any
     frame::Int
     served::Base.RefValue{Int}
-    # How a HOST frame gets onto the device: the `Update` the source pass
+    # How a host frame gets onto the device: the `Update` the source pass
     # reserved, and whether it was fired this frame. A `copyto!` in the pass body
     # would do the same copy — but a host→device upload inside a recorded batch
     # forces a `vkQueueSubmit`, one per layer per frame, and the CPU-decode path
@@ -119,15 +117,14 @@ FxState() = FxState(nothing, nothing, nothing, nothing, 0.0, nothing, 0, Ref(0),
 """
     sourcepicture!(st, dims) -> host image | nothing
 
-What this frame's source hands the graph as a HOST image, or `nothing` when there
+What this frame's source hands the graph as a host image, or `nothing` when there
 is nothing to upload — device planes a kernel converts in the pass, or a frame
-that lives on the device already.
+that is on the device already.
 
-Dispatch on the SOURCE, which is what knows: a decoder answers with the frame it
-decoded (`hostframe`), a scene with its picture (`scenepicture!`, in
-scenesource.jl). One question, asked once per frame, so both kinds of source
-reach the device the same way — through the `Update` the pass reserved, not
-through a `copyto!` in a recorded body.
+Dispatch is on the source, which is what knows: a decoder answers with the frame
+it decoded (`hostframe`), a scene with its picture (`scenepicture!`, in
+scenesource.jl). Asked once per frame, so both kinds of source reach the device
+through the `Update` the pass reserved rather than a `copyto!` in a recorded body.
 """
 sourcepicture!(st, dims::Tuple{Int, Int}) =
     st.baked !== nothing ? st.baked : sourcepicture!(st, dims, st.source)
@@ -136,12 +133,12 @@ sourcepicture!(st, ::Tuple{Int, Int}, source) = hostframe(source, st.decoded)
 """
     hostframe(source, decoded) -> Union{Nothing, Matrix{RGB{N0f8}}}
 
-The HOST picture a source handed over, or `nothing` when there is nothing to
-upload: a decoder's device-resident NV12 planes (a kernel converts those, in the
-pass, where they already are) or a frame that lives on the device already.
+The host picture a source handed over, or `nothing` when there is nothing to
+upload: a decoder's device-resident NV12 planes (a kernel converts those in the
+pass, where they already are) or a frame that is on the device already.
 
 `Array{RGB{N0f8}, 2}` exactly — a view or another element type falls through to
-the pass body's `copyto!`, which is correct, just not free.
+the pass body's `copyto!`, which is correct but not free.
 """
 hostframe(::Any, f::Array{RGB{N0f8}, 2}) = f
 hostframe(::Any, ::Any) = nothing
@@ -181,9 +178,9 @@ define [`nodefor`](@ref) + `chainpass!` instead.
 
 `nothing` for an op that did not opt in — and a stack entry is not always a
 picture: the loop finder is a slot on the clip so that it has a card and a place
-for its reference list, and it draws nothing at all. Stated as a FALLBACK rather
-than left undefined, because undefined made that a `MethodError` raised from
-inside the presenter: putting the tool on a clip stopped the preview.
+for its reference list, and it draws nothing at all. Stated as a fallback rather
+than left undefined: undefined raised a `MethodError` from inside the presenter,
+so putting the tool on a clip stopped the preview.
 """
 fxkind(::FxOp) = nothing
 
@@ -204,18 +201,18 @@ fxkind(e::OpacityEffect) = (a = e.α; Pointwise((c, uv) -> c * a))
 
 # ---------------------------------------------------------------- nodes
 
-"A node in a clip's render chain: produces one device image from the previous one."
-abstract type FxNode end
+# `FxNode` and `FxGraph` are declared in clips.jl, where `Clip` has a field of
+# one. The nodes themselves are here, with the passes they stand for.
 
 struct SourceNode <: FxNode end                                      # the decoded frame
 
 """
 The source pass for a clip whose time interpolation is `:flow`: the frame is
-SYNTHESIZED between the two the decoder produced, at [`sourcephase`](@ref).
+synthesized between the two the decoder produced, at [`sourcephase`](@ref).
 
-A node rather than an effect because it changes what the source IS, before any
-effect runs — the same category as `rate`, and for the same reason it cannot be
-one: an effect sees one frame and this needs two.
+A node rather than an effect because it changes what the source is, before any
+effect runs — the same category as `rate`, and for the same reason: an effect
+sees one frame and this needs two.
 """ 
 struct SmoothSourceNode <: FxNode end
 struct MotionNode <: FxNode; input::Int; end                         # stabilization warp
@@ -227,8 +224,8 @@ struct ColorNode <: FxNode; input::Int; adj::ColorAdjustments; end
 """
 How many Gaussian taps a blur's weight buffer holds: `2·64 + 1`.
 
-A cap on the RADIUS, at 64 — σ up to 21.3, where the declared slider maximum is
-12. Fixed rather than derived from σ because the count follows the value and a
+A cap on the radius at 64, so σ up to 21.3 against a declared slider maximum of
+12. Fixed rather than derived from σ, because the count follows the value and a
 buffer that resizes with a slider resizes the graph with it. 516 bytes.
 """
 const BLURTAPS = 2 * 64 + 1
@@ -246,7 +243,7 @@ struct PixelNode{K <: FxKind} <: FxNode; input::Int; kind::K; end    # a callbac
 
 # ---------------------------------------------------------------- plane ops
 """
-What a node reads BESIDES the picture, when what it reads is a whole image:
+What a node reads besides the picture, when what it reads is a whole image:
 a matte's alpha, a restoration model's finished frame. The other kind of
 per-frame analysis result — a colour gain, a warp matrix — is a handful of
 numbers and rides along as a kernel argument, which is why those stay
@@ -299,7 +296,7 @@ end
 
 """
 The node a [`PlaneOp`](@ref) becomes. `shape` is the plane's size, carried here
-because it is part of the PLAN SIGNATURE: the plane is a graph resource, so a
+because it is part of the plan signature: the plane is a graph resource, so a
 clip whose matte was analysed at another resolution needs its own plan rather
 than a buffer of the wrong size.
 """
@@ -319,18 +316,18 @@ planeshape(::FxNode) = nothing
 planeshape(n::PlaneNode) = n.shape
 
 
-# THE PLANES ARE GRAPH RESOURCES. There is no `BufferStore` and no `PlaneSlot`.
+# The planes are graph resources: there is no `BufferStore` and no `PlaneSlot`.
 #
 # A per-frame analysis image — a matte's alpha, a depth map, a colour table — used
 # to live in a persistent `Mantle.Buffer` beside the graph, because `Update` wrote
-# a whole buffer by RENAMING it and a transient's arena slice cannot be renamed.
+# a whole buffer by renaming it and a transient's arena slice cannot be renamed.
 # Mantle stages into a transient now (`stagewrite!`), so a plane is an ordinary
 # transient: the placer can alias it against anything already dead, its lifetime
 # comes from its use like everything else, and nothing reaches around the graph to
 # find it.
 
 """
-A node's SECOND input, as an edge of the graph.
+A node's second input, as an edge of the graph.
 
 A matte's alpha, a depth map, a colour table: the node that reads one declared it
 with `use`, the same way it declared the picture, so the plane is ordered against
@@ -340,10 +337,10 @@ that writes it at the head of the schedule, the node `Ref` that says what to
 sample, and whether there is anything to apply this frame.
 
 `active` is written by [`update!`](@ref) and read by the pass body, because "this
-frame is outside the analysed range" has to reach the kernel and there is nothing
-else to say it with. `dims` is what the edge was SIZED for; an analysis
-re-propagated at another resolution is a structural change, and comparing the two
-here is what makes a missed one render nothing instead of garbage.
+frame is outside the analysed range" has to reach the kernel. `dims` is what the
+edge was sized for; an analysis re-propagated at another resolution is a
+structural change, and comparing the two here makes a missed one render nothing
+rather than garbage.
 """
 struct PlaneEdge
     buf::Any                          # the transient the plane is written into
@@ -364,7 +361,7 @@ runs — the placer is free to alias its slice against anything already dead, wh
 is the whole point of the plane being an ordinary resource. Fired before `run!`,
 because an `Update`'s write position is at the head of the schedule.
 
-The data is a VIEW into the track, retained rather than copied until the write
+The data is a view into the track, retained rather than copied until the write
 happens later in the same `run!`; nothing mutates an analysis result during a
 render.
 """
@@ -378,9 +375,8 @@ function update!(e::PlaneEdge, clip::Clip, frame::Integer)
 end
 
 # What a node samples for its plane edge, and how big that is. Both forward to the
-# OP, which is where every existing analysis states them (`matte.jl`, `depth.jl`,
-# `restore.jl`) — a node is the op plus its wiring, and the wiring says nothing
-# about the data.
+# op, where every analysis states them (`matte.jl`, `depth.jl`, `restore.jl`): a
+# node is the op plus its wiring, and the wiring says nothing about the data.
 planedata(n::FxNode, clip::Clip, frame::Integer) = planedata(n.op, clip, frame)
 planeshape(n::FxNode, clip::Clip) = planeshape(n.op, clip)
 
@@ -388,13 +384,13 @@ planeshape(n::FxNode, clip::Clip) = planeshape(n.op, clip)
 #
 # chainpass!(graph, node, params, active, cur, ctx, dims) -> transient
 #
-# Adds ONE pass to the graph and returns the transient the next node reads.
+# Adds one pass to the graph and returns the transient the next node reads.
 # `cur` is the incoming image; `params` is a `Ref{typeof(node)}` the body reads at
 # record time, which is what makes a changed parameter a store rather than a new
 # plan. `active` is read the same way: an effect that is switched off, neutral at
 # this frame, or bypassed by the global compare toggle is a pass that does nothing
 # — the node stays in the structure, because whether a blur's σ is zero right now
-# is a VALUE and values must not change which graph is compiled.
+# is a value, and values must not change which graph is compiled.
 #
 # In-place nodes declare `read + write` on `cur` itself — in a chain every node is
 # its input's last consumer, so there is nothing to copy. Their inactive body is
@@ -529,7 +525,7 @@ end
 
 """
 The depth blur's node. A type of its own rather than a plain [`PlaneNode`](@ref)
-because it GATHERS: it reads neighbours of the pixel it writes, so it needs a
+because it gathers: it reads neighbours of the pixel it writes, so it needs a
 destination buffer, and `PlaneNode`'s pass is in place.
 """
 struct DepthBlurNode <: FxNode
@@ -611,7 +607,7 @@ function chainpass!(g, ::ColorNode, pr, act, cur, ctx::ChainBuild, dims)
 end
 
 """
-The blur's taps are an EDGE, like a matte's alpha.
+The blur's taps are an edge, like a matte's alpha.
 
 They used to be uploaded from the pass body, once per blur per frame — and a
 host→device upload inside a recorded batch forces a `vkQueueSubmit`, so a
@@ -619,8 +615,8 @@ four-layer composite made five submits where the graph promises one. As an edge
 they are written where every other per-frame input is: at the head of the
 schedule, staged, with nothing to drain.
 
-[`BLURTAPS`](@ref) is fixed, because the taps' COUNT follows σ and σ is a value —
-a buffer that resizes with a slider would resize the graph with it.
+[`BLURTAPS`](@ref) is fixed, because the tap count follows σ and σ is a value: a
+buffer that resized with a slider would resize the graph with it.
 """
 function blurweights!(g, pr, ctx::ChainBuild)
     wb = Mantle.Transient.Buffer(g, Float32, BLURTAPS)
@@ -685,14 +681,14 @@ end
 """
     nodefor(effect, input, clip) -> FxNode | nothing
 
-The node an effect renders as, or `nothing` when it renders as none: its ANALYSIS
-is not there (a stabilize slot whose track was removed, a matte that was never
-analysed), or it is not a pixel operation at all.
+The node an effect renders as, or `nothing` when it renders as none: its analysis
+is missing (a stabilize slot whose track was removed, a matte never analysed), or
+it is not a pixel operation at all.
 
-Saying so in the STRUCTURE is what keeps the graph honest about what it will read.
-It is not where "switched off" or "neutral right now" is decided — those are
-values, they change per frame, and a graph that recompiled when a blur's σ reached
-zero would recompile mid-drag. They are the node's `active` flag instead.
+This is structure, so it says what the graph will read. It is not where "switched
+off" or "neutral right now" is decided: those are values, they change per frame,
+and a graph that recompiled when a blur's σ reached zero would recompile mid-drag.
+They are the node's `active` flag instead.
 """
 nodefor(::StabilizeEffect, input, clip) =
     clip.motiontrack === nothing ? nothing : MotionNode(input)
@@ -715,15 +711,14 @@ nodefor(e::BlurEffect, input, clip) = BlurNode(input, e.σ)
 nodefor(e::SharpenEffect, input, clip) = SharpenNode(input, e.σ, e.amount)
 # Placement, not pixels: `layermatrix` reads it where the layer is placed.
 nodefor(::TransformEffect, input, clip) = nothing
-# Opacity is the LAYER's alpha, applied where the layer meets the canvas — never a
+# Opacity is the layer's alpha, applied where the layer meets the canvas — never a
 # fade to black inside the chain, which is what it would be with nothing under it.
 nodefor(::OpacityEffect, input, clip) = nothing
-# Callback effects (including plugins) — and the fallback for an op that renders
-# NOTHING. A stack entry is not always a picture: the loop finder is a slot on
-# the clip so that it gets a card and a place for its reference list, and it
-# draws nothing at all. Without this it reached `fxkind`, which has no method for
-# it, and the MethodError surfaced from inside the presenter — so putting the
-# tool on a clip stopped the preview rather than doing nothing.
+# Callback effects (including plugins), and the fallback for an op that renders
+# nothing. A stack entry is not always a picture: the loop finder is a slot on the
+# clip so that it gets a card and a place for its reference list, and draws
+# nothing. Without this it reached `fxkind`, which has no method for it, and the
+# MethodError surfaced from inside the presenter.
 function nodefor(e::FxOp, input, clip)   # callback effects, incl. plugins
     k = fxkind(e)
     return k === nothing ? nothing : PixelNode(input, k)
@@ -734,26 +729,6 @@ function planenode(op::PlaneOp, input::Int, clip::Clip)
     sh = planeshape(op, clip)
     sh === nothing && return nothing
     return PlaneNode(input, op, sh)
-end
-
-"""
-A clip's render as STRUCTURE: which nodes, in which order, and which effect each
-one came from.
-
-THE STRUCTURE, and nothing that changes per frame. Every value a node carries is
-overwritten by [`update!`](@ref) before each run, so what is stored in `nodes` is
-only ever the shape of the thing. `slots` is parallel to `nodes[2:end]` and is how
-`update!` finds the effect to re-read.
-
-Identity is the point: a graph object is REPLACED when the clip's structure
-changes and never edited in place, so `objectid` of it IS the clip's structural
-version. That is what a composition keys on — no fingerprint to compute, no hash
-of the stack per frame, and nothing that can agree by accident.
-"""
-struct FxGraph
-    nodes::Vector{FxNode}
-    slots::Vector{Effect}       # parallel to nodes[2:end]
-    dims::Tuple{Int, Int}
 end
 
 """
@@ -768,7 +743,7 @@ the buffers a recorded chain reserves are sized by it.
 """
 function graphof!(clip::Clip, dims::Tuple{Int, Int})
     g = clip.graph
-    g isa FxGraph && g.dims == dims && return g
+    g === nothing || (g.dims == dims && return g)
     nodes = FxNode[sourcenode(clip)]
     slots = Effect[]
     for fx in clip.effects
@@ -880,7 +855,7 @@ function update!(ch::ClipChain, sf::Integer, phase::Real, source;
     st.baked = bakedframe(clip, sf)
     for (i, fx) in enumerate(ch.slots)
         e = op(fx, sf)
-        ch.active[i][] = st.baked === nothing && applytracks && fx.enabled && !isneutral(e)
+        ch.active[i][] = st.baked === nothing && applytracks && fx.enabled[] && !isneutral(e)
         node = nodefor(e, ch.nodes[i + 1].input, clip)
         node === nothing || (ch.params[i][] = node)
     end

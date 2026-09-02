@@ -97,7 +97,7 @@ end
     p = VE.param(fx, :opacity)
     @test p !== nothing && VE.isanimated(p)
     # the keys moved by `start`: 10 → 0 and 30 → 20
-    @test [k.frame for k in p.curve.keys] == [0, 20]
+    @test [k.frame for k in p.curve[].keys] == [0, 20]
 end
 
 @testset "a scene clip is a clip: it trims, stacks and composites" begin

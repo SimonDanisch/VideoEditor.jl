@@ -166,8 +166,7 @@ end
     # keyframing the angle turns the part, and the parent chain carries the rest
     push!(fx.params, VE.Param(Symbol("arm.angle"), "Angle", 0.0; range = (-3.2, 3.2)))
     p = VE.param(fx, Symbol("arm.angle"))
-    p.curve = VE.AnimCurve{Float64}()
-    VE.setkey!(p.curve, 0, 0.0); VE.setkey!(p.curve, 19, 1.5)
+    VE.setkey!(p, 0, 0.0); VE.setkey!(p, 19, 1.5)
     a = Ref{Any}(nothing); b = Ref{Any}(nothing)
     VE.render(engine, clip.source, clip, 0) do o; a[] = copy(o); end
     VE.render(engine, clip.source, clip, 19) do o; b[] = copy(o); end
@@ -182,8 +181,10 @@ end
     push!(seq.clips, clip)
     fx = VE.findslot(clip, :scene)
     push!(fx.params, VE.Param(Symbol("title.fontsize"), "Fontsize", 12.0; range = (1.0, 99.0)))
-    VE.param(fx, Symbol("title.fontsize")).curve = VE.AnimCurve{Float64}()
-    VE.setkey!(VE.param(fx, Symbol("title.fontsize")).curve, 0, 12.0)
+    # two keys, so it is ANIMATED: a parameter is always a curve and one key is
+    # the constant it started as, which a project file writes as a plain value
+    VE.setkey!(VE.param(fx, Symbol("title.fontsize")), 0, 12.0)
+    VE.setkey!(VE.param(fx, Symbol("title.fontsize")), 19, 30.0)
 
     path = tempname() * ".videoedit"
     saveproject(path, seq)
@@ -197,4 +198,5 @@ end
     # on the effect rather than being discovered fresh from a scene each time
     p2 = VE.param(VE.findslot(c2, :scene), Symbol("title.fontsize"))
     @test p2 !== nothing && VE.isanimated(p2)
+    @test [(k.frame, k.value) for k in p2.curve[].keys] == [(0, 12.0), (19, 30.0)]
 end

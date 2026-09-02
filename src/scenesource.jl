@@ -1,4 +1,4 @@
-# A Makie scene AS A CLIP SOURCE.
+# A Makie scene as a clip source.
 #
 # Everything drawn that is not decoded video comes through here: a 3D animation, a
 # title, a lower third, a progress bar, a subtitle. They are clips on a track,
@@ -17,7 +17,7 @@
 """
     scenespecof(clip) -> Union{Nothing, SceneSpec}
 
-The scene a clip draws — its SOURCE's, because that is what a source is.
+The scene a clip draws, which is its source's: that is what a source is.
 
 It used to be a `Param{SceneSpec}` on the clip's `:scene` effect, so that it would
 be saved. But a spec is not a parameter: nothing keyframes it, no widget edits it,
@@ -31,20 +31,20 @@ scenespecof(::ClipSource) = nothing
 """
     prerender!(source, clip, frame) -> nothing
 
-Have the source draw this frame BEFORE the graph runs.
+Have the source draw this frame before the graph runs.
 
 Nothing for a decoder: `decodesource` is its version of the same idea, called
 from `update!` for the reason spelled out there.
 
-A SCENE draws with GLMakie, and its screen belongs to thread 1 — while the
-composite runs on whichever thread owns the Lava context, the pinned GPU worker.
-Drawing inside the pass body is therefore thread 1 → worker → thread 1 → worker,
-once per frame, and the hop back has to wait for the editor's own renderloop to
-reach a yield. Measured on the lego project: **22.5 ms of waiting against 7.3 ms
-of drawing**, and playback of a 60 fps timeline at 10–12 fps.
+A scene draws with GLMakie and its screen belongs to thread 1, while the composite
+runs on whichever thread owns the Lava context — the pinned GPU worker. Drawing
+inside the pass body is therefore thread 1 → worker → thread 1 → worker once per
+frame, and the hop back waits for the editor's renderloop to reach a yield.
+Measured on the lego project: 22.5 ms of waiting against 7.3 ms of drawing, and
+playback of a 60 fps timeline at 10–12 fps.
 
-Called where the caller is STILL on thread 1 — right before `runowned` hands the
-frame to the worker — so `onmainthread` inside is a no-op and the wait is gone.
+Called while the caller is still on thread 1, right before `runowned` hands the
+frame to the worker, so `onmainthread` inside is a no-op.
 """
 prerender!(::ClipSource, ::Clip, ::Integer) = nothing
 
@@ -58,7 +58,7 @@ end
 """
     prerenderscenes!(clips, n) -> nothing
 
-[`prerender!`](@ref) every clip of a frame, by TIMELINE frame.
+[`prerender!`](@ref) every clip of a frame, by timeline frame.
 
 The three places that hand a frame to the render engine call this immediately
 before they do — `compositeframe!`, `presentclipframe!` and `presentgpu!`. Not
@@ -93,25 +93,25 @@ end
 One frame of the scene, at `dims`.
 
 The standing scene is reused unless the canvas or the backend changed; only the
-VALUES this frame carries are written onto it (see [`liveframe!`](@ref)). The
+values this frame carries are written onto it (see [`liveframe!`](@ref)). The
 result is already the plane format — RGBA with the scene's own coverage, so what
 it did not draw on is uncovered and the clip below shows through.
 """
 function sceneframe!(src::SceneSource, clip::Clip, dims::Tuple{Int, Int})
-    # ON THREAD 1, wherever the composite runs — see [`onmainthread`](@ref).
+    # On thread 1, wherever the composite runs — see [`onmainthread`](@ref).
     # Everything from here down touches the screen: building it, writing this
     # frame's numbers onto its plots (which walks Makie's compute graph and can
     # reach the renderer), and reading the film back.
     img = onmainthread() do
         name = renderwith(src)
-        # The BAKE backend is a different renderer, so it is a different standing
+        # The bake backend is a different renderer, so it is a different standing
         # scene: `livescene!` rebuilds when the backend changes, which is exactly
         # what switching modes is.
         src.live = livescene!(src.live, src.root, dims, name, getbackend(name);
                               theme = rendertheme(src))
-        # …and NOW there is a scene to write this frame's numbers onto.
+        # …and now there is a scene to write this frame's numbers onto.
         applysceneparams!(src, clip, src.at)
-        # The first read at a position CLEARS the film; every read after it adds
+        # The first read at a position clears the film; every read after it adds
         # to it. Without the clear a path tracer would keep averaging the previous
         # frame's picture into this one and the animation would smear.
         liveframe!(src.live; clear = src.samples == 0)
@@ -132,7 +132,7 @@ renderwith(src::SceneSource) =
 """
     rendertheme(src) -> Dict
 
-Which SETTINGS this frame is drawn with: the live ones while previewing, the
+Which settings this frame is drawn with: the live ones while previewing, the
 bake's while baking. An empty bake theme means there is nothing to change — the
 scene draws the same either way, which is the common case for a rasteriser.
 """
@@ -143,7 +143,7 @@ rendertheme(src::SceneSource) =
 How many accumulated samples a live preview stops at.
 
 A bound, not a quality setting: past it the picture stops changing visibly and the
-GPU is better left to the next seek. A BAKE has no such bound — it renders what
+GPU is better left to the next seek. A bake has no such bound — it renders what
 its integrator is configured for.
 """
 const MAXSAMPLES = 64
@@ -153,7 +153,7 @@ const MAXSAMPLES = 64
 
 Whether this source has more samples to add at the frame it is showing.
 
-This is what makes a raytraced preview usable: a seek returns ONE sample in
+This is what makes a raytraced preview usable: a seek returns one sample in
 subseconds and standing still adds to it, instead of every playhead move costing
 the full budget. It only works because the screen is held across frames — see
 `SceneSource`.
@@ -192,7 +192,7 @@ end
 """
     applysceneparams!(src, clip, sf) -> nothing
 
-Write this frame's numbers onto the LIVE scene.
+Write this frame's numbers onto the live scene.
 
 Here rather than in `updatesource!`, because that runs before the plan does and
 the scene is built inside the source pass — there is nothing to write onto yet.
@@ -213,7 +213,7 @@ end
 
 # ------------------------------------------------- what a scene offers to animate
 #
-# FROM THE LIVE SCENE, not from a description of it beside the spec.
+# From the live scene, not from a description of it beside the spec.
 #
 # The scene is the truth: it is what the renderer draws, so it is what the panel
 # should list. A parallel model — our own parts, our own lights, our own camera —
@@ -229,7 +229,7 @@ end
 """
     sceneplots(scene) -> Vector{Pair{Symbol, Plot}}
 
-Every NAMED plot in the scene, depth first.
+Every named plot in the scene, depth first.
 
 Named only, and that is the contract: a path addresses a plot by its name
 (`"arm_left.rotation"`), and a name is what makes a keyframe survive the scene
@@ -251,7 +251,7 @@ end
 """
     rowkind(value) -> Symbol
 
-What KIND of row an attribute of this value gets: `:number` (a slider and a ◆),
+What kind of row an attribute of this value gets: `:number` (a slider and a ◆),
 `:vector`/`:colour` (one of those per component), `:data` (no slider — a mesh or a
 picture is not a number, it comes down an input), `:none` (not offered).
 
@@ -259,7 +259,7 @@ Dispatch on the value, not a list of attribute names we maintain. A plot attribu
 we have never heard of gets the right row because of what it IS.
 """
 # The rig's own bookkeeping is not something to put a slider on: `jointaxis` and
-# `jointbase` describe HOW a joint moves, not where it is now.
+# `jointbase` describe how a joint moves, not where it is now.
 rowkind(::Real) = :number
 rowkind(::Bool) = :none                     # `visible` is a toggle, not a slider
 rowkind(::Colorant) = :colour
@@ -283,7 +283,7 @@ rowcomponents(::Val{:colour}, v) =
 
 One entry per named plot in the live scene, with the paths its attributes offer.
 
-`nothing` scene → nothing to offer. The card is LAZY for exactly this reason: it
+`nothing` scene means nothing to offer, which is why the card is lazy: it
 asks when it is opened, by which time the clip has rendered at least once and the
 scene exists.
 """
@@ -299,7 +299,7 @@ function sceneattributes(src::SceneSource)
     end
     for (name, plot) in sceneplots(targetscene(src.live.target))
         rows = NamedTuple[]
-        # A JOINT's rows come from the description, not from the plot: `angle` and
+        # A joint's rows come from the description, not from the plot: `angle` and
         # `offset` are not attributes Makie knows, they are how the part is hung.
         # Their values live in the parameters, so a fresh row starts at rest.
         if haskey(src.joints, name)
@@ -307,8 +307,8 @@ function sceneattributes(src::SceneSource)
                          kind = :number, value = 0.0))
             append!(rows, comprows(name, :offset, 3, Vec3f(0)))
         end
-        # THE INPUTS, not everything the graph holds. A plot's attributes are a
-        # `ComputeGraph`, and most of what is in it is DERIVED — `eyeposition`,
+        # The inputs, not everything the graph holds. A plot's attributes are a
+        # `ComputeGraph` and most of what is in it is derived — `eyeposition`,
         # `view_direction`, `N_lights` are answers Makie computed from the scene,
         # and a slider on an answer is a slider that will be overwritten. The
         # graph already distinguishes the two; asking it is one rule rather than a
@@ -349,7 +349,7 @@ comprows(name, field::Symbol, n::Integer, v) =
 
 
 """
-One joint of a rig, as the PROJECT DESCRIPTION states it: an axis to turn about and
+One joint of a rig, as the project description states it: an axis to turn about and
 the translation the part was built with.
 
 Authored data, not runtime state. `angle` and `offset` are not here — those are
@@ -358,7 +358,7 @@ is left is what the description says about how the part is hung, which is exactl
 the input `rotate!(plot, axis, angle)` and `translate!(plot, base + offset)` need.
 
 `base` is where a part starts: one with an origin sits at its pivot, one without
-has to UNDO its parent's translation — its mesh is already in world coordinates and
+has to undo its parent's translation: its mesh is already in world coordinates and
 would otherwise inherit it twice, which is what made the hands float beside the
 figure. Computed once while the rig is built, because the parent chain carries
 every animated offset by itself.
@@ -383,7 +383,7 @@ One `rotate!`/`translate!` per part, from the parameters that hold its numbers a
 the description that says how it is hung. The parent chain does the rest: turning
 `arm_left` carries `hand_left` with it, so nothing here walks the tree.
 
-Together rather than one number at a time, because an angle and an offset are ONE
+Together rather than one number at a time, because an angle and an offset are one
 placement of the part — writing them separately would apply half a pose.
 """
 function applyjoints!(src::SceneSource, fx::Effect, sf::Integer)
@@ -413,10 +413,10 @@ end
 
 Write one number into the live scene at `path`. `false` when it addresses nothing.
 
-Three things a path can name, tried in order and all of them real: a JOINT of the
-rig (`"arm_left.angle"` — applied through the plot's transformation), the CAMERA
+Three things a path can name, tried in order: a joint of the rig
+(`"arm_left.angle"`, applied through the plot's transformation), the camera
 (`"camera.eye[1]"` — placed after the scene exists, which is the only time
-`cam3d!` can be told where to look), and any PLOT ATTRIBUTE (`"title.fontsize"` —
+`cam3d!` can be told where to look), and any plot attribute (`"title.fontsize"` —
 straight onto the attribute, because between frames a scene only ever changes
 values and re-specifying is the slower path).
 """
@@ -424,7 +424,7 @@ function setscenevalue!(src::SceneSource, path, v)
     a = scenepath(path)
     a === nothing && return false
     name, key, comp = a
-    # A joint's numbers are applied TOGETHER, by `applyjoints!`, once every
+    # A joint's numbers are applied together, by `applyjoints!`, once every
     # parameter has been read — an angle and an offset are one placement.
     haskey(src.joints, name) && haskey(JOINTFIELDS, key) && return true
     if name === :camera && src.camera !== nothing
@@ -476,7 +476,7 @@ withcomponent(old, ::Integer, v) = convert(typeof(old), v)
 # ---------------------------------------------------------------- the source pass
 
 """
-The source pass of a clip that RENDERS its frames. No decode, no upload of a
+The source pass of a clip that renders its frames. No decode, no upload of a
 decoded picture — the renderer hands back a host image in the plane's own format
 and it goes straight in.
 """
@@ -496,14 +496,14 @@ sourcenode(::SceneSource, ::Clip) = SceneNode()
 function chainpass!(g, ::SceneNode, ::Nothing, ::Nothing, ctx::ChainBuild, dims)
     cur = Mantle.Transient.Buffer(g, PlanePixel, prod(dims))
     st = ctx.state
-    # A SCENE'S PICTURE IS A HOST FRAME, and it comes in through an `Update` for
+    # A scene's picture is a host frame and comes in through an `Update` for
     # exactly the reason a decoded one does: a `copyto!` into a device transient
     # from inside a recorded pass body is a host→device upload mid-batch, which
     # forces a `vkQueueSubmit` and stalls. This was the video source's bug too —
     # it is the same bug, and it survived here because the scene pass has its own
-    # body. Measured on the lego project: playback of a timeline WITH a scene ran
-    # at 10.6 fps against 32.4 without one, and BAKING the scene (so the body only
-    # reads a PNG) changed nothing — which is what says the cost is the upload and
+    # body. Measured on the lego project: playback of a timeline with a scene ran
+    # at 10.6 fps against 32.4 without one, and baking the scene (so the body only
+    # reads a PNG) changed nothing, which is what puts the cost on the upload and
     # not the drawing.
     st.upload = Mantle.Update(g, cur)
     Mantle.custom!(g, "scene") do p
@@ -553,7 +553,7 @@ function sceneclip(built; build = nothing, start::Integer = 0, frames::Integer =
                       build, backend, width = canvas[1], height = canvas[2],
                       framerate, nframes = frames)
     clip = Clip(src; src_in = 0, src_out = Int(frames), start = Int(start))
-    # The `:scene` entry holds the clip's scene PARAMETERS — the curves — and
+    # The `:scene` entry holds the clip's scene parameters — the curves — and
     # nothing else. It starts empty: what is animatable is discovered from the
     # scene when the card is opened, and a parameter is minted then or read from
     # the project file, whichever comes first.
@@ -563,7 +563,7 @@ end
 
 # ---------------------------------------------------------------- the kind
 
-# The `:scene` entry is DATA, not a pixel operation: it has no `make`, so
+# The `:scene` entry is data, not a pixel operation: it has no `make`, so
 # `renderable` is false for it and the chain never asks it for a payload. It is
 # registered all the same, because being a registered kind is what gives it a
 # label in the panel, a card with its parameter sections, and a name a project
@@ -588,7 +588,7 @@ function addcaptionclip!(seq::Sequence; canvas = something(seq.canvas, (1920, 10
     clip = sceneclip(buildscene(build); build, start = 0, frames = n, canvas,
                      framerate = seq.framerate)
     clip.track = ntracks(seq) + 1
-    push!(seq.clips, clip)
+    addclip!(seq, clip)
     return clip
 end
 
@@ -599,11 +599,11 @@ end
 
 Place a scene clip at the playhead and select it.
 
-THE ONE PLACE a scene reaches the timeline — the title command, the bar, the
+The one place a scene reaches the timeline: the title command, the bar, the
 timecode, the captions and "add a 3D scene" all come through here, so they cannot
 drift apart on where it lands, how long it is, or whether it is undoable.
 
-On its OWN lane above whatever is there, because a graphic that replaced the shot
+On its own lane above whatever is there, because a graphic that replaced the shot
 under it is not what anybody meant by adding a title.
 """
 function addsceneclip!(player::Player, build::AbstractDict; label::AbstractString = "scene",
@@ -616,16 +616,15 @@ function addsceneclip!(player::Player, build::AbstractDict; label::AbstractStrin
     snapshot!(player)
     clip = sceneclip(buildscene(build); build, start = at, frames, canvas, framerate = fps)
     clip.track = track === nothing ? freetrack(seq, at, frames, ntracks(seq) + 1) : Int(track)
-    push!(seq.clips, clip)
+    addclip!(seq, clip)
     sort!(seq.clips; by = c -> c.start)
     bindinputs!(seq)
-    refreshedit!(player)
-    i = findfirst(c -> c === clip, seq.clips)
-    i === nothing || (player.timeline.selected[] = i)
+    redraw!(player)
+    player.timeline.selected[] = clip.id
     fx = findslot(clip, :scene)
     fx === nothing || selectfxcard!(player, (:fx, fx.id))
     setstatus!(player, "$label added on track $(clip.track) — " *
                        "$(round(frames / fps, digits = 1))s, trim it like any clip")
-    notify(player.playhead)
+    showplayhead!(player)
     return clip
 end

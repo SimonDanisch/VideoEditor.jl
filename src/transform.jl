@@ -2,10 +2,10 @@
 # rather than hunting for the right slider and guessing what a number does.
 #
 # The gizmo owns no state. It reads `transformof(clip)` and writes through
-# `applyslider!`, the SAME call the sliders make, which is what makes the two
-# agree: dragging moves the sliders, a slider moves the gizmo, one undo entry per
-# gesture either way, and a keyframed parameter gets a key at the playhead instead
-# of a static value — so drag-to-animate is just scrub-and-drag.
+# `editparam!`, the SAME call the sliders make, which is what makes the two agree:
+# dragging moves the sliders, a slider moves the gizmo, one undo entry per gesture
+# either way, and an animated parameter gets a key at the playhead — so
+# drag-to-animate is just scrub-and-drag.
 
 "How near a handle the pointer must be, in canvas pixels, to grab it."
 const GIZMOGRAB = 14.0
@@ -23,7 +23,7 @@ where the picture went.
 function layerquad(player::Player, clip::Clip, srcframe::Integer)
     lay = (clip.source.width, clip.source.height)
     can = size(player.frame[])
-    # the clip AT THIS FRAME: with the transform keyframed, the static effect is
+    # the clip at this frame: with the transform keyframed, the static effect is
     # not where the picture is — the handles would sit on the base values and stay
     # there while the animation moved underneath them
     Minv = inv(layermatrix(clip, lay, can, srcframe))
@@ -173,22 +173,23 @@ end
 transformdrag(player::Player) = get(player.fxwidgets, :transformdrag, nothing)
 
 """
-Write one of the gizmo's parameters and SHOW it everywhere at once.
+    setgizmoparam!(player, name, v) -> nothing
 
-`applyslider!` is the sliders' own path: it takes the undo snapshot, and it
-writes a KEY at the playhead when the parameter is keyframed rather than
-overwriting the curve. The slider widget is then pushed to the new value under
-`fxsyncing`, which is the flag that stops that echo from firing the slider's
-handler straight back at us.
+Write one of the transform's parameters from the gizmo.
+
+[`editparam!`](@ref) is the sliders' own path — the undo snapshot, a key at the
+playhead when the parameter is animated — and the row's slider follows because it
+is derived from the same curve. There is nothing to push into the widget, and so
+nothing that could come back as a second edit.
 """
-function setgizmoparam!(player::Player, key::Symbol, v::Real)
-    applyslider!(player, key, Float32(v))
-    s = get(player.fxsliders, key, nothing)
-    if s !== nothing
-        player.fxsyncing[] = true
-        Makie.set_close_to!(s, Float64(v))
-        player.fxsyncing[] = false
-    end
+function setgizmoparam!(player::Player, name::Symbol, v::Real)
+    loc = editclip(player)
+    loc === nothing && return nothing
+    clip = loc[1]
+    fx = findslot(clip, TransformEffect)
+    fx === nothing && return nothing
+    p = param(fx, name)
+    p === nothing || editparam!(player, clip, p, Float64(v))
     return nothing
 end
 
@@ -234,8 +235,8 @@ function transformdragto!(player::Player, p; shift::Bool = false, alt::Bool = fa
         # placement's position runs, so the drag delta carries straight through.
         # Negating it here — "screen y is up" — dragged the picture the opposite
         # way from the pointer.
-        setgizmoparam!(player, :pos_x, clamp(d.pos0[1] + dx, -1.0, 1.0))
-        setgizmoparam!(player, :pos_y, clamp(d.pos0[2] + dy, -1.0, 1.0))
+        setgizmoparam!(player, :x, clamp(d.pos0[1] + dx, -1.0, 1.0))
+        setgizmoparam!(player, :y, clamp(d.pos0[2] + dy, -1.0, 1.0))
         setstatus!(player, "transform: position " *
                            "$(round(d.pos0[1] + dx; digits = 3)), $(round(d.pos0[2] + dy; digits = 3))")
     elseif d.zone === :rotate

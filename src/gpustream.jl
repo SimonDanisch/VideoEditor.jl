@@ -140,7 +140,9 @@ function freedevicevram(backend::LavaBackend)
             free = max(free, avail)
         end
         return free
-    catch
+    catch e
+        # 0 reads as "no VRAM" everywhere upstream, so say why it could not be read
+        @warn "could not read the device memory budget" exception = (e, catch_backtrace())
         return 0
     end
 end
@@ -160,7 +162,8 @@ from the container boxes; 0 without an edit list (or a non-mp4 container).
 function editlistlead(path::AbstractString)
     bytes = try
         open(io -> Mmap.mmap(io, Vector{UInt8}), path)   # moov sits at either end — walk it all
-    catch
+    catch e
+        e isa SystemError || rethrow()   # unreadable file: no edit list to read
         return 0
     end
     # only ISO-BMFF containers carry edit lists; walking an mkv's EBML as boxes

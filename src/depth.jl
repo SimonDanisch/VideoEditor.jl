@@ -18,7 +18,7 @@ editor should run with it absent. [`registerdepth!`](@ref) installs it, and
     registerdepth!(f)
 
 Install the depth model. `f(img) -> AbstractMatrix{<:Real}` takes one host RGB
-frame and returns a depth map of any size; larger values must mean NEARER.
+frame and returns a depth map of any size; larger values mean nearer.
 
 Any size, because the model has its own input resolution and resampling it to the
 frame is this file's business, not the caller's. Any element type, because
@@ -47,7 +47,7 @@ const DEPTHANYTHING = Ref{Any}(nothing)
 `a` without its size-1 axes.
 
 The runner hands back the model's raw tensor — a depth map with a batch axis and
-a channel axis, neither of which a depth map has. Dropping them HERE, in the
+a channel axis, neither of which a depth map has. Dropping them here, in the
 adapter, keeps the editor's contract as "a depth map is a matrix" rather than
 widening every consumer to accept a 4-D array that only ever has two real axes.
 """
@@ -78,7 +78,7 @@ installdepth!() = registerdepth!(depthanythingdepth)
 
 One depth map, normalized to `0x00` (farthest) … `0xff` (nearest).
 
-**Per frame, and that is not a choice.** A monocular model has no scale: its
+Per frame, necessarily: a monocular model has no scale, so its
 output is an ordering, and the numbers behind that ordering drift between frames
 of the same shot. Normalizing per frame at least makes "nearest thing visible"
 mean the same thing everywhere; not normalizing would make an effect's threshold
@@ -152,19 +152,19 @@ end
 """
     depthscale(src, w, h) -> Matrix{UInt8}
 
-Resize a depth map to `w`×`h`, KEEPING its values.
+Resize a depth map to `w`×`h`, keeping its values.
 
 Not [`mattemaskscale`](@ref), which this used and which ends
 `v > 0 ? 0xff : 0x00` — correct for a binary seed mask, catastrophic for a depth
 map: every non-zero depth became 0xff, so the track was a uniform "everything is
 nearest" plane. Depth blur still changed the picture (it defocused everything
 equally), so it passed a does-the-effect-do-something check; it had simply never
-done anything DEPTH-related. The card's thumbnail, which is solid white when this
+done anything depth-related. The card's thumbnail, which is solid white when this
 is wrong, is what showed it.
 
-BILINEAR, unlike the mask version's nearest neighbour. A mask has two values and
+Bilinear, unlike the mask version's nearest neighbour. A mask has two values and
 nearest is the only honest choice; a depth map is continuous and drives a
-PER-PIXEL BLUR RADIUS, so a stepped depth map becomes visible banding in the
+per-pixel blur radius, so a stepped depth map becomes visible banding in the
 defocus — concentric rings where the radius jumps. Interpolating costs three
 extra lerps per pixel, once per frame, at analysis time.
 """
@@ -192,7 +192,7 @@ end
 
 One depth plane as a grayscale picture, bright = near.
 
-The card shows this because a monocular depth estimate is a GUESS, and the effect
+The card shows this because a monocular depth estimate is a guess, and the effect
 built on it hides how good a guess it was: defocus turns a wrong depth into a
 soft halo rather than a visible error, so a shot the model misread looks merely
 mediocre instead of wrong. The map shows whether it separated subject from
@@ -229,7 +229,7 @@ planedata(::DepthBlurOp, clip::Clip, srcframe::Integer) =
 
 Defocus `img` into `out` by each pixel's distance from `op.focus` in depth.
 
-**One gather pass, not two separable ones.** A per-pixel radius is not separable
+One gather pass, not two separable ones: a per-pixel radius is not separable
 — the two passes disagree wherever the radius changes — and separating it would
 buy a second scratch buffer for the privilege. At this radius the gather is ~169
 taps at the very worst and only where the picture is defocused.
@@ -245,7 +245,7 @@ function depthblur!(out, img, plane, op::DepthBlurOp)
         copyto!(out, img)
         return out
     end
-    # Capped in PIXELS, not by the fraction alone: the tap count is the square of
+    # Capped in pixels, not by the fraction alone: the tap count is the square of
     # this, so a fraction of a 4K frame would be a 40-tap radius and 6561 samples
     # a pixel. Six is where defocus reads as defocus and the cost stays flat.
     maxr = Int32(clamp(round(Int, s * 0.02 * min(w, h)), 1, 6))
@@ -276,7 +276,7 @@ and a radius is an integer by the time anything uses it.
         dx = clamp(div((x - Int32(1)) * dw, w) + Int32(1), Int32(1), dw)
         dy = clamp(div((y - Int32(1)) * dh, h) + Int32(1), Int32(1), dh)
         z = Float32(depth[dx + (dy - Int32(1)) * dw]) / 255.0f0
-        # DISTANCE from the focus plane, so the sharp band sits at `focus` and
+        # Distance from the focus plane, so the sharp band sits at `focus` and
         # both nearer and farther go soft — which is what a lens does, and what
         # makes focusing on a mid-ground subject possible at all.
         rad = clamp(Int32(round(abs(z - focus) * Float32(maxr))), Int32(0), maxr)

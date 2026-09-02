@@ -71,7 +71,7 @@ function commands(player::Player)
                            category = :effect,
                            keywords = vcat(["effect"], [p.label for p in k.params]),
                            enabled = p -> editclip(p) === nothing ?
-                                          "needs a clip at the playhead" : true,
+                                          "select a clip first" : true,
                            run = p -> addeffect!(p, k.name)))
     end
     return out
@@ -140,7 +140,7 @@ end
 # ------------------------------------------------------------ what ships here
 
 "True, or the reason there is no clip to act on."
-needsclip(player::Player) = editclip(player) === nothing ? "needs a clip at the playhead" : true
+needsclip(player::Player) = editclip(player) === nothing ? "select a clip first" : true
 "True, or the reason the timeline is empty."
 needsclips(player::Player) = isempty(player.sequence.clips) ? "the timeline is empty" : true
 
@@ -179,7 +179,7 @@ registercommand!(:depth_blur, "Blur background (depth)"; category = :effect,
 
 # Copy/paste were Ctrl+C/Ctrl+V and nothing else — the only edit operations with
 # no palette entry, while split, delete, undo, redo, crop and blade all have one.
-# The palette is also where a shortcut is LEARNED: it prints the key beside the
+# The palette is also where a shortcut is learned: it prints the key beside the
 # name, so a command that is missing from it hides its own keystroke.
 registercommand!(:copy_clips, "Copy the selected clip(s)"; category = :edit,
     shortcut = "Ctrl+C", keywords = ["duplicate", "clipboard", "copy"],
@@ -222,7 +222,7 @@ registercommand!(:bypass_all, "Bypass all effects (compare with the original)";
 registercommand!(:show_keyframes, "Animated parameters on this clip…"; category = :view,
     keywords = ["keyframes", "curves", "animation", "overview", "legend"],
     # a closure, not a bare reference: commands.jl is included before fxpanel.jl,
-    # so the name must resolve at CALL time, not at registration time
+    # so the name has to resolve at call time, not at registration time
     enabled = needsclip, run = p -> openkeyframes!(p))
 registercommand!(:toggle_curves, "Show / hide all keyframe curves"; category = :view,
     keywords = ["animation", "graph", "legend"],
@@ -267,7 +267,7 @@ registercommand!(:prev_edit, "Go to the previous edit point"; category = :transp
 
 # ------------------------------------------------------------------ scene clips
 #
-# A title, a lower third, a timecode and the subtitles are CLIPS, so there is no
+# A title, a lower third, a timecode and the subtitles are clips, so there is no
 # "add an overlay" verb any more — each of these is a preset that builds a
 # `SceneSpec` and puts a clip on the timeline. Adding another is writing a
 # function that returns plots (see overlays.jl) and one line here.
@@ -296,7 +296,7 @@ registercommand!(:add_captions, "Add the captions to the picture"; category = :e
         c = addsceneclip!(p, scenebuild(:captions, canvassize(seq)); label = "captions",
                           seconds = max(seqlength(seq), 1) / max(seq.framerate, 1))
         c.src_out = max(seqlength(seq), 1)      # the whole timeline, not three seconds
-        refreshedit!(p)
+        redraw!(p)
         return c
     end)
 

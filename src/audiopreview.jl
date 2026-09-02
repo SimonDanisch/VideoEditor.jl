@@ -182,14 +182,8 @@ function stopaudio!(player::Player)
     proc = ap.proc
     ap.proc = nothing
     if proc !== nothing && process_running(proc)
-        try
-            kill(proc)     # first — a blocked feeder may hold the pipe open
-        catch
-        end
-        try
-            close(proc.in)
-        catch
-        end
+        kill(proc)         # first — a blocked feeder may hold the pipe open
+        close(proc.in)
     end
     return nothing
 end

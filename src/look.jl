@@ -86,7 +86,7 @@ Grade `img` into `out`, mixed back toward the original by `strength`.
 At full strength this is `lut3d!` and nothing else. Below it a second pointwise
 pass lerps `out` back toward `img`.
 
-**Not `GPUFiltering.blend!`**, which would express this in one call and does
+Not `GPUFiltering.blend!`, which would express this in one call and does
 sanction the aliasing — but it synchronizes, and this runs inside a graph pass
 body where Mantle orders the passes and the kernels already there
 (`coloradjust!`, `lut3d!`) do not drain the pipeline. Draining it mid-graph is a

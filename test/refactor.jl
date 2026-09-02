@@ -80,7 +80,7 @@ end
     # switched on right now" is a value and a value must not decide which graph is
     # compiled — a σ reaching zero mid-drag would otherwise recompile.
     for s in clip.effects
-        s.enabled = false
+        s.enabled[] = false
     end
     @test VE.graphof!(clip, dims) === g
 end
@@ -101,7 +101,7 @@ end
     VE.bindinputs!(seq)
     @test VE.isdriven(pa)
     @test VE.valueat(pa, 0) ≈ 0.75f0
-    pb.value = 0.5f0
+    VE.setvalue!(pb, 0.5f0, 0)
     @test VE.valueat(pa, 0) ≈ 0.5f0          # …and it FOLLOWS, there is no copy
 
     # a `:mix` takes three inputs: two sources and the number between them
@@ -130,7 +130,7 @@ end
     VE.removeslot!(b, b.effects[1].id)
     VE.bindinputs!(seq)
     @test !VE.isdriven(pa)
-    @test VE.valueat(pa, 0) ≈ pa.value       # …and it reads as its own value
+    @test VE.valueat(pa, 0) ≈ pa.curve[].keys[1].value   # …and it reads as its own value
 
     # …and an edge survives a project round trip, because the file holds its ids
     seteffect!(b, VE.OpacityEffect(0.25f0))

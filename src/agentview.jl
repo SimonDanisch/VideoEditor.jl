@@ -1,7 +1,7 @@
-# Seeing an edit as an AGENT — images that carry the most information per token.
+# Seeing an edit as an agent: images that carry the most information per token.
 #
 # An LLM understands video through pictures, but a picture per frame drowns its
-# context. So this is a ZOOM, not a dump: three calls, each one image plus a
+# context. So this is a zoom, not a dump: three calls, each one image plus a
 # manifest that says exactly what is in it, and each answer tells you what to
 # call next.
 #
@@ -38,7 +38,7 @@ function sheetgrid(n::Integer, aspect::Real, size::Integer)
 end
 
 # A 3×5 bitmap digit font: at 50–64 px cells, antialiased text turns to mush,
-# and the cell INDEX is what an agent quotes back ("zoom into cell 27").
+# and the cell index is what an agent quotes back ("zoom into cell 27").
 const SHEETDIGITS = (
     0b111_101_101_101_111, 0b010_110_010_010_111, 0b111_001_111_100_111,
     0b111_001_111_001_111, 0b101_101_111_001_001, 0b111_100_111_001_111,
@@ -92,7 +92,7 @@ end
                  labels = true) -> (image, manifest)
 
 `cells` frames of the time range `[t0, t1]`, rendered as the export renders
-them, tiled into ONE image of about `size` × `size` pixels — the knob that
+them, tiled into one image of about `size` × `size` pixels. The knob that
 matters is `size`, because vision tokens go by pixels (512² ≈ 350 tokens for 64
 frames). Cells keep the source's aspect, so nothing is spent on black bars.
 Cell 1 is top-left, filled row by row; with `labels` each carries its number,
@@ -251,7 +251,7 @@ end
 """
     findchange(seq, t0, t1; threshold = 0.08, backend) -> (time, difference) | nothing
 
-Bisect `[t0, t1]` for the moment the picture CHANGES — a cut, a flash, a light
+Bisect `[t0, t1]` for the moment the picture changes — a cut, a flash, a light
 switching on: the first time the finished frame stops resembling the frame at
 `t0` by more than `threshold` (mean absolute difference of a 64×36 gray
 thumbnail, 0..1). O(log n) frame renders instead of a scan: 10 minutes at 30 fps
@@ -298,7 +298,7 @@ findchange(player::Player, args...; kwargs...) = findchange(player.sequence, arg
     viewsummary(seq) -> NamedTuple
 
 The numbers an agent needs before it looks at anything: duration, frame rate,
-canvas, per-clip ranges (timeline AND source), and what is on each clip
+canvas, per-clip ranges (timeline and source), and what is on each clip
 (effects, stabilization, keyframed params). The text half of "see the edit".
 """
 function viewsummary(seq::Sequence)
@@ -308,14 +308,14 @@ function viewsummary(seq::Sequence)
          start_time = round(c.start / fps, digits = 3),
          end_time = round(clipend(c) / fps, digits = 3),
          source = basename(sourcepath(c.source)),
-         # in the SOURCE's own seconds: `src_in` counts source frames, and on a
+         # in the source's own seconds: `src_in` counts source frames, and on a
          # conformed clip those don't tick at the sequence rate
          source_in = round(c.src_in / c.source.framerate, digits = 3),
          source_fps = c.source.framerate,
          conformed = conformed(c),
          crop = round.(c.crop, digits = 3),
          effects = [renderable(s) ? string(nameof(typeof(op(s)))) : String(s.kind)
-                    for s in c.effects if s.enabled],
+                    for s in c.effects if s.enabled[]],
          stabilized = c.motiontrack !== nothing,
          flicker_fixed = c.colortrack !== nothing,
          animated = sort!([string(fx.kind, ".", prm.name) for fx in c.effects

@@ -1,4 +1,4 @@
-# ONE registry for everything the editor can put on a clip.
+# One registry for everything the editor can put on a clip.
 #
 # There used to be three descriptors for one idea. `EffectKind` described the
 # built-ins, `FxPlugin` described registered effects, and `EditorTool` described
@@ -8,8 +8,8 @@
 #
 # There is no line to draw between them. "Blur" takes a parameter and shows a
 # slider; "Stabilize" takes a mode and runs an analysis; "Matte" wants a click in
-# the preview first. Those are differences in what a kind DOES, not in what a
-# kind IS: something you add to a clip, tune, and see in the render.
+# the preview first. Those are differences in what a kind does, not in what a kind
+# is: something added to a clip, tuned, and seen in the render.
 
 """
 One kind of effect: what the add-menu offers, what the palette can run, what a
@@ -52,9 +52,9 @@ end
 
 Keyword constructor.
 
-There is no `kfkeys` any more. It existed to give each parameter a GLOBALLY
-unique name, because a curve was stored on the clip under a bare symbol and had
-to be resolvable from it alone. A curve now lives on the parameter of the effect
+There is no `kfkeys` any more. It gave each parameter a globally unique name,
+because a curve was stored on the clip under a bare symbol and had to be
+resolvable from it alone. A curve now lives on the parameter of the effect
 it animates, so two kinds may both call a parameter `:strength` and nothing has
 to tell them apart.
 """
@@ -82,14 +82,17 @@ Effect(k::EffectKind; enabled::Bool = true) =
 """
     setparams!(fx, values)
 
-Write `values` (a NamedTuple) onto `fx`'s parameters, leaving their curves and
-lane visibility alone. What a slider does, and what replacing a payload used to
-do by overwriting the whole struct.
+Write `values` (a NamedTuple) onto `fx`'s parameters at `frame`, leaving their
+lane visibility alone. What a slider does, and what replacing a payload used to do
+by overwriting the whole struct.
+
+An animated parameter is keyed at `frame` rather than flattened — see
+[`setvalue!`](@ref).
 """
-function setparams!(fx::Effect, values::NamedTuple)
+function setparams!(fx::Effect, values::NamedTuple; frame::Integer = 0)
     for (name, v) in pairs(values)
         p = param(fx, name)
-        p === nothing || (p.value = convert(typeof(p.value), v))
+        p === nothing || setvalue!(p, convert(eltype(p), v), frame)
     end
     return fx
 end
@@ -317,22 +320,21 @@ registereffect!(EffectKind(:sharpen, "Sharpen";
     matches = e -> e isa SharpenEffect,
     read = e -> (sharpen = Float64(e.amount),)))
 
-# ONE card, not two. The sliders and the "click what should be sharp" action are
-# the same feature — `EffectKind` carries `params` AND `activate`, so splitting
-# them into an effect plus a tool would put two cards on the clip for one thing
-# and leave the user to work out that they are related.
+# One card, not two: the sliders and the "click what should be sharp" action are
+# one feature, and `EffectKind` carries `params` and `activate` together. Splitting
+# them into an effect plus a tool would put two cards on the clip for one thing.
 registereffect!(EffectKind(:depthblur, "Depth blur";
     description = "Defocus by distance from a focus plane, against estimated depth. " *
-                  "Focus is a DEPTH and nothing on screen is labelled with one, so " *
+                  "Focus is a depth and nothing on screen is labelled with one, so " *
                   "click the picture to set it to whatever you clicked.",
     params = [FxParam(:focus, "Focus"; min = 0.0, max = 1.0, default = 1.0),
               FxParam(:defocus, "Defocus"; min = 0.0, max = 1.0, default = 0.6)],
     make = nt -> DepthBlurEffect(Float32(nt.focus), Float32(nt.defocus)),
     matches = e -> e isa DepthBlurEffect,
     read = e -> (focus = Float64(e.focus), defocus = Float64(e.strength)),
-    # `body` only — NOT `activate` too. The panel draws the generic action button
-    # only for a kind with no body (see `fxpanel.jl`), so an `activate` here would
-    # never be reachable from the card and would only fire via `activatetool!`.
+    # `body` only, no `activate`: the panel draws the generic action button only for
+    # a kind with no body (see `fxpanel.jl`), so an `activate` here would not be
+    # reachable from the card and could only fire via `activatetool!`.
     body = ctx -> depthbody!(ctx)))
 
 registereffect!(EffectKind(:look, "Look";

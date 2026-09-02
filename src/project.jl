@@ -8,7 +8,7 @@ load, so the file holds no pixels; matte alpha, the one thing per-frame enough t
 matter, sits next to it as raw planes.
 
 MessagePack rather than JSON because most of a real project is not the edit but
-per-frame ANALYSIS. One hour of stabilization and colour tracking on ONE clip is
+per-frame analysis. One hour of stabilization and colour tracking on one clip is
 108 000 `Mat3f` and 216 000 `Vec3f`, and measured on exactly that:
 
     JSON                             52.4 MB   write 1.87 s   read 0.30 s
@@ -19,8 +19,8 @@ Nothing about the tree changed — see pack.jl for how a type says what it is. T
 saving is that a number stops being decimal text: `0.20000000298023224` was
 nineteen bytes for a `Float32` that JSON could not represent in the first place.
 
-Writing is ATOMIC (write a temp, rename) and keeps the previous version as a
-checkpoint: an interrupted save must not be able to destroy the last good one.
+Writing is atomic (write a temp, rename) and keeps the previous version as a
+checkpoint, so an interrupted save cannot destroy the last good one.
 """
 function saveproject(path::AbstractString, seq::Sequence; checkpoint::Bool = true)
     dict = Dict{String, Any}(
@@ -55,7 +55,7 @@ function saveproject(path::AbstractString, seq::Sequence; checkpoint::Bool = tru
     mv(tmp, path; force = true)          # atomic: a half-written file never replaces the good one
     savemattes(path, seq)
     # …and the baked frames, for the same reason: minutes of raytracing is an
-    # edit's OUTPUT, not something to recompute on every open. Defined in bake.jl,
+    # edit's output, not something to recompute on every open. Defined in bake.jl,
     # which loads after this file — resolved at call time.
     savebakes(path, seq)
     return path
@@ -83,8 +83,8 @@ function checkpointproject(path::AbstractString)
     end
     keep = sort!(readdir(dir))
     for old in keep[1:max(0, length(keep) - CHECKPOINTS)]
-        # a checkpoint that will not go is worth ONE line, not silence: the
-        # directory then grows without bound and nothing ever says why
+        # a checkpoint that will not go is worth one line: otherwise the directory
+        # grows without bound and nothing says why
         try
             rm(joinpath(dir, old); force = true)
         catch e
@@ -106,7 +106,7 @@ function projectcheckpoints(path::AbstractString)
 end
 
 """
-How a clip's SOURCE is written: a path for a file, the format for a scene.
+How a clip's source is written: a path for a file, the format for a scene.
 
 A scene clip has no media on disk — what it draws is a `SceneSpec` on its `:scene`
 effect, which goes out through the ordinary effect writer like every other
@@ -178,7 +178,7 @@ function clipdict(clip::Clip)
             "gains" => packvec(ct.gains),
             "offsets" => packvec(ct.offsets))
     end
-    # The matte's SEEDS are the edit and go in the project file; the propagated
+    # The matte's seeds are the edit and go in the project file; the propagated
     # alpha is a cache and goes to a sidecar, because a clip's worth of per-frame
     # mattes has no business inside the project file and losing it costs a
     # recompute rather than an edit.
@@ -189,10 +189,9 @@ function clipdict(clip::Clip)
             "size" => collect(Int64, size(t.alpha)))
     end
     # The learned look, on the same terms as the stabilization track above: it is
-    # an ANALYSIS but not a cache. Re-learning it is not the same operation —
+    # an analysis but not a cache. Re-learning is not the same operation:
     # `runlook!` fits from whatever frame the playhead is parked on, so a dropped
-    # LUT would come back as a different grade, which is worse than coming back
-    # empty. It is a `lookdim`³ table, small enough to sit in the file.
+    # LUT would come back as a different grade rather than as nothing. It is a `lookdim`³ table, small enough to sit in the file.
     if clip.look !== nothing
         cd["look"] = Dict{String, Any}(
             "dim" => size(clip.look, 1),
@@ -218,7 +217,7 @@ function loadproject(path::AbstractString)
         error("project references missing video file(s):\n  " * join(missing_sources, "\n  ") *
               "\nMove them back (or edit the paths in $path) and reload.")
     sources = Dict{String, VideoSource}()
-    # `saveproject` writes every field below, but the reader takes a DEFAULT for
+    # `saveproject` writes every field below, but the reader takes a default for
     # each one it can. A project file is meant to be writable by a script — an
     # agent placing clips does not want to spell out `timeinterp` to say nothing
     # — so the minimum is a source and a range, and everything else means what
@@ -291,7 +290,7 @@ function loadproject(path::AbstractString)
     # clip on a track above the footage, which is where it was drawn anyway.
     for od in get(dict, "overlays", [])
         c = clipfromoverlay(od, seq)
-        c === nothing || push!(seq.clips, c)
+        c === nothing || addclip!(seq, c)
     end
     if haskey(dict, "trackheights")
         empty!(seq.trackheights)
@@ -309,16 +308,10 @@ function loadproject(path::AbstractString)
         push!(seq.captions, Caption(Float64(cd["start"]), Float64(cd["stop"]),
                                     String(cd["text"])))
     end
-    # A parameter driven by another one is written as the IDS of what drives it;
-    # this is where those become the objects `valueat` follows. LAST, because it
-    # needs every clip and every effect to be in place — an edge is allowed to
-    # point across a clip boundary, in either direction.
-    #
-    # (The two lines that used to open this comment described loading baked scene
-    # frames from a sidecar "keyed on the overlays' ids and fingerprinted" —
-    # machinery that is gone twice over: a bake belongs to a CLIP and is
-    # invalidated by a dirty flag, not a fingerprint, and there are no overlays.
-    # It sat above a line that does something else entirely.)
+    # A parameter driven by another one is written as the ids of what drives it;
+    # this is where those become the objects `valueat` follows. Last, because it
+    # needs every clip and every effect in place — an edge may point across a clip
+    # boundary in either direction.
     bindinputs!(seq)
     # …and the bakes: their directory follows the project, and one whose inputs
     # moved on disk is switched off rather than shown as current.
@@ -332,14 +325,13 @@ end
 
 Warn about every renderer this project names that is not loaded, and return them.
 
-REPORTED, NOT SUBSTITUTED. A scene says which renderer draws it, and silently
-falling back to another one means opening a project and being shown a different
-picture than the one that was saved — quietly, with nothing on screen to say so.
-Loading the package that provides it (and `usebackend!`) is a thing the user can
-do; guessing on their behalf is not.
+Reported, not substituted: a scene says which renderer draws it, and falling back
+to another one shows a different picture than the one that was saved, with nothing
+on screen to say so. Loading the package that provides it (and `usebackend!`) is
+something the user can do.
 
-At LOAD rather than at the first render, because "why does this clip throw when I
-scrub onto it" is a worse way to find out than a line when the file opens.
+At load rather than at the first render, so it is not found by scrubbing onto the
+clip and getting an exception.
 """
 function reportbackends(seq::Sequence)
     want = Symbol[]
@@ -380,9 +372,9 @@ Where a clip's per-frame masks live, beside its alpha. `kind` is `"repairs"` or
 `"marks"`.
 
 Two stores, one format, because they are the same thing shaped differently: a
-frame number and a mask. Both are EDITS — a mark is what the propagator runs
-from, a repair is what overrules the result — and neither fits in a JSON file at
-a clip's worth of frames.
+frame number and a mask. Both are edits — a mark is what the propagator runs from,
+a repair is what overrules the result — and neither fits in a JSON file at a
+clip's worth of frames.
 """
 masksidecar(path::AbstractString, id::Integer, kind::AbstractString) =
     joinpath(mattedir(path), string(id, ".", kind, ".bin"))
@@ -398,11 +390,10 @@ Write a frame -> mask store next to the alphas.
 One record is `frame::Int32, w::Int32, h::Int32` then `w*h` bytes, so a file
 reads without consulting the alpha's shape.
 
-Losing either store was INVISIBLE, which is what made it worth chasing. The
-repaired pixels are baked into the alpha sidecar, so a reopened project looked
-correct — while the repair cards were gone and the next full run discarded every
-fix. And `runmatte!` propagates from the MARKS, so without them a reopened matte
-could not be re-run at all: "Apply matte to clip" met an empty store and refused.
+Losing either store is invisible at first: the repaired pixels are baked into the
+alpha sidecar, so a reopened project looks correct while the repair cards are gone
+and the next full run discards every fix. And `runmatte!` propagates from the
+marks, so without them a reopened matte cannot be re-run at all.
 """
 function savemasks(path::AbstractString, store, kind::AbstractString)
     any(!isempty, values(store)) || return

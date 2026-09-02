@@ -91,7 +91,7 @@ end
 A loop search on this clip: the reference frames the user marked and the cut
 points found from them (see the loop finder's card).
 
-Renders NOTHING — `isneutral` is true, so the graph never sees it. It exists so
+Renders nothing — `isneutral` is true, so the graph never sees it. It exists so
 that a search has a card on the clip it searches, like everything else the editor
 does to a clip.
 """
@@ -117,10 +117,10 @@ isneutral(::BlendEffect) = true
 Applies the clip's camera stabilization (see `analyzemotion!`).
 
 Holds nothing: the per-frame warps live on the clip's `MotionTrack`, for the same
-reason `MatteEffect` holds no pixels. What it adds is a PLACE IN THE STACK — the
-analysis used to be applied ahead of every effect by the graph builder, which
-meant there was no card to fold, no toggle to compare with, and no way to say
-"stabilize the cropped picture, not the raw one".
+reason `MatteEffect` holds no pixels. What it adds is a place in the stack: the
+graph builder used to apply the analysis ahead of every effect, so there was no
+card to fold, no toggle to compare with, and no way to say "stabilize the cropped
+picture, not the raw one".
 """
 struct StabilizeEffect <: FxOp end
 
@@ -144,7 +144,7 @@ isneutral(e::OpacityEffect) = e.α >= 0.999f0
 Where the clip sits on the canvas: scale, position and rotation on top of the
 automatic fit.
 
-An EFFECT, so it is added, folded, toggled, removed and keyframed like every
+An effect, so it is added, folded, toggled, removed and keyframed like every
 other one — and so the transform gizmo has a card to belong to. It holds no
 pixels; `layermatrix` reads it when it places the layer, which is why there is no
 `TransformNode` in the graph.
@@ -164,9 +164,8 @@ isneutral(e::TransformEffect) =
 """
     transformof(clip, frame = 0) -> (scale, x, y, rotation°)
 
-The clip's placement AT `frame`. ONE reader, so "where is this clip" has one
-answer: the `TransformEffect` when it has one, sampled like every other parameter,
-the identity fit otherwise.
+The clip's placement at `frame`, from one reader: the `TransformEffect` when it
+has one, sampled like every other parameter, the identity fit otherwise.
 
 Sampled here rather than by handing this an `effectiveclip`: the placement is four
 numbers, and copying the whole clip and its effect stack per frame to read them was
@@ -205,16 +204,16 @@ parameters — the inspector's toggle is lossless — while every render path (C
 stack, GPU graph, compositor, export) simply skips it.
 """
 liveeffects(clip::Clip) =
-    (op(s) for s in clip.effects if renderable(s) && s.enabled && !isneutral(op(s)))
+    (op(s) for s in clip.effects if renderable(s) && s.enabled[] && !isneutral(op(s)))
 
-"The slot with `id` on `clip`, or `nothing` — how anything points at ONE entry."
+"The slot with `id` on `clip`, or `nothing` — how anything points at one entry."
 function findslot(clip::Clip, id::Integer)
     i = findfirst(s -> s.id == id, clip.effects)
     return i === nothing ? nothing : clip.effects[i]
 end
 
 # There is no second walker over the stack here. `composite` (gpugraph.jl) is
-# the ONE renderer — every frame the editor shows or exports goes through it,
+# the one renderer — every frame the editor shows or exports goes through it,
 # one clip or eight — and it is not GPU-specific: the engine's Mantle device backs
 # its transients with host memory on `KA.CPU()` and VRAM through Lava, and the
 # passes run the identical kernels either way. The tier is the engine's backend,
@@ -228,7 +227,7 @@ end
 # every built-in that shipped to nobody. Deleted 2026-08-07.
 
 # Serialization lives in pack.jl — an effect and its parameters write and read
-# THEMSELVES there, so nothing about the project file appears in this file. What
+# themselves there, so nothing about the project file appears in this file. What
 # used to be here was thirteen hand-written writers (`effectdict(e::BlurEffect) =
 # ... "sigma" => e.σ ...`) and a `t == "blur" && return BlurEffect(...)` chain
 # back, so adding an effect meant writing its parameters down three times: once
@@ -237,8 +236,8 @@ end
 
 # ------------------------------------------------------- fixed-stack helpers
 
-"The clip's effect of type `T`, or `nothing` — a DISABLED slot still answers, so
-the inspector shows a switched-off effect's real parameters."
+"The clip's effect of type `T`, or `nothing`. A disabled slot still answers, so the
+inspector shows a switched-off effect's real parameters."
 function findeffect(clip::Clip, ::Type{T}) where {T <: FxOp}
     i = findfirst(s -> renderable(s) && op(s) isa T, clip.effects)
     return i === nothing ? nothing : op(clip.effects[i])::T
@@ -247,7 +246,7 @@ end
 """
     findslot(clip, kind::Symbol) -> Union{Nothing, Effect}
 
-The clip's slot of a named KIND. What a source or a tool reaches for when it needs
+The clip's slot of a named kind. What a source or a tool reaches for when it needs
 its own entry — the scene's `:scene` — where the type is not the thing that
 identifies it, because the entry may carry data no payload type could hold.
 """
@@ -259,10 +258,10 @@ end
 """
     renderable(fx) -> Bool
 
-Whether this entry is a PIXEL OPERATION — something the chain can ask for a
-payload and turn into a pass.
+Whether this entry is a pixel operation: something the chain can ask for a payload
+and turn into a pass.
 
-False for an entry that is DATA: the `:scene` effect holds a `SceneSpec` and the
+False for an entry that is data: the `:scene` effect holds a `SceneSpec` and the
 numbers animating it, and its kind has no `make` to build a payload from them. It
 belongs on the clip (it is what the clip draws, it is saved, it has a card, its
 numbers are keyframed) and it is not a step in the chain.
@@ -270,7 +269,7 @@ numbers are keyframed) and it is not a step in the chain.
 renderable(fx::Effect) = (k = kindbyname(fx.kind); k !== nothing && k.make !== nothing)
 
 "The clip's slot holding an effect of type `T`, or `nothing`."
-# `renderable` first, and it is not an optimisation: an entry that is DATA has no
+# `renderable` first, and not as an optimisation: an entry that is data has no
 # payload to ask for — `op` on the `:scene` entry would try to call a `make` that
 # is deliberately `nothing` — so "is there a Transform on this clip" must not be
 # answered by building every entry's payload and looking at its type.
@@ -296,7 +295,7 @@ function seteffect!(clip::Clip, e::FxOp)
         addslot!(clip, Effect(e))   # a new entry is a new pass
     else
         setparams!(clip.effects[i], effectkindfor(e).read(e))
-        clip.effects[i].enabled = true
+        clip.effects[i].enabled[] = true
     end
     return clip
 end
@@ -317,7 +316,7 @@ function prependeffect!(clip::Clip, e::FxOp)
         pushfirst!(clip.effects, Effect(e))
     else
         setparams!(clip.effects[i], effectkindfor(e).read(e))
-        clip.effects[i].enabled = true
+        clip.effects[i].enabled[] = true
     end
     return clip
 end

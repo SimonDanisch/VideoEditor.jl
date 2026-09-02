@@ -1,11 +1,11 @@
-# Rendering a `SceneSpec` — ONE path, with the backend as a parameter.
+# Rendering a `SceneSpec`: one path, with the backend as a parameter.
 #
 # There is no per-backend method here and no extension package, because there is
 # nothing backend-specific to say. Makie already takes the renderer as a value
 # (`display(scene; backend = SomeModule)`) and already reads a backend's own
-# options out of the THEME — `ScreenConfig`'s fields for RayMakie are exactly its
+# options out of the theme — `ScreenConfig`'s fields for RayMakie are exactly its
 # theme attributes (integrator, exposure, tonemap, gamma, device, …). So a scene
-# that carries a backend NAME and a theme carries everything the renderer needs,
+# that carries a backend name and a theme carries everything the renderer needs,
 # and this file just hands both over.
 #
 # That is why `SceneSpec.backend` is a Symbol: a project file has to name the
@@ -13,7 +13,7 @@
 # loaded. Loading RayMakie is what makes `backend = :RayMakie` work; nothing here
 # has to know it exists.
 #
-# Why not `Makie.colorbuffer(scene)`: that goes through GLMakie's SINGLETON
+# Why not `Makie.colorbuffer(scene)`: that goes through GLMakie's singleton
 # offscreen screen, and every scene-taking `Screen` constructor empties it and
 # re-displays itself on it. The editor's own window comes from the same
 # constructor, so rendering a scene that way evicts the editor's figure from its
@@ -23,12 +23,11 @@
 """
 The renderers a scene may name, by name.
 
-A project file has to name its backend in TEXT, so something has to turn
-`:RayMakie` into a module. That something is this, and it is a plain table you
-put a module INTO — `usebackend!(RayMakie)` — rather than a search over whatever
-happens to be loaded. Explicit both ways: nothing renders through a backend
-nobody asked for, and a missing one is named in the error instead of failing
-somewhere inside Makie.
+A project file names its backend in text, so something has to turn `:RayMakie`
+into a module. This is a plain table a module is put into (`usebackend!(RayMakie)`)
+rather than a search over whatever happens to be loaded: nothing renders through a
+backend nobody asked for, and a missing one is named in the error instead of
+failing inside Makie.
 
 GLMakie is here from the start because the editor draws its own window with it.
 """
@@ -61,15 +60,15 @@ const PIXELEXACT = Makie.Theme(GLMakie = (px_per_unit = 1.0, scalefactor = 1.0))
 """
     backendscreen(backend, spec, canvas) -> screen
 
-An offscreen screen of `backend`, configured from `theme` — WITHOUT touching
-the global theme.
+An offscreen screen of `backend`, configured from `theme`, without touching the
+global theme.
 
-THE GLOBAL THEME IS NOT OURS. This used to build under `Makie.with_theme(...)`,
-because that is how a backend's screen options are normally passed. But this runs
-from the overlay's draw callback — during a seek, and during PLAYBACK — while
-GLMakie's render loop is drawing the editor concurrently. `with_theme` restores
-by calling `set_theme!()` first, which resets to Makie's built-in LIGHT default
-for an instant, and a render landing in that window redraws the editor with it:
+Building under `Makie.with_theme(...)` — the usual way to pass a backend's screen
+options — is not safe here: this runs from the overlay's draw callback, during a
+seek and during playback, while GLMakie's render loop draws the editor
+concurrently. `with_theme` restores by calling `set_theme!()` first, which resets
+to Makie's built-in light default for an instant, and a render landing in that
+window redraws the editor with it:
 press Play, the whole window turns white. Simon found it by reading, not by
 reproducing — "wahrscheinlich veränderst du das globale Theme und machst keine
 saubere Trennung", which is exactly what it was.
@@ -92,13 +91,13 @@ function backendscreen(backend::Module, canvas::NTuple{2, Integer};
     # a backend that does not know one of these must not die of it
     fields = fieldnames(backend.ScreenConfig)
     filter!(kv -> kv[1] in fields || kv[1] === :visible, opts)
-    # NO RENDERLOOP BEHIND THIS SCREEN. A GLMakie screen starts one by default: an
+    # No renderloop behind this screen. A GLMakie screen starts one by default: an
     # `@async` task — sticky to the thread that made it, which is thread 1 — that
     # loops forever holding `with_context(screen.glscreen)` across its `sleep`.
     # This screen is never shown and never draws by itself; `readfilm` renders it,
     # through `colorbuffer`, which calls `render_frame` itself.
     #
-    # Left running, that loop is a THIRD task on thread 1 fighting for the one
+    # Left running, that loop is a third task on thread 1 fighting for the one
     # current GL context, next to the editor's own renderloop and the scene render
     # marshalled over by `onmainthread`. Measured on the lego project: playback of
     # a 60 fps timeline with a scene over it ran at 11.2 / 11.6 / 11.6 fps across
@@ -118,17 +117,16 @@ end
 
 A `GLNative` framebuffer with its rows the way a picture has them.
 
-OpenGL numbers scanlines from the BOTTOM, and `Makie.GLNative` is the raw buffer:
+OpenGL numbers scanlines from the bottom and `Makie.GLNative` is the raw buffer:
 `(width, height)`, y increasing upwards. `Makie.JuliaNative` is the same buffer
-flipped AND transposed — the transpose is what this path does not want, because
+flipped and transposed, and the transpose is what this path does not want, since
 the editor works in `(width, height)` throughout. Taking `GLNative` for the axis
 order inherits the flip with it.
 
-The whole scene came out UPSIDE DOWN and nothing said so: the lego figure hung
-head-down over the birdhouse, and a text preset read "OBEN" as "OBEИ" — O, B and
-E survive a top-to-bottom mirror almost unchanged, which is why it takes an N to
-see it. No test caught it either, because a flip preserves every pixel COUNT: the
-scene still drew on 9238 pixels, the same number as before the rebuild.
+Without the flip the whole scene renders upside down: the lego figure hung
+head-down over the birdhouse, and a text preset read "OBEN" as "OBEИ". No test
+caught it, because a flip preserves every pixel count — the scene still drew on
+9238 pixels.
 
 The depth buffer `coverage` reads is in the same orientation, so it is flipped
 here too — the two have to agree pixel for pixel.
@@ -140,30 +138,30 @@ upright(buf::AbstractMatrix) = view(buf, :, size(buf, 2):-1:1)
 
 Which pixels the scene actually drew on — `nothing` when the renderer cannot say.
 
-An overlay must be TRANSPARENT where the scene is empty, or it is not an overlay
-but a replacement: measured, the lego scene over footage changed all 57600 pixels
-of a 320x180 frame and the video was simply gone.
+An overlay has to be transparent where the scene is empty, or it replaces the
+picture instead of overlaying it: the lego scene over footage changed all 57600
+pixels of a 320x180 frame and the video was gone.
 
 GLMakie cannot answer this from colour. `colorbuffer` stages through a
 `Matrix{RGB{N0f8}}` framecache, so alpha is dropped before the caller sees it,
-and reading the framebuffer's own colour texture gives alpha 0 on EVERY pixel,
+and reading the framebuffer's own colour texture gives alpha 0 on every pixel,
 the figure's included. Rendering twice on two background colours does not work
 either — the scene's `backgroundcolor` makes no difference to what comes back
 (measured: black vs white differ in exactly 0 pixels).
 
-The DEPTH buffer does answer it: whatever the far plane still owns was never
+The depth buffer does answer it: whatever the far plane still owns was never
 drawn on. Measured against a colour-threshold mask of the same frame the two
 agree on 99.6% of pixels, and where they differ it is the antialiased fringe,
 which depth correctly leaves out.
 
-Dispatch rather than a branch on backend name: a renderer that carries real alpha
-— a raytracer knows a ray that hit nothing — adds its own method and nothing in
-the render path above changes.
+Dispatch rather than a branch on the backend name: a renderer that carries real
+alpha — a raytracer knows a ray that hit nothing — adds its own method, and the
+render path above does not change.
 """
 coverage(::Any) = nothing
 
 """
-The depth of what was LAST drawn, read without drawing it again.
+The depth of what was drawn last, read without drawing it again.
 
 `GLMakie.depthbuffer` opens with `render_frame` + `glFinish`: a full second
 redraw of the scene [`readfilm`](@ref) has just drawn, and a blocking wait for
@@ -172,14 +170,13 @@ meanwhile. Two renders and two stalls per scene frame.
 
 Measured on the lego project: playback of that timeline ran at 12.1 fps, the same
 timeline with the scene clip deleted at 32.6 (the renderloop's own 30 Hz ceiling),
-and the scene ALONE at 11.1 — so the scene cost a factor of three all by itself.
+and the scene alone at 11.1, so the scene cost a factor of three by itself.
 
-Everything below is `depthbuffer`'s own tail, from after the render. Reading the
-texture is what was wanted; drawing it twice was not. It has to run AFTER
-`readfilm`, which is what fills the buffer — `liveframe!` does them in that order.
+Everything below is `depthbuffer`'s own tail, from after the render: reading the
+texture without drawing it again. It has to run after `readfilm`, which fills the
+buffer — `liveframe!` does them in that order.
 
-…and UPRIGHT, like the film it masks: same bottom-up framebuffer, see
-[`upright`](@ref).
+Upright like the film it masks: same bottom-up framebuffer, see [`upright`](@ref).
 """
 function coverage(screen::GLMakie.Screen)
     GL = GLMakie.GLAbstraction
@@ -241,7 +238,7 @@ getbackend(name::AbstractString) = getbackend(Symbol(name))
 #
 # `renderspec` built a scene, drew one frame and closed it — a whole second render
 # path that existed because a bake had nowhere else to go. A scene is a clip's
-# SOURCE now, so one frame of it is `sceneframe!` like every other frame, holding
+# source now, so one frame of it is `sceneframe!` like every other frame, holding
 # the same screen.
 #
 # `scenepaths` listed what was animatable by walking our description of the scene.
@@ -249,7 +246,7 @@ getbackend(name::AbstractString) = getbackend(Symbol(name))
 
 # ---------------------------------------------------------------- in the editor
 
-# A scene is a CLIP's source, and this is what stands open for it.
+# A scene is a clip's source, and this is what stands open for it.
 #
 # The block that used to be here described the overlay: a spec riding in
 # `settings`, `overlaystate` merging per-frame paths over it, `setoverlaykey!`
@@ -260,7 +257,7 @@ getbackend(name::AbstractString) = getbackend(Symbol(name))
 # false trail that reads as authoritative.
 #
 # What is true now: `SceneSource` holds a `LiveScene` across frames, the animated
-# numbers are `Param`s on the clip's `:scene` entry keyed by SOURCE frame like
+# numbers are `Param`s on the clip's `:scene` entry keyed by source frame like
 # every other clip, and `sceneframe!` writes them onto the standing plots. The
 # backend is whatever the source names — `:GLMakie` while scrubbing, another for
 # the bake, and switching is a rebuild because a screen takes its settings at
@@ -268,19 +265,19 @@ getbackend(name::AbstractString) = getbackend(Symbol(name))
 """
 A scene held open across frames: what was built, and what it was built from.
 
-WHY IT IS HELD. The first version rebuilt everything inside the per-frame
-callback — a new `Scene`, a new `Screen`, and every mesh re-read from disk, for
-every frame of a seek AND of playback. Measured after fixing it, at 480x854 with a
-ten-part figure: first frame 0.28 s, every frame after 5.1-5.8 ms on GLMakie.
-Almost none of the original cost was rendering.
+Held across frames because the first version rebuilt everything inside the
+per-frame callback: a new `Scene`, a new `Screen` and every mesh re-read from
+disk, for every frame of a seek and of playback. Measured after fixing it, at
+480x854 with a ten-part figure: first frame 0.28 s, every frame after 5.1-5.8 ms
+on GLMakie. Almost none of the original cost was rendering.
 
-Holding the screen is also what lets a PROGRESSIVE backend work at all: RayMakie
+Holding the screen is also what lets a progressive backend work at all: RayMakie
 accumulates samples while the playhead stands still, and a screen thrown away
 after each frame has nothing to accumulate into.
 
-There is no spec diffing here and no plot list to keep in step. The structure of a
-clip's scene does not change over its life — `visible` is the only structural
-control it has — so the scene is realized once and after that only VALUES move.
+There is no spec diffing and no plot list to keep in step: the structure of a
+clip's scene does not change over its life (`visible` is its only structural
+control), so the scene is realized once and after that only values move.
 """
 mutable struct LiveScene
     scene::Any                     # what gets displayed
@@ -337,7 +334,7 @@ function livescene!(live::Union{Nothing, LiveScene}, root, canvas::NTuple{2, Int
                     backendname::Symbol, backend::Module;
                     theme::Dict{Symbol, Any} = Dict{Symbol, Any}())
     W, H = Int(canvas[1]), Int(canvas[2])
-    # The THEME is in it: a screen takes its settings at construction, so drawing
+    # The theme is part of it: a screen takes its settings at construction, so drawing
     # the same scene at another sample count is a different screen. That is what
     # makes switching between the live and the bake settings a rebuild and not a
     # value written onto something already open.
@@ -355,7 +352,7 @@ end
 """
     readfilm(screen, clear) -> image
 
-Read the screen's picture, ACCUMULATING into the film it already has when
+Read the screen's picture, accumulating into the film it already has when
 `clear = false` and the renderer can do that.
 
 A path tracer's frame is a running average of samples: asking it for the picture
@@ -363,7 +360,7 @@ without clearing adds more samples to what is there, which is what makes a live
 preview converge while the playhead stands still instead of costing its full
 budget on every frame. A rasteriser has nothing to accumulate and ignores it.
 
-Asked of the SCREEN rather than branched on a backend name — and asked with
+Asked of the screen rather than branched on a backend name — and asked with
 `hasmethod`, not a dependency, because the renderer is registered at runtime
 (`usebackend!`) and this file must not know which ones exist.
 """
@@ -410,20 +407,18 @@ function onmainthread(f::Function)
     t.sticky = true
     ccall(:jl_set_task_tid, Cint, (Any, Cint), t, 0)   # 0-based: thread 1
     schedule(t)
-    # WITH A DEADLINE, and that is not belt-and-braces. A bare `take!` here waits
-    # for a task pinned to thread 1 to be scheduled, and thread 1 is also where
-    # GLMakie's renderloop lives — holding `with_context` across its own `sleep`.
-    # If it never yields at a moment this task can take, the wait never ends and
-    # the editor is simply frozen, with no error and nothing on screen to say why.
-    # Reported live: "played a few janky frames and then immediately froze… then
-    # it unfroze… and now it is frozen forever". A freeze teaches nothing; a
-    # message names the thread and the caller.
+    # With a deadline: a bare `take!` waits for a task pinned to thread 1 to be
+    # scheduled, and thread 1 is where GLMakie's renderloop lives, holding
+    # `with_context` across its own `sleep`. If it never yields at a moment this
+    # task can take, the wait never ends and the editor freezes with nothing on
+    # screen to say why. The deadline turns that into a message naming the thread
+    # and the caller.
     t0 = time()
     while !isready(done)
         time() - t0 > SCENEWAIT &&
             error("a scene render waited $(SCENEWAIT)s to reach thread 1 and gave up. " *
                   "Called from thread $(Threads.threadid()); thread 1 is where GLMakie's " *
-                  "screen and the editor's renderloop both live. Renders belong BEFORE " *
+                  "screen and the editor's renderloop both live. Renders belong before " *
                   "the graph runs (`prerender!`), where the caller is already on thread 1.")
         sleep(0.001)
     end
@@ -435,8 +430,8 @@ end
 """
 How long [`onmainthread`](@ref) waits to be let onto thread 1 before giving up.
 
-Generous — a cold scene builds its screen and loads its meshes on the first call —
-but FINITE, because the alternative is a frozen editor.
+Generous, because a cold scene builds its screen and loads its meshes on the first
+call, but finite, because the alternative is a frozen editor.
 """
 const SCENEWAIT = 10.0
 
@@ -459,4 +454,4 @@ end
 
 # A scene is rendered by `SceneSource`'s pass (scenesource.jl), which holds the
 # `LiveScene` above across frames and writes this frame's numbers onto it. There
-# is no overlay registration here any more: a scene is a CLIP.
+# is no overlay registration here any more: a scene is a clip.

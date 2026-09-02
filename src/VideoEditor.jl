@@ -39,14 +39,14 @@ const RGBFrame = Matrix{RGB{N0f8}}
 """
 What a plane in the render graph is made of: RGBA, PREMULTIPLIED.
 
-Alpha is COVERAGE — how much of this pixel is there — and it is what a matte
+Alpha is coverage — how much of this pixel is there — and it is what a matte
 writes when it removes background, what a crop leaves behind, and what a rendered
 3D scene has outside its subject. Before it, "removed" was painted black, which is
 right over nothing and wrong over a track: the black is opaque, so a matte over a
 background plate showed a silhouette, and the compositor had to be handed a second
 image saying which black was which.
 
-Premultiplied because every op that MIXES pixels — a blur, the placement warp, a
+Premultiplied because every op that mixes pixels — a blur, the placement warp, a
 cross-fade — is a weighted sum, and a weighted sum of premultiplied colours is
 correct while one of straight colours drags the colour of absent pixels into
 present ones. That is the halo along a matte edge, and it is a property of the
@@ -75,6 +75,7 @@ include("registry.jl")  # ONE registry: built-ins, plugins and tools are all Eff
 include("project.jl")
 include("thumbnails.jl")
 include("clipview.jl")
+include("lane.jl")     # one parameter's curve on the timeline, as a recipe
 include("timeline.jl")
 include("gpudecode.jl")
 include("gpustream.jl")

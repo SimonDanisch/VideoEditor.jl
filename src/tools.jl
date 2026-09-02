@@ -1,5 +1,5 @@
-# GUI tools — premade editing operations with timeline presence. A tool draws
-# HINTS on the thumb track (arbitrary plots on the timeline axis), reads clicks
+# GUI tools: premade editing operations with timeline presence. A tool draws
+# hints on the thumb track (arbitrary plots on the timeline axis), reads clicks
 # there, and acts through the same editing API the rest of the editor uses
 # (snapshot!, addtransition!, trims, effects, …). Tools register live exactly
 # like effect plugins, so any package or MCP session can add its own.
@@ -9,13 +9,13 @@
 
 What an active tool works with: the `player`, plus bookkeeping so everything
 the tool adds — overlay plots, event handlers — is removed on deactivation.
-Timeline overlays draw in TIMELINE coordinates: x is seconds
+Timeline overlays draw in timeline coordinates: x is seconds
 ([`tooltime`](@ref)), y is the 0..1 track span ([`toolband`](@ref) for a
 clip's band); preview overlays draw on `player.previewaxis` in source pixels.
 Record plots with [`toolplot!`](@ref) and wire observables with
 [`ontool!`](@ref); `state` is tool-private scratch.
 """
-mutable struct ToolContext
+mutable struct ToolContext <: ToolState
     const player::Player
     const tool::Symbol          # the card this context fills — its slots, its widgets
     const plots::Vector{Any}    # (parent, plot) pairs for removal
@@ -41,25 +41,25 @@ function tooltip!(ctx::ToolContext, block, text::AbstractString)
     return block
 end
 
+"A card with no tool in it has nothing to clear — see [`dropcard!`](@ref)."
+cleartoolcontext!(::Nothing) = nothing
+
 "Remove everything a context put into its card and drop its listeners."
 function cleartoolcontext!(ctx::ToolContext)
+    # …including its entry in the panel index, so nothing reaches a context whose
+    # card is going away: `blendseconds`, `activetool` and the tests all look it
+    # up by tool name and would find one listening into a freed layout.
+    panels = get(ctx.player.fxwidgets, :toolpanels, nothing)
+    panels === nothing || get(panels, ctx.tool, nothing) !== ctx || delete!(panels, ctx.tool)
     tips = get(ctx.player.fxwidgets, :tips, nothing)
     tips === nothing || foreach(b -> delete!(tips, b), ctx.tips)
     empty!(ctx.tips)
     foreach(Observables.off, ctx.handlers)
     empty!(ctx.handlers)
-    for w in vcat(ctx.controls, ctx.rows)
-        try
-            Makie.delete!(w)
-        catch
-        end
-    end
+    foreach(Makie.delete!, vcat(ctx.controls, ctx.rows))
     empty!(ctx.controls); empty!(ctx.callbacks); empty!(ctx.rows)
     for (parent, plt) in ctx.plots
-        try
-            Makie.delete!(parent, plt)
-        catch
-        end
+        Makie.delete!(parent, plt)
     end
     empty!(ctx.plots)
     return nothing
@@ -106,17 +106,17 @@ registertool!(name::Symbol, label::AbstractString, description::AbstractString;
     registereffect!(EffectKind(name, label; description, body = panel,
                                activate, deactivate, analysis = true))
 
-"Every kind that has a card body or an action of its own. NOT a list of what is on
- screen — the Tools dock it once described is gone, and the Effects panel renders
- a kind's body inside its effect's card, or via `toolonlykinds` when it has none."
+"Every kind that has a card body or an action of its own — not a list of what is
+ on screen. The Effects panel renders a kind's body inside its effect's card, or
+ via `toolonlykinds` when it has none."
 toolkinds(registry::EffectRegistry = EFFECTS) =
     filter(k -> k.activate !== nothing || k.body !== nothing, registry.kinds)
 
 """
 Hard-wrap `text` at `cols` characters. A Makie `Label` with `word_wrap = true`
-derives its HEIGHT from its wrapped width — which the layout only knows after it
-has already sized the row, so a long description overflows its cell and draws over
-the card header. Pre-wrapped text has a known size in both directions.
+derives its height from its wrapped width, which the layout only knows after it
+has sized the row, so a long description overflows its cell and draws over the
+card header. Pre-wrapped text has a known size in both directions.
 """
 function wraptext(text::AbstractString, cols::Integer = 44)
     lines = String[]
@@ -154,6 +154,7 @@ function deactivatetool!(player::Player)
     cleartoolcontext!(ctx)
     cleartoolcards!(player)
     activetoolname(player)[] = :none
+    rebuildtoolcard!(player, tool.name)   # …its card offers to turn it on again
     return nothing
 end
 
@@ -179,6 +180,7 @@ function activatetool!(player::Player, name::Symbol)
     player.fxwidgets[:activetool] = (tool, ctx)
     activetoolname(player)[] = name
     tool.activate === nothing || tool.activate(ctx)
+    rebuildtoolcard!(player, name)   # …its card now offers what a RUNNING tool offers
     return ctx
 end
 
@@ -189,12 +191,38 @@ end
 # below are unchanged; the Effects panel builds them (`withtoolslots!`).
 
 """
-Make an (initially empty) layout report a height: GridLayoutBase treats a layout
-with no measurable content as indeterminate, and one such slot is enough to hide
-the height of everything above it — including the dock's scrollable content size.
+    measurable!(gl[, rows...]) -> gl
+
+Anchor `rows` of `gl` (row 1 by default) with a zero-sized box, so they report a
+height even while empty.
+
+An `Auto` row with nothing in it has no determinable size — not zero, *unknown* —
+and one unknown row makes the whole layout unknown, all the way up. In a scrolling
+dock that is invisible until it is fatal: `Subfigure.contentsize` reads the
+layout's intrinsic height, an indeterminate layout leaves it at zero, and a panel
+that overflows by a thousand pixels shows no scrollbar. The card stack hit this
+with the row the empty-state labels had been removed from.
+
+So every row this panel creates gets an anchor as it is created — a row a card can
+be deleted from is a row that can be empty. Idempotent: a row that already has one
+is left alone, so a rebuild does not stack them up.
+
+Callers anchor `1:row`, not `row`: putting content in row 4 grows the layout to
+four rows, and the three below it are born empty. The tool cards sit at their
+position in the registry, so opening the fourth one is exactly that case.
+
+In the row's own column, beside whatever else is there, rather than in a column of
+its own: a second column is a second *column gap*, and at the panel's 18 px that
+took 18 px off every card the layout held. Two nested layouts each with an anchor
+column cost the parameter rows 36 px, which is where the ▶ of every row went.
 """
-function measurable!(gl)
-    Box(gl[1, 2]; width = 0, height = 0, color = :transparent, strokewidth = 0)
+measurable!(gl) = measurable!(gl, 1)
+
+function measurable!(gl, rows::Integer...)
+    for r in rows
+        any(c -> c.content isa Box && c.span.rows == r:r, gl.content) && continue
+        Box(gl[r, 1]; width = 0, height = 0, color = :transparent, strokewidth = 0)
+    end
     return gl
 end
 
@@ -212,13 +240,12 @@ end
 """
     ghostbutton(colors) -> NamedTuple
 
-The look of a SECONDARY action: outlined, transparent fill, full-strength label.
+The look of a secondary action: outlined, transparent fill, full-strength label.
+Splat it into a `Button`.
 
-Splat it into a `Button`. It exists because `labelcolor = colors.text_muted` on a
-transparent fill reads as DISABLED, and that combination was written four
-separate times in this panel — "+ object", the brush's ±, a narration's render,
-a repair's "go to frame" — and was wrong all four times. Outlined-not-filled is
-what makes an action secondary; dimming its TEXT just makes it look broken.
+`labelcolor = colors.text_muted` on a transparent fill reads as disabled, which
+is what four buttons in this panel looked like. Outlined-not-filled is what makes
+an action secondary.
 """
 ghostbutton(colors) = (fontsize = 11, height = 24, tellwidth = false,
                        width = Makie.Relative(1.0), cornerradius = PILLRADIUS,
@@ -229,12 +256,12 @@ ghostbutton(colors) = (fontsize = 11, height = 24, tellwidth = false,
 """
     toolaction!(ctx, label, callback; footer = false)
 
-Add an action button to this tool's card. Repeated calls STACK, in call order;
+Add an action button to this tool's card. Repeated calls stack in call order;
 `ctx.callbacks` addresses them for tests and MCP.
 
-`footer = true` puts it BELOW the tool's cards instead of above them — for the
-action that consumes the whole list ("Apply matte to clip" under the frames that
-were marked), which above the list reads as a control for something else.
+`footer = true` puts it below the tool's cards instead of above them, for the
+action that consumes the whole list ("Apply matte to clip" under the marked
+frames), which above the list reads as a control for something else.
 """
 function toolaction!(ctx::ToolContext, label::AbstractString, callback;
                      footer::Bool = false)
@@ -242,10 +269,9 @@ function toolaction!(ctx::ToolContext, label::AbstractString, callback;
     slot === nothing && return nothing
     push!(ctx.callbacks, callback)
     i = length(ctx.callbacks)
-    # Controls stack by `ctx.controls`; the footer counts its own slot, because a
-    # footer button in `ctx.controls` would advance the CONTROL row too and leave
-    # a gap — and one empty row makes a layout indeterminate, which collapses the
-    # whole card.
+    # Controls stack by `ctx.controls`; the footer counts its own slot, since a
+    # footer button in `ctx.controls` would advance the control row too and leave
+    # a gap — and one empty row makes the layout indeterminate, collapsing the card.
     r = footer ? count(c -> c.content isa Button, slot.content) + 1 :
                  length(ctx.controls) + 1
     b = Button(slot[r, 1]; label = String(label), tellwidth = false,
@@ -266,7 +292,7 @@ result of an analysis.
 function toollabel!(ctx::ToolContext, text)
     slot = toolslot(ctx, :controls)
     slot === nothing && return nothing
-    # WRAPPED, like every other line in a card. An analysis result is a sentence
+    # Wrapped, like every other line in a card. An analysis result is a sentence
     # ("marking — left: subject, right: not subject, Enter: propagate"), it does
     # not fit a 300 px dock on one line, and a Label neither wraps nor truncates
     # on its own — it just draws past the card and the panel clips it mid-word.
@@ -302,8 +328,8 @@ end
 """
     toolcheckbox!(ctx, label, callback; checked = false) -> Checkbox
 
-Add a labelled checkbox to this tool's card — an option the user sets BEFORE the
-action, not another button that does something.
+Add a labelled checkbox to this tool's card: an option set before the action,
+rather than another button that does something.
 """
 function toolcheckbox!(ctx::ToolContext, label::AbstractString, callback;
                        checked::Bool = false)
@@ -321,21 +347,16 @@ end
 """
     toolrows!(ctx, entries)
 
-Show this tool's LIST — one row per thing it manages (each blend, each reference),
+Show this tool's list — one row per thing it manages (each blend, each reference),
 replacing the previous list. An entry is `(caption, [(label, callback), …],
-selected::Bool)`: the caption names the item, the small buttons act on THAT item,
-and a selected row is drawn in the accent colour. Declarative on purpose — a tool
-recomputes its entries after every change and calls this again.
+selected::Bool)`: the caption names the item, the small buttons act on that item,
+and a selected row is drawn in the accent colour. Declarative: a tool recomputes
+its entries after every change and calls this again.
 """
 function toolrows!(ctx::ToolContext, entries::Vector)
     slot = toolslot(ctx, :rows)
     slot === nothing && return nothing
-    for r in ctx.rows
-        try
-            Makie.delete!(r)
-        catch
-        end
-    end
+    foreach(Makie.delete!, ctx.rows)
     empty!(ctx.rows)
     colors = ctx.player.timeline.colors
     for (k, entry) in enumerate(entries)
@@ -358,7 +379,7 @@ end
 """
     toolcard!(build, ctx; caption, onremove) -> card
 
-ONE card holding a whole feature: a header row `[caption … ×]` and, under it,
+One card holding a whole feature: a header row `[caption … ×]` and, under it,
 whatever `build(body, blocks)` puts in the `body` layout — labels, buttons,
 checkboxes, a picture. Everything the callback creates goes into `blocks` so the
 next rebuild can delete it.
@@ -375,8 +396,8 @@ function toolcard!(build::Function, ctx::ToolContext; caption::AbstractString = 
     cardrows === nothing && return 0
     colors = ctx.player.timeline.colors
     cardbg = Makie.lerp_oklab(RGBf(Makie.to_color(colors.background)), RGBf(1, 1, 1), 0.075)
-    # `id` is GLOBAL (it addresses `cards`, which every tool shares) but the ROW
-    # is per-tool, and the two are not the same number. They coincided only while
+    # `id` is global (it addresses `cards`, which every tool shares) but the row is
+    # per tool, and the two are not the same number. They coincided only while
     # a single tool body rendered at a time; with the tool-only cards the panel now
     # builds four at once, so the second tool's first card landed in row 2 of its
     # own grid and left row 1 empty — and one empty row makes a nested layout
@@ -386,7 +407,7 @@ function toolcard!(build::Function, ctx::ToolContext; caption::AbstractString = 
     cell = cardrows[row, 1]
     frame = Box(cell; color = cardbg, strokecolor = colors.border, strokewidth = 1,
                 cornerradius = 6, tellwidth = false, tellheight = false)
-    # The header spans the card EDGE TO EDGE — the outer layout carries no padding
+    # The header spans the card edge to edge: the outer layout carries no padding
     # and the two rows bring their own. Inset by the body's margin it read as a
     # label floating inside the card rather than as the card's own title bar, which
     # is what the effect cards above it look like.
@@ -407,7 +428,7 @@ function toolcard!(build::Function, ctx::ToolContext; caption::AbstractString = 
     # preview lands) then still leaves everything it made in the teardown list.
     # Orphaned scene plots do not just leak — they keep drawing, stacked over the
     # card that replaced them.
-    # `tool` LAST. The note above says this list is read by field — and it mostly
+    # `tool` last. The note above says this list is read by field — and it mostly
     # is, but not everywhere: the suite indexes it positionally (`c[5](c[1])`), so
     # inserting a field in the middle turned `onclick` into a `Label` and every
     # click on a tool card threw. Appending is the only safe place to grow it.
@@ -433,14 +454,14 @@ function tooladdcard!(ctx::ToolContext, img::AbstractMatrix{RGB{N0f8}};
     tc = get(ctx.player.fxwidgets, :toolcards, nothing)
     tc === nothing && return 0
     cardslots, scene, cards = tc
-    cardrows = get(cardslots, ctx.tool, nothing)   # THIS tool's card area
+    cardrows = get(cardslots, ctx.tool, nothing)   # this tool's card area
     cardrows === nothing && return 0
     colors = ctx.player.timeline.colors
     id = length(cards) + 1
-    # PER TOOL, like `toolcard!` — `id` addresses the shared `cards` list, not a
+    # Per tool, like `toolcard!`: `id` addresses the shared `cards` list, not a
     # row in this tool's grid. Two cards per entry here (header + picture).
     k = 2 * count(c -> c.tool === ctx.tool, cards) + 1
-    # A CARD, visibly: one framed container holding a header row [caption … ×] and
+    # A card, visibly: one framed container holding a header row [caption … ×] and
     # the picture under it — the same section look the tool cards themselves use, so
     # a reference reads as one object instead of a loose label next to an image.
     cardbg = Makie.lerp_oklab(RGBf(Makie.to_color(colors.background)), RGBf(1, 1, 1), 0.075)
@@ -470,7 +491,7 @@ function tooladdcard!(ctx::ToolContext, img::AbstractMatrix{RGB{N0f8}};
                 space = :pixel, interpolate = true,
                 visible = lift(d -> d === :effects, ctx.player.dockopen))
     translate!(im, 0, 0, 20)
-    # NAMED, like the entry `toolcard!` registers: everything that reads this list
+    # Named, like the entry `toolcard!` registers: everything that reads this list
     # reads it by field (`c.onclick`, `c.frame`, `c.blocks`), so a positional tuple
     # here made every click on the tools panel throw a `FieldError` instead.
     # `blocks` is empty because the teardown loop already names every block this
@@ -502,19 +523,16 @@ function cleartoolcards!(player::Player)
     for c in cards
         for b in (c.frame, c.box, c.lbl, c.im, c.rm, c.blocks...)
             b === nothing && continue
-            try
-                b isa Makie.AbstractPlot ? Makie.delete!(scene, b) : Makie.delete!(b)
-            catch
-            end
+            b isa Makie.AbstractPlot ? Makie.delete!(scene, b) : Makie.delete!(b)
         end
     end
-    # …and a SWEEP. Every card picture is a plot in this scene and every one of
+    # …and a sweep: every card picture is a plot in this scene and every one of
     # them is recreated by the rebuild that follows, so anything still here is an
     # orphan: a card built but never registered, or one whose blocks list this
     # loop did not know about. An orphan does not merely leak — it keeps drawing,
     # at its old rectangle, stacked over the card that replaced it.
     for pl in copy(scene.plots)
-        pl isa Makie.Image && (try Makie.delete!(scene, pl) catch end)
+        pl isa Makie.Image && Makie.delete!(scene, pl)
     end
     empty!(cards)
     return nothing
@@ -547,7 +565,7 @@ function nearesttoolpoint(player::Player, pts::Vector{Point2f}, t, y)
     return best
 end
 
-"Draw the ACTIVE reference card's markers on the thumb track."
+"Draw the active reference card's markers on the thumb track."
 function showloopmarkers!(ctx::ToolContext)
     st = ctx.state
     player = ctx.player
@@ -567,7 +585,7 @@ function showloopmarkers!(ctx::ToolContext)
     return nothing
 end
 
-"▼ click: CUT the timeline at that hint (undoable) — the tool stays active."
+"▼ click: cut the timeline at that hint (undoable); the tool stays active."
 function loopcutat!(ctx::ToolContext, k::Integer)
     player = ctx.player
     st = ctx.state
@@ -583,7 +601,7 @@ function loopcutat!(ctx::ToolContext, k::Integer)
     else
         seek!(player, tframe)
         setstatus!(player, "Loop finder: cut at the hint — Ctrl+Z undoes, Esc puts the tool away")
-        refreshedit!(player)
+        redraw!(player)
     end
     return nothing
 end
@@ -604,8 +622,8 @@ function loopcard!(ctx::ToolContext, clip::Clip, ref::Integer)
         # tool's own list. They coincided while the loop finder was the only tool
         # drawing cards, and `st[:refs][cardid]` then indexed the wrong reference
         # (or past the end) as soon as another card was on the panel. `cardids`
-        # is the map, so `active` means one thing: WHICH REFERENCE.
-        onclick = cid -> begin      # clicking a card shows ITS similarity markers
+        # is the map, so `active` means one thing: which reference.
+        onclick = cid -> begin      # clicking a card shows its similarity markers
             i = findfirst(==(cid), st[:cardids])
             i === nothing && return
             st[:active][] = i
@@ -648,7 +666,7 @@ function loopfinderpanel!(ctx::ToolContext)   # `EffectContext` is an alias, def
     player = ctx.player
     cur = activetool(player)
     running = cur !== nothing && cur[2].tool === :loopfinder && cur[2].state !== nothing
-    # OFF: the one control that turns it on. The generic action button `fxcard!`
+    # Off: the one control that turns it on. The generic action button `fxcard!`
     # gives a kind with no body cannot serve here — a body decides its own
     # controls, and this one has two states.
     running || return (toolaction!(ctx, "Find similar frames",
@@ -689,7 +707,7 @@ function addloopref!(ctx::ToolContext, clip::Clip, ref::Integer, sig)
     return nothing
 end
 
-"The Find action: a NEW reference = the frame under the playhead right now.
+"The Find action: a new reference is the frame under the playhead right now.
 Signatures are computed once per clip; further references rescore instantly."
 function loopfind!(ctx::ToolContext)
     player = ctx.player
@@ -734,7 +752,7 @@ function activateloopfinder!(ctx::ToolContext)
                            :sigs => IdDict{Clip, Any}(),
                            :refs => Any[],            # (clip, ref, hints) per card
                            :cardids => Int[],         # …and the card each one is drawn as
-                           :active => Ref(0),         # WHICH REFERENCE, not which card
+                           :active => Ref(0),         # which reference, not which card
                            :hintpts => Observable(Point2f[]),
                            :hintcols => Observable(RGBAf[]),
                            :refpt => Observable(Point2f[]))
@@ -768,7 +786,7 @@ end
     opacityparam(clip) -> Union{Nothing, Param}
 
 The `Param` behind the clip's opacity, or `nothing` when it has no opacity
-effect. The fade helpers below reach for THIS rather than a clip-level curve
+effect. The fade helpers below reach for this rather than a clip-level curve
 keyed `:opacity`: the curve belongs to the parameter of the effect that renders
 it, so there is nothing to look up and nothing that can point at the wrong entry.
 """
@@ -780,8 +798,8 @@ end
 """
     keyfade!(clip, frames, dir) -> clip
 
-Key `clip`'s opacity as a fade over `frames` at its START (`dir = :in`, 0 → 1) or
-its END (`dir = :out`, 1 → 0), replacing whatever fade sat there before. The
+Key `clip`'s opacity as a fade over `frames` at its start (`dir = :in`, 0 → 1) or
+its end (`dir = :out`, 1 → 0), replacing whatever fade sat there before. The
 matching `OpacityEffect` is added when missing, so the fade shows up in the
 inspector's effect list like every other effect — its slider is the static value
 the curve animates, and the ◆ editor reshapes the curve.
@@ -790,19 +808,17 @@ function keyfade!(clip::Clip, frames::Integer, dir::Symbol)
     clearfade!(clip, dir)
     findslot(clip, OpacityEffect) === nothing && seteffect!(clip, OpacityEffect(1.0f0))
     prm = opacityparam(clip)
-    prm.curve === nothing && (prm.curve = AnimCurve{typeof(prm.value)}())
-    prm.visible = true
-    curve = prm.curve
-    # callers count the fade in TIMELINE frames (a length in seconds off the
-    # sequence rate); keys live on SOURCE frames. On a conformed clip those are
+    prm.visible[] = true
+    # callers count the fade in timeline frames (a length in seconds off the
+    # sequence rate); keys live on source frames. On a conformed clip those are
     # different counts, and a 0.6 s blend would otherwise last 0.3 s or 1.2 s.
     sf = max(round(Int, Int(frames) * clip.rate), 1)
     if dir === :out
-        setkey!(curve, clip.src_out - sf, 1.0)
-        setkey!(curve, clip.src_out - 1, 0.0)
+        setkey!(prm, clip.src_out - sf, 1.0)
+        setkey!(prm, clip.src_out - 1, 0.0)
     else
-        setkey!(curve, clip.src_in, 0.0)
-        setkey!(curve, clip.src_in + sf - 1, 1.0)
+        setkey!(prm, clip.src_in, 0.0)
+        setkey!(prm, clip.src_in + sf - 1, 1.0)
     end
     return clip
 end
@@ -817,16 +833,17 @@ are left the curve and its (now pointless) `OpacityEffect` go too.
 function clearfade!(clip::Clip, dir::Symbol)
     prm = opacityparam(clip)
     prm === nothing && return clip
-    c = prm.curve
-    c === nothing && return clip
-    half = max(srclength(clip) ÷ 2, 1)   # the fade zone is keyed in SOURCE frames
+    c = prm.curve[]
+    half = max(srclength(clip) ÷ 2, 1)   # the fade zone is keyed in source frames
     zone = dir === :out ? ((clip.src_out - half):clip.src_out) :
            (clip.src_in:(clip.src_in + half))
     filter!(k -> !(k.frame in zone), c.keys)
     if isempty(c.keys)
-        prm.curve = nothing
-        # …but the ENTRY stays while it carries the pairing. The pairing lives on
-        # THIS parameter's `input`, so dropping the slot drops it — and `keyfade!`
+        # A parameter always has a value, and an opacity with no keys left is a
+        # clip that is simply opaque — which is what removing its fade means.
+        push!(c.keys, Keyframe{eltype(prm)}(clip.src_in, oneunit(eltype(prm)), :linear))
+        # …but the entry stays while it carries the pairing. The pairing lives on
+        # this parameter's `input`, so dropping the slot drops it — and `keyfade!`
         # clears before it re-keys, which made "change a blend's length" forget
         # which clip it blends from. That is exactly what the note below says
         # must not happen; the note was right and the code did it anyway.
@@ -835,9 +852,10 @@ function clearfade!(clip::Clip, dir::Symbol)
             slot === nothing || removeslot!(clip, slot.id)
         end
     end
-    # NB: the pairing is NOT cleared here — `keyfade!` clears before it re-keys, and
+    # NB: the pairing is not cleared here — `keyfade!` clears before it re-keys, and
     # changing a blend's length must not forget which clip it blends from. Removing
     # a blend clears it explicitly (the × action).
+    notify(prm.curve)
     return clip
 end
 
@@ -846,14 +864,18 @@ end
 
 Length in frames of the fade-IN keyed at `clip`'s start (0 at the first frame,
 rising to full), or 0 when there is none. This — nothing else — is what makes a
-clip the incoming side of a blend, so the blend list is DERIVED from the keys
+clip the incoming side of a blend, so the blend list is derived from the keys
 instead of tracked beside them.
 """
 function fadeinlength(clip::Clip)
     prm = opacityparam(clip)
-    c = prm === nothing ? nothing : prm.curve
-    c === nothing && return 0
-    ks = c.keys
+    prm === nothing && return 0
+    # Keys inside the clip. A parameter is always a curve, and a constant's single
+    # key sits where the parameter was minted — frame 0 — which for a clip that
+    # does not start at source frame 0 is outside it and says nothing about how
+    # this clip starts. Reading it as "the first key" made every blend on a split
+    # clip invisible.
+    ks = filter(k -> clip.src_in <= k.frame < clip.src_out, prm.curve[].keys)
     length(ks) >= 2 && ks[1].frame == clip.src_in && ks[1].value < 0.02 || return 0
     j = findfirst(k -> k.value > 0.98, ks)
     j === nothing && return 0
@@ -867,9 +889,9 @@ end
 
 Every blend in the sequence as `(from, into, frames)` clip indices: a clip that
 fades in at its start, paired with the clip it blends away from — the one that was
-MARKED when the blend was made.
+marked when the blend was made.
 
-The pairing is an EDGE on the incoming clip's opacity parameter, pointing at the
+The pairing is an edge on the incoming clip's opacity parameter, pointing at the
 outgoing clip's (see [`ParamInput`](@ref), `op = :pairedwith`). It carries no value
 — the fade is keyed on one side only, because fading both darkens the middle — so
 it is a reference and nothing else, and `0` means that clip is gone. Nothing is
@@ -889,7 +911,7 @@ end
 """
     blendpartner(seq, clip) -> Union{Nothing, Int}
 
-Index of the clip `clip` blends away FROM, or `nothing`.
+Index of the clip `clip` blends away from, or `nothing`.
 """
 function blendpartner(seq::Sequence, clip::Clip)
     prm = opacityparam(clip)
@@ -917,9 +939,9 @@ end
 """
     blendclips!(player, a, b; seconds = 0.6) -> Bool
 
-Blend two clips by keying opacity on the LATER one: it fades in over its first
+Blend two clips by keying opacity on the later one: it fades in over its first
 `seconds` while the earlier clip stays fully opaque underneath. One clip, one
-curve — fading BOTH would darken the middle of the blend, because the outgoing
+curve — fading both would darken the middle of the blend, because the outgoing
 clip fades against black (nothing is below it) while the incoming one only
 partly covers it (measured: about half the brightness mid-blend).
 
@@ -936,9 +958,9 @@ function blendclips!(player::Player, a::Clip, b::Clip; seconds::Real = 0.6,
     d = max(min(round(Int, seconds * fps), cliplength(right) ÷ 2), 2)
     snapshot!(player)
     keyfade!(right, d, :in)        # …which is what creates the opacity parameter
-    pairblend!(seq, right, left)   # the pair YOU marked, remembered by id
-    fit && fitoverlap!(player, left, right, d)   # slide them together in ONE step
-    refreshedit!(player)
+    pairblend!(seq, right, left)   # the marked pair, remembered by id
+    fit && fitoverlap!(player, left, right, d)   # slide them together in one step
+    redraw!(player)
     seek!(player, clamp(right.start + d ÷ 2, 0, max(seqlength(seq) - 1, 0)))
     overlapping = right.start < clipend(left)
     setstatus!(player, "blend keyed: $(round(d / fps, digits = 1))s fade-in on the later clip " *
@@ -958,7 +980,7 @@ function movetotrack!(player::Player, clip::Clip, track::Integer)
     track >= 1 || return false
     snapshot!(player)
     clip.track = track
-    refreshedit!(player)
+    redraw!(player)
     setstatus!(player, "clip moved to V$track (Ctrl+Z undoes)")
     return true
 end
@@ -992,7 +1014,7 @@ function movetooverlap!(player::Player, a::Clip, b::Clip, frames::Integer)
     left, right = a.start <= b.start ? (a, b) : (b, a)
     snapshot!(player)
     fitoverlap!(player, left, right, frames)
-    refreshedit!(player)
+    redraw!(player)
     setstatus!(player, "clips overlap by $(round(frames / seq.framerate, digits = 1))s " *
                        "on V$(right.track) — the fade now cross-dissolves (Ctrl+Z undoes)")
     return true
@@ -1003,7 +1025,7 @@ end
 
 Add a labelled slider to this tool's card, with a live readout of its value.
 `callback(value)` fires while dragging — a slider (not a menu of canned values)
-so a length is whatever the cut needs, and so the control can SHOW the value the
+so a length is whatever the cut needs, and so the control can show the value the
 project actually has.
 """
 function toolslider!(ctx::ToolContext, label::AbstractString, range, callback;
@@ -1044,19 +1066,25 @@ end
 "The two marked clips as `(index, index)`, or `nothing` when the marks aren't a pair."
 function markedpair(player::Player)
     sel = player.timeline.selection[]
-    n = length(player.sequence.clips)
-    length(sel) == 2 && all(i -> 1 <= i <= n, sel) || return nothing
-    a, b = sel[1], sel[2]
-    return player.sequence.clips[a].start <= player.sequence.clips[b].start ? (a, b) : (b, a)
+    length(sel) == 2 || return nothing
+    clips = player.sequence.clips
+    a = findfirst(c -> c.id == sel[1], clips)
+    b = findfirst(c -> c.id == sel[2], clips)
+    (a === nothing || b === nothing) && return nothing   # a mark whose clip is gone
+    return clips[a].start <= clips[b].start ? (a, b) : (b, a)
 end
 
 "Mark `i` and `j` — the blend they form becomes the selected row, and both clips
 light up on the timeline."
-markpair!(player::Player, i::Integer, j::Integer) =
-    (player.timeline.selection[] = Int[i, j]; player.timeline.selected[] = j; nothing)
+function markpair!(player::Player, i::Integer, j::Integer)
+    clips = player.sequence.clips
+    player.timeline.selection[] = UInt64[clips[i].id, clips[j].id]
+    player.timeline.selected[] = clips[j].id
+    return nothing
+end
 
 """
-Fill the Blend card: the length control plus ONE ROW PER BLEND in the sequence.
+Fill the Blend card: the length control plus one row per blend in the sequence.
 The card shows PROJECT state, so it is built whether or not the tool is on and
 refreshes itself on every edit; the row whose two clips are marked is the selected
 one, and the length control reads and edits exactly that blend.
@@ -1084,7 +1112,7 @@ function blendpanel!(ctx::ToolContext)
 end
 
 """
-Re-key the SELECTED blend to `seconds` — live while dragging the slider — or, when
+Re-key the selected blend to `seconds` — live while dragging the slider — or, when
 nothing is selected, remember the length for the next blend. With "move clips to
 fit" ticked the overlap follows the new length, so the cross-dissolve stays exactly
 as long as the fade.
@@ -1104,7 +1132,7 @@ function setblendlength!(ctx::ToolContext, seconds::Real)
     snapshot!(player)
     keyfade!(into, frames, :in)
     i == 0 || !ctx.state[:fit] || fitoverlap!(player, seq.clips[i], into, frames)
-    refreshedit!(player)
+    redraw!(player)
     setstatus!(player, "blend: $(round(frames / seq.framerate, digits = 1))s")
     refreshblendlist!(ctx)
     return nothing
@@ -1125,8 +1153,8 @@ function selectedblend(player::Player)
         i = findfirst(b -> (b[1], b[2]) == marked, bs)
         i === nothing || return bs[i]
     end
-    sel = player.timeline.selected[]
-    1 <= sel <= length(seq.clips) || return nothing
+    sel = findfirst(c -> c.id == player.timeline.selected[], seq.clips)
+    sel === nothing && return nothing
     i = findfirst(b -> b[2] == sel, bs)
     return i === nothing ? nothing : bs[i]
 end
@@ -1145,7 +1173,7 @@ function refreshblendlist!(ctx::ToolContext)
     sig = (bs, marked)
     get(ctx.state, :listsig, nothing) == sig && return nothing
     ctx.state[:listsig] = sig
-    # the length control shows what the SELECTED blend actually is, so the card
+    # the length control shows what the selected blend is, so the card
     # never claims a value the timeline doesn't have
     sel = marked === nothing ? nothing : findfirst(b -> (b[1], b[2]) == marked, bs)
     sl = get(ctx.state, :slider, nothing)
@@ -1162,11 +1190,11 @@ function refreshblendlist!(ctx::ToolContext)
         into = seq.clips[j]
         from = i == 0 ? nothing : seq.clips[i]
         slot = findslot(into, OpacityEffect)      # the blend IS this effect entry
-        on = slot === nothing || slot.enabled
+        on = slot === nothing || slot.enabled[]
         crossing = from !== nothing && into.start < clipend(from)
         caption = "$(timestring(into.start / fps))  ·  $(round(d / fps, digits = 1)) s" *
                   (on ? "" : "  (off)") * (crossing ? "  ⇄" : from === nothing ? "  ↑" : "")
-        actions = Any[("▸", () -> (i == 0 ? (player.timeline.selected[] = j) :
+        actions = Any[("▸", () -> (i == 0 ? (player.timeline.selected[] = seq.clips[j].id) :
                                    markpair!(player, i, j);
                                    seek!(player, clamp(into.start + d ÷ 2, 0,
                                                        max(seqlength(seq) - 1, 0)))),
@@ -1174,9 +1202,9 @@ function refreshblendlist!(ctx::ToolContext)
         # ● on / ○ off — a glyph the UI font actually HAS (⏻ has no glyph and takes
         # Makie's text layout down with it)
         slot === nothing || push!(actions,
-            (on ? "●" : "○", () -> (snapshot!(player); slot.enabled = !slot.enabled;
-                         refreshedit!(player);
-                         setstatus!(player, "blend $(slot.enabled ? "on" : "off") " *
+            (on ? "●" : "○", () -> (snapshot!(player); slot.enabled[] = !slot.enabled[];
+                         redraw!(player);
+                         setstatus!(player, "blend $(slot.enabled[] ? "on" : "off") " *
                                             "(its keys stay — Ctrl+Z undoes)")),
              on ? "switch this blend off" : "switch it back on"))
         # ⇄ only while it would DO something: once the clips cross, the caption says so
@@ -1184,7 +1212,7 @@ function refreshblendlist!(ctx::ToolContext)
             ("⇄", () -> (markpair!(player, i, j); movetooverlap!(player, from, into, d)),
              "overlap the clips"))
         push!(actions, ("×", () -> (snapshot!(player); removeblend!(player.sequence, into);
-                                    refreshedit!(player);
+                                    redraw!(player);
                                     setstatus!(player, "blend removed (Ctrl+Z undoes)")),
                         "remove"))
         push!(entries, (caption, actions,
@@ -1213,7 +1241,7 @@ function removeblend!(seq::Sequence, into::Clip)
     slot = findslot(into, OpacityEffect)
     slot === nothing && return nothing
     prm = param(slot, :opacity)
-    (prm === nothing || (prm.curve === nothing && prm.input === nothing)) &&
+    (prm === nothing || (!isanimated(prm) && prm.input === nothing)) &&
         removeslot!(into, slot.id)
     return nothing
 end
@@ -1245,7 +1273,7 @@ end
 "The stabilization modes the tool offers, as Makie Menu `(label, value)` options."
 # Short on purpose: a Menu shares its row with the "Mode" label inside a 300 px
 # dock and, unlike a Label, neither wraps nor shrinks — it just draws past its box
-# and gets clipped mid-word. What each mode DOES belongs in the card's
+# and gets clipped mid-word. What each mode does belongs in the card's
 # description, which wraps.
 const STABMODES = [("Camera lock", :similarity),
                    ("Object lock", :objectlock),
@@ -1273,7 +1301,7 @@ stabmode(player::Player) = get!(() -> Ref(:similarity), player.fxwidgets, :stabm
 """
 Fill the Stabilize card: the mode, the action that runs the analysis, what the
 selected clip currently carries, and a way to take it off again. Stabilizing is
-an ANALYSIS of a clip — like the loop finder's search — so it lives with the
+an analysis of a clip, like the loop finder's search, so it lives with the
 tools, not in the effect stack (Simon, 2026-07-27); what it produces (the motion
 track) still renders as part of the clip like any other effect.
 """
@@ -1317,7 +1345,7 @@ function runstabilize!(ctx::ToolContext)
 end
 
 registereffect!(EffectKind(:stabilize, "Stabilize";
-    description = "Locks the SELECTED clip. Camera lock holds the framing like a tripod. " *
+    description = "Locks the selected clip. Camera lock holds the framing like a tripod. " *
         "Object lock keeps one subject still — click it in the preview afterwards. " *
         "Smooth keeps the camera moves and only takes the shake out.",
     make = _ -> StabilizeEffect(),
@@ -1329,7 +1357,7 @@ registereffect!(EffectKind(:stabilize, "Stabilize";
 # --------------------------------------------------------------- Flicker tool
 
 """
-Fill the Flicker card: run the analysis, see WHAT IT BOUGHT, dial it back live,
+Fill the Flicker card: run the analysis, see what it changed, dial it back live,
 or take it off. The old flow only staged a section from the effect palette and
 then waited for a second button nobody found — so the honest answer to "did it do
 anything?" was silence (Simon, 2026-07-27).
@@ -1347,11 +1375,11 @@ function flickerpanel!(ctx::ToolContext)
         ct = loc[1].colortrack
         ct === nothing && return
         ct.strength = Float32(v)
-        player.playing[] || notify(player.playhead)
+        player.playing[] || showplayhead!(player)
     end; startvalue = 1.0, format = v -> string(round(v, digits = 2)))
     # NB: plain Observable + `ontool!`, never a bare `lift` on a player observable:
     # a lift is not registered for cleanup, so every panel rebuild leaves another
-    # one writing into a DELETED label — which throws inside the observable chain
+    # one writing into a deleted label, which throws inside the observable chain
     # and takes every listener after it down with it (playback and the crop tool
     # stopped reacting three testsets later).
     status = Observable("not analyzed yet")
@@ -1370,7 +1398,7 @@ function flickerpanel!(ctx::ToolContext)
             return setstatus!(player, "no flicker fix on this clip")
         snapshot!(player)
         setcolortrack!(loc[1], nothing)
-        notify(player.playhead)
+        showplayhead!(player)
         setstatus!(player, "flicker fix removed (Ctrl+Z restores)")
     end)
     merge!(player.fxwidgets, Dict{Symbol, Any}(:color => analyze, :flickerremove => remove))
@@ -1396,7 +1424,7 @@ function runflickerfix!(ctx::ToolContext)
 end
 
 registereffect!(EffectKind(:flicker, "Fix flicker";
-    description = "Evens out exposure/colour jitter on the SELECTED clip: everything faster " *
+    description = "Evens out exposure/colour jitter on the selected clip: everything faster " *
         "than the cutoff is treated as flicker, slower changes survive.",
     params = [FxParam(:strength, "Strength"; min = 0.0, max = 1.0, default = 1.0)],
     make = nt -> FlickerEffect(Float32(nt.strength)),
@@ -1406,7 +1434,7 @@ registereffect!(EffectKind(:flicker, "Fix flicker";
 
 registereffect!(EffectKind(:loopfinder, "Loop finder";
     description = "Each reference card holds one frame; ▼ hints on the thumb track mark the " *
-        "frames most similar to the SELECTED card — click a ▼ to cut there. " *
+        "frames most similar to the selected card — click a ▼ to cut there. " *
         "Find adds the playhead frame as another reference.",
     make = _ -> LoopFinderEffect(),
     matches = e -> e isa LoopFinderEffect,
@@ -1468,8 +1496,8 @@ function mattepanel!(ctx::ToolContext)
     frames = collect(keys(marks))
     marking && !(col.srcframe in frames) && push!(frames, col.srcframe)
     sort!(frames)
-    # ONE CARD for the frame being marked — it holds the object pills and the live
-    # preview — and one thin ROW for each of the others. A full card per marked
+    # One card for the frame being marked — it holds the object pills and the live
+    # preview — and one thin row for each of the others. A full card per marked
     # frame turned ten marks into a screen and a half of scrolling, when all a
     # non-live mark needs is its number, a way back to it, and a way to drop it.
     # `toolrows!` is the codebase's own "list of items, not buttons" shape.
@@ -1486,7 +1514,7 @@ function mattepanel!(ctx::ToolContext)
                            false))
         end
     end
-    # …and one per REPAIRED frame. Without these a repair is invisible: you can
+    # …and one per repaired frame. Without these a repair is invisible: you can
     # fix a frame and have no way to see which frames you fixed, no way to get
     # back to one, and no way to drop a single repair short of undoing every edit
     # since. A repair is an edit and needs the same handle a mark has.
@@ -1513,7 +1541,7 @@ function mattepanel!(ctx::ToolContext)
     if marking && col.prevtrack !== nothing
         toolaction!(ctx, "Fix this frame only", () -> repairmattecollect!(col); footer = true)
     elseif !marking
-        # THE WAY BACK IN. "Mark subject" is gated on there being no matte yet, so
+        # The way back in: "Mark subject" is gated on there being no matte yet, so
         # once one was applied there was no button, no shortcut and no palette
         # entry that started marking again — and "Fix this frame only" above needs
         # a marking session to exist before it appears. The whole repair flow was
@@ -1521,7 +1549,7 @@ function mattepanel!(ctx::ToolContext)
         # frame in a finished matte, was the one case you could not reach.
         toolaction!(ctx, "Mark this frame", () -> startmattepick!(ctx); footer = true)
     end
-    # Say what it will COST when that is worth knowing. The alpha is linear in the
+    # Say what it will cost when that is worth knowing. The alpha is linear in the
     # shot's length — 3.5 GB a minute at 1080p — so on a long clip this is the
     # number that decides whether to matte the whole thing or trim it first. Shown
     # only past a gigabyte: on the short clips that are most of them it is noise.
@@ -1561,7 +1589,7 @@ end
 The transcript panel: how many lines there are, and the one under the playhead —
 editable.
 
-A transcript is a GUESS, and the one thing anybody reliably wants to do with a
+A transcript is a guess, and the one thing anybody reliably wants to do with a
 guess is correct it. Without this the speech integration is read-only: you can
 generate captions, see them, move them and restyle them, and the moment the model
 mishears a name your only recourse is to run it again and get the same answer.
@@ -1588,7 +1616,7 @@ function transcriptpanel!(ctx::ToolContext)
             c = seq.captions[i]
             box = Textbox(g[1, 1]; stored_string = c.text, width = Makie.Relative(1.0),
                           tellwidth = false, reset_on_defocus = false, fontsize = 11)
-            # `stored_string` fires on ENTER, not per keystroke, so one correction
+            # `stored_string` fires on Enter, not per keystroke, so one correction
             # is one undo step rather than one per letter.
             on(box.stored_string) do str
                 str === nothing && return
@@ -1603,7 +1631,7 @@ function transcriptpanel!(ctx::ToolContext)
         end
         nothing
     end
-    # Walk the transcript. The panel shows ONE line — the one under the playhead —
+    # Walk the transcript. The panel shows one line, the one under the playhead,
     # so without a way to step between them, fixing what the model misheard means
     # scrubbing at random until a line appears.
     slot = toolslot(ctx, :controls)
@@ -1618,7 +1646,7 @@ function transcriptpanel!(ctx::ToolContext)
                      buttoncolor = colors.surface)
         on(_ -> gotocaption!(player, -1), prev.clicks)
         on(_ -> gotocaption!(player, 1), nxt.clicks)
-        push!(ctx.controls, nav)          # ONE entry — see `matteviewrow!`
+        push!(ctx.controls, nav)          # one entry — see `matteviewrow!`
     end
     toolaction!(ctx, "Re-transcribe", () -> runtranscribe!(player); footer = true)
     return nothing
@@ -1627,7 +1655,7 @@ end
 """
 The narration panel: what has been said, and a box to say something new.
 
-Placed at the PLAYHEAD, because that is where you are when you decide a line
+Placed at the playhead, because that is where you are when you decide a line
 belongs — the alternative is a time field to type into, which means reading the
 timecode off the screen and copying it by hand.
 
@@ -1643,7 +1671,7 @@ function narrationpanel!(ctx::ToolContext)
         box = Textbox(g[1, 1]; placeholder = "what should be said…",
                       width = Makie.Relative(1.0), tellwidth = false,
                       reset_on_defocus = false, fontsize = 11)
-        # ENTER commits, so a line is one edit rather than one per keystroke.
+        # Enter commits, so a line is one edit rather than one per keystroke.
         on(box.stored_string) do str
             (str === nothing || isempty(strip(str))) && return
             addnarration!(player, str)
@@ -1655,7 +1683,7 @@ function narrationpanel!(ctx::ToolContext)
     for (i, nar) in enumerate(seq.narration)
         toolcard!(ctx; caption = "at $(round(nar.at; digits = 2))s",
                   onremove = _ -> dropnarration!(player, i)) do g, blocks
-            # A Textbox, not a Label: the words are the EDIT, and a line you can
+            # A Textbox, not a Label: the words are the edit, and a line you can
             # only delete and retype is not an editable line.
             box = Textbox(g[1, 1]; stored_string = nar.text, fontsize = 11,
                           width = Makie.Relative(1.0), tellwidth = false,
@@ -1706,13 +1734,15 @@ function addnarration!(player::Player, text::AbstractString)
     snapshot!(player)
     nar = Narration(String(text), at)
     push!(seq.narration, nar)
-    refreshedit!(player)
+    redraw!(player)
+    rebuildtoolcard!(player, :narration)   # the card lists the lines
     setstatus!(player, "narration: speaking…")
     runanalysis(player) do
         try
             render!(nar)
             put!(player.uiqueue, () -> begin
-                refreshedit!(player)
+                redraw!(player)
+                rebuildtoolcard!(player, :narration)
                 setstatus!(player, "narration added at $(round(at; digits = 2))s")
             end)
         catch e
@@ -1733,7 +1763,7 @@ Reword line `i`, which un-renders it.
 
 The samples are a cache OF THE WORDS. Keeping them after an edit would leave a
 line whose card says one thing and whose audio says another — so the replacement
-starts unrendered and the button goes back to saying "render". REPLACE rather
+starts unrendered and the button goes back to saying "render". Replace rather
 than mutate: the undo stack shares these objects.
 """
 function setnarrationtext!(player::Player, i::Integer, text::AbstractString)
@@ -1743,7 +1773,7 @@ function setnarrationtext!(player::Player, i::Integer, text::AbstractString)
     strip(String(text)) == strip(old.text) && return nothing
     snapshot!(player)
     seq.narration[i] = Narration(String(text), old.at, old.voice)
-    refreshedit!(player)
+    redraw!(player)
     setstatus!(player, "narration reworded — press render to speak it")
     return nothing
 end
@@ -1754,7 +1784,7 @@ end
 Speak line `i` in a different voice, which un-renders it.
 
 Same rule as [`setnarrationtext!`](@ref) and for the same reason: the samples are
-a cache of the words AND the voice, so keeping them would leave a card claiming
+a cache of the words and the voice, so keeping them would leave a card claiming
 one voice over audio in another. Replaces rather than mutates — the undo stack
 shares these objects.
 """
@@ -1765,7 +1795,7 @@ function setnarrationvoice!(player::Player, i::Integer, voice::AbstractString)
     String(voice) == old.voice && return nothing
     snapshot!(player)
     seq.narration[i] = Narration(old.text, old.at, String(voice))
-    refreshedit!(player)
+    redraw!(player)
     setstatus!(player, "narration voice $(voice) — press render to hear it")
     return nothing
 end
@@ -1775,7 +1805,7 @@ end
 
 Move line `i` to the playhead, keeping its audio.
 
-WHEN a voiceover lands is the thing you adjust most, and it was the one property
+When a voiceover lands is what gets adjusted most, and it was the one property
 with no control at all: a line added a second early had to be deleted and typed
 again with the playhead moved. The words have not changed, so the samples are
 still valid and come along — re-synthesizing to move a line would cost seconds
@@ -1791,7 +1821,7 @@ function movenarration!(player::Player, i::Integer)
     append!(fresh.samples, old.samples)
     fresh.rate = old.rate
     seq.narration[i] = fresh
-    refreshedit!(player)
+    redraw!(player)
     setstatus!(player, "narration moved to $(round(at; digits = 2))s")
     return nothing
 end
@@ -1804,12 +1834,12 @@ function rendernarration!(player::Player, i::Integer)
     setstatus!(player, "narration: speaking…")
     runanalysis(player) do
         try
-            # REPLACE, never `render!` in place — see `render`. The undo stack
+            # Replace, never `render!` in place — see `render`. The undo stack
             # shares this object.
             fresh = render(nar)
             put!(player.uiqueue, () -> (i <= length(seq.narration) &&
                                         (seq.narration[i] = fresh)))
-            put!(player.uiqueue, () -> (refreshedit!(player);
+            put!(player.uiqueue, () -> (redraw!(player);
                                         setstatus!(player, "narration rendered")))
         catch e
             bt = catch_backtrace()
@@ -1828,7 +1858,8 @@ function dropnarration!(player::Player, i::Integer)
     1 <= i <= length(seq.narration) || return nothing
     snapshot!(player)
     deleteat!(seq.narration, i)
-    refreshedit!(player)
+    redraw!(player)
+    rebuildtoolcard!(player, :narration)
     setstatus!(player, "narration line removed")
     return nothing
 end
@@ -1858,7 +1889,7 @@ end
 
 The depth-blur card's body: estimate the depth, or pick the focus point.
 
-The card's sliders come from its `EffectKind` params; this adds the two ACTIONS,
+The card's sliders come from its `EffectKind` params; this adds the two actions,
 so one card answers "make the background soft" end to end instead of sending the
 user to a second card for the analysis and a third for the picker.
 """
@@ -1921,8 +1952,8 @@ function pickfocus!(player::Player)
         snapshot!(player)
         e = findeffect(clip, DepthBlurEffect)
         seteffect!(clip, DepthBlurEffect(z, e === nothing ? 0.6f0 : e.strength))
-        refreshedit!(player)
-        notify(player.playhead)
+        redraw!(player)
+        showplayhead!(player)
         setstatus!(player, "focus set to $(round(z; digits = 2)) — what you clicked is sharp")
         return nothing
     end
@@ -1937,7 +1968,7 @@ the alternative cost: "there was no card to fold, no toggle to compare with".
 Optical flow was reachable only from the command palette, so a clip either
 juddered or did not and nothing on screen said which, or why.
 
-Shows the RATE too, because the mode does nothing at all above 1× and a control
+Shows the rate too, because the mode does nothing above 1× and a control
 that is correctly idle looks broken. A user who turns it on and sees no change
 needs to be told the clip is not slowed, not left to conclude the feature is.
 """
@@ -1977,8 +2008,8 @@ function setinterp!(player::Player, clip::Clip, mode::Symbol)
     clip.timeinterp === mode && return nothing
     snapshot!(player)
     settimeinterp!(clip, mode)
-    refreshedit!(player)
-    notify(player.playhead)
+    redraw!(player)
+    showplayhead!(player)
     setstatus!(player, mode === :flow ?
         "optical flow on — in-between frames are synthesized" :
         "frame sampling — the nearest source frame repeats")
@@ -1986,14 +2017,14 @@ function setinterp!(player::Player, clip::Clip, mode::Symbol)
 end
 
 registertool!(:timeinterp, "Time interpolation",
-    "How a SLOWED clip fills the frames its source does not have: repeat the " *
+    "How a slowed clip fills the frames its source does not have: repeat the " *
     "nearest (frame sampling) or synthesize it with RIFE (optical flow).";
     activate = ctx -> smoothslowmo!(ctx.player),
     panel = timeinterppanel!)
 
 registertool!(:narration, "Narration",
     "Type a line, press Enter, and Kokoro speaks it at the playhead. Mixed over " *
-    "the timeline in the preview AND in the export.";
+    "the timeline in the preview and in the export.";
     activate = ctx -> setstatus!(ctx.player, "narration: type a line in the card and press Enter"),
     panel = narrationpanel!)
 
@@ -2020,7 +2051,7 @@ end
 The preview's picture while a matte is being made: the finished matte, or SAM 2's
 segmentation with each object outlined in its colour.
 
-On the PANEL rather than in a card, because it is one state for the whole clip —
+On the panel rather than in a card, because it is one state for the whole clip —
 with one card per marked frame there is no card that owns it.
 """
 function matteviewrow!(ctx::ToolContext)
@@ -2036,7 +2067,7 @@ function matteviewrow!(ctx::ToolContext)
                 width = Makie.Relative(1.0), buttoncolor = v === :sam2 ? MATTECOLORS[2] : off)
     on(_ -> setmatteview!(player, :matte), b1.clicks)
     on(_ -> setmatteview!(player, :sam2), b2.clicks)
-    # EXACTLY ONE entry, like every other control helper: the next control's row
+    # Exactly one entry, like every other control helper: the next control's row
     # is `length(ctx.controls) + 1`, so pushing the two buttons as well left rows
     # 3 and 4 empty — and an empty row makes the whole layout indeterminate, which
     # collapsed the effect card to a 64 px sliver. `delete!` on a GridLayout
@@ -2061,12 +2092,12 @@ function brushrow!(ctx::ToolContext)
     slot === nothing && return nothing
     player = ctx.player
     row = GridLayout(slot[length(ctx.controls) + 1, 1])
-    # the FULL palette, for `text_muted` — see `matteseedcard!`
+    # the full palette, for `text_muted` — see `matteseedcard!`
     colors = player.fxwidgets[:uicolors]
     Label(row[1, 1], "Alt+drag paints · right erases"; fontsize = 10,
           color = colors.text_muted, halign = :left, tellwidth = false)
     pct = round(Int, 100 * player.brushradius)
-    # The HINT stays muted — it is a sentence you read once. The ± are controls
+    # The hint stays muted, being a sentence read once. The ± are controls
     # and are drawn as controls: at `text_muted` on a transparent fill they were
     # as quiet as the sentence next to them and read as decoration, the same way
     # `+ object` did before it got its contrast back.
@@ -2079,7 +2110,7 @@ function brushrow!(ctx::ToolContext)
                   strokecolor = (colors.text, 0.45), labelcolor = colors.text)
     on(_ -> setbrushradius!(player, player.brushradius / 1.25), minus.clicks)
     on(_ -> setbrushradius!(player, player.brushradius * 1.25), plus.clicks)
-    # ONE entry, like `matteviewrow!` — see the note there about empty rows.
+    # One entry, like `matteviewrow!` — see the note there about empty rows.
     push!(ctx.controls, row)
     return (minus, plus)
 end
@@ -2160,8 +2191,8 @@ function rundepth!(player::Player)
                 findeffect(clip, DepthBlurEffect) === nothing &&
                     addslot!(clip, Effect(DepthBlurEffect()))
                 player.jobprogress[] = NaN
-                refreshedit!(player)
-                notify(player.playhead)
+                redraw!(player)
+                showplayhead!(player)
                 setstatus!(player, "depth ready — Focus and Defocus are keyframable in the inspector")
             end)
         catch e
@@ -2181,7 +2212,7 @@ end
 
 Grade the clip under the playhead from the frame under the playhead.
 
-**From the frame you are looking at**, not the clip's first: a shot often opens
+From the frame being looked at, not the clip's first: a shot often opens
 on black or mid-whip, and a look predicted from that is a look for a frame nobody
 sees. Choosing the frame is the entire user input to this feature, which is why
 it is the playhead's and not a hidden default.
@@ -2203,8 +2234,8 @@ function runlook!(player::Player)
             put!(player.uiqueue, () -> begin
                 findeffect(clip, LookEffect) === nothing &&
                     addslot!(clip, Effect(LookEffect()))
-                refreshedit!(player)
-                notify(player.playhead)
+                redraw!(player)
+                showplayhead!(player)
                 setstatus!(player, "look applied — Look is keyframable in the inspector")
             end)
         catch e
@@ -2242,13 +2273,14 @@ function runtranscribe!(player::Player)
             caps = transcribe!(seq)
             put!(player.uiqueue, () -> begin
                 player.jobprogress[] = NaN
-                # …and a caption CLIP on the track above, if there is none: the
+                # …and a caption clip on the track above, if there is none: the
                 # transcript is what a user fixes, the clip is where it is drawn.
                 any(c -> c.source isa SceneSource &&
                          partbyname(scenespecof(c), :captions) !== nothing,
                     seq.clips) || addcaptionclip!(seq)
-                refreshedit!(player)
-                notify(player.playhead)
+                redraw!(player)
+                rebuildtoolcard!(player, :transcript)   # the card lists the lines
+                showplayhead!(player)
                 setstatus!(player, "captions: $(length(caps)) line(s) — the caption " *
                                    "clip's Y/Size are in the inspector")
             end)
@@ -2314,7 +2346,7 @@ function mattebrushto!(player::Player, p; radius::Real = 0.04)
     # Shown by writing the live track, not by committing: the picture has to
     # follow the brush, and the document must not.
     repairframe!(clip, srcframe, mask)
-    notify(player.playhead)
+    showplayhead!(player)
     return true
 end
 
@@ -2343,7 +2375,7 @@ function repairmatteat!(player::Player, mask::AbstractMatrix)
     clip.mattetrack === nothing &&
         (setstatus!(player, "matte: nothing to repair — run the matte first"); return false)
     snapshot!(player)
-    # COPY the track before writing into it. `snapshot` shares `mattetrack`
+    # Copy the track before writing into it: `snapshot` shares `mattetrack`
     # between the undo record and the live clip, so mutating the alpha in place
     # would edit the snapshot too and the repair would survive its own undo.
     # One clip's alpha, once per explicit repair — the alternative is an undo
@@ -2357,7 +2389,7 @@ function repairmatteat!(player::Player, mask::AbstractMatrix)
     end
     matterepairs(player, clip)[Int(srcframe)] = Matrix{UInt8}(mask)
     refreshmattepanel!(player)
-    notify(player.playhead)
+    showplayhead!(player)
     setstatus!(player, "matte: frame $srcframe repaired — kept through the next full run")
     return true
 end
@@ -2413,7 +2445,7 @@ function runmatte!(ctx::ToolContext; clip = nothing, seeds = nothing)
                                      "$(round(Int, 100cov))% kept"
                 player.jobprogress[] = NaN
                 refreshmattepanel!(player)
-                notify(player.playhead)
+                showplayhead!(player)
                 # A matte that keeps everything (or nothing) renders as no visible
                 # change, which reads as a broken tool — so report the number.
                 setstatus!(player, if cov > 0.97 || cov < 0.02
@@ -2452,7 +2484,7 @@ function removematte!(player::Player)
     i === nothing || removeslotat!(clip, i)
     player.matteinfo[] = "no matte"
     refreshmattepanel!(player; structure = true)
-    notify(player.playhead)
+    showplayhead!(player)
     setstatus!(player, "matte removed")
     return nothing
 end
@@ -2491,7 +2523,7 @@ end
 """
 Corner radius of the matte card's object pills.
 
-**5, not 12.** At `height = 24` a radius of 12 is exactly half the height, i.e. a
+5, not 12: at `height = 24` a radius of 12 is exactly half the height, i.e. a
 full stadium — the roundest a rounded rectangle can be — and it read as a
 different design language from every other control in the editor, which sits at
 3–6. It also renders badly: at half-height the two arcs meet with no straight
@@ -2503,7 +2535,7 @@ const PILLRADIUS = 5
 """
 A pill's height, and the gap between two of them.
 
-They are constants together because the row that holds the pills is a NESTED
+They are constants together because the row that holds the pills is a nested
 grid, and a nested grid reports one row's height however many it holds — so the
 outer row has to be sized by hand, from exactly these two numbers. When that
 arithmetic assumed a gap the grid did not actually have, each extra object
@@ -2518,10 +2550,10 @@ const PILLGAP = 4
 pillrowsize(n::Integer) = Makie.Fixed((PILLHEIGHT + PILLGAP) * n - PILLGAP)
 
 """
-ONE card for ONE marked frame: which objects were marked there, and the × that
+One card per marked frame: which objects were marked there, and the × that
 un-marks that frame.
 
-Per FRAME because a mark is per frame. Propagation drifts, you go back, you mark
+Per frame because a mark is per frame. Propagation drifts, you go back, you mark
 another frame — the list of marks is the list of corrections, and each one has to
 be removable on its own. This × used to take the entire matte off the clip
 instead, so "drop this correction" deleted all the work; taking the whole effect
@@ -2529,7 +2561,7 @@ off is the effect card's own ×, one level up.
 """
 function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::Bool)
     player = ctx.player
-    # the FULL palette (the timeline's is a six-colour subset with no `text_muted`)
+    # the full palette (the timeline's is a six-colour subset with no `text_muted`)
     colors = player.fxwidgets[:uicolors]
     col    = live ? mattecollect(player) : nothing
     ids    = col === nothing ? Int[] : mattecardobjects(col)
@@ -2549,7 +2581,7 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
             pills = measurable!(GridLayout(g[r += 1, 1]))
             for (k, id) in enumerate(ids)
                 n = count(q -> q[4] == id, col.points)
-                # lit = WHERE THE NEXT CLICK LANDS (`object`), not `selected`,
+                # lit = where the next click lands (`object`), not `selected`,
                 # which is the isolate-its-dots toggle. A fresh session and a
                 # fresh `+ object` both light their pill at once, so pressing it
                 # visibly did something before any point exists.
@@ -2579,7 +2611,7 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
                 push!(pillwidgets, (; object = id, pill, remove = bx))
             end
             colsize!(pills, 1, Makie.Auto(false, 1.0))
-            # SET the gap rather than assume one: `rowsize!` below computes the
+            # Set the gap rather than assume one: `rowsize!` below computes the
             # outer row from it, and the default is not 4.
             rowgap!(pills, PILLGAP)
 
@@ -2596,7 +2628,7 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
                             height = PILLHEIGHT, tellwidth = false, width = Makie.Relative(1.0),
                             cornerradius = PILLRADIUS, buttoncolor = (:transparent, 0.0),
                             # Outlined, to read as "makes a new one" rather than as
-                            # another object — but the LABEL is full-strength text.
+                            # another object — but the label is full-strength text.
                             # At `text_muted` on a transparent fill it looked
                             # switched off, which is a bad way to draw the one
                             # control on this card that creates a pill.
@@ -2618,7 +2650,7 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
             push!(blocks, newobj)
         else
             # Not the frame being marked: the way back to it. `gotomatteseed!`
-            # moves the playhead AND starts marking, which is the whole reason to
+            # moves the playhead and starts marking, which is the reason to
             # press it — so there is no separate "edit points" button.
             jump = Button(g[r += 1, 1]; label = "go to frame $seedframe", fontsize = 11,
                           height = 24, tellwidth = false, width = Makie.Relative(1.0))
@@ -2639,10 +2671,10 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
 end
 
 """
-Un-mark ONE frame: the selection made there goes, the rest of the matte stays.
+Un-mark one frame: the selection made there goes, the rest of the matte stays.
 
 The effect, the other marks and the propagated track are untouched — removing a
-correction must not delete the work it was correcting. When the LAST mark goes
+correction must not delete the work it was correcting. When the last mark goes
 the track is dropped too, because nothing the user asked for derives it any more,
 but the effect slot stays: its × is the one that means "take this off the clip".
 """
@@ -2660,7 +2692,7 @@ function removematteseed!(player::Player, clip::Clip, frame::Integer)
         setstatus!(player, "matte: frame $frame un-marked — Apply to propagate from the rest")
     end
     refreshmattepanel!(player; structure = true)
-    notify(player.playhead)
+    showplayhead!(player)
     return nothing
 end
 
@@ -2679,7 +2711,7 @@ function selectmatteobject!(player::Player, obj::Integer)
     col = mattecollect(player)
     col === nothing && return setstatus!(player, "matte: nothing being marked")
     col.selected = col.selected == obj ? 0 : Int(obj)
-    col.object = col.selected == 0 ? col.object : Int(obj)   # further clicks refine THIS one
+    col.object = col.selected == 0 ? col.object : Int(obj)   # further clicks refine this one
     refreshmattedots!(col)
     refreshmattepanel!(player; structure = true)
     setstatus!(player, col.selected == 0 ? "matte: no object selected" :
@@ -2710,7 +2742,7 @@ end
 """
 Back to the frame this seed belongs to, ready to edit its points.
 
-The card's picture is a FROZEN seed frame, not a live preview: moving the playhead
+The card's picture is a frozen seed frame, not a live preview: moving the playhead
 leaves it alone (its points come off the screen, since they describe that frame
 and no other), and this is the way back to it.
 """
@@ -2735,7 +2767,7 @@ function repaintmattecard!(player::Player)
     w = get(player.fxwidgets, :mattecard, nothing)
     w === nothing && return false
     loc = editclip(player)
-    # a different clip needs a different CARD, not a repaint
+    # a different clip needs a different card, not a repaint
     (loc === nothing || loc[1] !== w.clip) && return false
     col = mattecollect(player)
     (col === nothing || col.clip !== w.clip || col.srcframe != w.srcframe) && return false
@@ -2766,7 +2798,7 @@ function warmmattepanel!(ctx::ToolContext)
     MATTEWARMED[] && return nothing
     loc0 = editclip(player)
     mw, mh = loc0 === nothing ? (480, 270) : mattereadsize(loc0[1], nothing)
-    # The longest wait in the editor — MEASURED 67 s for the first matte of a
+    # The longest wait in the editor: measured 67 s for the first matte of a
     # session (~49 s building the model, ~18 s compiling kernels for this clip's
     # shape) and ~18 s again for each new resolution. It showed only a line of
     # text in the card, which for a minute of silence reads as a hang. The footer
@@ -2798,11 +2830,11 @@ const MATTESEED = Ref{Float64}(0.25)
 """
 A selection being marked.
 
-The interaction is a **scene laid over the preview**, not a mode the rest of the
+The interaction is a scene laid over the preview, not a mode the rest of the
 editor has to know about. `scene` is a child of the preview axis with
 `captures_mouse = true`: while it is visible it claims the pointer, so
 `Makie.receives_events` is false for every other handler over that viewport, and
-false for its OWN handlers the moment it is hidden. "Am I marking?" is therefore
+false for its own handlers the moment it is hidden. "Am I marking?" is therefore
 not a flag anyone can consult and get wrong — it is whether the scene is up.
 
 Everything the interaction owns hangs off it: the two dot plots live in that
@@ -2858,7 +2890,7 @@ mattecollect(player::Player) = get(player.fxwidgets, :mattecollect, nothing)
     matteoverlay(player) -> (scene, fg, bg)
 
 The marking overlay: a child scene of the preview axis, plus the two point
-vectors drawn in it. Built on first use and then **reused** — one per player, for
+vectors drawn in it. Built on first use and then reused — one per player, for
 the player's life.
 
 Not rebuilt per marking: a `Scene` adds itself to its parent's `children` and
@@ -2873,7 +2905,7 @@ for pointer routing.
 function matteoverlay(player::Player)
     return get!(player.fxwidgets, :matteoverlay) do
         ax = player.previewaxis
-        # A SIBLING of the axis, not a child of it. `receives_events` lets a
+        # A sibling of the axis, not a child of it. `receives_events` lets a
         # covering scene through to anything on its own root-to-leaf path, so a
         # child would claim the pointer and still leave the axis' own handlers
         # (crop, pick, scrub) firing — the exact conflict this is here to end.
@@ -2909,7 +2941,7 @@ Start marking. Clicks land in the preview until the user is done:
 
   * left click marks the subject, right click marks what is *not* the subject
   * dragging paints a run of points
-  * every point re-mattes THIS frame only, so the picture updates while marking
+  * every point re-mattes this frame only, so the picture updates while marking
   * Enter propagates across the clip, Esc restores what was there before
 
 The live matte goes through the ordinary render path — a one-frame `MatteTrack`
@@ -2946,7 +2978,7 @@ function startmattepick!(ctx::ToolContext)
             return Consume(true)
         elseif event.action == Mouse.release && col.painting !== nothing
             col.painting = nothing
-            livematte!(col)          # ONE model run per stroke, not per point
+            livematte!(col)          # one model run per stroke, not per point
             return Consume(true)
         end
         return Consume(false)
@@ -2967,19 +2999,19 @@ function startmattepick!(ctx::ToolContext)
         return Consume(true)
     end)
     player.fxwidgets[:mattecollect] = col
-    # The gesture depends on what makes the seed. A segmenter turns ONE click
+    # The gesture depends on what makes the seed. A segmenter turns one click
     # into the object's boundary, so telling the user to drag would have them
     # painting a stroke the model does not need; without one the seed IS the
     # painted shape and a stroke is the only way to cover a subject.
     clicks = player.segmenter !== nothing
     player.matteinfo[] = clicks ? "marking: click the subject, right-click to exclude" :
                                   "painting: drag over the subject, right-drag to exclude"
-    setstatus!(player, (clicks ? "matte: CLICK the subject (right-click excludes) · " :
-                                 "matte: DRAG over the subject (right-drag excludes) · ") *
+    setstatus!(player, (clicks ? "matte: click the subject (right-click excludes) · " :
+                                 "matte: drag over the subject (right-drag excludes) · ") *
                        "Ctrl+Z or Backspace undoes · Enter propagates · Esc cancels")
     # deferred: this runs inside the button's own callback, and the refresh
     # rebuilds that button
-    # The points describe ONE frame. Move the playhead and they come off the
+    # The points describe one frame. Move the playhead and they come off the
     # screen (the card keeps the frozen picture, and its "go to frame" brings both
     # back), so the next frame can be seeded on its own instead of collecting
     # clicks that belong to somewhere else.
@@ -3002,12 +3034,12 @@ end
 """
 Add one marked point and re-matte this frame — or take one away.
 
-Clicking a point you already placed **removes** it, whichever button you use:
+Clicking a point that is already placed removes it, whichever button is used:
 the gesture that put a point down takes it back, with no mode to enter and no
 modifier to remember. Backspace drops the most recent one, for the "no, not
 there" immediately after clicking.
 
-The target is the **dot you can see**, `hit` canvas units wide — deliberately not
+The target is the drawn dot, `hit` canvas units wide — deliberately not
 the much larger disc that dot paints into the seed. Matching the paint radius
 made two neighbouring points impossible to place: on a cropped, stabilized clip
 the preview is scaled up, so a second click aimed at a subject right next to the
@@ -3079,7 +3111,7 @@ function showmatteview!(col::MatteCollect)
         ct.visible[] = true
     end
     # the matte is the OTHER view of the same thing: SAM 2 up means the plain
-    # frame with outlines, and switching back has to put the live matte BACK —
+    # frame with outlines, and switching back has to restore the live matte —
     # leaving it off was "the toggle does nothing" in the other direction
     if sam2
         col.clip.mattetrack === col.prevtrack || clearlivematte!(col)
@@ -3087,7 +3119,7 @@ function showmatteview!(col::MatteCollect)
         livematte!(col)
     end
     matteinfo!(col)
-    notify(player.playhead)
+    showplayhead!(player)
     return nothing
 end
 
@@ -3116,7 +3148,7 @@ function refreshmattedots!(col::MatteCollect)
     for (nx, ny, isfg, obj) in col.points
         q = Point2f(mattetopreview(player, col.clip, col.srcframe, (nx, ny)))
         # dimmed unless it belongs to the selected object — that is what selecting
-        # a bar in the card SHOWS
+        # a bar in the card shows
         a = (col.selected == 0 || col.selected == obj) ? 0.95f0 : 0.30f0
         c = RGBAf(mattecolor(obj), a)
         push!(isfg ? fg : bg, q)
@@ -3169,7 +3201,7 @@ function livematte!(col::MatteCollect)
     # mutated by every click, so keeping a reference would let `lastseedpoints`
     # silently agree with points the seed was never computed from.
     points = copy(col.points)
-    # SAY something before the model runs. Discs were instant, so a silent path
+    # Say something before the model runs. Discs were instant, so a silent path
     # was honest; a segmenter takes ~0.6 s warm, and the first click of a session
     # also builds and compiles the model — measured at 58 s. A dot appearing and
     # then nothing at all for a minute reads as a tool that does not work.
@@ -3237,7 +3269,7 @@ function showlivematte!(col::MatteCollect, alpha::Matrix{UInt8}; strength = 0.85
                        col.srcframe, [col.srcframe])
     col.clip.mattetrack = track
     if col.prevmatte === nothing                       # first preview of this marking
-        # `findeffect` hands back the EFFECT (`findslot` is the one that returns
+        # `findeffect` hands back the effect (`findslot` is the one that returns
         # the slot) — reaching for `.effect` here asked a `MatteEffect` for a
         # field it has never had, on the very first marked point.
         col.prevmatte = something(findeffect(col.clip, MatteEffect), MatteEffect())
@@ -3246,7 +3278,7 @@ function showlivematte!(col::MatteCollect, alpha::Matrix{UInt8}; strength = 0.85
     nobj = isempty(col.points) ? 1 : length(unique(q[4] for q in col.points))
     player.matteinfo[] = "marking — $(length(col.points)) point(s) on $nobj object(s), " *
                          "this frame only"
-    notify(player.playhead)
+    showplayhead!(player)
     return nothing
 end
 
@@ -3296,7 +3328,7 @@ end
 """
     repairmattecollect!(col) -> Bool
 
-End the marking session by writing THIS FRAME only, instead of propagating.
+End the marking session by writing this frame only, instead of propagating.
 
 The other exit from a marking session, and the one a finished matte usually
 wants. `finishmattecollect!` adds the marks as a seed and re-propagates the whole
@@ -3325,7 +3357,7 @@ function repairmattecollect!(col::MatteCollect)
         return false
     end
     ok = repairmatteat!(player, mask)
-    ok && notify(player.playhead)
+    ok && showplayhead!(player)
     return ok
 end
 
@@ -3376,17 +3408,25 @@ end
 """
 Bring the matte UI up to date.
 
-`structure = true` when the CARD itself must appear or disappear (a matte was
-removed, marking was active, another clip was selected) — that is the only case
-worth a dock rebuild. Everything else is a repaint of the card that is already
-there: a rebuild recreates every tool's blocks and its scene plots, and it throws
+`structure = true` when the card's CONTENT has to change shape (a matte was
+removed, marking was active, another object was added) — that is the only case
+worth rebuilding it. Everything else is a repaint of the card that is already
+there: a rebuild recreates the card's blocks and its scene plots, and it throws
 the user's scroll position away, which turns "click a checkbox" into "scroll back
 down to the card again".
+
+One card, not the panel. It used to bump the effect registry's version, which
+rebuilt every card of every kind on the clip — because that was the only signal
+the stack listened to.
 """
 function refreshmattepanel!(player::Player; structure::Bool = false)
-    r = get(player.fxwidgets, :fxlistrefresh, nothing)
-    r === nothing || r()                      # inspector: the MatteEffect card
-    (structure || !repaintmattecard!(player)) && (EFFECTS.version[] += 1)
+    (structure || !repaintmattecard!(player)) || return nothing
+    loc = editclip(player)
+    loc === nothing && return nothing
+    clip = loc[1]
+    slot = findslot(clip, MatteEffect)
+    slot === nothing && return nothing
+    rebuildcard!(player, clip, slot)
     return nothing
 end
 
@@ -3396,8 +3436,8 @@ The crop card: what the next drag will change, and how big the project is now.
 The crop tool had no card at all — it was a toolbar button and a status line, and
 the status line is where its one irreversible act (resizing the project) was
 reported and then overwritten by the next message. Two things needed a home on
-screen: the SCOPE, because "crop this clip" and "resize the project" are
-different intents that were one gesture, and the CANVAS SIZE, because a project
+screen: the scope, because "crop this clip" and "resize the project" are
+different intents that were one gesture, and the canvas size, because a project
 size you cannot see is one you cannot check before exporting.
 
 The scope is a two-button toggle rather than a modifier on the drag, for the
@@ -3425,12 +3465,12 @@ function croppanel!(ctx::ToolContext)
                     buttoncolor = scope[] === :clip ? colors.accent : off)
         on(_ -> setcropscope!(player, :canvas), b1.clicks)
         on(_ -> setcropscope!(player, :clip), b2.clicks)
-        # ONE entry — see `matteviewrow!` on what an empty row does to the layout.
+        # One entry — see `matteviewrow!` on what an empty row does to the layout.
         push!(ctx.controls, row)
     end
 
-    # The ratio row, under the scope row: first WHAT the drag changes, then WHAT
-    # SHAPE it comes out — the order the two decisions are actually made in.
+    # The ratio row, under the scope row: first what the drag changes, then what
+    # shape it comes out as — the order the two decisions are made in.
     slot2 = toolslot(ctx, :controls)
     if slot2 !== nothing
         arow = GridLayout(slot2[length(ctx.controls) + 1, 1])
@@ -3476,7 +3516,7 @@ ratiolabel(a::Real) =
 
 Lock the crop tool to a shape (or to `nothing`, for free-drag).
 
-Locking RESHAPES the framing already in force rather than waiting for the next
+Locking reshapes the framing already in force rather than waiting for the next
 drag. Choosing 9:16 and seeing nothing happen reads as a control that did not
 work — and the whole reason to pick a ratio is to see the shot in it.
 """
@@ -3492,13 +3532,13 @@ function setcropaspect!(player::Player, a)
             (max(2 * (round(Int, clip.crop[3] * clip.source.width) ÷ 2), 2),
              max(2 * (round(Int, clip.crop[4] * clip.source.height) ÷ 2), 2)))
         applycrop!(player, clip)
-        refreshedit!(player)
+        redraw!(player)
     end
     showcurrentcrop!(player)
     sz = canvassize(player.sequence)
     setstatus!(player, a === nothing ? "crop: drag any shape" :
                        "crop locked to $(ratiolabel(a)) — $(sz[1])×$(sz[2])")
-    refreshcroppanel!(player)
+    rebuildtoolcard!(player, :crop)
     return nothing
 end
 
@@ -3513,20 +3553,20 @@ was one click of ceremony on every use.
 """
 function setcropscope!(player::Player, s::Symbol)
     cropscope(player)[] = s
-    # NOT `usetool!`, which TOGGLES: changing scope while the crop tool is already
+    # Not `usetool!`, which toggles: changing scope while the crop tool is already
     # up would have put it away, i.e. the control would cancel the thing it
     # configures.
     player.tool[] === :crop || usetool!(player, :crop)
     showcurrentcrop!(player)
     setstatus!(player, s === :canvas ?
-        "crop resizes the WHOLE PROJECT — drag past the edge to make it bigger" :
-        "crop reframes THIS CLIP only — the project keeps its size")
-    refreshcroppanel!(player)
+        "crop resizes the whole project — drag past the edge to make it bigger" :
+        "crop reframes this clip only — the project keeps its size")
+    rebuildtoolcard!(player, :crop)
     return s
 end
 
 registereffect!(EffectKind(:crop, "Crop";
-    description = "Drag a rectangle on the preview. The rectangle may reach OUTSIDE the " *
+    description = "Drag a rectangle on the preview. The rectangle may reach outside the " *
         "picture — that is how the canvas grows, and the new area comes in empty, " *
         "exactly as it exports. Choose whether the drag resizes the whole project " *
         "or reframes only the clip you dragged on.",
@@ -3536,12 +3576,12 @@ registereffect!(EffectKind(:crop, "Crop";
     # gesture, and `addablekinds` correctly leaves it out of the Add-effect menu.
     activate = ctx -> usetool!(ctx.player, :crop)))
 
-# ONE kind: the parameters that tune the matte AND the card that produces it.
+# One kind: the parameters that tune the matte and the card that produces it.
 # Split across two registries these were two entries with the same name — a
 # "Matte" row of sliders in the Inspector that could not make a matte, and a
 # "Matte" card in Tools that could not tune one.
 registereffect!(EffectKind(:matte, "Matte";
-    description = "Isolates a subject on the SELECTED clip. CLICK the subject (right-click " *
+    description = "Isolates a subject on the selected clip. Click the subject (right-click " *
         "marks what is NOT it), then Enter: SAM 2 turns each click into an object " *
         "boundary, and that seed is propagated across the clip. Mark another frame " *
         "wherever it drifts. Both models see the clip AFTER its effects — cropped and " *
@@ -3580,7 +3620,7 @@ function restorepanel!(ctx::ToolContext)
         i === nothing || removeslotat!(loc[1], i)
         player.restoreinfo[] = "no restoration"
         refreshmattepanel!(player)
-        notify(player.playhead)
+        showplayhead!(player)
         setstatus!(player, "restored frames cleared")
     end)
     hasrestoremodel() ||
@@ -3612,7 +3652,7 @@ function runrestore!(ctx::ToolContext)
                 player.restoreinfo[] = "$got frames restored from $(first) (x$(restorescale()))"
                 player.jobprogress[] = NaN
                 refreshmattepanel!(player)
-                notify(player.playhead)
+                showplayhead!(player)
                 setstatus!(player, "restored $got frames — Restore is keyframable in the inspector")
             end)
         catch e
@@ -3628,7 +3668,7 @@ end
 
 registereffect!(EffectKind(:restore, "Restore";
     description = "Runs an upscaling/restoration model over frames around the playhead on the " *
-        "SELECTED clip. Needs a model installed (examples/basicvsrpp.jl).",
+        "selected clip. Needs a model installed (examples/basicvsrpp.jl).",
     params = [FxParam(:strength, "Restore"; min = 0.0, max = 1.0, default = 1.0)],
     make = nt -> RestoreEffect(Float32(nt.strength)),
     matches = e -> e isa RestoreEffect,

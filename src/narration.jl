@@ -3,7 +3,7 @@ Spoken narration, from `KokoroRunner`.
 
 The seventh JuliaVision model in the editor, and the second that produces sound
 rather than pixels — but unlike the captions it produces something the timeline
-has to PLAY and EXPORT, which is the whole difficulty. This editor has no
+has to play and export, which is the difficulty. This editor has no
 audio-only clip: audio arrives with a video source and is mixed from the clip
 list. Narration is therefore a sequence-level track, mixed over that list on both
 paths — [`fillaudio!`](@ref) for the preview and `muxaudio` for the export.
@@ -28,7 +28,7 @@ hasspeakmodel() = SPEAKMODEL[] !== nothing
     SPEAKVOICES
 
 `() -> Vector{String}`, or `nothing`: which voices the installed synthesizer can
-use. Separate from the synthesizer itself because it must be CHEAP — the panel
+use. Separate from the synthesizer itself because it has to be cheap — the panel
 asks on every rebuild, and a list that built a model to answer would freeze the
 UI to draw a menu.
 """
@@ -51,7 +51,7 @@ end
 """
 Kokoro's usable voices, or empty until the model is loaded.
 
-**Filtered to `af_`/`am_`/`bf_`/`bm_`.** Kokoro ships 54, but the rest are for
+Filtered to `af_`/`am_`/`bf_`/`bm_`: Kokoro ships 54, but the rest are for
 languages this package has no G2P for — offering them would be offering 40-odd
 ways to produce noise.
 
@@ -118,7 +118,7 @@ end
 
 Add every rendered narration over `out`, which already holds the clips' audio.
 
-ADDS rather than writes, and that is the whole reason narration is a second pass
+Adds rather than writes, which is why narration is a second pass
 over the block instead of another branch inside [`fillaudio!`](@ref)'s clip loop:
 a voiceover plays *over* the timeline, not instead of it.
 
