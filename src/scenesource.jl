@@ -36,19 +36,26 @@ Have the source draw this frame before the graph runs.
 Nothing for a decoder: `decodesource` is its version of the same idea, called
 from `update!` for the reason spelled out there.
 
-A scene draws with GLMakie and its screen belongs to thread 1, while the composite
-runs on whichever thread owns the Lava context — the pinned GPU worker. Drawing
-inside the pass body is therefore thread 1 → worker → thread 1 → worker once per
+A scene draws with resources that belong to ONE thread — GLMakie's screen to
+thread 1, a Lava-backed renderer's Vulkan context to the worker's — while the
+composite runs on whichever thread owns the render engine's Lava context.
+Drawing inside the pass body therefore zigzags caller → owner → caller once per
 frame, and the hop back waits for the editor's renderloop to reach a yield.
 Measured on the lego project: 22.5 ms of waiting against 7.3 ms of drawing, and
 playback of a 60 fps timeline at 10–12 fps.
 
 Called while the caller is still on thread 1, right before `runowned` hands the
-frame to the worker, so `onmainthread` inside is a no-op.
+frame to the worker: the hop inside [`sceneframe!`](@ref) is then a no-op for a
+GLMakie scene and one straight hop to the worker for a Lava-backed one — the
+zigzag never happens.
 """
 prerender!(::ClipSource, ::Clip, ::Integer) = nothing
 
 function prerender!(src::SceneSource, clip::Clip, sf::Integer)
+    # Between frames, on thread 1: the one point where a screen a backend switch
+    # replaced can be destroyed without taking GL objects out from under a frame
+    # that is being drawn. See [`closeretired!`](@ref).
+    closeretired!(src.live)
     updatesource!(src, clip, sf)          # settles `at`, and resets the sample count
     src.pending = sceneframe!(src, clip, (src.width, src.height))
     src.pendingat = Int(sf)
@@ -88,7 +95,7 @@ function takepending!(src::SceneSource, sf::Integer)
 end
 
 """
-    sceneframe!(src, spec, dims) -> Matrix{RGBA{N0f8}}
+    sceneframe!(src, spec, dims; exact = false) -> Matrix{RGBA{N0f8}}
 
 One frame of the scene, at `dims`.
 
@@ -96,25 +103,34 @@ The standing scene is reused unless the canvas or the backend changed; only the
 values this frame carries are written onto it (see [`liveframe!`](@ref)). The
 result is already the plane format — RGBA with the scene's own coverage, so what
 it did not draw on is uncovered and the clip below shows through.
+
+`exact` is the finished-output policy (the bake, the export): the frame renders
+the integrator's full sample budget in one go. The live preview renders ONE
+sample per read instead — a playhead move must not block on a path tracer's
+whole budget — and accumulates the rest while the playhead stands still.
 """
-function sceneframe!(src::SceneSource, clip::Clip, dims::Tuple{Int, Int})
-    # On thread 1, wherever the composite runs — see [`onmainthread`](@ref).
-    # Everything from here down touches the screen: building it, writing this
-    # frame's numbers onto its plots (which walks Makie's compute graph and can
-    # reach the renderer), and reading the film back.
-    img = onmainthread() do
-        name = renderwith(src)
+function sceneframe!(src::SceneSource, clip::Clip, dims::Tuple{Int, Int};
+                     exact::Bool = false)
+    # On the thread the renderer's resources belong to, wherever the composite
+    # runs — see [`renderthread`](@ref). Everything from here down touches the
+    # screen: building it, writing this frame's numbers onto its plots (which
+    # walks Makie's compute graph and can reach the renderer), and reading the
+    # film back.
+    name = renderwith(src)
+    backend = getbackend(name)
+    img = onthread(renderthread(backend)) do
         # The bake backend is a different renderer, so it is a different standing
         # scene: `livescene!` rebuilds when the backend changes, which is exactly
         # what switching modes is.
-        src.live = livescene!(src.live, src.root, dims, name, getbackend(name);
-                              theme = rendertheme(src))
+        src.live = livescene!(src.live, src.root, dims, name, backend;
+                              opts = renderopts(src))
         # …and now there is a scene to write this frame's numbers onto.
         applysceneparams!(src, clip, src.at)
         # The first read at a position clears the film; every read after it adds
         # to it. Without the clear a path tracer would keep averaging the previous
         # frame's picture into this one and the animation would smear.
-        liveframe!(src.live; clear = src.samples == 0)
+        liveframe!(src.live; clear = src.samples == 0,
+                   samples = exact ? nothing : 1)
     end
     src.samples += 1
     return img
@@ -130,23 +146,20 @@ renderwith(src::SceneSource) =
     src.mode === :bake && src.bakewith !== :auto ? src.bakewith : src.backend
 
 """
-    rendertheme(src) -> Dict
+    renderopts(src) -> Dict
 
-Which settings this frame is drawn with: the live ones while previewing, the
-bake's while baking. An empty bake theme means there is nothing to change — the
-scene draws the same either way, which is the common case for a rasteriser.
-"""
-rendertheme(src::SceneSource) =
-    src.mode === :bake && !isempty(src.baketheme) ? src.baketheme : src.theme
+Which settings this frame is drawn with: the preview's own while live, and while
+baking the preview's overridden by whatever the bake dialog set. The merge is
+what the bake dialog shows — its form is seeded from the preview's values, and a
+field it never touched keeps following the preview.
 
+A NEW dict either way: the dialogs edit the source's dicts in place, and handing
+`livescene!` the very dict the standing screen was built with would make every
+edit compare equal to itself there — a changed setting that never rebuilds the
+screen.
 """
-How many accumulated samples a live preview stops at.
-
-A bound, not a quality setting: past it the picture stops changing visibly and the
-GPU is better left to the next seek. A bake has no such bound — it renders what
-its integrator is configured for.
-"""
-const MAXSAMPLES = 64
+renderopts(src::SceneSource) =
+    src.mode === :bake ? merge(src.screenopts, src.bakescreenopts) : copy(src.screenopts)
 
 """
     refining(src) -> Bool
@@ -157,9 +170,15 @@ This is what makes a raytraced preview usable: a seek returns one sample in
 subseconds and standing still adds to it, instead of every playhead move costing
 the full budget. It only works because the screen is held across frames — see
 `SceneSource`.
+
+No sample bound, which is the whole point: a path tracer's picture keeps getting
+better and a number that stops it is a number that has to be right for every
+scene. It stops when the playhead moves or playback starts — which is the only
+thing that makes the picture wrong — and how much a FINISHED frame is worth is
+the bake's sample count, not the preview's.
 """
 refining(src::SceneSource) =
-    src.live !== nothing && progressive(src.live.screen) && src.samples < MAXSAMPLES
+    src.live !== nothing && progressive(src.live.screen)
 refining(::ClipSource) = false
 
 """
@@ -509,8 +528,9 @@ function chainpass!(g, ::SceneNode, ::Nothing, ::Nothing, ctx::ChainBuild, dims)
     Mantle.custom!(g, "scene") do p
         Mantle.use(p, cur; read = true, write = true)
         # …and the body only has work left when nobody filled the update: the
-        # export and the bake are single-threaded and draw right here.
-        () -> st.uploaded || copyto!(frameview(cur, dims), scenepicture!(st, dims))
+        # export and the bake are single-threaded and draw right here, at the
+        # full budget `st.exact` says this frame is owed.
+        () -> st.uploaded || copyto!(frameview(cur, dims), scenepicture!(st, dims; exact = st.exact))
     end
     return cur
 end
@@ -524,15 +544,16 @@ This frame of the scene as a host image: the bake if there is one, the frame
 The one place that answers "what does this scene look like at this frame", so the
 update below and the pass body above cannot disagree about it.
 """
-function scenepicture!(st, dims::Tuple{Int, Int})
+function scenepicture!(st, dims::Tuple{Int, Int}; exact::Bool = false)
     img = takepending!(st.source, st.served[])
-    return img === nothing ? sceneframe!(st.source, st.clip, dims) : img
+    return img === nothing ? sceneframe!(st.source, st.clip, dims; exact) : img
 end
 
 # …and that is what `sourcepicture!` answers for a scene clip. `update!` asks it
 # once per frame, before the plan runs, so the picture goes in through the update
 # instead of a `copyto!` inside a recorded pass.
-sourcepicture!(st, dims::Tuple{Int, Int}, ::SceneSource) = scenepicture!(st, dims)
+sourcepicture!(st, dims::Tuple{Int, Int}, ::SceneSource; exact::Bool = false) =
+    scenepicture!(st, dims; exact)
 
 # ---------------------------------------------------------------- making one
 
@@ -571,7 +592,10 @@ end
 registereffect!(EffectKind(:scene, "Scene";
     description = "What this clip draws: a Makie scene. Every number in it — a \
                    joint angle, a light, the camera, a font size — is a parameter \
-                   here, so it keyframes like any other."))
+                   here, so it keyframes like any other. How it is drawn — the \
+                   renderer and its settings — is not one of those numbers: it \
+                   belongs to the clip, and it lives in the rendering dialog on \
+                   the clip's bake row."))
 
 """
     addcaptionclip!(seq; track, canvas) -> Clip

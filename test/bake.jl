@@ -115,3 +115,173 @@ end
     @test (vclip.source.width, vclip.source.height) == (src.width, src.height)
     VE.emptyengine!(engine)
 end
+
+@testset "screen settings: what a form can offer" begin
+    opts = VE.screenoptions(GLMakie)
+    names = [o.name for o in opts]
+    # everything offered is a real ScreenConfig field — `backendscreen` pins
+    # `visible`/`px_per_unit`/`scalefactor` itself, and window-manager fields
+    # have no business in an offscreen render
+    @test all(n -> n in fieldnames(GLMakie.ScreenConfig), names)
+    @test issorted(names)
+    for skipped in (:visible, :px_per_unit, :scalefactor, :title, :renderloop,
+                    :monitor, :fullscreen, :render_pipeline)
+        @test skipped ∉ names
+    end
+    byname = Dict(o.name => o for o in opts)
+    @test byname[:framerate].kind === :number
+    @test byname[:vsync].kind === :flag
+    # and every backend Makie knows a theme for answers — a renderer loaded
+    # later brings its settings with it, there is no list to fall behind
+    @test !isempty(opts)
+end
+
+# A stand-in renderer: `coerceopt` reads a string against the field's declared
+# type, so the test backend's config has one field per kind the real ones have.
+const FAKEBACKEND = Module(gensym(:FakeBackend))
+Core.eval(FAKEBACKEND, quote
+    struct ScreenConfig
+        tonemap::Union{Nothing, Symbol}
+        samples::Int64
+        hook::Any
+    end
+    double(x) = 2x
+end)
+
+@testset "screen settings: text becomes what the field declares" begin
+    fb = FAKEBACKEND
+    @test VE.coerceopt(fb, :tonemap, "aces") === :aces
+    @test VE.coerceopt(fb, :tonemap, :aces) === :aces      # already a value: through
+    @test VE.coerceopt(fb, :tonemap, "nothing") === nothing
+    @test VE.coerceopt(fb, :samples, "64") === 64.0
+    @test VE.coerceopt(fb, :samples, 64) === 64
+    # an object a text box cannot carry goes as an expression, evaluated in the
+    # BACKEND's module — the names its settings use are the names it exports
+    @test VE.coerceopt(fb, :hook, "double") === fb.double
+    @test VE.coerceopt(fb, :hook, "double(21)") === 42
+end
+
+@testset "the bake's settings are the preview's, overridden" begin
+    build = VE.scenebuild(:bar, (64, 48))
+    clip = VE.sceneclip(VE.buildscene(build); build, frames = 6, canvas = (64, 48))
+    src = clip.source
+    src.screenopts[:framerate] = 30.0
+    src.screenopts[:vsync] = false
+
+    # live: the preview's own — a COPY, because the dialogs edit the dict in
+    # place and `livescene!` compares settings to decide on a rebuild
+    live = VE.renderopts(src)
+    @test live == src.screenopts && live !== src.screenopts
+
+    # bake: merged, the bake's winning — touching one bake setting must not
+    # drop the preview's others, which is what the old either/or did
+    src.mode = :bake
+    @test VE.renderopts(src) == src.screenopts          # no overrides: same picture
+    src.bakescreenopts[:framerate] = 60.0
+    merged = VE.renderopts(src)
+    @test merged[:framerate] == 60.0 && merged[:vsync] == false
+    @test !haskey(src.screenopts, :integrator)
+end
+
+@testset "screen settings survive the project file" begin
+    build = VE.scenebuild(:bar, (64, 48))
+    clip = VE.sceneclip(VE.buildscene(build); build, frames = 10, canvas = (64, 48))
+    src = clip.source
+    src.bakewith = :GLMakie
+    src.screenopts[:vsync] = false
+    src.screenopts[:framerate] = 24.0
+    src.bakescreenopts[:framerate] = 60.0
+    src.bakescreenopts[:tonemap] = :aces                    # a Symbol
+    src.bakescreenopts[:integrator] = "VolPath(samples=8)"  # an expression
+    src.bakescreenopts[:denoise_config] = nothing           # an explicit nothing
+    proj = joinpath(mktempdir(), "p.videoedit")
+    saveproject(proj, Sequence([clip], 30.0); checkpoint = false)
+    c2 = loadproject(proj).clips[1].source
+    @test c2.bakewith === :GLMakie
+    # numbers, flags and strings come back as themselves; a Symbol as its name
+    # and a nothing as the word — `coerceopt` reads both against the field's
+    # type at screen-build time
+    @test c2.screenopts[:vsync] === false
+    @test c2.screenopts[:framerate] == 24.0
+    @test c2.bakescreenopts[:framerate] == 60.0
+    @test c2.bakescreenopts[:tonemap] == "aces"
+    @test c2.bakescreenopts[:integrator] == "VolPath(samples=8)"
+    @test c2.bakescreenopts[:denoise_config] == "nothing"
+end
+
+# A screen that records how it was asked — the sample-budget contract has no
+# real path tracer in the test environment, so the renderer is faked at exactly
+# the seam `readfilm` asks through.
+mutable struct FakeFilmScreen
+    calls::Vector{NamedTuple}
+end
+function VE.Makie.colorbuffer(s::FakeFilmScreen, ::VE.Makie.ImageStorageFormat;
+                              clear = true, samples = nothing)
+    push!(s.calls, (; clear, samples))
+    return fill(VE.RGB{VE.N0f8}(0.5), 4, 4)
+end
+
+@testset "one sample per preview read, the full budget for finished output" begin
+    scr = FakeFilmScreen(NamedTuple[])
+    VE.readfilm(scr, true; samples = 1)
+    @test scr.calls == [(; clear = true, samples = 1)]     # a playhead move: one sample
+    VE.readfilm(scr, false; samples = 1)
+    @test scr.calls[end] == (; clear = false, samples = 1) # standing still: accumulate one
+    VE.readfilm(scr, true)                                 # bake/export: the full budget
+    @test scr.calls[end] == (; clear = true, samples = nothing)
+end
+
+@testset "the preview keeps refining, with no sample bound" begin
+    # It used to stop at a constant 64 — a number that has to be right for every
+    # scene, and is not. The bound that matters is what a FINISHED frame costs,
+    # which is the renderer's own `samples` setting on the Bake tab; the preview
+    # improves the picture you are looking at until you look somewhere else.
+    spec = VE.Makie.SpecApi.Scene(; camera = VE.Makie.campixel!)
+    clip = VE.sceneclip((root = spec, joints = Dict{Symbol, Any}(), camera = nothing);
+                        frames = 10, canvas = (16, 16))
+    src = clip.source
+    @test !VE.refining(src)                               # nothing built yet
+    src.live = VE.LiveScene(nothing, FakeFilmScreen(NamedTuple[]), nothing,
+                            (16, 16), :Fake, spec, Dict{Symbol, Any}(), Any[])
+    @test VE.progressive(src.live.screen)                 # …or none of this is asked
+    for n in (0, 64, 100_000)
+        src.samples = n
+        @test VE.refining(src)
+    end
+    # A rasteriser has nothing to add and must not be asked to keep going.
+    src.live = VE.LiveScene(nothing, nothing, nothing, (16, 16), :Fake, spec,
+                            Dict{Symbol, Any}(), Any[])
+    @test !VE.refining(src)
+end
+
+# A Lava-backed renderer (RayMakie) shares the ONE Vulkan context the pinned GPU
+# worker owns — rendering it on thread 1 died with "BatchQueue is single-writer;
+# cross-thread sweep forbidden". The thread a scene renders on is the backend's
+# property, not the caller's: asked of the module (it binds Lava or it doesn't),
+# never hard-coded per name.
+module FakeLavaBackend
+    import Lava
+end
+
+@testset "a scene renders on the thread its renderer owns" begin
+    @test VE.renderthread(VE.GLMakie) == 0                          # GLMakie: thread 1
+    @test VE.renderthread(FakeLavaBackend) == Threads.nthreads() - 1   # Lava: the worker's
+    # …and the hop lands there, from wherever it is called
+    @test VE.onthread(() -> Threads.threadid(), 0) == 1
+    @test VE.onworkerthread(() -> Threads.threadid()) == Threads.nthreads()
+end
+
+@testset "a slow render is not a stuck one" begin
+    # The deadline is on STARTING, not on running. The first RayMakie frame builds
+    # its screen and compiles the renderer's shaders, which took longer than the
+    # ten seconds allowed: the render was aborted with "waited 10.0s to reach thread 24",
+    # the retry after it succeeded because everything was compiled by then, and the
+    # error therefore looked alarming and harmless at once. The failure it is
+    # actually for — an owning thread that never yields, so the pinned task never
+    # runs — is unchanged.
+    tid = Threads.nthreads() - 1                          # a real hop, not the caller
+    @test VE.onthread(tid; startwithin = 0.05) do
+        sleep(0.3)                                        # running, just not finished
+        :rendered
+    end === :rendered
+end

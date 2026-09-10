@@ -1584,8 +1584,9 @@ a full sample budget on every playhead move instead is a freeze per click, which
 is what this replaces — and it works only because the scene's screen is held
 across frames (see `SceneSource`).
 
-Bounded by `MAXSAMPLES`, and it stops the moment the playhead moves, playback
-starts, or nothing visible is progressive. Shares `player.refining` with
+Unbounded: it stops when the playhead moves, when playback starts, or when
+nothing visible is progressive, and otherwise keeps improving the picture you are
+looking at. Shares `player.refining` with
 [`retrypresent`](@ref): both mean "the picture on screen is not final yet", and
 exactly one of them should be improving it.
 """
@@ -1593,18 +1594,31 @@ function refinepreview!(player::Player)
     atrest(player) || return nothing
     any(c -> refining(c.source), clipsat(player.sequence, player.playhead[])) || return nothing
     Threads.atomic_cas!(player.refining, false, true) === false || return nothing
-    @async try
+    @async begin
         n = player.playhead[]
-        while atrest(player) && player.playhead[] == n
-            clips = clipsat(player.sequence, n)
-            any(c -> refining(c.source), clips) || break
-            present!(player) || break
-            yield()
+        try
+            while atrest(player) && player.playhead[] == n
+                clips = clipsat(player.sequence, n)
+                any(c -> refining(c.source), clips) || break
+                present!(player) || break
+                yield()
+            end
+        catch e
+            @warn "progressive refinement stopped" exception = (e, catch_backtrace())
+        finally
+            player.refining[] = false
         end
-    catch e
-        @warn "progressive refinement stopped" exception = (e, catch_backtrace())
-    finally
-        player.refining[] = false
+        # Whoever asked for the frame this loop just abandoned got nothing: the
+        # playhead moved, `showplayhead!` ran for the new frame, and both refiners
+        # it can reach found the slot still held here. Ask again now that it is
+        # free — without this a scrub over a raytraced clip left every frame after
+        # the first at one sample. Only on a move, so a `present!` that keeps
+        # failing cannot respawn this forever.
+        #
+        # Handing the slot back BETWEEN samples instead does not work: the loop
+        # then loses it to whatever task happens to run at that yield, and
+        # measured, it never survived past its first sample.
+        player.playhead[] == n || showplayhead!(player)
     end
     return nothing
 end
@@ -1630,43 +1644,55 @@ is nowhere near.
 """
 function retrypresent(player::Player; budget::Real = 20.0)
     Threads.atomic_cas!(player.refining, false, true) === false || return nothing
-    @async try
-        deadline = time() + budget
-        drawn = -1                       # the frame a stand-in is already up for
-        while !player.playing[]
-            n = player.playhead[]        # the current frame, never a captured one
-            # Show a stand-in first, then refine. A full-quality seek lands mid-GOP
-            # and decodes forward from the preceding keyframe: ~2.1 ms per frame on
-            # a 250-frame GOP, so 90 to 455 ms depending on where in the GOP it
-            # falls, with the previous frame on screen throughout. The compositor
-            # is not in it — playback renders a stand-in in 0.9 ms.
-            #
-            # `standin = true` draws the nearest decoded frame in about a
-            # millisecond and returns whether it was the exact one, so one call
-            # both answers immediately and says whether anything is left to refine.
-            if n != drawn
-                drawn = n
-                if showframe!(player, n; standin = true)
+    @async begin
+        try
+            deadline = time() + budget
+            drawn = -1                   # the frame a stand-in is already up for
+            while !player.playing[]
+                n = player.playhead[]    # the current frame, never a captured one
+                # Show a stand-in first, then refine. A full-quality seek lands
+                # mid-GOP and decodes forward from the preceding keyframe: ~2.1 ms
+                # per frame on a 250-frame GOP, so 90 to 455 ms depending on where
+                # in the GOP it falls, with the previous frame on screen
+                # throughout. The compositor is not in it — playback renders a
+                # stand-in in 0.9 ms.
+                #
+                # `standin = true` draws the nearest decoded frame in about a
+                # millisecond and returns whether it was the exact one, so one call
+                # both answers immediately and says whether anything is left to
+                # refine.
+                if n != drawn
+                    drawn = n
+                    if showframe!(player, n; standin = true)
+                        player.presented += 1
+                        player.playhead[] == n && break
+                        deadline = time() + budget
+                        continue
+                    end
+                end
+                if showframe!(player, n)
                     player.presented += 1
-                    player.playhead[] == n && break
+                    player.playhead[] == n && break  # …unless it moved meanwhile
                     deadline = time() + budget
-                    continue
+                elseif time() > deadline
+                    # the stand-in is already up — say why it is staying
+                    setstatus!(player, "frame $n never finished decoding — showing the nearest decoded frame")
+                    break
+                else
+                    sleep(0.005)
                 end
             end
-            if showframe!(player, n)
-                player.presented += 1
-                player.playhead[] == n && break   # …unless it moved while we rendered
-                deadline = time() + budget
-            elseif time() > deadline
-                # the stand-in is already up — say why it is staying
-                setstatus!(player, "frame $n never finished decoding — showing the nearest decoded frame")
-                break
-            else
-                sleep(0.005)
-            end
+        finally
+            player.refining[] = false
         end
-    finally
-        player.refining[] = false
+        # The frame is up — and if anything on it is progressive, it is up at ONE
+        # sample. `showplayhead!` reaches exactly one of the two refiners and it
+        # chose this one, because the decode was not ready when it asked; handing
+        # over here is what lets a raytraced clip go on converging after a seek
+        # that had to wait for its footage. Measured before this: every frame
+        # after such a seek stayed at one sample, however long the playhead then
+        # stood still.
+        atrest(player) && refinepreview!(player)
     end
     return nothing
 end

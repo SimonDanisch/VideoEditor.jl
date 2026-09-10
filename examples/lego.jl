@@ -47,21 +47,13 @@ end
 #   "camera.eye[1]"          — …and the camera is keyframed like anything else
 
 # ---------------------------------------------------------------- 4. bake it
-# RayMakie has to be loaded and registered before a scene may name it, and it
-# needs one method VideoEditor cannot provide itself: which pixels the render
-# actually covered. VideoEditor does not depend on RayMakie, so the method lives
-# here — `coverage` dispatches exactly so a renderer can bring its own.
+# RayMakie has to be loaded and registered before a scene may name it. No
+# `coverage` method is needed: a raytracer knows which rays hit nothing, and
+# RayMakie's frame carries that in its alpha (the scene background here is
+# transparent, so misses read as uncovered) — the plane convention already.
 begin
     using RayMakie
     VE.usebackend!(RayMakie)
-
-    function VE.coverage(screen::RayMakie.Screen)
-        isempty(screen.scene_states) && return nothing
-        film = first(values(screen.scene_states)).film
-        # misses carry 1f30 — a large FINITE value, not Inf — and the film is
-        # stored (H, W) while the editor works in (W, H)
-        return permutedims(Array(film.depth) .< 1.0f29, (2, 1))
-    end
 end
 
 # The bake writes each frame to `<project>.bakes/` as it finishes, so minutes of

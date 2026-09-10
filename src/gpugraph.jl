@@ -110,9 +110,13 @@ mutable struct FxState
     # path), and unfired for a decoder that serves device planes.
     upload::Any
     uploaded::Bool
+    # The finished-output policy of the frame being rendered (see `update!`):
+    # a scene reads it to decide between one progressive sample and the full
+    # budget. Per frame, like `uploaded` — the pass body outlives any one frame.
+    exact::Bool
 end
 FxState() = FxState(nothing, nothing, nothing, nothing, 0.0, nothing, 0, Ref(0),
-                    nothing, false)
+                    nothing, false, false)
 
 """
     sourcepicture!(st, dims) -> host image | nothing
@@ -126,9 +130,10 @@ it decoded (`hostframe`), a scene with its picture (`scenepicture!`, in
 scenesource.jl). Asked once per frame, so both kinds of source reach the device
 through the `Update` the pass reserved rather than a `copyto!` in a recorded body.
 """
-sourcepicture!(st, dims::Tuple{Int, Int}) =
-    st.baked !== nothing ? st.baked : sourcepicture!(st, dims, st.source)
-sourcepicture!(st, ::Tuple{Int, Int}, source) = hostframe(source, st.decoded)
+sourcepicture!(st, dims::Tuple{Int, Int}; exact::Bool = false) =
+    st.baked !== nothing ? st.baked : sourcepicture!(st, dims, st.source; exact)
+sourcepicture!(st, ::Tuple{Int, Int}, source; exact::Bool = false) =
+    hostframe(source, st.decoded)
 
 """
     hostframe(source, decoded) -> Union{Nothing, Matrix{RGB{N0f8}}}
@@ -874,7 +879,8 @@ function update!(ch::ClipChain, sf::Integer, phase::Real, source;
     # reaches the device this frame reaches it the same way. A SCENE goes the same
     # route: its picture is a host image too, whether it was drawn, pre-rendered
     # or read off a bake.
-    hf = st.upload === nothing ? nothing : sourcepicture!(st, ch.dims)
+    st.exact = exact
+    hf = st.upload === nothing ? nothing : sourcepicture!(st, ch.dims; exact)
     st.uploaded = hf !== nothing && size(hf) == ch.dims
     st.uploaded && st.upload(vec(hf))
     for e in ch.edges                     # `served` is settled: the planes can be written

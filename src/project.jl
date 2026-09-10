@@ -110,7 +110,12 @@ How a clip's source is written: a path for a file, the format for a scene.
 
 A scene clip has no media on disk — what it draws is a `SceneSpec` on its `:scene`
 effect, which goes out through the ordinary effect writer like every other
-parameter. All the file needs is how big its frames are and how many.
+parameter. All the file needs is how big its frames are and how many — plus how
+it renders: the backend, the bake's, and both sets of screen settings. A
+`Symbol` setting goes out as its name and a `nothing` as the word; the field's
+declared type makes them a symbol and a nothing again at use (see `coerceopt`),
+and an expression string needs no marking — it reads as code because the field
+asks for an object.
 """
 sourcedict(s::VideoSource) = Dict{String, Any}("source" => s.path)
 sourcedict(s::SceneSource) = Dict{String, Any}(
@@ -118,7 +123,13 @@ sourcedict(s::SceneSource) = Dict{String, Any}(
         "width" => s.width, "height" => s.height,
         "framerate" => s.framerate, "nframes" => s.nframes,
         "backend" => String(s.backend), "bakewith" => String(s.bakewith),
+        "screenopts" => optsdict(s.screenopts),
+        "bakescreenopts" => optsdict(s.bakescreenopts),
         "build" => s.build))
+
+optsdict(d::Dict{Symbol, Any}) = Dict{String, Any}(
+    string(k) => (v isa Symbol ? String(v) : v === nothing ? "nothing" : v) for (k, v) in d)
+optsfromdict(d) = Dict{Symbol, Any}(Symbol(k) => v for (k, v) in d)
 
 "The inverse: a source from what the file says about it."
 function sourcefromdict(cd::AbstractDict, sources::Dict{String, VideoSource})
@@ -132,6 +143,8 @@ function sourcefromdict(cd::AbstractDict, sources::Dict{String, VideoSource})
                            build = build,
                            backend = Symbol(get(sd, "backend", "GLMakie")),
                            bakewith = Symbol(get(sd, "bakewith", "auto")),
+                           screenopts = optsfromdict(get(sd, "screenopts", Dict())),
+                           bakescreenopts = optsfromdict(get(sd, "bakescreenopts", Dict())),
                            width = Int(get(sd, "width", 1920)),
                            height = Int(get(sd, "height", 1080)),
                            framerate = Float64(get(sd, "framerate", 30.0)),

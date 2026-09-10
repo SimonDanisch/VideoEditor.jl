@@ -9,11 +9,16 @@ bird = "/windows/Users/sdani/Cloudi/giffers/20260708_160827.mp4"
 # `autodetectgpu!` establishes worker ownership in the right order.
 player = Player(bird; gpupreview=true);
 
-1+1
 begin
     using VideoEditor, Lava, RayMakie, GLMakie
     import VideoEditor as VE
     GLMakie.activate!()
+    # Loading RayMakie is not enough: a scene names its renderer in text, and a
+    # name resolves only once the module is registered.
+    VE.usebackend!(RayMakie)
+    # No `coverage` method needed: a raytracer knows which rays hit nothing, and
+    # RayMakie's frame carries that in its alpha (a transparent scene background
+    # makes misses read as uncovered), which is the plane convention already.
     project = "/sim/Programmieren/VideoEdit/media/lego.videoedit"
     player = Player(project)
 end

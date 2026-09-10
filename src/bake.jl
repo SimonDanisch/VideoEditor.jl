@@ -250,54 +250,341 @@ end
 # adding one method and nothing here changes.
 
 """
-    bakesettings!(source, gridpos, uicolors) -> apply
+    screenoptions(backend) -> Vector{NamedTuple{(:name, :default, :kind)}}
+
+The settings of `backend`'s screen that a form can offer, with the values Makie
+would use if nobody said otherwise and the kind of widget each wants:
+`:flag` (checkbox), `:number`, `:symbol`, or `:expr` — a Julia expression the
+screen build evaluates in the backend's module, for the settings a text box
+cannot carry as a plain value (`integrator = VolPath(samples=256)`,
+`device = CPU()`).
+
+`ScreenConfig`'s fields ARE what `activate!` and `Screen(...)` accept, and Makie
+keeps their defaults in the default theme under the backend's name — so this needs
+no per-backend list and a renderer loaded later brings its own settings with it.
+
+Left out: the three `backendscreen` pins (`visible`, `px_per_unit`, `scalefactor`)
+and the window-manager fields an offscreen bake has no use for.
+"""
+const SCREENOPTS_SKIP = (:visible, :px_per_unit, :scalefactor, :renderloop,
+                         :render_pipeline, :monitor, :title, :fullscreen,
+                         :decorated, :focus_on_show, :float, :pause_renderloop)
+
+function screenoptions(backend::Module)
+    fields = fieldnames(backend.ScreenConfig)
+    theme = Makie.current_default_theme()
+    key = nameof(backend)
+    opt = NamedTuple{(:name, :default, :kind), Tuple{Symbol, Any, Symbol}}
+    haskey(theme, key) || return opt[]
+    out = opt[]
+    for (k, v) in pairs(theme[key])
+        (k in fields && !(k in SCREENOPTS_SKIP)) || continue
+        val = v[]
+        types = (T = fieldtype(backend.ScreenConfig, k)) isa Union ?
+                Base.uniontypes(T) : (T,)
+        # From the DEFAULT's value where it has one, from the field's type where
+        # it does not (`nothing` could be a symbol or a number; an `Automatic()`
+        # stands for an object only the backend can name).
+        kind = val isa Bool ? :flag :
+               val isa Real ? :number :
+               val isa Symbol ? :symbol :
+               val === nothing && any(t -> t === Symbol, types) ? :symbol :
+               val === nothing && any(t -> t <: Real, types) ? :number :
+               :expr
+        push!(out, (name = k, default = val, kind = kind))
+    end
+    return sort!(out; by = o -> o.name)
+end
+
+"""
+    screenoptsform!(gl, backend, store, uicolors; base, onchange) -> Vector
+
+One row per setting of `backend`: a checkbox for a flag, a number box, a symbol
+box, or an expression box, by the setting's kind (see [`screenoptions`](@ref)).
+Every widget writes into `store` — there is no apply step and nothing to read
+back out. A row shows `base`'s value where `store` has none of its own, which is
+how the bake dialog shows what the bake inherits from the preview; clearing a
+field removes the key, handing the default (or `base`) back.
+
+`onchange` runs after every edit — the preview dialog uses it to redraw, the
+bake dialog leaves it, since a bake reads the settings when it runs.
+
+Returns the blocks it made so the caller can take them off again when the backend
+changes, which is the one thing that changes WHICH settings exist. `widgets` is
+filled with the same blocks keyed by the setting they edit, for the callers that
+need a NAMED one — a test, and the walkthrough that types a sample count into it.
+"""
+function screenoptsform!(gl, backend::Module, store::Dict{Symbol, Any}, uicolors;
+                         base::Dict{Symbol, Any} = store, onchange = nothing,
+                         widgets::Dict{Symbol, Any} = Dict{Symbol, Any}())
+    made = Any[]
+    empty!(widgets)
+    changed() = (onchange === nothing || onchange(); nothing)
+    for (r, opt) in enumerate(screenoptions(backend))
+        k, dflt, kind = opt.name, opt.default, opt.kind
+        # `tellwidth = true`: the label column has to be as wide as the longest
+        # name, or it collapses to nothing and every caption is drawn underneath
+        # the box it belongs to.
+        lbl = Label(gl[r, 1], String(k); halign = :left, fontsize = 11,
+                    color = uicolors.text_muted, tellwidth = true)
+        cur = get(store, k, get(base, k, dflt))
+        w = if kind === :flag
+            cb = Checkbox(gl[r, 2]; checked = cur === true)
+            on(cb.checked) do v
+                store[k] = v
+                changed()
+            end
+            cb
+        elseif kind === :number
+            # Empty is a VALUE here — it means "leave this to the default", which is
+            # what clearing the field does below. `validator = Float64` called that
+            # invalid, so a setting with no default of its own (RayMakie's
+            # `samples`) opened blank and turned red the moment it was clicked into,
+            # before anything had been typed. The placeholder says what blank means
+            # instead of leaving an empty box to be read as a broken one.
+            box = Textbox(gl[r, 2]; stored_string = cur === nothing ? "" : string(cur),
+                          width = 90,
+                          placeholder = dflt === nothing ? "unset" : string(dflt),
+                          validator = s -> isempty(strip(s)) ||
+                                           tryparse(Float64, s) !== nothing)
+            on(box.stored_string) do str
+                s = strip(something(str, ""))
+                if isempty(s)
+                    delete!(store, k)      # back to the default / `base`
+                else
+                    v = tryparse(Float64, s)
+                    v === nothing && return nothing
+                    store[k] = dflt isa Integer ? round(Int, v) : v
+                end
+                changed()
+                return nothing
+            end
+            box
+        elseif kind === :symbol
+            box = Textbox(gl[r, 2]; stored_string = cur === nothing ? "" : string(cur),
+                          width = 90)
+            on(box.stored_string) do str
+                s = strip(something(str, ""))
+                if isempty(s)
+                    delete!(store, k)
+                elseif s == "nothing"
+                    store[k] = nothing     # a symbol field's "off", e.g. no tonemap
+                else
+                    store[k] = Symbol(s)
+                end
+                changed()
+                return nothing
+            end
+            box
+        else # :expr — evaluated in the backend's module when the screen is built
+            okexpr(s) = (e = Meta.parse(s); !(e isa Expr && e.head in (:error, :incomplete)))
+            box = Textbox(gl[r, 2];
+                          stored_string = cur isa AbstractString ? String(cur) : "",
+                          width = 160, placeholder = repr(dflt),
+                          validator = s -> isempty(strip(s)) || okexpr(s))
+            on(box.stored_string) do str
+                s = strip(something(str, ""))
+                isempty(s) ? delete!(store, k) : (store[k] = s)
+                changed()
+                return nothing
+            end
+            box
+        end
+        append!(made, (lbl, w))
+        widgets[k] = w
+    end
+    return made
+end
+
+"""
+    backendrow!(gl, r, caption, options, current, uicolors) -> Menu
+
+A "render this with" menu. `options` are `(label, value)` pairs.
+"""
+function backendrow!(gl, r::Integer, caption::AbstractString, options, current, uicolors)
+    # In its own single-column cell. A row's height is determined only from
+    # content that spans ONE column (`determinedirsize`), so laying the label and
+    # the menu out as two columns of the OUTER grid — next to a settings block
+    # spanning both — left that block contributing nothing: it measured 1 px tall
+    # and drew over the rest of the dialog.
+    row = GridLayout(gl[r, 1])
+    Label(row[1, 1], caption; halign = :left, fontsize = 11,
+          color = uicolors.text_muted, tellwidth = true)
+    i = findfirst(o -> o[2] === current, options)
+    # `tellwidth = true`: the menu has a fixed width, and a column told nothing
+    # collapses — the menu was then drawn from x = 0 of that column, on top of the
+    # caption beside it.
+    return Menu(row[1, 2]; options = options, default = options[something(i, 1)][1],
+                width = 180, tellwidth = true)
+end
+
+"""
+    bakesettings!(source, gridpos, uicolors; menu, widgets) -> apply
 
 Draw the settings this source contributes to a bake, and return `apply()`.
 
 Nothing for a file: what a decoder produces is not a choice.
-"""
-bakesettings!(::ClipSource, gridpos, uicolors) = () -> nothing
 
-function bakesettings!(src::SceneSource, gridpos, uicolors)
+`menu` and `widgets` are `Ref`/`Dict` the caller owns, filled with the renderer
+menu and each setting's widget by name — a test and the walkthrough type a sample
+count into one of them, and nothing else can reach a block this deep.
+"""
+bakesettings!(::ClipSource, gridpos, uicolors; menu = Ref{Any}(nothing),
+              widgets::Dict{Symbol, Any} = Dict{Symbol, Any}()) = () -> nothing
+
+function bakesettings!(src::SceneSource, gridpos, uicolors;
+                       menu = Ref{Any}(nothing),
+                       widgets::Dict{Symbol, Any} = Dict{Symbol, Any}())
     gl = GridLayout(gridpos)
-    Label(gl[1, 1], "Render the bake with"; halign = :left, fontsize = 11,
-          color = uicolors.text_muted, tellwidth = false)
     names = sort!(collect(keys(BACKENDS)))
-    opts = vcat([("same as the preview", :auto)], [(String(n), n) for n in names])
-    i = findfirst(o -> o[2] === src.bakewith, opts)
-    menu = Menu(gl[1, 2]; options = opts, default = opts[something(i, 1)][1],
-                width = 180, tellwidth = false)
     # A path tracer is minutes per frame and a rasteriser is milliseconds, which is
     # the whole reason a scene has two: this says which one the final picture uses.
-    return () -> (src.bakewith = menu.selection[]; nothing)
+    # The PREVIEW renderer is not here — it is not a bake setting, it is how the
+    # clip draws all the time, and it lives on the scene's own card.
+    bake = backendrow!(gl, 1, "Bake with",
+                       vcat([("same as the preview", :auto)], [(String(n), n) for n in names]),
+                       src.bakewith, uicolors)
+    menu[] = bake
+    # `measurable!`: a layout whose rows all left has no determinable height, and
+    # one such row makes the whole block indeterminate — it measured 1 px and drew
+    # over the rest of the dialog. Same rule as the effects panel's slots.
+    sub = measurable!(GridLayout(gl[2, 1]))
+    made = Any[]
+    # The settings of the renderer the bake WILL use — "same as the preview"
+    # resolves to the preview's renderer. Seeded from the preview's own settings
+    # (`base`), because that is what the bake inherits: `renderopts` merges these
+    # over them. Editing a row pins that one setting for the bake; clearing it
+    # hands the preview's value back.
+    function fill!(name)
+        foreach(Makie.delete!, made); empty!(made)
+        resolved = name === :auto ? src.backend : name
+        append!(made, screenoptsform!(sub, getbackend(resolved), src.bakescreenopts,
+                                      uicolors; base = src.screenopts, widgets))
+        return nothing
+    end
+    fill!(src.bakewith)
+    on(bake.selection) do v
+        v === nothing && return nothing
+        src.bakewith = v
+        empty!(src.bakescreenopts)   # …they belonged to the renderer that left
+        fill!(v)
+        return nothing
+    end
+    # Nothing to apply: every widget writes the clip as it is used.
+    return () -> nothing
 end
 
 """
-    openbakemodal!(player) -> nothing
+    previewpane!(player, parent, clip) -> nothing
 
-The bake dialog for the clip at the playhead: canvas, frame range, whatever the
-source contributes, and the button that runs it.
+The Preview tab of the rendering dialog: which renderer draws this clip while
+you work, and that renderer's own settings.
 
-One modal for every clip, because baking is one operation. A complex effect stack
-on ordinary footage is worth pre-rendering for the same reason a raytraced scene
-is, and the only thing that differs between them is what the source has to say.
+A non-scene clip has nothing to choose — what you see is the effect graph's
+output — and the tab says so instead of offering a menu that does nothing.
 """
-function openbakemodal!(player::Player)
-    loc = editclip(player)
-    loc === nothing && return setstatus!(player, "bake: no clip at the playhead")
-    clip = loc[1]
+function previewpane!(player::Player, parent, clip::Clip)
+    src = clip.source
     uicolors = player.fxwidgets[:uicolors]
-    modal = Modal(player.fig; title = "Bake this clip", min_size = (420, 220))
-    body = GridLayout(modal[1, 1])
+    body = GridLayout(parent)
+    if !(src isa SceneSource)
+        Label(body[1, 1], wraptext("This clip does not render a scene — the preview is " *
+                                   "the effect graph's output, and there is nothing to " *
+                                   "choose here.", 64);
+              halign = :left, justification = :left, fontsize = 11,
+              color = uicolors.text_muted, tellwidth = true)
+        return nothing
+    end
+    # `tellwidth = true`, unlike a caption sitting beside a control: this text is
+    # the widest thing in the pane, and the dialog takes its width from what the
+    # pane reports (see [`fittabs!`](@ref)). Told nothing, the dialog sized itself
+    # to the settings form and the sentence ran off its right edge. Pre-wrapped, so
+    # the width it reports is a real one.
+    Label(body[1, 1], wraptext("Which renderer draws this clip in the preview, and what " *
+                               "that renderer is set to. The bake can use another one — " *
+                               "see the Bake tab.", 64);
+          halign = :left, justification = :left, fontsize = 11,
+          color = uicolors.text_muted, tellwidth = true)
+    gl = GridLayout(body[2, 1])
+    names = sort!(collect(keys(BACKENDS)))
+    prev = backendrow!(gl, 1, "Preview with", [(String(n), n) for n in names],
+                       src.backend, uicolors)
+    sub = measurable!(GridLayout(gl[2, 1]))
+    made = Any[]
+    # Published like every other panel widget: the renderer menu and each setting
+    # by name, so a test and the walkthrough can reach them. `previewopts` is
+    # refilled in place on every rebuild, so a holder keeps seeing the live one.
+    opts = get!(() -> Dict{Symbol, Any}(), player.fxwidgets, :previewopts)
+    player.fxwidgets[:previewmenu] = prev
+    # `onchange`: a screen takes its settings at construction, so an edit only
+    # shows once the frame is drawn again — ask for it. (`renderopts` hands
+    # `livescene!` a copy, so the edit is seen as a change and the screen is
+    # rebuilt with it.)
+    fill!(name) = (foreach(Makie.delete!, made); empty!(made);
+                   append!(made, screenoptsform!(sub, getbackend(name),
+                                                 src.screenopts, uicolors;
+                                                 onchange = () -> showplayhead!(player),
+                                                 widgets = opts));
+                   nothing)
+    fill!(src.backend)
+    # No bound to set for the preview, and that is deliberate — see [`refining`](@ref).
+    # `samples` in the form above is a different number and worth saying so: it is
+    # what ONE finished frame costs, which the preview never pays because it asks
+    # for one sample at a time.
+    Label(gl[3, 1], wraptext("A progressive renderer keeps adding samples to the " *
+                             "frame for as long as the playhead holds still, so there " *
+                             "is no limit to set here. A renderer's own `samples` is " *
+                             "what ONE finished frame costs: the export renders at it, " *
+                             "and the Bake tab can override it.", 64);
+          halign = :left, justification = :left, fontsize = 11,
+          color = uicolors.text_muted, tellwidth = true)
+    on(prev.selection) do v
+        v === nothing && return nothing
+        src.backend = v
+        empty!(src.screenopts)
+        fill!(v)
+        # The standing scene belongs to the renderer that made it: `livescene!`
+        # rebuilds when the backend changes, and the preview has to be asked for
+        # again to see it.
+        showplayhead!(player)
+        return nothing
+    end
+    return nothing
+end
+
+"""
+    bakepane!(player, parent, clip, modal) -> nothing
+
+The Bake tab of the rendering dialog: canvas, frame range, whatever the source
+contributes (for a scene: which renderer the bake uses and its settings), and
+the button that runs it.
+
+Baking is offered for every clip, because baking is one operation. A complex
+effect stack on ordinary footage is worth pre-rendering for the same reason a
+raytraced scene is, and the only thing that differs between them is what the
+source has to say.
+"""
+function bakepane!(player::Player, parent, clip::Clip, modal)
+    uicolors = player.fxwidgets[:uicolors]
+    body = GridLayout(parent)
+    # Published like every other panel's widgets: a dialog a test cannot reach is
+    # a dialog nothing checks.
+    player.fxwidgets[:bakemodal] = (; modal, body)
+    player.fxwidgets[:bakego] = nothing        # …replaced once the button exists
     b = clip.bake
     have = b === nothing ? "" :
            "\nIt has one already: frames $(first(b.frames))–$(last(b.frames)) at " *
            "$(b.canvas[1])×$(b.canvas[2]), $(b.enabled ? "in use" : "switched off")" *
            (bakestale(clip) ? " · out of date — the clip changed since" : "")
-    Label(body[1, 1], "Pre-render this clip's effect graph to disk. While the bake is on, " *
-                      "the clip shows those frames instead of running the graph." * have;
+    # Pre-wrapped, not `word_wrap`: a wrapping Label derives its height from a
+    # width the layout only knows after it has sized the row — see `wraptext`.
+    # `word_wrap_width` is not a Label attribute at all, so this threw and the
+    # bake dialog could not be opened.
+    Label(body[1, 1], wraptext("Pre-render this clip's effect graph to disk. While the bake " *
+                               "is on, the clip shows those frames instead of running the " *
+                               "graph.", 64) * have;
           halign = :left, justification = :left, fontsize = 11,
-          color = uicolors.text_muted, tellwidth = false, word_wrap_width = 400)
+          color = uicolors.text_muted, tellwidth = true)
 
     form = GridLayout(body[2, 1])
     Label(form[1, 1], "Frames"; halign = :left, fontsize = 11, tellwidth = false)
@@ -307,18 +594,35 @@ function openbakemodal!(player::Player)
     W0, H0 = clip.source.width, clip.source.height
     wbox = Textbox(form[2, 2]; stored_string = string(W0), width = 80, validator = Int)
     hbox = Textbox(form[2, 3]; stored_string = string(H0), width = 80, validator = Int)
-    Label(form[3, 1], decodable(clip.source) ?
-                      "fixed at $(W0)×$(H0) — a decoder delivers the frames it has" :
-                      "this clip renders, so this is the size it renders at — the " *
-                      "preview follows it; the crop and the placement stay live";
-          halign = :left, fontsize = 10, color = uicolors.text_muted, tellwidth = false)
-    apply = bakesettings!(clip.source, body[3, 1], uicolors)
+    # In `body`, not in `form`: `form` is three columns wide and this note spans
+    # one of them, so telling its width there would have made the label column as
+    # wide as the sentence and pushed the boxes off to the right. A row of its own
+    # can report the width the dialog needs.
+    Label(body[3, 1], wraptext(decodable(clip.source) ?
+                               "fixed at $(W0)×$(H0) — a decoder delivers the frames it has" :
+                               "this clip renders, so this is the size it renders at — the " *
+                               "preview follows it; the crop and the placement stay live", 58);
+          halign = :left, justification = :left, fontsize = 10,
+          color = uicolors.text_muted, tellwidth = true)
+    bakemenu = Ref{Any}(nothing)
+    bakeopts = get!(() -> Dict{Symbol, Any}(), player.fxwidgets, :bakeopts)
+    apply = bakesettings!(clip.source, body[4, 1], uicolors;
+                          menu = bakemenu, widgets = bakeopts)
+    player.fxwidgets[:bakemenu] = bakemenu
 
-    status = Label(body[4, 1], ""; halign = :left, fontsize = 11,
+    status = Label(body[5, 1], ""; halign = :left, fontsize = 11,
                    color = uicolors.text_muted, tellwidth = false)
-    row = GridLayout(body[5, 1])
+    row = GridLayout(body[6, 1])
     go = Button(row[1, 1]; label = "Bake", width = 120)
     cancel = Button(row[1, 2]; label = "Close", width = 100)
+    player.fxwidgets[:bakego] = go
+    player.fxwidgets[:bakestatus] = status
+    # The OBSERVABLE, not the block: a bake outlives the dialog it was started
+    # from, and reopening the dialog deletes this one (see `openrendermodal!`).
+    # A deleted block has no attributes left, so `status.text` would then throw
+    # from inside the render's progress callback — writing the observable it used
+    # to be drawn from is simply unread.
+    statustext = status.text
     on(_ -> close!(modal), cancel.clicks)
 
     num(box, dflt) = (v = tryparse(Int, something(box.stored_string[], "")); v === nothing ? dflt : v)
@@ -328,30 +632,139 @@ function openbakemodal!(player::Player)
         hi = clamp(num(tob, clip.src_out - 1), lo, clip.src_out - 1)
         canvas = (max(num(wbox, W0), 2), max(num(hbox, H0), 2))
         dir = bakedirfor(player, clip)
-        status.text[] = "baking $(hi - lo + 1) frame(s)…"
+        nframes = hi - lo + 1
+        statustext[] = "baking $nframes frame(s)…"
+        # …and in the editor's own status line and footer spinner as well, because
+        # a bake outlives this dialog: close it mid-render and the label goes with
+        # it, while the render keeps going with nothing on screen saying so.
+        # `jobprogress` is what every other long job here writes — the footer
+        # animates the spinner and the bar off it, and NaN means idle.
+        setstatus!(player, "baking $nframes frame(s)…")
+        player.jobprogress[] = 0.0
         # On the engine's thread, like every other render: the plan's context has
         # one owning thread and a bake is the same graph the preview runs.
         runanalysis(player) do
             src = clip.source
             src isa SceneSource && (src.mode = :bake)
-            try
+            # Throttled: the frame counter is 180 `put!`s on a 32-slot queue on a
+            # 180-frame bake, and a blocked queue blocks the RENDER. The spinner
+            # polls `jobprogress` at its own rate and carries the animation.
+            lastui = Ref(0.0)
+            ok = try
                 bakeclip!(clip, player.engine; frames = lo:hi, canvas, dir,
                           sourcefor = (c, sf) -> bakesource(player, c, sf),
-                          progress = (i, n) -> put!(player.uiqueue,
-                                                    () -> (status.text[] = "baking $i / $n…")))
+                          progress = function (i, n)
+                              player.jobprogress[] = i / max(n, 1)
+                              time() - lastui[] < 0.1 && return nothing
+                              lastui[] = time()
+                              put!(player.uiqueue, () -> (statustext[] = "baking $i / $n…"))
+                              return nothing
+                          end)
+                true
+            catch e
+                # A bake that dies used to leave the dialog reading "baking N
+                # frame(s)…" for good: the worker logged it and nothing on screen
+                # ever changed. It is the same "nothing happened" as a button that
+                # does not fire.
+                @error "bake failed" exception = (e, catch_backtrace())
+                msg = "bake failed: $(sprint(showerror, e))"
+                setstatus!(player, msg)
+                put!(player.uiqueue, () -> (statustext[] = msg))
+                false
             finally
                 src isa SceneSource && (src.mode = :live)
+                player.jobprogress[] = NaN
             end
-            put!(player.uiqueue, () -> begin
-                status.text[] = "done — the clip is showing its bake"
+            ok && put!(player.uiqueue, () -> begin
+                statustext[] = "done — the clip is showing its bake"
+                setstatus!(player, "bake done — the clip is showing its pre-rendered frames")
                 showplayhead!(player)
             end)
         end
     end
-    open!(modal)
     return nothing
 end
 
+"""
+    fittabs!(tabs) -> nothing
+
+Size a `Tabs` block to the tab that is showing, so the dialog around it can size
+itself to what is actually in it.
+
+The tab that is SHOWING rather than the largest of them: the two forms differ by
+a third of the dialog's height, and sizing to the larger leaves the other one
+sitting in a field of empty dialog. Switching tabs then resizes the dialog, which
+is what a dialog that fits its content does.
+
+Called once when the dialog is built AND on every later change, because the two
+are not the same event: the panes are filled before this is wired up, so their
+`contentsize` already holds its final value and firing on change alone never
+fires at all — the dialog then opened at `min_size` with the settings form
+scrolled out of sight. `refresh_contentsize!` recomputes rather than reads,
+because a layout that has not been through a `computedbbox` yet has published
+nothing.
+"""
+function fittabs!(tabs)
+    w, h = Makie.refresh_contentsize!(tabs[tabs.active[]])
+    (w > 0 && h > 0) || return nothing
+    # Rounded UP: a content width the block matches to the pixel leaves the tab's
+    # own scroll view a fraction short, and it answers with a scrollbar along the
+    # bottom of a dialog that fits.
+    tabs.width = ceil(w) + 1
+    tabs.height = ceil(h) + 1 + tabs.headerheight[]
+    return nothing
+end
+
+"""
+    openrendermodal!(player) -> nothing
+
+How the clip at the playhead is rendered: one dialog, two tabs. **Preview** —
+which renderer draws the clip while you work, and that renderer's settings.
+**Bake** — which renderer and settings the pre-rendered frames are made with,
+and the button that makes them.
+
+One dialog because the two are the same question at two timescales, and the
+settings form is the same one: the bake tab's is the preview tab's, seeded with
+the preview's values and overriding them.
+"""
+function openrendermodal!(player::Player)
+    loc = editclip(player)
+    loc === nothing && return setstatus!(player, "no clip at the playhead")
+    clip = loc[1]
+    # The dialog is built per open, because its two forms describe THIS clip and
+    # this clip's renderer. So the previous one has to go: `close!` only hides a
+    # Modal, and a hidden dialog is still a dialog — its blocks stay in the
+    # figure with their event handlers live. Measured before this line existed:
+    # a second open put a working dialog on screen whose tab header could not be
+    # clicked, because the first dialog's `Tabs` — invisible, at the same place —
+    # took the click and switched its own tab.
+    prev = get(player.fxwidgets, :rendermodal, nothing)
+    prev === nothing || Makie.delete!(prev.modal)
+    modal = Modal(player.fig; title = "Rendering", min_size = (440, 240))
+    # `tellwidth`/`tellheight`: a `Tabs` defaults to neither, because it is built to
+    # fill the space it is given and scroll what does not fit. Here it is the other
+    # way round — the dialog has no size of its own and takes the tabs' — and a
+    # block that tells its parent nothing leaves the modal at `min_size` with the
+    # settings form scrolled out of sight. See [`fittabs!`](@ref) for the numbers.
+    tabs = Tabs(modal[1, 1], ["Preview", "Bake"]; closable = false,
+                tellwidth = true, tellheight = true)
+    # Published like every other panel's widgets: a dialog a test cannot reach is
+    # a dialog nothing checks.
+    player.fxwidgets[:rendermodal] = (; modal, tabs)
+    previewpane!(player, tabs[1][1, 1], clip)
+    bakepane!(player, tabs[2][1, 1], clip, modal)
+    # Tabs is a fixed-space container by design — it scrolls what overflows —
+    # while the Modal sizes itself from its content. So nobody was saying how
+    # big the content IS, and the dialog clipped it to min_size. Bridge the two:
+    # the tabs block gets the bigger tab's size, and the modal's own
+    # content-sizing takes it from there. Live: switching the renderer rebuilds
+    # the settings form, and the dialog grows with it.
+    fittabs!(tabs)
+    onany((_...) -> fittabs!(tabs),
+          tabs.active, tabs[1].contentsize, tabs[2].contentsize, tabs.headerheight)
+    open!(modal)
+    return nothing
+end
 """
 Where this clip's bake goes: beside the project when there is one, a temp
 directory otherwise — an unsaved edit still gets to bake, it just does not survive

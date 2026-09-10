@@ -308,6 +308,9 @@ CPU frame `player.frame[]` is uploaded once. Returns `true` when on screen; `fal
 function presentgpu!(player::Player, clip::Clip, srcframe::Integer;
                      stream = nothing, source = nothing, chunks::Integer = 5)
     gp = player.gpupreview
+    # Same rule as the composite tier: a Lava-backed scene shares this device and
+    # the shared image comes back holding other memory. See [`sharesdevice`](@ref).
+    sharesdevice(clip) && return false
     try
         # source = the streaming decoder (disk→VRAM) or a decoded CPU frame (one upload)
         src = stream !== nothing ? stream : source !== nothing ? source : player.frame[]
@@ -375,6 +378,11 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer;
                               chunks::Integer = 5)
     gp = player.gpupreview
     streamed(player, clips) || return false
+    # A Lava-backed scene in the stack shares this tier's device, and the shared
+    # image comes back holding other memory — see [`sharesdevice`](@ref). The CPU
+    # tier composites the same frame correctly, so the picture is right and this
+    # one clip's playback is slower until the interleaving itself is fixed.
+    any(sharesdevice, clips) && return false
     try
         W, H = canvassize(player.sequence)   # the SEQUENCE's format, not the top layer's
         if (gp.width, gp.height) != (W, H)

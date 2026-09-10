@@ -3305,6 +3305,151 @@ end
     end
 end
 
+"Every block under a layout, however deeply nested — the dialog's buttons live
+several `GridLayout`s down and nothing publishes them individually."
+function allblocks(gl, out = Any[])
+    for c in Makie.GridLayoutBase.contents(gl)
+        c isa Makie.GridLayout ? allblocks(c, out) : push!(out, c)
+    end
+    return out
+end
+
+@testset "the bake is reachable by mouse and says what it is doing" begin
+    # The report was "pressing Bake does nothing — no visual feedback — nothing".
+    # Two of the three were true: the panel row that the dialog is opened FROM was
+    # refreshed only by the playhead listener, so a finished bake left it reading
+    # "no bake"; and the footer spinner every other long job animates was never
+    # given anything to animate. So this drives the whole path with mouse events —
+    # panel row → dialog → tab → button — and asserts what a user can see.
+    p = Player(testvideo; gpupreview = false)
+    try
+        sleep(1.5)
+        ev = Makie.events(p.fig)
+        ctr(bb) = Point2f(bb.origin .+ bb.widths ./ 2)
+        function click(pos)
+            ev.mouseposition[] = Tuple(Point2f(pos)); sleep(0.15)
+            ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.press); sleep(0.1)
+            ev.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.release); sleep(0.3)
+        end
+        waitfor(pred; s = 60) = (t0 = time();
+                                 while !pred() && time() - t0 < s; sleep(0.05) end;
+                                 pred())
+        VE.seek!(p, 0)
+        @test VE.runcommand!(p, :add_bar)     # making the clip is not what is tested
+        c = VE.selectedclip(p)
+        c.src_out = 60
+        VE.opendock!(p, :effects); VE.redraw!(p); sleep(0.8)
+        @test p.fxwidgets[:bakelabel].text[] == "no bake — the graph renders every frame"
+
+        # …and from here, mouse only.
+        click(ctr(p.fxwidgets[:bakebutton].layoutobservables.computedbbox[]))
+        w = get(p.fxwidgets, :rendermodal, nothing)
+        @test w !== nothing                          # the row's button opens the dialog
+        @test w.tabs.active[] == 1                   # …on Preview
+        click(ctr(w.tabs.tabs[2].rect[]))            # the tab header is a click target
+        @test w.tabs.active[] == 2
+        go = first(b for b in allblocks(p.fxwidgets[:bakemodal].body)
+                   if b isa Makie.Button && b.label[] == "Bake")
+        click(ctr(go.layoutobservables.computedbbox[]))
+
+        # The spinner runs WHILE it renders — polled, because a bake this short can
+        # finish between two `sleep`s and an assertion on one sample would be a
+        # coin toss.
+        spun = false
+        t0 = time()
+        while c.bake === nothing && time() - t0 < 60
+            isnan(p.jobprogress[]) || (spun = true)
+            sleep(0.02)
+        end
+        @test c.bake !== nothing
+        @test spun                                   # footer spinner + bar animated
+        @test waitfor(() -> isnan(p.jobprogress[]); s = 10)          # …and stopped
+        @test waitfor(() -> startswith(p.fxwidgets[:bakelabel].text[], "bake in use"))
+        @test p.fxwidgets[:bakeuse].label[] == "off"
+
+        # Open it a SECOND time. `close!` only hides a Modal, so the first dialog
+        # stayed in the figure with its handlers live, and its `Tabs` — invisible,
+        # at exactly the same place — answered `tab_at` and took the click meant
+        # for the new one. Measured in the walkthrough take: the second dialog's
+        # Bake tab could not be reached at all, so the samples field was never
+        # typed into and the bake never ran.
+        nmodals() = count(b -> b isa Makie.Modal, p.fig.content)
+        before = nmodals()
+        click(Point2f(30, 500))                      # backdrop dismiss, as a person does
+        @test waitfor(() -> !w.modal.open[]; s = 5)
+        click(ctr(p.fxwidgets[:bakebutton].layoutobservables.computedbbox[]))
+        w2 = p.fxwidgets[:rendermodal]
+        @test w2 !== w                               # a fresh dialog…
+        @test nmodals() == before                    # …and the first one is gone, not hidden
+        @test w2.tabs.active[] == 1
+        click(ctr(w2.tabs.tabs[2].rect[]))
+        @test w2.tabs.active[] == 2                  # the tab header still is a click target
+    finally
+        close(p)
+    end
+end
+
+# A renderer that accumulates, and needs no GPU: what makes a preview progressive
+# is `colorbuffer(...; clear)`, and this is the smallest thing that has it.
+module FakeProgressiveBackend
+    import Makie
+    struct ScreenConfig
+        visible::Bool
+        px_per_unit::Float64
+        scalefactor::Float64
+    end
+    mutable struct Screen
+        size::Tuple{Int, Int}
+        reads::Int
+    end
+    function Screen(scene::Makie.Scene; visible = false, px_per_unit = 1.0, scalefactor = 1.0)
+        w, h = round.(Int, Makie.widths(Makie.viewport(scene)[]))
+        return Screen((max(w, 1), max(h, 1)), 0)
+    end
+    Base.display(s::Screen, ::Makie.Scene; kw...) = s
+    Base.close(::Screen) = nothing
+    function Makie.colorbuffer(s::Screen, ::Makie.ImageStorageFormat = Makie.JuliaNative;
+                               clear = true, samples = nothing, figure = nothing)
+        s.reads += 1
+        return fill(Makie.RGBAf(0, 0, 0, 1), s.size[1], s.size[2])
+    end
+end
+
+@testset "a progressive preview keeps refining, and again after every seek" begin
+    # Two things this pins down. There is no sample bound: the preview used to stop
+    # at a constant 64, a number that has to be right for every scene and is not.
+    # And it restarts at each new position: `showplayhead!` reaches exactly ONE of
+    # the two refiners, and when the decode was not ready it chose `retrypresent` —
+    # which then never handed over, so every frame after such a seek stayed at one
+    # sample however long the playhead stood still.
+    VE.usebackend!(FakeProgressiveBackend)
+    p = Player(testvideo; gpupreview = false)
+    try
+        sleep(1.5)
+        VE.seek!(p, 0)
+        @test VE.runcommand!(p, :add_bar)
+        c = VE.selectedclip(p)
+        c.src_out = 120
+        c.source.backend = :FakeProgressiveBackend
+        VE.redraw!(p)
+        counts = Int[]
+        for n in (20, 50, 80)
+            VE.seek!(p, n); sleep(1.2)
+            @test c.source.at == VE.sourceframe(c, n)
+            push!(counts, c.source.samples)
+        end
+        # Well past one, and well past the 64 that used to stop it — the numbers
+        # are a rate, so the assertion is on the ORDER, not on a value.
+        @test all(>(64), counts)
+        # …and it stops when there is nothing to look at any more.
+        c.source.backend = :GLMakie
+        VE.seek!(p, 0); sleep(0.5)
+    finally
+        delete!(VE.BACKENDS, :FakeProgressiveBackend)
+        close(p)
+    end
+end
+
 @testset "Player opens a saved project" begin
     src = VideoSource(testvideo)
     seq = Sequence(src)

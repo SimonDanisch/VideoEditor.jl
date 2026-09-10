@@ -306,10 +306,10 @@ registercommand!(:add_scene, "Add a 3D scene"; category = :edit,
 
 # ------------------------------------------------------------------ baking
 
-registercommand!(:bake_clip, "Bake this clip…"; category = :effect,
-    keywords = ["render", "prerender", "cache", "freeze", "raytrace", "bake"],
+registercommand!(:bake_clip, "Rendering: preview and bake settings"; category = :effect,
+    keywords = ["render", "prerender", "cache", "freeze", "raytrace", "bake", "preview"],
     enabled = needsclip,
-    run = p -> openbakemodal!(p))
+    run = p -> openrendermodal!(p))
 
 registercommand!(:bake_toggle, "Use this clip's bake (on/off)"; category = :effect,
     keywords = ["bake", "prerender", "cache", "toggle"],

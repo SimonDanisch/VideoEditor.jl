@@ -69,7 +69,13 @@ mutable struct SceneSource <: ClipSource
     # can. A placeholder until scenes serialise themselves; see `buildscene`.
     build::Any
     backend::Symbol              # which renderer draws it live
-    theme::Dict{Symbol, Any}     # a backend's own settings, under its own name
+    # The renderer's own settings, as the keywords its screen takes — `px_per_unit`,
+    # `ssao`, RayMakie's `integrator`/`exposure`/`samples`. Passed straight to the
+    # screen constructor (and to `colorbuffer`/`record`), not keyed by backend name
+    # inside a theme: the settings belong to the call that uses them, and that call
+    # already knows which backend it is making. A Makie THEME — fonts, colours — is
+    # set where the scene is built, which is a different thing.
+    screenopts::Dict{Symbol, Any}
     width::Int
     height::Int
     framerate::Float64
@@ -91,7 +97,7 @@ mutable struct SceneSource <: ClipSource
     # backends is that the preview is cheap and the final render is not, and "how
     # many samples" is exactly the number that differs between them. Empty means
     # the bake draws with the live settings.
-    baketheme::Dict{Symbol, Any}
+    bakescreenopts::Dict{Symbol, Any}
     # Which of the two is being asked for right now. A field rather than an
     # argument because the render happens inside a graph pass, several calls below
     # whoever decided — `bakeclip!` sets it around its loop.
@@ -112,14 +118,14 @@ mutable struct SceneSource <: ClipSource
 end
 SceneSource(root; joints::Dict{Symbol, Any} = Dict{Symbol, Any}(), camera = nothing,
             build = nothing, backend::Symbol = :GLMakie,
-            theme::Dict{Symbol, Any} = Dict{Symbol, Any}(),
+            screenopts::Dict{Symbol, Any} = Dict{Symbol, Any}(),
             width::Integer = 1920, height::Integer = 1080,
             framerate::Real = 30.0, nframes::Integer = 90,
             bakewith::Symbol = :auto,
-            baketheme::Dict{Symbol, Any} = Dict{Symbol, Any}()) =
-    SceneSource(root, joints, camera, build, backend, theme, Int(width), Int(height),
+            bakescreenopts::Dict{Symbol, Any} = Dict{Symbol, Any}()) =
+    SceneSource(root, joints, camera, build, backend, screenopts, Int(width), Int(height),
                 Float64(framerate),
-                Int(nframes), nothing, -1, bakewith, baketheme, :live, 0, nothing, -1)
+                Int(nframes), nothing, -1, bakewith, bakescreenopts, :live, 0, nothing, -1)
 
 decodable(::SceneSource) = false
 sourcepath(::SceneSource) = ""

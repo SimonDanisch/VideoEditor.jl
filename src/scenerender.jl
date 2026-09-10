@@ -3,9 +3,9 @@
 # There is no per-backend method here and no extension package, because there is
 # nothing backend-specific to say. Makie already takes the renderer as a value
 # (`display(scene; backend = SomeModule)`) and already reads a backend's own
-# options out of the theme — `ScreenConfig`'s fields for RayMakie are exactly its
-# theme attributes (integrator, exposure, tonemap, gamma, device, …). So a scene
-# that carries a backend name and a theme carries everything the renderer needs,
+# options straight to the screen — `ScreenConfig`'s fields for RayMakie are exactly
+# its settings (integrator, exposure, tonemap, gamma, device, …). So a scene that
+# carries a backend name and those settings carries everything the renderer needs,
 # and this file just hands both over.
 #
 # That is why `SceneSpec.backend` is a Symbol: a project file has to name the
@@ -52,16 +52,47 @@ Pixels are 1:1 unless the scene says otherwise.
 
 A composited frame is measured in pixels, so a screen that applies HiDPI scaling
 silently returns a different size than asked for — measured, a (240, 180) canvas
-came back (261, 348). These are ordinary theme entries under the backend's name,
-so a spec that wants something else simply says so and wins the merge below.
+came back (261, 348). A scene that wants something else says so and wins the
+merge below.
 """
 const PIXELEXACT = Makie.Theme(GLMakie = (px_per_unit = 1.0, scalefactor = 1.0))
 
 """
+    coerceopt(backend, key, value) -> value
+
+A screen setting as the backend's `ScreenConfig` field wants it.
+
+A dialog text box and a project file both hold text, so a STRING is read against
+the field's declared type: a field that takes a `Symbol` gets one (`tonemap`),
+one that takes a number gets it parsed, and anything else is a Julia expression
+evaluated in the backend's own module — `integrator = "VolPath(samples=256)"`,
+`device = "CPU()"`. The expression is the only way a text box can carry an
+object, and it is what makes the dialogs reach everything `activate!` accepts
+rather than the numbers-and-flags subset. It is also why a backend registered
+with [`usebackend!`](@ref) must re-export what its settings name (RayMakie
+re-exports `VolPath` for exactly this).
+"""
+function coerceopt(backend::Module, key::Symbol, v)
+    v isa AbstractString || return v
+    s = strip(String(v))
+    isempty(s) && error("screen setting $key is an empty string — leave it out instead")
+    T = fieldtype(backend.ScreenConfig, key)
+    T === Any && return Base.eval(backend, Meta.parse(s))
+    types = T isa Union ? Base.uniontypes(T) : (T,)
+    String <: T && return s
+    s == "nothing" && Nothing <: T && return nothing
+    any(t -> t === Symbol, types) && return Symbol(s)
+    any(t -> t <: Real, types) && return tryparse(Float64, s)
+    return Base.eval(backend, Meta.parse(s))
+end
+
+"""
     backendscreen(backend, spec, canvas) -> screen
 
-An offscreen screen of `backend`, configured from `theme`, without touching the
-global theme.
+An offscreen screen of `backend`, configured from `opts` — the keywords that
+backend's `ScreenConfig` declares — without touching the global theme. Values
+that arrived as text (the dialog, a project file) are coerced against the
+field's type, see [`coerceopt`](@ref).
 
 Building under `Makie.with_theme(...)` — the usual way to pass a backend's screen
 options — is not safe here: this runs from the overlay's draw callback, during a
@@ -81,16 +112,28 @@ theme that is not theirs.
 `px_per_unit`/`scalefactor` are pinned to 1: a screen applying its HiDPI scale
 silently returns a different size than asked for — measured, a (300, 400) canvas
 came back (434, 579). A spec that says otherwise for this backend wins.
+
+`scene` is there for backends whose screen cannot be built without one:
+RayMakie offers `Screen(scene; screen_config…)` only. Where a scene-LESS
+constructor exists it is used, because GLMakie's scene-taking one goes through
+`singleton_screen` — the one window the editor's own figure is displayed on.
+Building a scene's screen that way empties the editor's window, and closing the
+scene's screen then closes the editor with it (measured: preview switched to
+RayMakie and back, the window was gone).
 """
 function backendscreen(backend::Module, canvas::NTuple{2, Integer};
-                       theme::Dict{Symbol, Any} = Dict{Symbol, Any}())
-    opts = Dict{Symbol, Any}(:visible => false, :px_per_unit => 1.0, :scalefactor => 1.0)
-    for (k, v) in get(theme, nameof(backend), Dict{Symbol, Any}())
-        opts[Symbol(k)] = v
-    end
-    # a backend that does not know one of these must not die of it
+                       opts::Dict{Symbol, Any} = Dict{Symbol, Any}(), scene)
+    o = Dict{Symbol, Any}(:visible => false, :px_per_unit => 1.0, :scalefactor => 1.0)
+    # A backend that does not know a key must not die of it — the bake dialog's
+    # overrides are merged over the preview's settings, and the two renderers
+    # rarely name the same ones.
     fields = fieldnames(backend.ScreenConfig)
-    filter!(kv -> kv[1] in fields || kv[1] === :visible, opts)
+    for (k, v) in opts
+        k = Symbol(k)
+        (k in fields || k === :visible) || continue
+        o[k] = k in fields ? coerceopt(backend, k, v) : v
+    end
+    opts = o
     # No renderloop behind this screen. A GLMakie screen starts one by default: an
     # `@async` task — sticky to the thread that made it, which is thread 1 — that
     # loops forever holding `with_context(screen.glscreen)` across its `sleep`.
@@ -99,17 +142,26 @@ function backendscreen(backend::Module, canvas::NTuple{2, Integer};
     #
     # Left running, that loop is a third task on thread 1 fighting for the one
     # current GL context, next to the editor's own renderloop and the scene render
-    # marshalled over by `onmainthread`. Measured on the lego project: playback of
+    # marshalled over by [`onthread`](@ref). Measured on the lego project: playback of
     # a 60 fps timeline with a scene over it ran at 11.2 / 11.6 / 11.6 fps across
     # three passes, with `dropped == 0` the whole time — the playhead keeps time
     # and the picture does not, which is what "janky" is.
     #
-    # `hasmethod(…, (:start_renderloop,))` rather than passing it blind: it is
-    # GLMakie's keyword, not every renderer's, and the same shape as `readfilm`
-    # asking whether a screen can accumulate.
-    hasmethod(backend.Screen, Tuple{}, (:start_renderloop,)) &&
-        return backend.Screen(; start_renderloop = false, opts...)
-    return backend.Screen(; opts...)
+    # `Base.kwarg_decl` rather than `hasmethod(…, (:start_renderloop,))`: a
+    # constructor ending in `screen_config...` claims EVERY keyword name to
+    # `hasmethod`, and RayMakie's would then swallow `start_renderloop` into its
+    # config. The question is whether the constructor declares it, not whether
+    # it accepts anything.
+    declaresstartrenderloop(types) =
+        any(m -> :start_renderloop in Base.kwarg_decl(m), methods(backend.Screen, types))
+    if hasmethod(backend.Screen, Tuple{})
+        declaresstartrenderloop(Tuple{}) &&
+            return backend.Screen(; start_renderloop = false, opts...)
+        return backend.Screen(; opts...)
+    end
+    declaresstartrenderloop(Tuple{Makie.Scene}) &&
+        return backend.Screen(scene; start_renderloop = false, opts...)
+    return backend.Screen(scene; opts...)
 end
 
 """
@@ -154,9 +206,11 @@ drawn on. Measured against a colour-threshold mask of the same frame the two
 agree on 99.6% of pixels, and where they differ it is the antialiased fringe,
 which depth correctly leaves out.
 
-Dispatch rather than a branch on the backend name: a renderer that carries real
-alpha — a raytracer knows a ray that hit nothing — adds its own method, and the
-render path above does not change.
+Dispatch rather than a branch on the backend name: a renderer whose picture
+cannot answer it from colour adds its own method, and the render path above does
+not change. A renderer whose picture carries REAL alpha — a raytracer knows a
+ray that hit nothing — adds nothing at all: `nothing` here lets that alpha
+through to the plane, which is the coverage already.
 """
 coverage(::Any) = nothing
 
@@ -205,7 +259,8 @@ out non-black over the footage, because dropping the alpha left the colour.
 `cov === nothing` means the renderer could not tell us, and the honest result is
 then fully covered — a scene that hides the frame is wrong, but inventing a mask
 from colour would key out the figure's own white parts, which is worse and much
-harder to see.
+harder to see. An image that carries its own alpha (a raytracer's, where a miss
+is transparent) simply keeps it: the conversion passes the channels through.
 """
 withalpha(img::AbstractMatrix, ::Nothing) = PlanePixel.(img)
 
@@ -286,7 +341,11 @@ mutable struct LiveScene
     canvas::NTuple{2, Int}
     backend::Symbol
     root::Any                      # the spec it was built from
-    theme::Dict{Symbol, Any}       # …and the settings its screen was opened with
+    opts::Dict{Symbol, Any}        # …and the settings its screen was opened with
+    # Screens a backend switch replaced, waiting to be closed between frames —
+    # see [`closeretired!`](@ref). `(backendname, screen)`, because which thread
+    # may close a screen is a property of the renderer that made it.
+    retired::Vector{Any}
 end
 
 """
@@ -332,40 +391,88 @@ clip's scene is realized once and animated by writing values onto it.
 """
 function livescene!(live::Union{Nothing, LiveScene}, root, canvas::NTuple{2, Integer},
                     backendname::Symbol, backend::Module;
-                    theme::Dict{Symbol, Any} = Dict{Symbol, Any}())
+                    opts::Dict{Symbol, Any} = Dict{Symbol, Any}())
     W, H = Int(canvas[1]), Int(canvas[2])
-    # The theme is part of it: a screen takes its settings at construction, so drawing
+    # The settings are part of it: a screen takes them at construction, so drawing
     # the same scene at another sample count is a different screen. That is what
     # makes switching between the live and the bake settings a rebuild and not a
     # value written onto something already open.
     if live !== nothing && live.canvas == (W, H) && live.backend === backendname &&
-       live.root === root && live.theme == theme
+       live.root === root && live.opts == opts
         return live
     end
-    live === nothing || (applicable(close, live.screen) && close(live.screen))
+    # The old screen is RETIRED, not closed here — see [`closeretired!`](@ref).
+    # This runs inside the frame the caller is producing, and closing a GLMakie
+    # screen destroys GL objects in a context the editor's own screen shares.
+    retired = live === nothing ? Any[] : Any[(live.backend, live.screen)]
     scene, target = realize(root, (W, H))
-    screen = backendscreen(backend, (W, H); theme = theme)
+    screen = backendscreen(backend, (W, H); opts = opts, scene)
     display(screen, scene)
-    return LiveScene(scene, screen, target, (W, H), backendname, root, theme)
+    return LiveScene(scene, screen, target, (W, H), backendname, root, opts, retired)
 end
 
 """
-    readfilm(screen, clear) -> image
+    closeretired!(live) -> nothing
+
+Close the screens a backend switch left behind, between frames.
+
+Switching a scene's renderer builds the new screen and hands the old one to
+`live.retired` instead of closing it on the spot. Closing it on the spot means
+destroying GL objects from inside the frame the caller is in the middle of
+producing, and a scene's GLMakie screen shares its context with the editor's own:
+measured, switching the preview renderer with the rendering dialog open, while a
+frame was being read back, drew the preview as blocks of unrelated memory — and a
+second run at the same moment span at 134 % CPU and never returned. Neither
+reproduced with the switch alone, the dialog alone, or the readback alone.
+
+Called from [`prerender!`](@ref), which is the defined point between frames: the
+caller is on thread 1 and nothing is mid-render.
+
+Each screen closes on the thread ITS renderer owns, not the one this frame renders
+on — a GLMakie screen torn down on the GPU worker dies with
+`ThreadAssertionError: Code must run on thread 1`.
+"""
+function closeretired!(live::LiveScene)
+    isempty(live.retired) && return nothing
+    for (backendname, screen) in live.retired
+        onthread(renderthread(getbackend(backendname))) do
+            applicable(close, screen) && close(screen)
+        end
+    end
+    empty!(live.retired)
+    return nothing
+end
+closeretired!(::Nothing) = nothing
+
+"""
+    readfilm(screen, clear; samples = nothing) -> image
 
 Read the screen's picture, accumulating into the film it already has when
 `clear = false` and the renderer can do that.
 
+`samples` is how many samples this read renders: 1 for the live preview — a
+playhead move must cost one sample, and standing still adds one at a time — and
+`nothing` for finished output (the bake, the export), which renders the
+integrator's full configured budget in one go. A renderer that takes `clear`
+but not `samples` is asked without it; one that takes neither renders as it
+always did.
+
 A path tracer's frame is a running average of samples: asking it for the picture
 without clearing adds more samples to what is there, which is what makes a live
 preview converge while the playhead stands still instead of costing its full
-budget on every frame. A rasteriser has nothing to accumulate and ignores it.
+budget on every frame. A rasteriser has nothing to accumulate and ignores both.
 
 Asked of the screen rather than branched on a backend name — and asked with
 `hasmethod`, not a dependency, because the renderer is registered at runtime
 (`usebackend!`) and this file must not know which ones exist.
 """
-function readfilm(screen, clear::Bool)
-    if hasmethod(Makie.colorbuffer, Tuple{typeof(screen), typeof(Makie.GLNative)}, (:clear,))
+function readfilm(screen, clear::Bool; samples::Union{Nothing, Integer} = nothing)
+    T = Tuple{typeof(screen), typeof(Makie.GLNative)}
+    if samples !== nothing && hasmethod(Makie.colorbuffer, T, (:clear, :samples))
+        return upright(Makie.colorbuffer(screen, Makie.GLNative;
+                                         clear = clear, samples = Int(samples)))
+    end
+    if hasmethod(Makie.colorbuffer, T, (:clear,))
         return upright(Makie.colorbuffer(screen, Makie.GLNative; clear = clear))
     end
     return upright(Makie.colorbuffer(screen, Makie.GLNative))
@@ -378,26 +485,32 @@ progressive(screen) =
 
 
 """
-    onmainthread(f) -> f()
+    onthread(f, tid; startwithin = 10.0) -> f()
 
-Run `f` on thread 1, from wherever this is called.
+Run `f` pinned to (0-based) thread `tid`, from wherever this is called.
 
-A scene clip is the one source that draws with the UI's own toolkit: GLMakie's
-screen belongs to thread 1 and asserts it (`ThreadAssertionError: Code must run
-on thread 1`), while the composite runs on whichever thread owns the render
-engine's Lava context — the pinned GPU worker in the usual case. So the two
-owners meet here, at the one operation that has both.
+A scene clip is the one source that draws with resources that belong to a
+thread: GLMakie's screen belongs to thread 1 and asserts it
+(`ThreadAssertionError: Code must run on thread 1`), a Lava-backed renderer's
+Vulkan context belongs to the pinned GPU worker's thread (a `BatchQueue` is
+single-writer) — and the composite runs on whichever thread owns the render
+engine, so caller and owner routinely differ. They meet here.
 
-Already on thread 1: straight through, no channel and no scheduler round trip —
-which is the export path, the bake and every headless test.
+Already on the right thread: straight through, no channel and no scheduler round
+trip — the export path, the bake and every headless test.
 
-Safe to call from the worker while thread 1 waits for it: the wait is a `take!`,
-which yields, so a task pinned to thread 1 runs while the caller is blocked.
+Safe to call while the owning thread waits for the caller: the wait is a
+`take!`, which yields, so a pinned task runs while its waiter is blocked.
+
+`startwithin` bounds how long the render may take to START. Nothing bounds how
+long it may then run — see the comment on the wait.
 """
-function onmainthread(f::Function)
-    Threads.threadid() == 1 && return f()
+function onthread(f::Function, tid::Int; startwithin::Real = 10.0)
+    Threads.threadid() == tid + 1 && return f()
     done = Channel{Any}(1)
+    started = Threads.Atomic{Bool}(false)
     t = Task() do
+        started[] = true               # …which is what the deadline below watches
         try
             put!(done, (true, f()))
         catch e
@@ -405,21 +518,28 @@ function onmainthread(f::Function)
         end
     end
     t.sticky = true
-    ccall(:jl_set_task_tid, Cint, (Any, Cint), t, 0)   # 0-based: thread 1
+    ccall(:jl_set_task_tid, Cint, (Any, Cint), t, tid)
     schedule(t)
-    # With a deadline: a bare `take!` waits for a task pinned to thread 1 to be
-    # scheduled, and thread 1 is where GLMakie's renderloop lives, holding
-    # `with_context` across its own `sleep`. If it never yields at a moment this
-    # task can take, the wait never ends and the editor freezes with nothing on
-    # screen to say why. The deadline turns that into a message naming the thread
-    # and the caller.
+    # The deadline covers STARTING, not running. The failure it exists for is the
+    # owning thread never yielding — it can be holding a renderloop's
+    # `with_context` across its own `sleep`, and then a pinned task scheduled onto
+    # it never runs, the wait never ends, and the editor freezes with nothing on
+    # screen to say why.
+    #
+    # Once the render is running there is no deadline at all, because a slow
+    # render is not that failure and never was: the first render of a scene builds
+    # its screen, compiles the renderer's shaders and loads its meshes, which took
+    # well over ten seconds on RayMakie's first frame. Timing that out aborted a
+    # render that was working, and the retry after it succeeded — which is what
+    # made the error look both alarming and harmless.
     t0 = time()
     while !isready(done)
-        time() - t0 > SCENEWAIT &&
-            error("a scene render waited $(SCENEWAIT)s to reach thread 1 and gave up. " *
-                  "Called from thread $(Threads.threadid()); thread 1 is where GLMakie's " *
-                  "screen and the editor's renderloop both live. Renders belong before " *
-                  "the graph runs (`prerender!`), where the caller is already on thread 1.")
+        (started[] || time() - t0 <= startwithin) ||
+            error("a scene render never started on thread $(tid + 1), which owns " *
+                  "the renderer's resources; that thread has not yielded in " *
+                  "$(startwithin)s. Called from thread $(Threads.threadid()). Renders " *
+                  "belong before the graph runs (`prerender!`), where the caller is " *
+                  "not waiting on the composite that waits for this.")
         sleep(0.001)
     end
     ok, val = take!(done)
@@ -427,13 +547,63 @@ function onmainthread(f::Function)
     return val
 end
 
-"""
-How long [`onmainthread`](@ref) waits to be let onto thread 1 before giving up.
+"Run `f` on thread 1, where GLMakie's screen and the editor's renderloop live."
+onmainthread(f::Function) = onthread(f, 0)
 
-Generous, because a cold scene builds its screen and loads its meshes on the first
-call, but finite, because the alternative is a frozen editor.
 """
-const SCENEWAIT = 10.0
+    onworkerthread(f) -> f()
+
+Run `f` on the LAST thread — the one the GPU worker pins itself to
+(`GPUWorker` in player.jl), and so the one Lava's Vulkan context belongs to.
+
+Called whether or not the worker exists yet: a context belongs to the thread
+that first touched it, and routing scene renders here either way keeps that
+thread the same — if no worker exists, this render is the first touch, and a
+worker created later pins itself here too.
+"""
+onworkerthread(f::Function) = onthread(f, Threads.nthreads() - 1)
+
+"""
+    renderthread(backend::Module) -> 0-based thread id
+
+The thread this renderer's screens may be touched from — building the screen,
+writing a frame's values onto its plots, reading the film.
+
+A renderer that draws through Lava — its module binds it (`import Lava`) —
+shares the one Vulkan context the GPU worker owns, so it renders on the worker's
+thread; anything else (GLMakie) renders on thread 1. Asked of the module with
+`isdefined`, not a name comparison: this file must not know which backends exist
+(see [`usebackend!`](@ref)).
+"""
+renderthread(backend::Module) = isdefined(backend, :Lava) ? Threads.nthreads() - 1 : 0
+
+"""
+    sharesdevice(clip) -> Bool
+
+Whether this clip draws through the same GPU device the preview's shared texture
+lives on — i.e. a scene rendered by a Lava-backed renderer.
+
+The GPU preview tier hands the composited canvas to GLMakie through a Vulkan image
+imported as a GL texture. Interleaving a Lava-backed scene render with the blit
+into that image leaves the image holding UNRELATED GPU MEMORY: measured by
+switching a scene clip's preview to RayMakie with the rendering dialog open, the
+preview drew blocks of noise while `player.frame[]` — the same composite, on the
+CPU — was pixel-correct, and one `showcpuframe!` put the correct picture back
+instantly. So it is neither the composite nor the upload; it is the shared image's
+contents.
+
+Asked of the renderer's module, like [`renderthread`](@ref), so this file still
+does not know which backends exist. An unregistered name is not a Lava renderer as
+far as this is concerned — it cannot render at all, and `sceneframe!` is where
+that gets reported.
+"""
+function sharesdevice(clip::Clip)
+    src = clip.source
+    src isa SceneSource || return false
+    name = renderwith(src)
+    haskey(BACKENDS, name) || return false
+    return isdefined(BACKENDS[name], :Lava)
+end
 
 """
     liveframe!(live; clear = true) -> Matrix{PlanePixel}
@@ -447,8 +617,9 @@ specs are the slower path for animation ("it needs to re-create plots often and
 needs to go over the whole plot tree"), and between frames a scene only ever
 changes values.
 """
-function liveframe!(live::LiveScene; clear::Bool = true)
-    img = readfilm(live.screen, clear)
+function liveframe!(live::LiveScene; clear::Bool = true,
+                    samples::Union{Nothing, Integer} = nothing)
+    img = readfilm(live.screen, clear; samples)
     return withalpha(img, coverage(live.screen))
 end
 
