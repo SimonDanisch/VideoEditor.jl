@@ -243,6 +243,11 @@ end
             # state here: one clip, frames 0:60 (2 s)
             clip = p.sequence.clips[1]
             @test VE.cliplength(clip) == 60
+            # The trim handle is found by PICKING, which reads the last rendered
+            # picking buffer — and this suite injects events without drawing. The
+            # running editor renders continuously, so this is the test's business,
+            # not the handler's.
+            Makie.colorbuffer(p.screen); sleep(0.2)
             moveto(tlx(1.0))                      # clip middle: no trim handle
             @test isempty(p.timeline.edgeline[])
             moveto(tlx(2.0))                      # right edge: handle bar shows
@@ -3195,6 +3200,56 @@ end
         @test Makie.over_content(card.header,
                                  Point2f(eb.origin[1] + eb.widths[1] / 2,
                                          eb.origin[2] + eb.widths[2] / 2))
+    finally
+        close(p)
+    end
+end
+
+# The trim handle was found by TIME alone, across every lane, and drawn from
+# y 0.02 to 0.86 — the whole stack. So hovering anywhere in the timeline's height
+# offered the edge of a clip two lanes down, and the bar marking it ran over every
+# other clip as well. `edgeat` now asks Makie which plot is under the cursor and
+# maps it back to its clip, so "which lane" is not a calculation at all.
+@testset "the trim handle belongs to one lane" begin
+    p = Player(testvideo; gpupreview = false)
+    try
+        sleep(1.5)
+        tl, seq = p.timeline, p.sequence
+        fps = seq.framerate
+        VE.snapshot!(p); VE.split!(seq, 60); VE.redraw!(p); sleep(0.5)
+        @test length(seq.clips) == 2
+        seq.clips[2].track = 2                      # …a second lane to be wrong about
+        VE.redraw!(p); sleep(0.8)
+        ntr = VE.ntracks(seq)
+        @test ntr == 2
+        ax = tl.axis
+        # picking reads the rendered picking buffer, so the frame has to exist
+        Makie.colorbuffer(p.screen); sleep(0.3)
+        mid(t) = (b = VE.trackband(seq, t, ntr); (b[1] + b[2]) / 2)
+        px(t, y) = Makie.project(ax.scene, Point2f(t, y)) .+ Makie.minimum(ax.scene.viewport[])
+
+        # the far edge of the clip on lane 2 exists only there
+        far = VE.clipend(seq.clips[2]) / fps
+        @test VE.edgeat(tl, px(far, mid(2))) !== nothing
+        @test VE.edgeat(tl, px(far, mid(1))) === nothing
+        # …and the near edge of the one on lane 1 likewise
+        near = seq.clips[1].start / fps
+        @test VE.edgeat(tl, px(near, mid(1))) !== nothing
+        @test VE.edgeat(tl, px(near, mid(2))) === nothing
+        # the middle of a clip is not an edge, however well it picks
+        @test VE.edgeat(tl, px((near + far) / 4, mid(1))) === nothing
+        # the scrub strip and the drop zone above the stack trim nothing
+        @test VE.edgeat(tl, px(far, 1.05)) === nothing
+        @test VE.edgeat(tl, px(far, 0.95)) === nothing
+
+        # …and the bar marking it spans that clip's lane, not the whole stack
+        VE.hoverat!(tl, far, mid(2), px(far, mid(2))); sleep(0.2)
+        lo, hi = VE.trackband(seq, 2, ntr)
+        ys = [pt[2] for pt in tl.edgeline[]]
+        @test length(ys) == 2
+        @test minimum(ys) ≈ lo && maximum(ys) ≈ hi
+        VE.hoverat!(tl, far, mid(1), px(far, mid(1))); sleep(0.2)
+        @test isempty(tl.edgeline[])
     finally
         close(p)
     end

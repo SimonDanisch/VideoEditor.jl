@@ -621,6 +621,18 @@ function dropclipview!(clip::Clip)
 end
 
 """
+    placetracks!(clip) -> nothing
+
+…said from `clips.jl`, where a clip's track is written and no timeline is in
+reach. A clip in no editor has no geometry to place.
+"""
+function placetracks!(clip::Clip)
+    player = editorof(clip)
+    player === nothing && return nothing
+    return placetracks!(player.timeline)
+end
+
+"""
     placetracks!(timeline) -> nothing
 
 The STACK\'s geometry changed — a track gained or lost, resized, soloed.
@@ -630,8 +642,9 @@ pass that goes looking: it is one quantity with N dependants, and the clips are
 the N. Called where that quantity is written — `settrackheight!`, `settrackedge!`,
 `solotrack!`, and `addclip!`/`removeclip!`, which can add or drop a lane.
 
-Where a single clip MOVES, nothing here runs: that is `placeclip!`, and it is
-called by the write itself (see `Clip`\'s `setproperty!`).
+A clip moving along its own lane does not come here — that is `placeclip!`, called
+by the write itself. A clip changing TRACK does, because it can add or drop a lane
+and every other clip's band is a share of the stack (see `Clip`\'s `setproperty!`).
 """
 function placetracks!(timeline::Timeline)
     seq = timeline.sequence
@@ -941,7 +954,7 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int};
             end
             isempty(timeline.selection[]) || (timeline.selection[] = UInt64[])
             timeline.selected[] = i === nothing ? UInt64(0) : seq.clips[i].id
-            edge = edgeat(timeline, t)
+            edge = edgeat(timeline, axis.scene.events.mouseposition[])
             if ispressed(axis.scene, Keyboard.left_control | Keyboard.right_control) && i !== nothing
                 clip = seq.clips[i]
                 timeline.dragclip = (clip, n - clip.start)
@@ -1026,7 +1039,7 @@ function wiretimelinemouse(timeline::Timeline, playhead::Observable{Int};
             n == playhead[] || (playhead[] = n)
         elseif inside
             mp = mouseposition(axis.scene)
-            hoverat!(timeline, mp[1], mp[2])
+            hoverat!(timeline, mp[1], mp[2], axis.scene.events.mouseposition[])
         end
         if inside
             t = clamp(mouseposition(axis.scene)[1], 0.0, seqduration(seq))
@@ -1055,6 +1068,10 @@ end
 "Half-width of the clip-edge trim grab zone, in seconds at the current zoom."
 edgezone(timeline::Timeline) = 12 / max(timeline.pps[], 1.0e-9)
 
+"How far from the cursor [`edgeat`](@ref) looks for a clip, in pixels — the same
+reach as the grab zone, so a press just outside a clip still finds it."
+const PICKRADIUS = 12
+
 """
     grabzone(timeline; px = 6) -> axis-y half-width of the lane-edge grip
 
@@ -1068,36 +1085,92 @@ function grabzone(timeline::Timeline; px::Real = 6)
 end
 
 """
-The trim edge within grab range of time `t`: `(clipindex, :left/:right)`, or
-`nothing`. Scans every clip's edges rather than starting from `clipat`, which
-misses the exact edge (the boundary frame belongs to the next clip) and presses
-just past the last clip. Where two edges coincide at a cut, the cursor's side
-picks the clip.
+    clipof(seq, plot) -> Clip | nothing
+
+The clip a picked plot belongs to. Picking hands back the leaf plot a recipe drew
+with, so this walks up the parents to the one a clip holds as its view.
 """
-function edgeat(timeline::Timeline, t::Real)
+function clipof(seq::Sequence, plot)
+    p = plot
+    while p isa Makie.Plot
+        for c in seq.clips
+            v = c.view
+            v === nothing || v.plot !== p || return c
+        end
+        p = p.parent
+    end
+    return nothing
+end
+
+"""
+    edgeat(timeline, xy) -> (clipindex, :left/:right) | nothing
+
+The trim edge within grab range of the window position `xy`, in pixels.
+
+Asks Makie which plot is there and maps it back to its clip, rather than looking
+for a clip whose numbers put it near the cursor. Everything the old scan had to
+reason about falls out of that: the lane is wherever the plot was drawn, a press
+just past a clip's end still finds it (picking searches a neighbourhood), and at a
+cut the clip under the cursor is the one whose edge you get — no tie-break on
+which side of the boundary the cursor sits.
+
+`pick_sorted`, not `pick`: keyframe lanes and the drag ghost are drawn OVER the
+clips, so the nearest plot is often not one. The first hit that belongs to a clip
+is the one being pointed at.
+
+Being near the clip is not being near its EDGE — that is asked of the span the
+clip's view was drawn with, which is the same span on screen.
+"""
+function edgeat(timeline::Timeline, xy)
     seq = timeline.sequence
-    fps = seq.framerate
-    zone = edgezone(timeline)
-    best = nothing
-    bestd = Inf
-    for (i, clip) in enumerate(seq.clips)
-        for (side, e) in ((:left, clip.start / fps), (:right, clipend(clip) / fps))
-            d = abs(t - e)
-            d <= zone || continue
-            better = d < bestd - 1.0e-12 ||
-                     (d <= bestd + 1.0e-12 && ((t < e) == (side === :right)))
-            better && (best = (i, side); bestd = d)
+    clip = pickclip(timeline, xy)
+    clip === nothing && return nothing
+    i = findfirst(c -> c === clip, seq.clips)
+    i === nothing && return nothing
+    x0, x1 = clip.view.range[]
+    # …from `xy`, not from the live cursor: the position asked about is the one
+    # answered about, which is also what lets a test say where it points.
+    t = Makie.to_world(timeline.axis.scene,
+                       Makie.screen_relative(timeline.axis.scene, Point2f(xy)))[1]
+    dl, dr = abs(t - x0), abs(t - x1)
+    min(dl, dr) <= edgezone(timeline) || return nothing  # on the clip, off its edges
+    return (i, dl <= dr ? :left : :right)
+end
+
+"""
+    pickclip(timeline, xy) -> Clip | nothing
+
+The clip drawn at window position `xy`, reaching [`PICKRADIUS`](@ref) pixels to
+either side ALONG THE TIME AXIS.
+
+Horizontally only, and by three point picks rather than one square neighbourhood:
+a square of twelve pixels also reaches into the lane above, so the drop zone over
+the stack offered the top clip's edge, and a point in an empty lane offered the
+edge of a clip one lane down. The reach exists for the other case — grabbing an
+edge from just outside the clip — and that one is horizontal by nature.
+
+`pick_sorted`, not `pick`: keyframe lanes and the drag ghost are drawn OVER the
+clips, so the nearest plot at a point is often not one.
+"""
+function pickclip(timeline::Timeline, xy)
+    seq = timeline.sequence
+    for dx in (0, -PICKRADIUS, PICKRADIUS)
+        at = Point2f(xy[1] + dx, xy[2])
+        for (plot, _) in Makie.pick_sorted(timeline.axis.scene, at, 1)
+            c = clipof(seq, plot)
+            c === nothing || return c
         end
     end
-    return best
+    return nothing
 end
 
 "Hover feedback: brighten the border of the clip under the cursor (the edge's
-clip when a trim handle is grabbable), and mark that edge with a handle bar.
+clip when a trim handle is grabbable), and mark that edge with a handle bar
+across that clip's lane.
 
-With `y`, a lane's top edge takes precedence and shows the resize grip instead,
-in the same order the press handler decides in."
-function hoverat!(timeline::Timeline, t::Real, y::Real)
+A lane's top edge takes precedence and shows the resize grip instead, in the same
+order the press handler decides in."
+function hoverat!(timeline::Timeline, t::Real, y::Real, xy)
     seq = timeline.sequence
     te = trackedgeat(seq, y, ntracks(seq); grab = grabzone(timeline))
     if te !== nothing
@@ -1105,11 +1178,7 @@ function hoverat!(timeline::Timeline, t::Real, y::Real)
         timeline.hovered[] == 0 || (timeline.hovered[] = 0; setstates!(timeline))
         return nothing
     end
-    return hoverat!(timeline, t)
-end
-
-function hoverat!(timeline::Timeline, t::Real)
-    edge = edgeat(timeline, t)
+    edge = edgeat(timeline, xy)
     i = edge !== nothing ? edge[1] :
         clipat(timeline.sequence, timelineframe(timeline, t))
     hovered = i === nothing ? UInt64(0) : timeline.sequence.clips[i].id
@@ -1126,10 +1195,15 @@ as the press handler."
 function edgemark!(timeline::Timeline, edge)
     pts = Point2f[]
     if edge !== nothing
-        clip = timeline.sequence.clips[edge[1]]
-        fps = timeline.sequence.framerate
-        e = edge[2] === :left ? clip.start / fps : clipend(clip) / fps
-        append!(pts, (Point2f(e, 0.02), Point2f(e, 0.86)))
+        seq = timeline.sequence
+        clip = seq.clips[edge[1]]
+        e = edge[2] === :left ? clip.start / seq.framerate : clipend(clip) / seq.framerate
+        # Across the clip's OWN lane. It used to run 0.02..0.86 — the whole stack
+        # of tracks — so the handle for a cut on one lane was drawn over every
+        # other lane as well, and read as belonging to whichever clip you were
+        # looking at.
+        lo, hi = trackband(seq, clip.track, ntracks(seq))
+        append!(pts, (Point2f(e, lo), Point2f(e, hi)))
     end
     (isempty(pts) && isempty(timeline.edgeline[])) || (timeline.edgeline[] = pts)
     return nothing

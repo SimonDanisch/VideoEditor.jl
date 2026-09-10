@@ -563,6 +563,16 @@ function Base.setproperty!(clip::Clip, name::Symbol, x)
         placeclip!(clip)
         retitle!(clip)   # …the panel header names the span
     end
+    # Moving a clip to another track can change how many tracks there ARE, and
+    # every lane's height is a share of the stack — so this is the one place a
+    # write to one clip moves all the others. Placing only the clip that changed
+    # left the rest drawn with the bands they had when there was one track fewer:
+    # clip 1 went on covering both lanes, and a press anywhere in its old height
+    # still found it.
+    name === :track && placetracks!(clip)
+    # …and the panel's bake row follows the field it reports on, for the same
+    # reason: a bake finishing, an undo, a project load all just write this.
+    name === :bake && showbake!(clip)
     return r
 end
 
