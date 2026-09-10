@@ -45,6 +45,7 @@ struct EffectKind
     activate::Any    # (ctx::EffectContext) -> nothing, or nothing
     deactivate::Any  # (ctx::EffectContext) -> nothing
     analysis::Bool
+    tool::Bool     # no home on a clip: opened from the menu, never in clip.effects
 end
 
 """
@@ -63,9 +64,10 @@ function EffectKind(name::Symbol, label::AbstractString;
                     params::Vector{FxParam} = FxParam[],
                     make = nothing, matches = nothing, read = nothing,
                     body = nothing, activate = nothing,
-                    deactivate = ctx -> nothing, analysis::Bool = false)
+                    deactivate = ctx -> nothing, analysis::Bool = false,
+                    tool::Bool = false)
     return EffectKind(name, String(label), String(description), params,
-                      make, matches, read, body, activate, deactivate, analysis)
+                      make, matches, read, body, activate, deactivate, analysis, tool)
 end
 
 """

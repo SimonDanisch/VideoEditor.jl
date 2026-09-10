@@ -3294,6 +3294,22 @@ end
         @test fx !== nothing && !isempty(fx.params)
         @test all(q -> q.range !== nothing, fx.params)   # every row is buildable
 
+        # …and ONLY that card. `sceneparamsections` asked whether the CLIP was a
+        # scene and never whether the entry was the one rendering it, so every
+        # other effect on a scene clip got the whole object list — and since
+        # `sceneparam!` mints what it cannot find, it wrote all of them onto that
+        # effect too. A Blur card read "229 parameters · 11 objects".
+        nscene = length(fx.params)
+        VE.addeffect!(p, :blur); sleep(0.8)
+        blur = VE.findslot(c, :blur)
+        @test blur !== nothing
+        @test [q.name for q in blur.params] == [:blur]      # its own, and nothing else
+        @test length(fx.params) == nscene                   # the scene kept its own
+        secs = VE.paramsections(c, blur)
+        @test length(secs) == 1 && isempty(secs[1].label) && length(secs[1].params) == 1
+        @test length(VE.paramsections(c, fx)) > 1           # the scene still groups
+        VE.removeeffect!(p, c, blur); sleep(0.4)
+
         # removing it puts the frame back exactly — the composite is not cumulative
         sel!(p, 1)
         VE.deleteclip!(p.sequence, c; ripple = false)

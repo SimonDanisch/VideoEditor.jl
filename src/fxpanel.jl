@@ -146,39 +146,24 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
           tellwidth = false)
 
     # One bake row per clip, for scenes and ordinary footage alike: the state
-    # ("no bake" / "in use" / "out of date") and the way to change it belong with
-    # the clip's effects rather than in a separate dialog.
+    # ("no bake" / "in use" / "out of date"), the on/off switch for it, and the
+    # rendering dialog — preview and bake settings are the same question at two
+    # timescales, so they share one dialog with two tabs.
     bakerow = GridLayout(panel[5, 1])
     bakelabel = Label(bakerow[1, 1], ""; halign = :left, fontsize = 10,
                       color = uicolors.text_muted, tellwidth = false)
     bakeuse = Button(bakerow[1, 2]; label = "use", width = 42, height = 18, fontsize = 10)
-    bakebtn = Button(bakerow[1, 3]; label = "Bake…", width = 58, height = 18, fontsize = 10)
+    bakebtn = Button(bakerow[1, 3]; label = "Rendering", width = 74, height = 18, fontsize = 10)
     player.fxwidgets[:bakebutton] = bakebtn
     player.fxwidgets[:bakeuse] = bakeuse
-    on(_ -> openbakemodal!(player), bakebtn.clicks)
+    on(_ -> openrendermodal!(player), bakebtn.clicks)
     on(bakeuse.clicks) do _
         runcommand!(player, :bake_toggle)
     end
-    function refreshbake()
-        loc = editclip(player)
-        clip = loc === nothing ? nothing : loc[1]
-        b = clip === nothing ? nothing : clip.bake
-        # Both buttons stay put: hiding one would move the row's layout while it
-        # is being read. The label says what there is to do, and the command
-        # refuses with a reason when there is nothing.
-        bakelabel.text[] =
-            clip === nothing ? "" :
-            b === nothing ? "no bake — the graph renders every frame" :
-            !b.enabled && bakestale(clip) ?
-                "bake switched off: the clip changed since · $(length(b.frames)) frames kept" :
-            !b.enabled ? "bake off · $(length(b.frames)) frames on disk" :
-            "bake in use · frames $(first(b.frames))–$(last(b.frames))"
-        bakeuse.label[] = b === nothing ? "—" : b.enabled ? "off" : "use"
-        return
-    end
-    player.fxwidgets[:bakerefresh] = refreshbake
-    on(_ -> refreshbake(), player.playhead)
-    refreshbake()
+    player.fxwidgets[:bakelabel] = bakelabel
+    player.fxwidgets[:bakerefresh] = () -> showbake!(player)
+    on(_ -> showbake!(player), player.playhead)
+    showbake!(player)
 
     # `measurable!`: a row with no content has no determinable height, and one such
     # row makes the whole panel indeterminable. That stretches it to fill the dock
@@ -404,6 +389,54 @@ function retitle!(clip::Clip)
     player = editorof(clip)
     (player === nothing || selectedclip(player) !== clip) && return nothing
     return retitle!(player)
+end
+
+"""
+    showbake!(player) -> nothing
+    showbake!(clip) -> nothing
+
+Put the clip's bake state into the panel's bake row: what there is, whether it is
+in use, and what the switch beside it would do.
+
+Driven from `Clip`'s `setproperty!` when `:bake` is written — the bake finishing,
+an undo restoring the one a clip had, a project load — rather than from those
+places one by one. The row was refreshed only by the playhead listener, so a
+finished bake left it reading "no bake — the graph renders every frame" until the
+playhead moved: no feedback at exactly the moment someone is watching that row for
+a result. The clip's own picture is separate and already follows (`showplayhead!`).
+"""
+function showbake!(player::Player)
+    bakelabel = get(player.fxwidgets, :bakelabel, nothing)
+    bakeuse = get(player.fxwidgets, :bakeuse, nothing)
+    (bakelabel === nothing || bakeuse === nothing) && return nothing
+    # `clip.bake` is written by `bakeclip!`, which runs on the pinned worker, and
+    # a Label's text reaches GLMakie's screen — thread 1's. The queue is the
+    # editor's one way across, and it is closed with the player.
+    if Threads.threadid() != 1
+        isopen(player.uiqueue) && put!(player.uiqueue, () -> showbake!(player))
+        return nothing
+    end
+    loc = editclip(player)
+    clip = loc === nothing ? nothing : loc[1]
+    b = clip === nothing ? nothing : clip.bake
+    # Both buttons stay put: hiding one would move the row's layout while it
+    # is being read. The label says what there is to do, and the command
+    # refuses with a reason when there is nothing.
+    bakelabel.text[] =
+        clip === nothing ? "" :
+        b === nothing ? "no bake — the graph renders every frame" :
+        !b.enabled && bakestale(clip) ?
+            "bake switched off: the clip changed since · $(length(b.frames)) frames kept" :
+        !b.enabled ? "bake off · $(length(b.frames)) frames on disk" :
+        "bake in use · frames $(first(b.frames))–$(last(b.frames))"
+    bakeuse.label[] = b !== nothing && b.enabled ? "off" : "use"
+    return nothing
+end
+
+function showbake!(clip::Clip)
+    player = editorof(clip)
+    player === nothing && return nothing
+    return showbake!(player)
 end
 
 """
@@ -634,14 +667,27 @@ function withtoolslots!(build::Function, player::Player, ctx::EffectContext, gri
                  player.fxwidgets, :toolslots)
     cards = get!(() -> (Dict{Symbol, Any}(), contentscene(player), Any[]),
                  player.fxwidgets, :toolcards)
-    gl = GridLayout(gridpos)
-    slots[1][ctx.tool] = measurable!(GridLayout(gl[1, 1]))
-    slots[2][ctx.tool] = measurable!(GridLayout(gl[2, 1]))
-    cards[1][ctx.tool] = measurable!(GridLayout(gl[3, 1]))
+    # Every one of these SPANS the card. A GridLayout reports its content's width
+    # and is centred in its cell, so a slot holding rows that do not report one —
+    # a status label, a list row, anything `tellwidth = false` — shrank to the
+    # widest child that did: the matte panel drew its list in a 20 px column with
+    # "frame 0" clipped to "n". `fill!` is the whole statement, made where the
+    # slot is created rather than in each tool that builds into one.
+    # …and the COLUMN gets the width too. A tool's controls are built as
+    # `Button(slot[r, 1]; tellwidth = false, width = Relative(1.0))` — "as wide as
+    # my column", by a widget that tells the column nothing. In an `Auto` column
+    # that is circular and resolves to one pixel, which is what every action
+    # button in a tool card was.
+    span!(g) = (g.width[] = Makie.Relative(1.0); g.halign[] = :left;
+                colsize!(g, 1, Makie.Relative(1.0)); g)
+    gl = span!(GridLayout(gridpos))
+    slots[1][ctx.tool] = span!(measurable!(GridLayout(gl[1, 1])))
+    slots[2][ctx.tool] = span!(measurable!(GridLayout(gl[2, 1])))
+    cards[1][ctx.tool] = span!(measurable!(GridLayout(gl[3, 1])))
     # …and one below the cards, for the action that acts on the whole list: "Apply
     # matte to clip" above the marked frames reads as a control for something
     # further up.
-    slots[3][ctx.tool] = measurable!(GridLayout(gl[4, 1]))
+    slots[3][ctx.tool] = span!(measurable!(GridLayout(gl[4, 1])))
     # The four slots sit nearly flush. GridLayout's default rowgap of 16 is ~48 px
     # of empty band under every tool card's header, paid whether or not the slots
     # below hold anything. The content separates itself (a card has padding,
@@ -922,8 +968,16 @@ function toolonlycard!(player::Player, toolgl, row::Integer, kind, uicolors)
     return card, ctx
 end
 
-"Kinds the Effects panel must render on their own — a body, but no effect to hang it on."
-toolonlykinds() = filter(k -> k.body !== nothing && k.make === nothing, effectkinds())
+"""
+Kinds the Effects panel must render on their own — a card with no home on a
+clip, opened from the menu.
+
+Declared (`tool = true`), not inferred: "a body and no `make`" also describes the
+`:scene` kind, whose body belongs INSIDE the clip's own card — inferring the
+shape put a "Scene" entry in the Add-effect menu whose card had no clip to
+describe.
+"""
+toolonlykinds() = filter(k -> k.tool, effectkinds())
 
 """
 The kind behind a stack entry: from its payload where it has one, by name where it
@@ -1387,7 +1441,15 @@ or made when the card was last open — is reused, so its curve is never lost.
 function paramsections(target, fx::Effect)
     secs = sceneparamsections(target, fx)
     secs === nothing || return secs
-    rest = Param[q for q in fx.params if q.range !== nothing]
+    # The ones the KIND declares, not everything the entry happens to carry. A
+    # Blur on a scene clip used to be handed the scene's two hundred parameters —
+    # and `sceneparam!` does not only read them, it MINTS them onto the effect, so
+    # projects saved since carry them. Filtering here is what stops such an entry
+    # from drawing a scene's object list in a Blur card.
+    k = kindbyname(fx.kind)
+    declared = k === nothing ? nothing : Set{Symbol}(p.name for p in k.params)
+    rest = Param[q for q in fx.params
+                 if q.range !== nothing && (declared === nothing || q.name in declared)]
     return isempty(rest) ? NamedTuple[] :
            NamedTuple[(label = "", detail = "", params = rest)]
 end
@@ -1400,11 +1462,17 @@ The sections a scene clip's card shows, or `nothing` when the target is not one.
 `nothing` rather than an empty list, so "not a scene" and "a scene not built yet"
 stay different answers; the second is what a clip returns before it has rendered
 once.
+
+Both halves are asked: the clip has to BE a scene, and the entry has to be the one
+that renders it. Asking only the clip gave every effect on a scene clip the whole
+object list — a Blur card headed "229 parameters · 11 objects" — and because
+[`sceneparam!`](@ref) mints what it does not find, it wrote all of them onto that
+Blur as well.
 """
 sceneparamsections(::Any, ::Effect) = nothing
 
 function sceneparamsections(clip::Clip, fx::Effect)
-    clip.source isa SceneSource || return nothing
+    (fx.kind === :scene && clip.source isa SceneSource) || return nothing
     out = NamedTuple[]
     for obj in sceneattributes(clip.source)
         ps = Param[sceneparam!(fx, r) for r in obj.rows if r.kind === :number]
