@@ -104,10 +104,12 @@ mutable struct Player <: Editor
     # `endmattebrush!` puts it on the undo stack, so one stroke is one step and an
     # abandoned one costs nothing.
     mattebrush::Any
-    # The matte brush's radius, as a fraction of the matte's width. A field
-    # because it is per-editor state a user adjusts constantly ([ and ]), and
-    # because painting with a size you cannot see or change is guesswork.
-    brushradius::Float64
+    # The matte brush's radius, in PIXELS of the canvas being painted on. Not a
+    # fraction of the frame width: the same fraction is a different brush in every
+    # project, and at the old floor (0.4%) it was still 8 px across on a 1080-wide
+    # canvas and could not go finer. An Observable because the ring on the preview
+    # and the number in the panel are both derived from it — see `setbrushradius!`.
+    const brushradius::Observable{Float64}
     analysisbackend::Any  # KA backend for analysis/GPU playback; set by auto-detect
     const fig::Figure
     const previewaxis::Axis
@@ -676,7 +678,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                     Observable("no matte"), Observable("no restoration"),
                     Dict{UInt64, Dict{Int, Matrix{UInt8}}}(),
                     Dict{UInt64, Dict{Int, Matrix{UInt8}}}(),
-                    nothing, 0.04,
+                    nothing, Observable(24.0),
                     analysisbackend,
                     fig, ax, Ref(false),
                     Observable(Point2f[]),
@@ -1354,7 +1356,16 @@ function showframe!(player::Player, n::Integer; standin::Bool = !atrest(player))
                 # another as soon as the layers differed in size.
                 cw, ch = canvassize(player.sequence)
                 player.lastcrop = (0.0, 0.0, 1.0, 1.0)
-                coverlimits!(player, 0, cw, ch, 0)
+                # …when the canvas is a different SIZE, and only then — the same
+                # rule `applycrop!` follows on the other tier. Writing the limits
+                # on every present threw away the user's zoom at every frame: the
+                # live matte preview publishes a frame per painted point, so a
+                # stroke zoomed the preview out from under the cursor and then put
+                # the paint where the pointer now was, which is somewhere else.
+                if (cw, ch) != player.lastcanvas
+                    player.lastcanvas = (cw, ch)
+                    coverlimits!(player, 0, cw, ch, 0)
+                end
                 return true
             end
         end
@@ -2819,7 +2830,7 @@ function wirecroptool(player::Player)
             if event.action == Mouse.press && is_mouseinside(ax.scene)
                 beginmattebrush!(player, event.button == Mouse.left) || return Consume(false)
                 mattebrushto!(player, Point2f(mouseposition(ax.scene));
-                              radius = player.brushradius)
+                              radius = player.brushradius[])
                 return Consume(true)
             elseif event.action == Mouse.release && player.mattebrush !== nothing
                 endmattebrush!(player)
@@ -2839,16 +2850,20 @@ function wirecroptool(player::Player)
     end
     on(events(ax.scene).mouseposition) do _
         mine() || return Consume(false)
-        # Show (or hide) the brush footprint. Diameter in screen pixels, from the
-        # radius' fraction of the matte width and the preview's width, so the
-        # circle is the size the stroke will be at any zoom.
+        # Show (or hide) the brush footprint. The radius is in canvas pixels, so
+        # the ring's diameter on screen is that times how many screen pixels one
+        # canvas pixel currently covers — which is the zoom. Scaling it by the
+        # viewport width instead drew a ring that stayed put while the stroke it
+        # promised grew with every zoom step.
         bp = get(player.fxwidgets, :brushpos, nothing)
         if bp !== nothing
             vp = ax.scene.viewport[]
             if brushing() && editclip(player) !== nothing
                 bp[] = Point2f(mouseposition(ax.scene))
+                fl = ax.finallimits[]
+                scale = fl.widths[1] > 0 ? vp.widths[1] / fl.widths[1] : 1.0
                 player.fxwidgets[:brushsize][] =
-                    Float32(2 * player.brushradius * vp.widths[1])
+                    Float32(2 * player.brushradius[] * scale)
             else
                 bp[] = Point2f(NaN, NaN)
             end
@@ -2856,7 +2871,8 @@ function wirecroptool(player::Player)
         if player.mattebrush !== nothing
             # Direction comes from the stroke, not from the mouse right now — see
             # `beginmattebrush!`.
-            mattebrushto!(player, Point2f(mouseposition(ax.scene)); radius = player.brushradius)
+            mattebrushto!(player, Point2f(mouseposition(ax.scene));
+                          radius = player.brushradius[])
             return Consume(true)
         end
         anchor = player.cropanchor
@@ -2880,21 +2896,18 @@ they must agree: the cursor ring on the preview and the percentage in the panel
 are both derived from this field, so a caller that set it directly would move the
 brush and leave one of the two showing the old size.
 
-Steps are the caller's, and geometric by convention: at 1% a fixed step is half
-the brush and at 20% it is nothing, so the same gesture has to mean the same
-proportion.
+Steps are the caller's, and geometric by convention: a fixed step is half the
+brush at the fine end and nothing at the coarse one, so the same gesture means
+the same proportion wherever you are.
 """
 function setbrushradius!(player::Player, r::Real)
-    player.brushradius = clamp(Float64(r), 0.004, 0.4)
-    bp = get(player.fxwidgets, :brushsize, nothing)
-    bp === nothing ||
-        (bp[] = Float32(2 * player.brushradius *
-                        player.previewaxis.scene.viewport[].widths[1]))
-    setstatus!(player, "matte brush $(round(100 * player.brushradius; digits = 1))% " *
-                       "of the frame width")
-    # the panel prints the number too, and only rebuilds when asked
-    refreshmattepanel!(player)
-    return player.brushradius
+    player.brushradius[] = clamp(Float64(r), 1.0, 500.0)
+    setstatus!(player, "matte brush $(round(Int, player.brushradius[])) px radius")
+    # No panel rebuild. The panel's number is DERIVED from this observable, and
+    # rebuilding the card to print a changed integer meant every press of ± tore
+    # down and rebuilt the whole matte card — which is what made resizing the
+    # brush feel like the slowest control in the editor.
+    return player.brushradius[]
 end
 
 """
@@ -3076,7 +3089,7 @@ function wirekeys(player::Player)
             # steps, not linear: at 1% a fixed step is half the brush and at 20%
             # it is nothing, so the same key has to mean the same PROPORTION.
             f = event.key == Keyboard.right_bracket ? 1.25 : 0.8
-            setbrushradius!(player, player.brushradius * f)
+            setbrushradius!(player, player.brushradius[] * f)
         elseif event.key == Keyboard.c && ispress &&
                ispressed(player.fig, Keyboard.left_control | Keyboard.right_control)
             copyclips!(player)          # before bare `c`, which is the crop tool

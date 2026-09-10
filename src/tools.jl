@@ -104,7 +104,7 @@ to Blur.
 registertool!(name::Symbol, label::AbstractString, description::AbstractString;
               activate, deactivate = ctx -> nothing, panel = ctx -> nothing) =
     registereffect!(EffectKind(name, label; description, body = panel,
-                               activate, deactivate, analysis = true))
+                               activate, deactivate, analysis = true, tool = true))
 
 "Every kind that has a card body or an action of its own — not a list of what is
  on screen. The Effects panel renders a kind's body inside its effect's card, or
@@ -435,7 +435,15 @@ function toolcard!(build::Function, ctx::ToolContext; caption::AbstractString = 
     entry = (; id, frame, im = nothing, lbl, onclick = nothing, rm, box = nothing,
              blocks, tool = ctx.tool)
     push!(cards, entry)
-    build(GridLayout(g[2, 1]; alignmode = Makie.Outside(8, 8, 6, 8)), blocks)
+    # The title bar and the body meet; each brings its own inset (the header's
+    # `Outside`, the body's below). GridLayout's default 18 px between them put a
+    # band of card background under every caption that belonged to neither.
+    rowgap!(g, 0)
+    # …and the body's rows sit at the same rhythm as the pills inside them, rather
+    # than at the default that made "+ object" float away from the list it adds to.
+    body = GridLayout(g[2, 1]; alignmode = Makie.Outside(8, 8, 6, 8))
+    rowgap!(body, 6)
+    build(body, blocks)
     return entry
 end
 
@@ -2041,7 +2049,7 @@ Forget one frame's repair. The pixels stay until the matte is re-run — see
 function dropmatterepair!(player::Player, clip::Clip, srcframe::Integer)
     snapshot!(player)
     delete!(matterepairs(player, clip), Int(srcframe))
-    refreshmattepanel!(player; structure = true)
+    refreshmattepanel!(player)
     setstatus!(player, "matte: repair on frame $srcframe forgotten — re-run the " *
                        "matte to put the propagated frame back")
     return nothing
@@ -2067,6 +2075,10 @@ function matteviewrow!(ctx::ToolContext)
                 width = Makie.Relative(1.0), buttoncolor = v === :sam2 ? MATTECOLORS[2] : off)
     on(_ -> setmatteview!(player, :matte), b1.clicks)
     on(_ -> setmatteview!(player, :sam2), b2.clicks)
+    # Reachable, so the toggle can write them. Which of the two is lit is the
+    # only thing a view switch changes on this card, and two colours are two
+    # colours — see `setmatteview!`.
+    player.fxwidgets[:matteviewbuttons] = (matte = b1, sam2 = b2, off = off)
     # Exactly one entry, like every other control helper: the next control's row
     # is `length(ctx.controls) + 1`, so pushing the two buttons as well left rows
     # 3 and 4 empty — and an empty row makes the whole layout indeterminate, which
@@ -2096,7 +2108,7 @@ function brushrow!(ctx::ToolContext)
     colors = player.fxwidgets[:uicolors]
     Label(row[1, 1], "Alt+drag paints · right erases"; fontsize = 10,
           color = colors.text_muted, halign = :left, tellwidth = false)
-    pct = round(Int, 100 * player.brushradius)
+
     # The hint stays muted, being a sentence read once. The ± are controls
     # and are drawn as controls: at `text_muted` on a transparent fill they were
     # as quiet as the sentence next to them and read as decoration, the same way
@@ -2104,12 +2116,17 @@ function brushrow!(ctx::ToolContext)
     minus = Button(row[1, 2]; label = "−", fontsize = 12, width = 22, height = 22,
                    buttoncolor = (:transparent, 0.0), strokewidth = 1,
                    strokecolor = (colors.text, 0.45), labelcolor = colors.text)
-    Label(row[1, 3], "$(pct)%"; fontsize = 10, color = colors.text, tellwidth = true)
+    # DERIVED from the radius, not printed into a card that has to be rebuilt to
+    # change: `setbrushradius!` writes the observable and this follows. The
+    # registration goes on the context, which unhooks it with the card.
+    sizetext, reg = derive(r -> "$(round(Int, r)) px", player.brushradius)
+    push!(ctx.handlers, reg)
+    Label(row[1, 3], sizetext; fontsize = 10, color = colors.text, tellwidth = true)
     plus = Button(row[1, 4]; label = "+", fontsize = 12, width = 22, height = 22,
                   buttoncolor = (:transparent, 0.0), strokewidth = 1,
                   strokecolor = (colors.text, 0.45), labelcolor = colors.text)
-    on(_ -> setbrushradius!(player, player.brushradius / 1.25), minus.clicks)
-    on(_ -> setbrushradius!(player, player.brushradius * 1.25), plus.clicks)
+    on(_ -> setbrushradius!(player, player.brushradius[] / 1.25), minus.clicks)
+    on(_ -> setbrushradius!(player, player.brushradius[] * 1.25), plus.clicks)
     # One entry, like `matteviewrow!` — see the note there about empty rows.
     push!(ctx.controls, row)
     return (minus, plus)
@@ -2331,18 +2348,29 @@ function beginmattebrush!(player::Player, foreground::Bool)
     clip, srcframe = loc
     m = matteframe(clip, srcframe)
     m === nothing && (setstatus!(player, "matte: nothing to paint into — run the matte first"); return false)
+    # One snapshot per STROKE, taken here at the press. `docsnapshot` already
+    # carries `matterepairs`, so painting was undoable in every respect except
+    # that nobody wrote the undo entry — a stroke could not be taken back at all,
+    # and on a matte that is the edit you most want to retry. Per point it would
+    # be a hundred entries for one gesture; per stroke is what a brush means.
+    snapshot!(player)
     # `foreground` is fixed for the stroke's whole length. Re-reading the mouse on
     # every move would flip add to erase mid-stroke on a stray second button.
     player.mattebrush = (clip, Int(srcframe), m, foreground)
     return true
 end
 
-function mattebrushto!(player::Player, p; radius::Real = 0.04)
+function mattebrushto!(player::Player, p; radius::Real = 24)
     br = player.mattebrush
     br === nothing && return false
     clip, srcframe, mask, foreground = br
     nx, ny = previewtomatte(player, clip, srcframe, p)
-    brushmatte!(mask, nx, ny, foreground; radius)
+    # `radius` is in CANVAS pixels — what the user sees and sets. `brushmatte!`
+    # wants a fraction of the mask's width, and the mask has its own resolution
+    # (a matte is not stored at the canvas size), so the fraction is what carries
+    # the size across the two.
+    W = max(size(player.frame[], 1), 1)
+    brushmatte!(mask, nx, ny, foreground; radius = radius / W)
     # Shown by writing the live track, not by committing: the picture has to
     # follow the brush, and the document must not.
     repairframe!(clip, srcframe, mask)
@@ -2483,7 +2511,7 @@ function removematte!(player::Player)
     i = findfirst(s -> renderable(s) && op(s) isa MatteEffect, clip.effects)
     i === nothing || removeslotat!(clip, i)
     player.matteinfo[] = "no matte"
-    refreshmattepanel!(player; structure = true)
+    refreshmattepanel!(player)
     showplayhead!(player)
     setstatus!(player, "matte removed")
     return nothing
@@ -2566,6 +2594,9 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
     col    = live ? mattecollect(player) : nothing
     ids    = col === nothing ? Int[] : mattecardobjects(col)
     pillwidgets = Any[]
+    pilllayoutref = Base.RefValue{Any}(nothing)
+    outerref = Base.RefValue{Any}(nothing)
+    pillrowref = Base.RefValue{Int}(0)
     newobjbtn = Ref{Any}(nothing)
 
     card = toolcard!(ctx; caption = "frame $seedframe",
@@ -2579,41 +2610,16 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
             # `measurable!`: an empty nested layout has no determinable height, and
             # one such cell makes the whole card indeterminate.
             pills = measurable!(GridLayout(g[r += 1, 1]))
+            pilllayoutref[] = pills; outerref[] = g; pillrowref[] = r
             for (k, id) in enumerate(ids)
-                n = count(q -> q[4] == id, col.points)
-                # lit = where the next click lands (`object`), not `selected`,
-                # which is the isolate-its-dots toggle. A fresh session and a
-                # fresh `+ object` both light their pill at once, so pressing it
-                # visibly did something before any point exists.
-                sel = col.object == id
-                base = mattecolor(id)
-                fill = Makie.lerp_oklab(RGBf(Makie.to_color(colors.background)), base,
-                                        sel ? 0.55 : 0.16)
-                pill = Button(pills[k, 1]; label = "$n point$(n == 1 ? "" : "s")",
-                              fontsize = 11, height = PILLHEIGHT, tellwidth = false,
-                              width = Makie.Relative(1.0), cornerradius = PILLRADIUS,
-                              buttoncolor = fill,
-                              buttoncolor_hover = Makie.lerp_oklab(RGBf(Makie.to_color(colors.background)),
-                                                                   base, 0.35),
-                              buttoncolor_active = base,
-                              labelcolor = sel ? RGBf(0.09, 0.09, 0.10) : colors.text,
-                              strokewidth = sel ? 2 : 1,
-                              strokecolor = sel ? base : (base, 0.4))
-                on(_ -> selectmatteobject!(player, id), pill.clicks)
-                bx = Button(pills[k, 2]; label = "×", fontsize = 11, width = 22,
-                            height = PILLHEIGHT,
-                            buttoncolor = (:transparent, 0.0), strokewidth = 0,
-                            labelcolor = colors.text_muted,
-                            buttoncolor_hover = Makie.lerp_oklab(RGBf(Makie.to_color(colors.background)),
-                                                                 RGBf(1, 0.4, 0.35), 0.35))
-                on(_ -> deletematteobject!(player, id), bx.clicks)
-                push!(blocks, pill, bx)
-                push!(pillwidgets, (; object = id, pill, remove = bx))
+                push!(pillwidgets,
+                      buildmattepill!(player, pills, k, id, col, colors, blocks))
             end
             colsize!(pills, 1, Makie.Auto(false, 1.0))
-            # Set the gap rather than assume one: `rowsize!` below computes the
-            # outer row from it, and the default is not 4.
-            rowgap!(pills, PILLGAP)
+            # The × belongs to the pill beside it. At the default 18 px it sat in
+            # a lane of its own with a dead band between, reading as a control for
+            # the list rather than for that row.
+            colgap!(pills, 4)
 
             # UNDER the pills, because that is where the thing it makes appears.
             # Further clicks on a subject REFINE it — that is what SAM 2 does with
@@ -2635,18 +2641,20 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
                             strokewidth = 1, strokecolor = (colors.text, 0.45),
                             labelcolor = colors.text,
                             buttoncolor_hover = colors.surface)
+            # Set the gap rather than assume one: `rowsize!` below computes the
+            # outer row from it, and the default is not 4.
+            #
+            # AFTER the `+ object` row exists. `rowgap!` sets the gaps a layout has
+            # at that moment, so setting it while only the pills were there left
+            # the new row with the default 18 — while `pillrowsize` went on
+            # computing with 4. The card was then 14 px too short and its own
+            # bottom edge cut through the button.
+            rowgap!(pills, PILLGAP)
             # …which makes the row one taller than the object count. Without an
             # explicit height the nested layout reported one row's worth however
             # many it held, and everything below was laid over what did not fit.
             rowsize!(g, r, pillrowsize(length(ids) + 1))
-            on(newobj.clicks) do _
-                c = mattecollect(player)
-                c === nothing && return setstatus!(player, "matte: mark a subject first")
-                c.object = (isempty(c.points) ? 0 : maximum(q[4] for q in c.points)) + 1
-                c.selected = c.object
-                refreshmattepanel!(player; structure = true)
-                setstatus!(player, "matte: object $(c.object) — click the next subject")
-            end
+            on(_ -> addmatteobject!(player), newobj.clicks)
             push!(blocks, newobj)
         else
             # Not the frame being marked: the way back to it. `gotomatteseed!`
@@ -2661,6 +2669,13 @@ function matteseedcard!(ctx::ToolContext, clip::Clip, seedframe::Integer, live::
     end
     return (; clip, srcframe = Int(seedframe), live,
             nobj = length(ids), pills = pillwidgets,
+            # The LAYOUTS, not just the widgets: adding an object puts a row into
+            # `pilllayout`, and the block that holds it has to be re-measured
+            # (`outer`, `pillrow`) because its height is set explicitly — see
+            # `pillrowsize`. Without these a new pill had nowhere to go and the
+            # whole card was rebuilt to make room for one button.
+            pilllayout = pilllayoutref[], outer = outerref[], pillrow = pillrowref[],
+            colors,
             # `newobj` is published for the same reason `pills` is — everything on
             # this card should be addressable by a test, a walkthrough or MCP. It
             # was the one control that MAKES a pill and the one that could not be
@@ -2691,7 +2706,7 @@ function removematteseed!(player::Player, clip::Clip, frame::Integer)
     else
         setstatus!(player, "matte: frame $frame un-marked — Apply to propagate from the rest")
     end
-    refreshmattepanel!(player; structure = true)
+    refreshmattepanel!(player)
     showplayhead!(player)
     return nothing
 end
@@ -2701,7 +2716,11 @@ function setmatteview!(player::Player, v::Symbol)
     mattecardview(player)[] = v
     col = mattecollect(player)
     col === nothing || showmatteview!(col)
-    refreshmattepanel!(player; structure = true)
+    b = get(player.fxwidgets, :matteviewbuttons, nothing)
+    if b !== nothing
+        b.matte.buttoncolor = v === :matte ? MATTECOLORS[2] : b.off
+        b.sam2.buttoncolor = v === :sam2 ? MATTECOLORS[2] : b.off
+    end
     setstatus!(player, v === :sam2 ? "matte view: SAM 2 segmentation" : "matte view: matte")
     return nothing
 end
@@ -2710,10 +2729,15 @@ end
 function selectmatteobject!(player::Player, obj::Integer)
     col = mattecollect(player)
     col === nothing && return setstatus!(player, "matte: nothing being marked")
+    was = col.object
     col.selected = col.selected == obj ? 0 : Int(obj)
     col.object = col.selected == 0 ? col.object : Int(obj)   # further clicks refine this one
     refreshmattedots!(col)
-    refreshmattepanel!(player; structure = true)
+    # Two pills change colour, so two pills are written: the one that was lit and
+    # the one that is now. The card is the same card — nothing about its shape
+    # changed — and rebuilding it also lost the click arriving mid-rebuild.
+    mattepillstyle!(col, was)
+    mattepillstyle!(col, col.object)
     setstatus!(player, col.selected == 0 ? "matte: no object selected" :
                        "matte: object $obj selected — clicks refine it")
     return nothing
@@ -2734,7 +2758,8 @@ function deletematteobject!(player::Player, obj::Integer)
     end
     refreshmattedots!(col)
     isempty(col.points) ? clearlivematte!(col) : livematte!(col)
-    refreshmattepanel!(player; structure = true)
+    dropmatteobjectrow!(player, obj)
+    mattepillstyle!(col, col.object)   # …whichever one inherits the clicks
     setstatus!(player, "matte: object $obj removed")
     return nothing
 end
@@ -2755,31 +2780,6 @@ function gotomatteseed!(ctx::ToolContext, clip::Clip, seedframe::Integer)
     return nothing
 end
 
-"""
-Repaint the card's picture and caption where they stand.
-
-A checkbox must not rebuild the dock: the rebuild deletes and recreates every
-tool's blocks, and a second click arriving mid-rebuild lands on a block that is
-being replaced — one toggle in four was simply lost. Only the image and the
-caption depend on the toggles, and both are observables.
-"""
-function repaintmattecard!(player::Player)
-    w = get(player.fxwidgets, :mattecard, nothing)
-    w === nothing && return false
-    loc = editclip(player)
-    # a different clip needs a different card, not a repaint
-    (loc === nothing || loc[1] !== w.clip) && return false
-    col = mattecollect(player)
-    (col === nothing || col.clip !== w.clip || col.srcframe != w.srcframe) && return false
-    # …and so does a new object: it brings its own pill, which a repaint cannot add
-    ids = mattecardobjects(col)
-    length(ids) == w.nobj || return false
-    for p in w.pills
-        n = count(q -> q[4] == p.object, col.points)
-        p.pill.label[] = "$n point$(n == 1 ? "" : "s")"
-    end
-    return true
-end
 
 """
 Warm the propagation model once, while the user is still choosing where to click.
@@ -3026,10 +3026,173 @@ function startmattepick!(ctx::ToolContext)
                                      "kept; press the card's picture to go back")
         return nothing
     end)
-    put!(player.uiqueue, () -> refreshmattepanel!(player; structure = true))
+    put!(player.uiqueue, () -> refreshmattepanel!(player))
     return nothing
 end
 
+
+"""
+    addmatteobject!(player) -> nothing
+
+Start marking a new object: it becomes the one clicks land in, and its pill row
+is built onto the card.
+
+The `+ object` button moves down to make room and the pill block is re-measured,
+because its height is explicit (see [`pillrowsize`](@ref)). Rebuilding the card
+for this used to be the only way a new pill appeared.
+"""
+function addmatteobject!(player::Player)
+    col = mattecollect(player)
+    col === nothing && return setstatus!(player, "matte: mark a subject first")
+    was = col.object          # …read BEFORE it moves, or the pill that was lit
+                              # never gets told it no longer is
+    col.object = (isempty(col.points) ? 0 : maximum(q[4] for q in col.points)) + 1
+    col.selected = col.object
+    w = get(player.fxwidgets, :mattecard, nothing)
+    if w !== nothing && w.pilllayout !== nothing
+        k = length(w.pills) + 1
+        push!(w.pills, buildmattepill!(player, w.pilllayout, k, col.object, col,
+                                       w.colors, nothing))
+        w.newobj === nothing || (w.pilllayout[k + 1, 1] = w.newobj)
+        rowgap!(w.pilllayout, PILLGAP)
+        rowsize!(w.outer, w.pillrow, pillrowsize(k + 1))
+    end
+    # the pill that was lit no longer is
+    mattepillstyle!(col, was)
+    setstatus!(player, "matte: object $(col.object) — click the next subject")
+    return nothing
+end
+
+"""
+    dropmatteobjectrow!(player, id) -> nothing
+
+Take object `id`'s pill row off the card and close the gap it leaves.
+
+The rows below move up: that is what a list does when an item leaves, not a pass
+that goes looking for what changed.
+"""
+function dropmatteobjectrow!(player::Player, id::Integer)
+    w = get(player.fxwidgets, :mattecard, nothing)
+    (w === nothing || w.pilllayout === nothing) && return nothing
+    i = findfirst(p -> p.object == id, w.pills)
+    i === nothing && return nothing
+    Makie.delete!(w.pills[i].pill)
+    Makie.delete!(w.pills[i].remove)
+    deleteat!(w.pills, i)
+    for (k, p) in enumerate(w.pills)
+        w.pilllayout[k, 1] = p.pill
+        w.pilllayout[k, 2] = p.remove
+    end
+    n = length(w.pills)
+    w.newobj === nothing || (w.pilllayout[n + 1, 1] = w.newobj)
+    rowgap!(w.pilllayout, PILLGAP)
+    rowsize!(w.outer, w.pillrow, pillrowsize(n + 1))
+    return nothing
+end
+
+"""
+    buildmattepill!(player, pills, k, id, col, colors, blocks) -> NamedTuple
+
+One object's row in the pill list: the pill itself and the × that drops it.
+
+Its own function because a row is made in two places — when the card is drawn and
+when [`addmatteobject!`](@ref) adds one — and a list whose rows are built two
+different ways drifts.
+"""
+function buildmattepill!(player::Player, pills, k::Integer, id::Integer,
+                         col::MatteCollect, colors, blocks)
+    n = count(q -> q[4] == id, col.points)
+    # lit = where the next click lands (`object`), not `selected`, which is the
+    # isolate-its-dots toggle. A fresh session and a fresh `+ object` both light
+    # their pill at once, so pressing it visibly did something before any point
+    # exists.
+    c = mattepillcolors(colors, id, col.object == id)
+    pill = Button(pills[k, 1]; label = "$n point$(n == 1 ? "" : "s")",
+                  fontsize = 11, height = PILLHEIGHT, tellwidth = false,
+                  width = Makie.Relative(1.0), cornerradius = PILLRADIUS,
+                  buttoncolor = c.fill, buttoncolor_hover = c.hover,
+                  buttoncolor_active = c.active, labelcolor = c.label,
+                  # Only the lit pill is outlined. A hairline around every one of
+                  # them stepped visibly at the corners and added nothing: the
+                  # fill already says which object this is, so the outline is free
+                  # to mean "this is the one your clicks land in".
+                  strokewidth = c.strokewidth, strokecolor = c.stroke)
+    on(_ -> selectmatteobject!(player, id), pill.clicks)
+    # …and its × is part of the row, not a grey glyph floating beside it: same
+    # height, same corner, a fill from the same family. It keeps its own cell so a
+    # press lands on exactly one of the two.
+    bx = Button(pills[k, 2]; label = "×", fontsize = 11, width = 24,
+                height = PILLHEIGHT, cornerradius = PILLRADIUS, strokewidth = 0,
+                buttoncolor = c.removefill, labelcolor = colors.text_muted,
+                buttoncolor_hover = Makie.lerp_oklab(RGBf(Makie.to_color(colors.background)),
+                                                     RGBf(1, 0.4, 0.35), 0.35))
+    on(_ -> deletematteobject!(player, id), bx.clicks)
+    blocks === nothing || push!(blocks, pill, bx)
+    return (; object = Int(id), pill, remove = bx)
+end
+
+"""
+    mattepillcolors(colors, id, lit) -> NamedTuple
+
+How object `id`'s pill is drawn, in one place: `lit` is the object further clicks
+land in. Both the build and [`mattepillstyle!`](@ref) read it, so a pill that is
+restyled cannot drift from one that was just made.
+"""
+function mattepillcolors(colors, id::Integer, lit::Bool)
+    base = mattecolor(id)
+    bg = RGBf(Makie.to_color(colors.background))
+    return (fill = Makie.lerp_oklab(bg, base, lit ? 0.55 : 0.16),
+            hover = Makie.lerp_oklab(bg, base, 0.35),
+            active = base,
+            label = lit ? RGBf(0.09, 0.09, 0.10) : colors.text,
+            strokewidth = lit ? 2 : 0,
+            stroke = lit ? base : (base, 0),
+            removefill = Makie.lerp_oklab(bg, base, 0.10))
+end
+
+"""
+    mattepillstyle!(col, id) -> nothing
+
+Redraw object `id`'s pill for whether it is the one clicks land in.
+
+Called where that changes — [`selectmatteobject!`](@ref) — for the pill that lost
+it and the one that gained it. Nothing else looks: two buttons change colour, so
+two buttons are written.
+"""
+function mattepillstyle!(col::MatteCollect, id::Integer)
+    w = get(col.ctx.player.fxwidgets, :mattecard, nothing)
+    w === nothing && return nothing
+    i = findfirst(p -> p.object == id, w.pills)
+    i === nothing && return nothing
+    c = mattepillcolors(col.ctx.player.fxwidgets[:uicolors], id, col.object == id)
+    b = w.pills[i].pill
+    b.buttoncolor = c.fill
+    b.labelcolor = c.label
+    b.strokewidth = c.strokewidth
+    b.strokecolor = c.stroke
+    return nothing
+end
+
+"""
+    mattepilllabel!(col, object) -> nothing
+
+Write the point count onto that object's pill.
+
+Called wherever a point joins or leaves an object, which is the moment that
+object's count changes. The pill is on the card's own record
+(`fxwidgets[:mattecard]`), so the label is written there and then — nothing has to
+notice it afterwards. This replaced `repaintmattecard!`, which walked every pill
+on the card asking each one whether its number had moved.
+"""
+function mattepilllabel!(col::MatteCollect, object::Integer)
+    w = get(col.ctx.player.fxwidgets, :mattecard, nothing)
+    w === nothing && return nothing
+    i = findfirst(p -> p.object == object, w.pills)
+    i === nothing && return nothing
+    n = count(q -> q[4] == object, col.points)
+    w.pills[i].pill.label[] = "$n point$(n == 1 ? "" : "s")"
+    return nothing
+end
 
 """
 Add one marked point and re-matte this frame — or take one away.
@@ -3059,12 +3222,15 @@ function addmattepoint!(col::MatteCollect, p, foreground::Bool;
             q = mattetopreview(player, col.clip, col.srcframe, col.points[i])
             (q[1] - p[1])^2 + (q[2] - p[2])^2 <= hit^2
         end : nothing
+    touched = col.object
     if ondot === nothing
         push!(col.points, (nx, ny, foreground, col.object))
     else
+        touched = col.points[ondot][4]
         deleteat!(col.points, ondot)
     end
     refreshmattedots!(col)
+    mattepilllabel!(col, touched)
     # `live = false` while painting: the model runs once when the stroke ends,
     # not once per point laid down.
     live && (isempty(col.points) ? clearlivematte!(col) : livematte!(col))
@@ -3074,8 +3240,10 @@ end
 "Drop the most recently marked point."
 function dropmattepoint!(col::MatteCollect)
     isempty(col.points) && return nothing
+    touched = last(col.points)[4]
     pop!(col.points)
     refreshmattedots!(col)
+    mattepilllabel!(col, touched)
     isempty(col.points) ? clearlivematte!(col) : livematte!(col)
     return nothing
 end
@@ -3406,21 +3574,17 @@ end
 
 
 """
-Bring the matte UI up to date.
+Rebuild the matte card, because what it CONTAINS has changed shape.
 
-`structure = true` when the card's CONTENT has to change shape (a matte was
-removed, marking was active, another object was added) — that is the only case
-worth rebuilding it. Everything else is a repaint of the card that is already
-there: a rebuild recreates the card's blocks and its scene plots, and it throws
-the user's scroll position away, which turns "click a checkbox" into "scroll back
-down to the card again".
-
-One card, not the panel. It used to bump the effect registry's version, which
-rebuilt every card of every kind on the clip — because that was the only signal
-the stack listened to.
+Every remaining caller is a place where the card gained or lost a row: a matte
+appeared, an object was added, a marking session opened. Each of those should
+instead have a function that makes the change and builds or drops that row, the
+way `addslot!` builds an effect's card; this exists until they all do. It is not a
+refresh — nothing calls it to find out whether something moved.
+`repaintmattecard!`, which did exactly that, is gone: a point now writes its own
+pill's label (see [`mattepilllabel!`](@ref)).
 """
-function refreshmattepanel!(player::Player; structure::Bool = false)
-    (structure || !repaintmattecard!(player)) || return nothing
+function refreshmattepanel!(player::Player)
     loc = editclip(player)
     loc === nothing && return nothing
     clip = loc[1]
@@ -3574,7 +3738,9 @@ registereffect!(EffectKind(:crop, "Crop";
     # No `make`/`matches`: crop is not an effect in the stack. `clip.crop` is a
     # field, and the canvas is the sequence's — so this kind is a card and a
     # gesture, and `addablekinds` correctly leaves it out of the Add-effect menu.
-    activate = ctx -> usetool!(ctx.player, :crop)))
+    # A TOOL: the card has no home on a clip and is opened from the menu —
+    # unlike the scene kind, whose body rides on the clip's own `:scene` entry.
+    activate = ctx -> usetool!(ctx.player, :crop), tool = true))
 
 # One kind: the parameters that tune the matte and the card that produces it.
 # Split across two registries these were two entries with the same name — a

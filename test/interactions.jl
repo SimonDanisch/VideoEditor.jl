@@ -1875,6 +1875,22 @@ end
             VE.dropmatterepair!(p, clip, sf)                 # …and the record drops
             @test isempty(VE.matterepairs(p, clip))
 
+            # A painted STROKE is one undo entry. `docsnapshot` carried the
+            # repairs all along and `docrestore!` put them back — but nothing in
+            # the paint path ever took a snapshot, so a stroke could not be taken
+            # back at all, on the one edit you most want to retry.
+            n0 = length(p.undostack)
+            @test VE.beginmattebrush!(p, true)
+            @test length(p.undostack) == n0 + 1               # …one, at the press
+            W, H = size(p.frame[])
+            VE.mattebrushto!(p, Point2f(W / 2, H / 2); radius = 24)
+            VE.mattebrushto!(p, Point2f(W / 2 + 3, H / 2); radius = 24)
+            @test length(p.undostack) == n0 + 1               # …not one per point
+            VE.endmattebrush!(p)
+            @test !isempty(VE.matterepairs(p, clip))
+            VE.undo!(p); sleep(0.3)
+            @test isempty(VE.matterepairs(p, clip))           # …and Ctrl+Z takes it back
+
             clip.mattetrack = nothing
             VE.docrestore!(p, snap0)
             empty!(VE.matterepairs(p, clip))
@@ -1948,21 +1964,24 @@ end
         @testset "the matte brush has a size you can see and change" begin
             # Painting with a fixed, invisible radius is guesswork — the gesture
             # exists but you cannot tell where the brush is or how big.
-            @test p.brushradius ≈ 0.04
-            r0 = p.brushradius
+            # In PIXELS of the canvas. A fraction of the frame width is a
+            # different brush in every project, and its floor was still 8 px
+            # across on a 1080-wide canvas.
+            @test p.brushradius[] ≈ 24.0
+            r0 = p.brushradius[]
             keypress(Keyboard.right_bracket); sleep(0.1)
-            @test p.brushradius > r0
+            @test p.brushradius[] > r0
             keypress(Keyboard.left_bracket); sleep(0.1)
-            @test p.brushradius ≈ r0                    # ] then [ returns
+            @test p.brushradius[] ≈ r0                  # ] then [ returns
             # Geometric, so one key is the same PROPORTION at any size: a fixed
-            # step is half the brush at 1% and nothing at 20%.
-            p.brushradius = 0.004
+            # step is half the brush at the fine end and nothing at the coarse one.
+            p.brushradius[] = 1.0
             keypress(Keyboard.left_bracket); sleep(0.1)
-            @test p.brushradius ≈ 0.004                 # clamped, not below
-            p.brushradius = 0.4
+            @test p.brushradius[] ≈ 1.0                 # clamped, not below
+            p.brushradius[] = 500.0
             keypress(Keyboard.right_bracket); sleep(0.1)
-            @test p.brushradius ≈ 0.4                   # …and not above
-            p.brushradius = 0.04
+            @test p.brushradius[] ≈ 500.0               # …and not above
+            p.brushradius[] = 24.0
 
             # The kernel honours the radius it is given, so the cursor and the
             # stroke cannot disagree about size.
