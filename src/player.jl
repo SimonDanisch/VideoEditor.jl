@@ -464,13 +464,20 @@ function Player(path::AbstractString; capacity::Integer = 64,
     # an explicit GPU analysis backend implies GPU playback — `gpupreview = false` opts out
     wantgpu = gpupreview === true || (gpupreview === nothing && !(backend isa KA.CPU))
     wantgpu && backend isa KA.CPU &&
-        error("gpupreview = true requires a GPU backend, e.g. Player(path; analysisbackend = LavaBackend(), gpupreview = true)")
+        error("gpupreview = true requires a GPU backend, e.g. Player(path; analysisbackend = Mantle.defaultbackend(), gpupreview = true)")
     # a project path opens the saved edit instead of a video
     isproject = endswith(lowercase(path), ".videoedit")
     sequence = isproject ? loadproject(path) : Sequence(VideoSource(path))
     isempty(sequence.clips) && error("project has no clips: $path")
     source = sequence.clips[1].source
-    pools = Dict{Any, SourcePool}(source => SourcePool(source; capacity))
+    # Seeded only for a VIDEO source. A pool is decode state, and a scene has
+    # nothing to decode — it is rendered. `pool` already says so by dispatching
+    # on `::VideoSource`, so every LATER source was handled; this one line
+    # assumed the first clip was footage, and a project made of scene clips
+    # alone — two raytraced layers, which is exactly what compositing them is
+    # for — could not be opened at all.
+    pools = Dict{Any, SourcePool}()
+    source isa VideoSource && (pools[source] = SourcePool(source; capacity))
 
     frame = Observable(zeros(RGB{N0f8}, source.width, source.height))
     playhead = Observable(0)
@@ -3252,12 +3259,16 @@ end
 
 "Set the window's mouse cursor (`:arrow`, `:crosshair`, `:hand`, `:hresize`, or
 `:scissor`); no-op when headless."
-function setcursor!(player::Player, shape::Symbol)
-    screen = player.screen
-    screen === nothing && return nothing
+setcursor!(player::Player, shape::Symbol) = setcursor!(player.screen, shape)
+
+# No GLFW window to set a cursor on: no screen yet, a headless GLMakie screen, or
+# a RayMakie screen, whose window belongs to `Mantle.Window` — which has no cursor
+# verb yet, and is where one belongs.
+setcursor!(::Union{Nothing, Makie.MakieScreen}, ::Symbol) = nothing
+
+function setcursor!(screen::GLMakie.Screen{GLMakie.GLFW.Window}, shape::Symbol)
     GLFW = GLMakie.GLFW
     win = screen.glscreen
-    win isa GLFW.Window || return nothing   # a headless screen has no cursor to set
     cur = get!(CURSORS, shape) do
         shape === :scissor  ? GLFW.CreateCursor(scissor_bitmap(), (12, 3)) :
         shape === :hresize  ? GLFW.CreateStandardCursor(GLFW.RESIZE_EW_CURSOR) :

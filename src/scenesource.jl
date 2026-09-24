@@ -95,6 +95,26 @@ function takepending!(src::SceneSource, sf::Integer)
 end
 
 """
+One scene render at a time, per process.
+
+Two tasks reach here — the frame the caller is producing and whatever the ui
+queue is draining — and on a Mantle backend both record into the SAME submit
+channel. A channel's hold frames are a STACK, pushed by `acquire!` and popped by
+the submission, which is only correct while recordings nest. Interleaved they do
+not: the inner submission pops the outer's frame, and the outer's next `hold!`
+throws `no recording is open on this channel` from inside a render that was
+otherwise fine.
+
+`onthread` does not prevent it. When the caller is already on the render thread
+it runs INLINE, and when it is not it waits in a `sleep` loop — which yields, so
+the other task runs on the same thread and interleaves anyway.
+
+Held across the whole render, not just the emit: building the screen and writing
+the frame's values both record too.
+"""
+const SCENELOCK = ReentrantLock()
+
+"""
     sceneframe!(src, spec, dims; exact = false) -> Matrix{RGBA{N0f8}}
 
 One frame of the scene, at `dims`.
@@ -118,7 +138,7 @@ function sceneframe!(src::SceneSource, clip::Clip, dims::Tuple{Int, Int};
     # film back.
     name = renderwith(src)
     backend = getbackend(name)
-    img = onthread(renderthread(backend)) do
+    img = lock(SCENELOCK) do; onthread(renderthread(backend)) do
         # The bake backend is a different renderer, so it is a different standing
         # scene: `livescene!` rebuilds when the backend changes, which is exactly
         # what switching modes is.
@@ -131,7 +151,7 @@ function sceneframe!(src::SceneSource, clip::Clip, dims::Tuple{Int, Int};
         # frame's picture into this one and the animation would smear.
         liveframe!(src.live; clear = src.samples == 0,
                    samples = exact ? nothing : 1)
-    end
+    end; end
     src.samples += 1
     return img
 end
@@ -547,7 +567,16 @@ update below and the pass body above cannot disagree about it.
 """
 function scenepicture!(st, dims::Tuple{Int, Int}; exact::Bool = false)
     img = takepending!(st.source, st.served[])
-    return img === nothing ? sceneframe!(st.source, st.clip, dims; exact) : img
+    img === nothing || return img
+    # Settle the frame first. `sceneframe!` draws whatever `src.at` currently
+    # says, and reaching here means the prerender did not match the frame being
+    # composited — so `at` is some other frame, and drawing it would put the
+    # scene one pose out of step with the layers under it.
+    #
+    # `updatesource!` also resets the sample count, so the film is cleared rather
+    # than accumulating this pose on top of the last one.
+    updatesource!(st.source, st.clip, st.served[])
+    return sceneframe!(st.source, st.clip, dims; exact)
 end
 
 # …and that is what `sourcepicture!` answers for a scene clip. `update!` asks it
