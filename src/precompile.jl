@@ -21,14 +21,14 @@ gone. It is `include`d last for the other half of that rule: a workload has to
 come after everything it calls is defined.
 
 Sharing `DNNKernels.KERNELS_VERSION` with the networks is the point rather than an
-accident: the editor and the models both broadcast over `LavaArray`s, and one
+accident: the editor and the models both broadcast over device arrays, and one
 frozen entry serves both.
 """
 
 # Only the workload below needs the matte propagator — the editor itself takes
 # whatever `registermatte!` was handed (see matte.jl).
 import MatAnyoneRunner
-using Lava: @setup_workload, @compile_workload
+using Mantle: @setup_workload, @compile_workload
 
 """`DNNKernels.KERNELS_VERSION` — one generation for the whole runtime. Read
 through `SAM2Runner` (already a dependency, and it defines the constant as
@@ -82,20 +82,20 @@ function runeditorframe(seq, engine, readers, dest, n::Integer)
     return dest
 end
 
-# The editor's only `__init__`, and this is what it exists for: point Lava at the
+# The editor's only `__init__`, and this is what it exists for: point the runtime at the
 # frozen cache the workload below fills, before anything asks for a kernel.
 function __init__()
-    Lava.use_frozen_kernels(KERNELS_VERSION)
+    Mantle.use_frozen_kernels(KERNELS_VERSION)
     # Install the matte propagator here, and never from the workload below. The
     # workload's closure has already run, so its `modelref` holds a built model —
-    # and a built model holds `LavaArray`s whose `VkContext` belongs to the
+    # and a built model holds device arrays whose context belongs to the
     # *precompilation* process. `registermatte!` writes a module global, so that
     # gets serialised into the package image and every matte call at runtime then
-    # drives a dead device: `sync_access!` sees a `BatchQueue` from another
+    # drives a dead device: `sync_access!` sees a `SubmitChannel` from another
     # context and refuses, and before that guard existed it was a segfault inside
     # vkQueueSubmit2 during `warmmatte!`. `matanyonepropagator` builds its model
     # on first use, so registering a fresh one costs nothing at load.
-    MATTEPROPAGATOR[] = nothing     # drop anything an older image baked in
+    INSTALLED.matte = nothing     # drop anything an older image baked in
     # `assetdir()` can reach `ensure_artifact_installed`, so this could in
     # principle download at load. It does not in practice: the workload below
     # resolves the same asset during precompilation, and `sam2ready()` does the
@@ -119,7 +119,7 @@ end
     asset = editorassets()
     if isfile(asset)
         try
-            backend = LavaBackend()
+            backend = Mantle.defaultbackend()
             src = VideoSource(asset)
             seq = Sequence(src)
             engine = FxEngine(backend)
@@ -202,7 +202,7 @@ end
                 end
 
                 # …and camera stabilization, the one expensive GPU path that was
-                # Not traced here. Its first run compiles the Lava feature and
+                # Not traced here. Its first run compiles the GPU feature and
                 # flow kernels: `record_demo.jl` warms it off-camera and puts it
                 # at "~30 s on first use", which a user pays as a dead editor on
                 # the first "Stabilize clip" — the same first-click stall the

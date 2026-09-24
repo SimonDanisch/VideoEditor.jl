@@ -20,10 +20,9 @@ Install the look model. `f(img) -> Array{Float32,4}` takes one host RGB frame an
 returns a `(D, D, D, 3)` table. Pluggable for the same reason the depth and
 restoration models are: the editor has to run with it absent.
 """
-const LOOKMODEL = Ref{Any}(nothing)
 
-registerlook!(f) = (LOOKMODEL[] = f; nothing)
-haslookmodel() = LOOKMODEL[] !== nothing
+registerlook!(f) = (INSTALLED.look = f; nothing)
+haslookmodel() = INSTALLED.look !== nothing
 
 """
 The built-in look model: NeuralLUT, from `NeuralLUTRunner`.
@@ -33,13 +32,12 @@ because the table is stored on the clip and belongs in a project file — a
 device-resident LUT could not be saved, and would be on the wrong device the
 moment `autodetectgpu!` upgrades the backend under it.
 """
-const NEURALLUT = Ref{Any}(nothing)
 
 function neurallutlook(img)
-    if NEURALLUT[] === nothing
-        NEURALLUT[] = NeuralLUTRunner.neurallut(; backend = Lava.LavaBackend())
+    if INSTALLED.neurallut === nothing
+        INSTALLED.neurallut = NeuralLUTRunner.neurallut(; backend = Mantle.defaultbackend())
     end
-    return Array(NeuralLUTRunner.predictlut(NEURALLUT[], img))
+    return Array(NeuralLUTRunner.predictlut(INSTALLED.neurallut, img))
 end
 
 """
@@ -61,7 +59,7 @@ that produces a look for a frame nobody will ever see.
 """
 function analyzelook!(clip::Clip, img::AbstractMatrix{<:AbstractRGB})
     haslookmodel() || error("no look model installed — see registerlook!")
-    lut = LOOKMODEL[](img)
+    lut = INSTALLED.look(img)
     ndims(lut) == 4 && size(lut, 4) == 3 ||
         error("a look must be (D, D, D, 3), got $(size(lut))")
     clip.look = Array{Float32, 4}(lut)
@@ -105,14 +103,15 @@ function applylook!(out, img, lut, strength::Real)
 end
 
 "`out = (1-s)·img + s·out`, pointwise, where `out` already holds the graded frame."
-@kernel function lookmix_kernel!(out, @Const(img), s::Float32)
+@kernel function lookmix_kernel!(out, @Const(img), sp)
     I = @index(Global, Cartesian)
     @inbounds begin
+        s = paramvalue(sp)
         a = out[I]
         b = img[I]
         q = 1.0f0 - s
         # `topixel`, not the validating `RGB{N0f8}(::Float32, …)` — the latter's
-        # error path builds a message with `repr`, and Lava rejects the whole
+        # error path builds a message with `repr`, and the shader compiler rejects the whole
         # kernel for the string allocation, so this compiled on the CPU and could
         # never have run on the GPU it was written for.
         out[I] = topixel(eltype(out),

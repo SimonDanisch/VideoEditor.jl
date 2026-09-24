@@ -110,7 +110,7 @@ end
 GPU thumbnail worker: decodes through its OWN small [`GpuVideoStream`](@ref)
 (never evicting the playback ring) and area-averages on-device — only the tiny
 finished thumb crosses to the host. Every GPU touch goes through `cache.gpurun`
-(the player's pinned worker — Lava is single-writer). Falls back to the CPU
+(the player's pinned worker — the submit channel is single-writer). Falls back to the CPU
 loop when the stream won't open.
 """
 const THUMBLOG = Tuple{Symbol, Int, Int, Float64}[]
@@ -122,10 +122,10 @@ function gputhumbloop(cache::ThumbnailCache)
         # `long`: cold this compiles decode + convert + downscale — warm them all
         # here, so the per-thumb jobs below stay bounded and presents interleave
         cache.gpurun() do
-            stream = openstream(LavaBackend(), source.path, source.width, source.height;
+            stream = openstream(Mantle.defaultbackend(), source.path, source.width, source.height;
                                 vrambudget = 2^30)
-            dev = KA.allocate(LavaBackend(), RGB{N0f8}, (source.width, source.height))
-            thumbdev = KA.allocate(LavaBackend(), RGB{N0f8}, (cache.thumbwidth, cache.thumbheight))
+            dev = KA.allocate(Mantle.defaultbackend(), RGB{N0f8}, (source.width, source.height))
+            thumbdev = KA.allocate(Mantle.defaultbackend(), RGB{N0f8}, (cache.thumbwidth, cache.thumbheight))
             f = exactframeat!(stream, 0)
             nv12torgb!(dev, f.y, f.uv; bt601 = stream.bt601)
             areadownscale!(thumbdev, dev)
@@ -156,7 +156,7 @@ function gputhumbloop(cache::ThumbnailCache)
                 nv12torgb!(dev, f.y, f.uv; bt601 = stream.bt601)
                 areadownscale!(thumbdev, dev)
                 # The device→host copy has to wait for the downscale kernel.
-                KA.synchronize(LavaBackend())
+                KA.synchronize(Mantle.defaultbackend())
                 copyto!(host, thumbdev)
                 nothing
             end

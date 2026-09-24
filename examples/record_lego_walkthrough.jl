@@ -30,7 +30,7 @@ if !haskey(ENV, "XAUTHORITY")
 end
 ENV["XDG_RUNTIME_DIR"] = get(ENV, "XDG_RUNTIME_DIR", "/run/user/1000")
 
-using VideoEditor, Lava, RayMakie, GLMakie, Makie
+using VideoEditor, Mantle, RayMakie, GLMakie, Makie
 import VideoEditor as VE
 import FFMPEG_jll
 import Printf

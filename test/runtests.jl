@@ -811,18 +811,18 @@ end
                  stdout = devnull, stderr = devnull))
     @test readchomp(`$(FFMPEG_jll.ffprobe()) -v error -select_streams v:0
                      -show_entries stream=pix_fmt -of csv=p=0 $v444`) == "yuv444p"
-    # ON THE PINNED WORKER, not here. A Lava `BatchQueue` belongs to the thread that
-    # first builds the Vulkan context, and this is the suite's first touch of Lava —
-    # so calling `LavaBackend()` inline made MAIN the owner for the rest of the
+    # ON THE PINNED WORKER, not here. A `SubmitChannel` belongs to the thread that
+    # first builds the GPU context, and this is the suite's first touch of it —
+    # so constructing the backend inline made MAIN the owner for the rest of the
     # session, and every later analysis, which the editor runs on its pinned worker
-    # by design, died on "BatchQueue is single-writer". That is what took the matte
+    # by design, died on "SubmitChannel is single-writer". That is what took the matte
     # marking beats in `interactions.jl` down (they pass when run on their own,
     # where nothing has claimed the context first). Every `GPUWorker` pins to the
     # same thread, so borrowing one here puts the whole suite on the editor's owner.
     # The assertions stay out here: a testset's state is task-local, so an `@test`
     # inside the worker records nowhere.
     probe = VE.rungpusync(VE.GPUWorker()) do
-        gpu = VE.Lava.LavaBackend()
+        gpu = VE.Mantle.defaultbackend()
         src444, src420 = VideoSource(v444), VideoSource(testvideo)
         # THE ANCHOR. If 4:2:0 does not take the GPU path on this machine then
         # both cases fall back for unrelated reasons and the assertion below
@@ -1383,9 +1383,9 @@ end
     # whatever is installed: VideoEditor registers the real MatAnyone propagator at
     # load, and then this would (a) assert disc geometry against a segmentation
     # model and (b) drive a GPU model from the main thread, which after
-    # `interactions.jl` no longer owns the Lava context — "BatchQueue is
+    # `interactions.jl` no longer owns the GPU context — "SubmitChannel is
     # single-writer".
-    prevprop = VideoEditor.MATTEPROPAGATOR[]
+    prevprop = VideoEditor.INSTALLED.matte
     VideoEditor.registermatte!((frames, seeds; progress = nothing) -> begin
         k0 = minimum(keys(seeds))
         repeat(seeds[k0], 1, 1, length(frames))
@@ -1501,16 +1501,16 @@ end
         fill(0xff, size(frames[1])..., length(frames))
     end)
     try
-        @test VideoEditor.MATTEPROPAGATOR[] !== nothing
+        @test VideoEditor.INSTALLED.matte !== nothing
         t4 = VideoEditor.analyzematte!(clip, reader, Dict(0 => mask); maxside = 96)
         @test called[] == 1
         @test all(==(0xff), t4.alpha)
     finally
-        VideoEditor.MATTEPROPAGATOR[] = nothing
+        VideoEditor.INSTALLED.matte = nothing
     end
-    @test VideoEditor.MATTEPROPAGATOR[] === nothing
+    @test VideoEditor.INSTALLED.matte === nothing
     finally
-        VideoEditor.MATTEPROPAGATOR[] = prevprop   # put back what was installed
+        VideoEditor.INSTALLED.matte = prevprop   # put back what was installed
     end
 end
 
@@ -1609,7 +1609,7 @@ end
     # share to tune. Asserted structurally, not by timing: the reader must still
     # be being called after propagation has started reporting. Collecting frames
     # up front would satisfy every monotonicity check below and fail this one.
-    prevprop = VideoEditor.MATTEPROPAGATOR[]
+    prevprop = VideoEditor.INSTALLED.matte
     # This stand-in has to FETCH each frame as it goes, the way the real
     # propagator does. One that only touched `frames[1]` read a single frame
     # under streaming and could not tell deferred reads from eager ones.
@@ -1661,7 +1661,7 @@ end
         @test maximum(frm) <= 1.0 + 1e-9
         @test frm[end] ≈ 1.0
     finally
-        VideoEditor.MATTEPROPAGATOR[] = prevprop
+        VideoEditor.INSTALLED.matte = prevprop
     end
 end
 
@@ -1747,7 +1747,7 @@ end
         rn = g.nodes[findfirst(n -> n isa VideoEditor.PlaneNode{VideoEditor.RestoreOp}, g.nodes)]
         @test rn.shape == (2 * src.width, 2 * src.height)
     finally
-        VideoEditor.RESTOREMODEL[] = nothing
+        VideoEditor.INSTALLED.restore = nothing
         VideoEditor.clearrestore!(clip)
     end
     @test !VideoEditor.hasrestoremodel()

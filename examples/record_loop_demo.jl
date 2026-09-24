@@ -20,8 +20,9 @@ if !haskey(ENV, "XAUTHORITY")
 end
 ENV["XDG_RUNTIME_DIR"] = get(ENV, "XDG_RUNTIME_DIR", "/run/user/1000")
 
-using VideoEditor, GLMakie, Makie, Lava
+using VideoEditor, GLMakie, Makie, Mantle
 import VideoEditor as VE
+import KernelAbstractions as KA
 import FFMPEG_jll
 
 isdefined(Main, :FakeInteraction) ||
@@ -34,7 +35,7 @@ const OUT_MP4  = joinpath(@__DIR__, "..", "..", "..", "media", "loop_walkthrough
 const OUT_GIF  = joinpath(tempdir(), "bird_fullcycle.gif")
 
 GLMakie.activate!(; visible = false, framerate = 30)
-# NOT `analysisbackend = LavaBackend()`. Lava's context belongs to whichever
+# NOT `analysisbackend = Mantle.defaultbackend()`. the GPU context belongs to whichever
 # thread touches it FIRST, and constructing the backend here makes that MAIN —
 # after which every analysis on the pinned worker dies with "BatchQueue is
 # single-writer; cross-thread sweep forbidden". `autodetectgpu!` (spawned by the
@@ -43,11 +44,11 @@ GLMakie.activate!(; visible = false, framerate = 30)
 # context. So let it, and wait for it rather than racing it.
 player = Player(DEMOLOOP)
 let t0 = time()
-    while !(player.analysisbackend isa LavaBackend) && time() - t0 < 90
+    while !(player.analysisbackend isa KA.GPU) && time() - t0 < 90
         sleep(0.2)
     end
-    player.analysisbackend isa LavaBackend ||
-        @warn "GPU autodetect did not enable Lava — the walkthrough will run on the CPU tier"
+    player.analysisbackend isa KA.GPU ||
+        @warn "GPU autodetect did not enable the GPU tier — the walkthrough will run on the CPU tier"
 end
 # DO NOT set `player.gpupreview = nothing` here. Importing the shared Vulkan
 # texture into GL fails on this machine ("GL import of the shared texture
@@ -65,7 +66,7 @@ Makie.disconnect!(player.screen, Makie.mouse_position)   # keep the real OS mous
 fig.scene.events.hasfocus[] = false
 player.fxwidgets[:exportpath][] = OUT_GIF    # off-camera: preset the export path
 
-# Warm the GPU kernels off-camera (the first Lava analysis compiles them).
+# Warm the GPU kernels off-camera (the first GPU analysis compiles them).
 #
 # `rungpusync`, not `rungpu` + `while !done[]`: fire-and-forget gives the caller
 # no way to hear that the job failed, so when the worker died on a lost device
@@ -73,7 +74,7 @@ player.fxwidgets[:exportpath][] = OUT_GIF    # off-camera: preset the export pat
 # The sync form carries the exception back and rethrows it here.
 VE.rungpusync(player) do
     VE.analyzemotion!(VE.Clip(VideoSource(DEMOLOOP), 0, 48, 0, (0., 0., 1., 1.));
-                      backend = LavaBackend())
+                      backend = Mantle.defaultbackend())
 end
 
 # ------------------------------------------------------------------ helpers

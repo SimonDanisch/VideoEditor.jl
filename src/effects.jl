@@ -3,7 +3,7 @@ Non-destructive per-clip effects, interpreted in stack order by `graphof` and ru
 as a Mantle graph — the one renderer, whatever the tier. All pixel work is
 GPUFiltering kernels through KernelAbstractions, and the buffers are transients
 placed by the engine's Mantle device, so the same code runs on host memory under
-`KA.CPU()` and on the GPU through Lava. There is no CPU stack and no GPU stack;
+`KA.CPU()` and on the GPU through Mantle. There is no CPU stack and no GPU stack;
 there is one graph and a backend parameter.
 """
 abstract type FxOp end
@@ -215,7 +215,7 @@ end
 # There is no second walker over the stack here. `composite` (gpugraph.jl) is
 # the one renderer — every frame the editor shows or exports goes through it,
 # one clip or eight — and it is not GPU-specific: the engine's Mantle device backs
-# its transients with host memory on `KA.CPU()` and VRAM through Lava, and the
+# its transients with host memory on `KA.CPU()` and VRAM through Mantle, and the
 # passes run the identical kernels either way. The tier is the engine's backend,
 # a parameter — never a second code path.
 #

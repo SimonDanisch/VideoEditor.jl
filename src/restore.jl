@@ -29,22 +29,19 @@ restored frames, each `scale` times larger.
 Temporal models need the window, not a frame: that is the whole reason this is
 an analysis. The returned frames must line up one-to-one with the input.
 """
-const RESTOREMODEL = Ref{Any}(nothing)
-const RESTORESCALE = Ref{Int}(4)
 # How many consecutive frames the model wants per call. Exported graphs pin the
 # frame count, so the UI has to ask rather than choose.
-const RESTOREWINDOW = Ref{Int}(5)
 
 function registerrestore!(f; scale::Integer = 4, window::Integer = 5)
-    RESTOREMODEL[] = f
-    RESTORESCALE[] = Int(scale)
-    RESTOREWINDOW[] = Int(window)
+    INSTALLED.restore = f
+    INSTALLED.restorescale = Int(scale)
+    INSTALLED.restorewindow = Int(window)
     nothing
 end
 
-hasrestoremodel() = RESTOREMODEL[] !== nothing
-restorescale() = RESTORESCALE[]
-restorewindowlength() = RESTOREWINDOW[]
+hasrestoremodel() = INSTALLED.restore !== nothing
+restorescale() = INSTALLED.restorescale
+restorewindowlength() = INSTALLED.restorewindow
 
 """
     restorecache!(clip) -> RestoreCache
@@ -88,7 +85,7 @@ function restorewindow!(clip::Clip, readframe, first::Integer, n::Integer;
     hi = min(clip.src_out - 1, lo + Int(n) - 1)
     hi >= lo || return 0
     frames = [copy(readframe(f)) for f in lo:hi]
-    out = RESTOREMODEL[](frames; progress = progress)
+    out = INSTALLED.restore(frames; progress = progress)
     length(out) == length(frames) ||
         error("restoration model returned $(length(out)) frames for $(length(frames))")
     c = restorecache!(clip)
@@ -112,8 +109,9 @@ half of.
 the source, so it is sampled rather than blitted — which also means the effect
 does something visible even when the render target is not 4x.
 """
-@kernel function restore_kernel!(buf, @Const(hi), sw::Int32, sh::Int32, strength::Float32)
+@kernel function restore_kernel!(buf, @Const(hi), sw::Int32, sh::Int32, sp)
     i, j = @index(Global, NTuple)
+    strength = Float32(paramvalue(sp))
     @inbounds begin
         w, h = size(buf, 1), size(buf, 2)
         u = clamp(round(Int32, (Float32(i) - 0.5f0) / Float32(w) * Float32(sw) + 0.5f0),
@@ -124,7 +122,7 @@ does something visible even when the render target is not 4x.
         c = buf[i, j]
         # `unitn0f8`, not `RGB{N0f8}(::Float32, …)` — see its docstring in
         # matte.jl: the checked constructor's error path builds a message with
-        # `repr`, and Lava rejects the whole kernel for the string allocation.
+        # `repr`, and the shader compiler rejects the whole kernel for the string allocation.
         # This kernel had the checked one, so the restoration compiled on the
         # CPU and could never have run on the GPU tier at all; nothing noticed
         # because nothing had rendered a restored clip on a device.

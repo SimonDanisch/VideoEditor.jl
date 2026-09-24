@@ -15,7 +15,7 @@
 #             (scale, rotation, translation) trajectory (motion inpainting).
 #
 # Runs at full resolution (downscaling blurs fine texture and aliases on repeating
-# structures). The per-feature LK is a KA kernel, so it runs on the Vulkan/Lava GPU.
+# structures). The per-feature LK is a KA kernel, so it runs on the GPU through Mantle.
 
 """
     deoutlier(v, w, thresh) -> Vector

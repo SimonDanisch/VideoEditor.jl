@@ -3,12 +3,12 @@
 # The compressed Annex-B elementary stream is `mmap`'d from a demux temp file, so it
 # is disk-backed and paged in by the OS — a GOP is a byte-slice and only the bytes
 # actually decoded are ever resident, however long the clip. The stream is split into
-# GOPs at IDR boundaries; a GOP's bytes are handed to Lava's Vulkan-Video decoder,
+# GOPs at IDR boundaries; a GOP's bytes are handed to Mantle's video decoder,
 # which returns NV12 planes kept GPU-resident. `frameat!` decodes the owning GOP on a
 # miss and evicts the least-recently-used GOP, so at most `capacity` frames live in
 # VRAM at once. NV12 → RGB conversion happens once per shown frame, downstream (the
 # ring stays in the compact native decode format). Every method takes the stream
-# explicitly and runs on whichever thread owns the Lava context (the player's GPU
+# explicitly and runs on whichever thread owns the GPU context (the player's GPU
 # worker) — the type is pure device logic, threading is the caller's concern.
 
 "One GOP: its byte range in the elementary stream, the display index of its first
@@ -19,10 +19,18 @@ struct Gop
     nframes::Int
 end
 
-"An NV12 frame resident in VRAM — luma and interleaved-chroma planes."
-struct Nv12Frame
-    y::LavaArray{UInt8, 2}
-    uv::LavaArray{UInt8, 2}
+"""
+An NV12 frame resident in VRAM — luma and interleaved-chroma planes.
+
+PARAMETERISED on the array the decoder handed back rather than naming one
+backend's: the editor talks to the runtime, and which device array that is
+belongs to the platform. A field typed abstractly would read the same and cost a
+dynamic lookup per plane per frame, which is why this is a parameter and not
+`Any`.
+"""
+struct Nv12Frame{A<:AbstractMatrix{UInt8}}
+    y::A
+    uv::A
 end
 
 """
@@ -33,8 +41,8 @@ frames by display index via [`frameat!`](@ref); the ring keeps recently-used GOP
 frames VRAM-resident up to `capacity` frames. `close` frees the ring and unmaps the
 bitstream.
 """
-mutable struct GpuVideoStream
-    backend   ::LavaBackend
+mutable struct GpuVideoStream{B<:KA.GPU}
+    backend   ::B
     codec     ::Symbol                    # :h264 | :hevc — selects parser + decode session
     tmpfile   ::String                    # demux temp file (mmap-backed); removed on close
     bitstream ::Vector{UInt8}             # Mmap view of `tmpfile` — disk-paged
@@ -46,7 +54,7 @@ mutable struct GpuVideoStream
     ring      ::Dict{Int, Nv12Frame}      # display-frame index → VRAM NV12 frame
     resident  ::Vector{Int}               # resident GOP indices, LRU order (front = oldest)
     capacity  ::Int
-    dec       ::Any                       # lazy persistent Lava H264Decoder (chroma)
+    dec       ::Any                       # lazy persistent Mantle H264Decoder (chroma)
     feedgop   ::Int                       # GOP being incrementally decoded (0 = none)
     feednext  ::Int                       # display index the active feed emits next
 end
@@ -72,7 +80,7 @@ driver reports enough free device memory (a stingy default must not hitch a 20 G
 card). If even one GOP exceeds the final budget the stream refuses to open (the
 caller falls back to CPU decode) rather than thrash.
 """
-function openstream(backend::LavaBackend, path::AbstractString, width::Integer, height::Integer;
+function openstream(backend::KA.GPU, path::AbstractString, width::Integer, height::Integer;
                     capacity::Integer = 120, vrambudget::Integer = 3 * 2^30)
     codec = videocodec(path)
     codec in (:h264, :hevc) ||
@@ -130,9 +138,9 @@ Free device-local VRAM in bytes — the driver's budget minus its usage
 (VK_EXT_memory_budget); half the heap size when the extension is missing,
 0 when no context is up (callers treat that as "don't grow").
 """
-function freedevicevram(backend::LavaBackend)
+function freedevicevram(backend::KA.GPU)
     try
-        heaps = Lava.probe_device_memory_budget(Lava.vk_context())
+        heaps = Mantle.probe_device_memory_budget(Mantle.vk_context())
         free = 0
         for h in heaps
             h.device_local || continue
@@ -328,7 +336,7 @@ end
 
 The device-resident NV12 frame at display index `n`, decoded INCREMENTALLY: a miss
 starts (or continues) a chunked feed of `n`'s GOP through the stream's persistent
-[`Lava.VideoDecode.H264Decoder`] — at most ~5 chunks (≈90 ms) per call, then the
+[`Mantle.VideoDecode.H264Decoder`] — at most ~5 chunks (≈90 ms) per call, then the
 nearest already-decoded frame is served. Callers that need exactness poll
 [`hasframe`](@ref) and re-present (the player's retry loop refines a scrub to the
 exact frame across a few calls instead of stalling one call for a whole GOP).
@@ -422,14 +430,14 @@ startswithparams(s::GpuVideoStream, bytes) =
 function startfeed!(s::GpuVideoStream, g::Integer)
     if s.dec === nothing
         params = isempty(s.leadparams) ? s.bitstream[s.gops[1].bytes] : s.leadparams
-        ctx = Lava.vk_context()
-        s.dec = s.codec === :hevc ? Lava.VideoDecode.H265Decoder(ctx, params; chroma = true) :
-                                    Lava.VideoDecode.H264Decoder(ctx, params; chroma = true)
+        ctx = Mantle.vk_context()
+        s.dec = s.codec === :hevc ? Mantle.VideoDecode.H265Decoder(ctx, params; chroma = true) :
+                                    Mantle.VideoDecode.H264Decoder(ctx, params; chroma = true)
     end
     gop = s.gops[g]
     bytes = s.bitstream[gop.bytes]
     startswithparams(s, bytes) || (bytes = vcat(s.leadparams, bytes))
-    Lava.VideoDecode.feed!(s.dec, bytes)
+    Mantle.VideoDecode.feed!(s.dec, bytes)
     s.feedgop = g
     s.feednext = gop.firstframe
     g in s.resident || push!(s.resident, g)   # partially resident from the first chunk on
@@ -445,14 +453,14 @@ the number of frames landed; completes the feed (and applies eviction) at GOP en
 """
 function decodechunk!(s::GpuVideoStream; frames::Integer = 7)
     s.feedgop == 0 && return 0
-    out = Lava.VideoDecode.decodemore!(s.dec, frames)
+    out = Mantle.VideoDecode.decodemore!(s.dec, frames)
     for (y, uv) in out
         idx = s.feednext
         s.feednext += 1
         idx < 0 && continue   # edit-list lead-in: decoded (refs need it), never shown
         s.ring[idx] = Nv12Frame(y, uv)
     end
-    if Lava.VideoDecode.remaining(s.dec) == 0
+    if Mantle.VideoDecode.remaining(s.dec) == 0
         s.feedgop = 0
         evict!(s)
     end
@@ -486,7 +494,7 @@ function evict!(s::GpuVideoStream)
         for k in 0:(gop.nframes - 1)
             f = pop!(s.ring, gop.firstframe + k, nothing)
             f === nothing && continue
-            Lava.unsafe_free!(f.y); Lava.unsafe_free!(f.uv)
+            Mantle.unsafe_free!(f.y); Mantle.unsafe_free!(f.uv)
         end
     end
     return nothing
@@ -499,7 +507,7 @@ function Base.close(s::GpuVideoStream)
     # driver, and the crash lands here, in `close`, with nothing naming the
     # dispatch that was still using it: seen twice as
     # `signal (11): Segmentation fault … close at gpustream.jl … gputhumbloop`.
-    # Same shape as the buffer-lifetime bug in Lava's own pool.
+    # Same shape as the buffer-lifetime bug in the allocator's own pool.
     #
     # BEFORE the decoder too, not only before the planes: the observed crash is in
     # `close(s.dec)` itself, and a decode session owns device memory the same
@@ -507,7 +515,7 @@ function Base.close(s::GpuVideoStream)
     KA.synchronize(s.backend)
     s.dec === nothing || (close(s.dec); s.dec = nothing)
     s.feedgop = 0
-    for f in values(s.ring); Lava.unsafe_free!(f.y); Lava.unsafe_free!(f.uv); end
+    for f in values(s.ring); Mantle.unsafe_free!(f.y); Mantle.unsafe_free!(f.uv); end
     empty!(s.ring); empty!(s.resident)
     finalize(s.bitstream)                       # unmap
     isfile(s.tmpfile) && rm(s.tmpfile; force = true)

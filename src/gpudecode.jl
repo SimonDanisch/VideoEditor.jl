@@ -1,10 +1,10 @@
-# GPU video decode — hardware H.264 decode via Lava's Vulkan Video engine.
+# GPU video decode — hardware H.264 decode via Mantle's video engine.
 #
 # ffmpeg (already a dep) DEMUXes the container to an H.264 Annex-B elementary
-# stream (no decode); Lava decodes it on the GPU's dedicated video-decode queue
+# stream (no decode); Mantle decodes it on the GPU's dedicated video-decode queue
 # (VK_KHR_video_decode) and returns luma (Y) planes — exactly the grayscale the
-# motion tracker consumes — kept device-resident as `LavaArray`s. VideoEditor
-# doesn't hard-depend on Lava, so we reach the decoder through the backend's own
+# motion tracker consumes — kept device-resident. VideoEditor
+# names no backend, so we reach the decoder through the backend's own
 # module (the same trick the GPU-preview bridge uses).
 
 "Demux `path` to an in-memory H.264 Annex-B elementary stream (no re-encode)."
@@ -20,15 +20,15 @@ end
     gpu_decode_luma(backend, path; maxframes = typemax(Int)) -> (width, height, frames)
 
 Hardware-decode the H.264 video at `path` on the GPU and return its luma (Y)
-planes in display order, kept device-resident as `LavaArray{UInt8,2}` (grayscale =
-the NV12 Y plane). `backend` must be a `LavaBackend` on a video-capable device.
+planes in display order, kept device-resident as a device `UInt8` matrix (grayscale =
+the NV12 Y plane). `backend` must be a GPU backend on a video-capable device.
 Throws for unsupported streams (non-4:2:0 chroma, or `max_num_ref_frames < 2`);
 use [`gpu_decodable`](@ref) to probe first.
 """
 function gpu_decode_luma(backend, path::AbstractString; maxframes::Integer = typemax(Int))
     lava = parentmodule(typeof(backend))
     isdefined(lava, :decode_h264_gpu) ||
-        error("GPU video decode requires a LavaBackend whose Lava exposes decode_h264_gpu")
+        error("GPU video decode requires a GPU backend whose Mantle exposes decode_h264_gpu")
     return lava.decode_h264_gpu(demux_annexb(path); maxframes = Int(maxframes))
 end
 
@@ -56,7 +56,7 @@ end
     gpu_decode_rgb(backend, path; maxframes = typemax(Int)) -> (width, height, frames)
 
 Hardware-decode `path` and return RGB frames kept device-resident as
-`LavaArray{RGB{N0f8},2}` — the NV12 planes are decoded and converted to RGB
+a device `RGB{N0f8}` matrix — the NV12 planes are decoded and converted to RGB
 entirely on the GPU (see [`nv12torgb!`]), matching VideoIO's RGB to within a couple
 of levels. Feeding these to `grayscale!` gives the Rec.709 grayscale the tracker
 expects, identical to the CPU decode path. Throws for unsupported streams.
@@ -64,7 +64,7 @@ expects, identical to the CPU decode path. Throws for unsupported streams.
 function gpu_decode_rgb(backend, path::AbstractString; maxframes::Integer = typemax(Int))
     lava = parentmodule(typeof(backend))
     isdefined(lava, :decode_h264_nv12) ||
-        error("GPU RGB decode requires a LavaBackend whose Lava exposes decode_h264_nv12")
+        error("GPU RGB decode requires a GPU backend whose Mantle exposes decode_h264_nv12")
     w, h, ys, uvs = lava.decode_h264_nv12(demux_annexb(path); maxframes = Int(maxframes))
     bt601 = video_is_bt601(path)
     rgbs = [KA.allocate(backend, RGB{N0f8}, (w, h)) for _ in eachindex(ys)]

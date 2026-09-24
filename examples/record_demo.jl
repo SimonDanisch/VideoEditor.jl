@@ -31,7 +31,7 @@
 #   [ 9] camera stabilization: added via Ctrl+P (typed, Enter takes the first
 #        hit), then its card's mode menu opened on screen and
 #        "Camera lock" selected, analysis progress (running on the GPU via
-#        Lava/Vulkan — the CPU is busy rendering the recording itself),
+#        the GPU — the CPU is busy rendering the recording itself),
 #        locked playback + A/B
 #   [9b] object lock: "Object lock" mode, Stabilize starts a pick, the
 #        birdhouse is CLICKED in the preview and pinned in place
@@ -41,8 +41,9 @@
 #   (not shown: preview proxies — they kick in automatically for heavy
 #   sources and are visually transparent by design)
 
-using VideoEditor, GLMakie, Makie, Lava
+using VideoEditor, GLMakie, Makie, Mantle
 import VideoEditor as VE
+import KernelAbstractions as KA
 import FFMPEG_jll
 
 isdefined(Main, :FakeInteraction) ||
@@ -72,7 +73,7 @@ end
 # the synthetic positions.
 GLMakie.activate!(; visible = false, framerate = 30)
 
-# NOT `analysisbackend = LavaBackend()`. Lava's context belongs to whichever
+# NOT `analysisbackend = Mantle.defaultbackend()`. the GPU context belongs to whichever
 # thread touches it FIRST, and constructing the backend here makes that MAIN —
 # after which every analysis on the pinned worker dies with "BatchQueue is
 # single-writer; cross-thread sweep forbidden". `autodetectgpu!` (spawned by the
@@ -80,11 +81,11 @@ GLMakie.activate!(; visible = false, framerate = 30)
 # the backend built around the worker-owned context second.
 player = Player(demosource)
 let t0 = time()
-    while !(player.analysisbackend isa LavaBackend) && time() - t0 < 90
+    while !(player.analysisbackend isa KA.GPU) && time() - t0 < 90
         sleep(0.2)
     end
-    player.analysisbackend isa LavaBackend ||
-        @warn "GPU autodetect did not enable Lava — the walkthrough will run on the CPU tier"
+    player.analysisbackend isa KA.GPU ||
+        @warn "GPU autodetect did not enable the GPU tier — the walkthrough will run on the CPU tier"
 end
 # DO NOT set `player.gpupreview = nothing` here — see record_loop_demo.jl. The
 # GL shared-texture import fails on this machine and the editor says so in the
@@ -105,7 +106,7 @@ fig.scene.events.hasfocus[] = false
 # device turned this into a silent forever-spin. The sync form rethrows here.
 VE.rungpusync(player) do
     warmclip = VE.Clip(VideoSource(demosource2), 0, 48, 0, (0.0, 0.0, 1.0, 1.0))
-    analyzemotion!(warmclip; backend = LavaBackend())  # camera-lock patch kernels
+    analyzemotion!(warmclip; backend = Mantle.defaultbackend())  # camera-lock patch kernels
 end
 
 # ------------------------------------------------------------------ helpers

@@ -29,7 +29,7 @@ A 0…1 float as `N0f8`, clamped, without the range check.
 
 `N0f8(x)` (and therefore `RGB{N0f8}(::Float32, …)`) validates and calls
 `throw_colorerror`, which builds its message with `repr`/`string`. That drags
-string allocation and dynamic dispatch into the kernel's IR, and Lava rejects the
+string allocation and dynamic dispatch into the kernel's IR, and the shader compiler rejects the
 whole kernel for it — a compile error on the *error path*, reached by no input.
 The clamp here is the check.
 """
@@ -123,10 +123,27 @@ end
 # background, the placement resamples colour and coverage together, and the
 # compositor reads the alpha that is already in the pixel.
 
-@kernel function matte_kernel!(buf, @Const(alpha), mw::Int32, mh::Int32,
-                               strength::Float32, feather::Float32,
-                               cx::Float32, cy::Float32, cw::Float32, ch::Float32)
+"""
+The matte's per-frame numbers, as one value.
+
+A dispatch is packed with its arguments once, at `record!`, so what changes per
+frame arrives through a `Mantle.GPURef` — and one ref holding this beats six
+holding a float each: one store, one argument, and the kernel reads the set it
+was given rather than six that might disagree. `paramvalue` takes it either way, so
+`applymatte!` still calls this with a plain value.
+"""
+struct MatteParams
+    strength::Float32
+    feather::Float32
+    crop::Vec4f
+end
+MatteParams() = MatteParams(0.0f0, 0.0f0, Vec4f(0, 0, 1, 1))
+
+@kernel function matte_kernel!(buf, @Const(alpha), mw::Int32, mh::Int32, pp)
     i, j = @index(Global, NTuple)
+    p = paramvalue(pp)
+    strength, feather = p.strength, p.feather
+    cx, cy, cw, ch = p.crop[1], p.crop[2], p.crop[3], p.crop[4]
     @inbounds begin
         w, h = size(buf, 1), size(buf, 2)
         # The matte covers the clip's crop and `buf` is the whole layer, so map
@@ -192,9 +209,9 @@ function applyplane!(buf::AnyRGBFrame, plane, op::MatteOp, clip::Clip)
     s <= 0.0f0 && return buf
     backend = KA.get_backend(buf)
     cr = clip.crop
-    matte_kernel!(backend)(buf, plane, Int32(size(plane, 1)), Int32(size(plane, 2)), s,
-                           clamp(op.feather, 0.0f0, 1.0f0),
-                           Float32(cr[1]), Float32(cr[2]), Float32(cr[3]), Float32(cr[4]);
+    matte_kernel!(backend)(buf, plane, Int32(size(plane, 1)), Int32(size(plane, 2)),
+                           MatteParams(s, clamp(op.feather, 0.0f0, 1.0f0),
+                                       Vec4f(cr[1], cr[2], cr[3], cr[4]));
                            ndrange = size(buf))
     return buf
 end
@@ -219,7 +236,6 @@ function applymatte!(buf::AnyRGBFrame, clip::Clip, srcframe::Integer;
     return applyplane!(buf, reshape(d, planeshape(op, clip)), op, clip)
 end
 
-const MATTEWARMED = Ref(false)
 
 """
     warmmatte!(w, h) -> Bool
@@ -240,8 +256,8 @@ that has no clip yet and only wants the model loaded.
 Returns whether it ran (false when no propagator is installed, or it already has).
 """
 function warmmatte!(w::Integer = 480, h::Integer = 270)
-    MATTEWARMED[] && return false
-    MATTEWARMED[] = true
+    INSTALLED.mattewarmed && return false
+    INSTALLED.mattewarmed = true
     w, h = Int(w), Int(h)
     frames = [fill(RGB{N0f8}(0.4, 0.5, 0.6), w, h) for _ in 1:2]
     qw, qh = max(1, w ÷ 4), max(1, h ÷ 4)
@@ -253,7 +269,7 @@ function warmmatte!(w::Integer = 480, h::Integer = 270)
     try
         matteprop()(frames, Dict(1 => seed); progress = nothing)
     catch e
-        MATTEWARMED[] = false
+        INSTALLED.mattewarmed = false
         rethrow()
     end
     return true
@@ -283,15 +299,14 @@ forward — the readers are sequential decoders and random access costs a seek.
 
 This is the seam a model runner plugs into. VideoEditor deliberately does not
 depend on one: the editor owns the track, the UI and the render path, and the
-propagator is whatever is installed — the same reasoning that keeps Lava behind
+propagator is whatever is installed — the same reasoning that keeps the GPU behind
 `parentmodule(typeof(player.analysisbackend))` in `glbridge.jl`.
 """
-const MATTEPROPAGATOR = Ref{Any}(nothing)
-registermatte!(f) = (MATTEPROPAGATOR[] = f; MATTEWARMED[] = false; nothing)
+registermatte!(f) = (INSTALLED.matte = f; INSTALLED.mattewarmed = false; nothing)
 "The installed propagator, or a loud failure. There is no fallback: a matte
 without the model would be a different feature wearing its name."
 function matteprop()
-    p = MATTEPROPAGATOR[]
+    p = INSTALLED.matte
     p === nothing && error("no matte propagator installed — MatAnyone's assets are " *
                            "missing or its package failed to load")
     return p
@@ -325,17 +340,17 @@ sam2ready() = isfile(joinpath(SAM2Runner.assetdir(), "weights.safetensors"))
 # ~5 GB of VRAM and a Vulkan context — one per process, whatever else is going
 # on — so it is a singleton because the GPU is, not for convenience.
 #
-# Built on FIRST USE and never at load: a `BatchQueue` is single-writer and
+# Built on FIRST USE and never at load: a `SubmitChannel` is single-writer and
 # belongs to whichever thread first touches the context, and the editor calls a
 # segmenter from `runanalysis` — its pinned GPU worker. Constructing it at load
 # would bind the queue to whoever loaded the package, and every later click would
-# die on "BatchQueue is single-writer".
+# die on "SubmitChannel is single-writer".
 const SAM2MODEL = Ref{Any}(nothing)
 
 """
     sam2seed(frame, points; key) -> Matrix{UInt8}
 
-The built-in segmenter: SAM 2.1 on Lava, turning clicks into an object boundary.
+The built-in segmenter: SAM 2.1 on the GPU, turning clicks into an object boundary.
 
 `pick = :confident` takes the highest predicted IoU but breaks a near-tie by
 logit magnitude, which on measured clicks cuts the seed's boundary fragmentation
@@ -345,7 +360,7 @@ the model says so by returning three proposals.
 """
 function sam2seed(frame, points; key = nothing)
     if SAM2MODEL[] === nothing
-        model = SAM2Runner.sam2model(; backend = Lava.LavaBackend(), replaydecode = false)
+        model = SAM2Runner.sam2model(; backend = Mantle.defaultbackend(), replaydecode = false)
         SAM2MODEL[] = SAM2Runner.sam2segmenter(model; pick = :confident)
     end
     return SAM2MODEL[](frame, points; key)
@@ -376,7 +391,7 @@ function briefly(e)
     s = sprint(showerror, e)
     occursin("Out of GPU memory", s) &&
         return "out of GPU memory — another process is likely holding the card"
-    occursin("BatchQueue is single-writer", s) &&
+    occursin("SubmitChannel is single-writer", s) &&
         return "the GPU model was built on the wrong thread (restart the editor)"
     return first(split(s, '\n'))
 end
@@ -874,16 +889,15 @@ least-recently-used files to stay under a budget, which could pull the file out
 from under a live mapping. `atexit` removes it; a crash leaves one behind, which
 `clearmattescratch!` sweeps on the next start.
 """
-const MATTESCRATCH = Ref{String}("")
 
 function mattescratch()
-    if isempty(MATTESCRATCH[])
+    if isempty(INSTALLED.mattescratch)
         dir = joinpath(cachedir("matte_alpha"), string(getpid()))
         isdir(dir) || mkpath(dir)
-        MATTESCRATCH[] = dir
+        INSTALLED.mattescratch = dir
         atexit(() -> rm(dir; recursive = true, force = true))
     end
-    return MATTESCRATCH[]
+    return INSTALLED.mattescratch
 end
 
 """

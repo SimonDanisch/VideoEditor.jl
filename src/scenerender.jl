@@ -491,8 +491,8 @@ Run `f` pinned to (0-based) thread `tid`, from wherever this is called.
 
 A scene clip is the one source that draws with resources that belong to a
 thread: GLMakie's screen belongs to thread 1 and asserts it
-(`ThreadAssertionError: Code must run on thread 1`), a Lava-backed renderer's
-Vulkan context belongs to the pinned GPU worker's thread (a `BatchQueue` is
+(`ThreadAssertionError: Code must run on thread 1`), a Mantle-backed renderer's
+Vulkan context belongs to the pinned GPU worker's thread (a `SubmitChannel` is
 single-writer) — and the composite runs on whichever thread owns the render
 engine, so caller and owner routinely differ. They meet here.
 
@@ -554,7 +554,7 @@ onmainthread(f::Function) = onthread(f, 0)
     onworkerthread(f) -> f()
 
 Run `f` on the LAST thread — the one the GPU worker pins itself to
-(`GPUWorker` in player.jl), and so the one Lava's Vulkan context belongs to.
+(`GPUWorker` in player.jl), and so the one the Vulkan context belongs to.
 
 Called whether or not the worker exists yet: a context belongs to the thread
 that first touched it, and routing scene renders here either way keeps that
@@ -569,22 +569,43 @@ onworkerthread(f::Function) = onthread(f, Threads.nthreads() - 1)
 The thread this renderer's screens may be touched from — building the screen,
 writing a frame's values onto its plots, reading the film.
 
-A renderer that draws through Lava — its module binds it (`import Lava`) —
+A renderer that draws through Mantle — its module binds it (`import Mantle`) —
 shares the one Vulkan context the GPU worker owns, so it renders on the worker's
 thread; anything else (GLMakie) renders on thread 1. Asked of the module with
 `isdefined`, not a name comparison: this file must not know which backends exist
 (see [`usebackend!`](@ref)).
 """
-renderthread(backend::Module) = isdefined(backend, :Lava) ? Threads.nthreads() - 1 : 0
+renderthread(backend::Module) =
+    isdefined(backend, :Mantle) ? mantlethread(backend.Mantle) : 0
+
+"""
+    mantlethread(M) -> 0-based thread id
+
+The thread Mantle's submit channel belongs to, ASKED rather than assumed.
+
+This returned `Threads.nthreads() - 1` unconditionally — the GPU worker's thread
+— on the reasoning above: a context belongs to whoever touched it first, and
+always routing here made that the worker. That held while the editor's own window
+was GLMakie and the only thing touching Vulkan was the worker.
+
+It stopped holding when the editor moved onto RayMakie. The GUI opens its screen
+on thread 1, so thread 1 touches the context first and OWNS it, and routing a
+scene render to the worker then breaks the single-writer invariant outright:
+`SubmitChannel is single-writer: it belongs to thread 1 and this is thread 24`.
+A `SubmitChannel` records the thread it belongs to, so the honest answer is to
+read it — which is also right in the old arrangement, where it answers with the
+worker's thread exactly as before.
+"""
+mantlethread(M::Module) = M.batchqueue(M.Device()).thread - 1
 
 """
     sharesdevice(clip) -> Bool
 
 Whether this clip draws through the same GPU device the preview's shared texture
-lives on — i.e. a scene rendered by a Lava-backed renderer.
+lives on — i.e. a scene rendered by a Mantle-backed renderer.
 
 The GPU preview tier hands the composited canvas to GLMakie through a Vulkan image
-imported as a GL texture. Interleaving a Lava-backed scene render with the blit
+imported as a GL texture. Interleaving a Mantle-backed scene render with the blit
 into that image leaves the image holding UNRELATED GPU MEMORY: measured by
 switching a scene clip's preview to RayMakie with the rendering dialog open, the
 preview drew blocks of noise while `player.frame[]` — the same composite, on the
@@ -593,7 +614,7 @@ instantly. So it is neither the composite nor the upload; it is the shared image
 contents.
 
 Asked of the renderer's module, like [`renderthread`](@ref), so this file still
-does not know which backends exist. An unregistered name is not a Lava renderer as
+does not know which backends exist. An unregistered name is not a Mantle renderer as
 far as this is concerned — it cannot render at all, and `sceneframe!` is where
 that gets reported.
 """
@@ -602,7 +623,7 @@ function sharesdevice(clip::Clip)
     src isa SceneSource || return false
     name = renderwith(src)
     haskey(BACKENDS, name) || return false
-    return isdefined(BACKENDS[name], :Lava)
+    return isdefined(BACKENDS[name], :Mantle)
 end
 
 """

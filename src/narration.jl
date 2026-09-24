@@ -19,32 +19,29 @@ the end of the job.
 Install the speech synthesizer. `f(text, voice) -> (samples::Vector{Float32},
 rate)`, mono.
 """
-const SPEAKMODEL = Ref{Any}(nothing)
 
-registerspeak!(f; voices = nothing) = (SPEAKMODEL[] = f; SPEAKVOICES[] = voices; nothing)
-hasspeakmodel() = SPEAKMODEL[] !== nothing
+registerspeak!(f; voices = nothing) = (INSTALLED.speak = f; INSTALLED.voices = voices; nothing)
+hasspeakmodel() = INSTALLED.speak !== nothing
 
 """
-    SPEAKVOICES
+    INSTALLED.voices
 
 `() -> Vector{String}`, or `nothing`: which voices the installed synthesizer can
 use. Separate from the synthesizer itself because it has to be cheap — the panel
 asks on every rebuild, and a list that built a model to answer would freeze the
 UI to draw a menu.
 """
-const SPEAKVOICES = Ref{Any}(nothing)
 
 "The installed synthesizer's voices, or empty if it has none to offer yet."
-speakvoices() = SPEAKVOICES[] === nothing ? String[] : SPEAKVOICES[]()
+speakvoices() = INSTALLED.voices === nothing ? String[] : INSTALLED.voices()
 
 "The built-in synthesizer: Kokoro, from `KokoroRunner`. Built on first use."
-const KOKORO = Ref{Any}(nothing)
 
 function kokorospeak(text::AbstractString, voice::AbstractString)
-    if KOKORO[] === nothing
-        KOKORO[] = KokoroRunner.Kokoro(; backend = Lava.LavaBackend())
+    if INSTALLED.kokoro === nothing
+        INSTALLED.kokoro = KokoroRunner.Kokoro(; backend = Mantle.defaultbackend())
     end
-    samples = KokoroRunner.speak(KOKORO[], String(text); voice = String(voice))
+    samples = KokoroRunner.speak(INSTALLED.kokoro, String(text); voice = String(voice))
     return (Vector{Float32}(vec(Array(samples))), Int(KokoroRunner.SAMPLERATE))
 end
 
@@ -60,10 +57,10 @@ and building a model to populate a menu would cost seconds on a panel rebuild.
 The picker appears once you have spoken one line, which is also when you first
 have a reason to want it.
 """
-kokorovoices() = KOKORO[] === nothing ? String[] :
+kokorovoices() = INSTALLED.kokoro === nothing ? String[] :
     filter(v -> startswith(v, "af_") || startswith(v, "am_") ||
                 startswith(v, "bf_") || startswith(v, "bm_"),
-           KokoroRunner.voices(KOKORO[]))
+           KokoroRunner.voices(INSTALLED.kokoro))
 
 installspeak!() = registerspeak!(kokorospeak; voices = kokorovoices)
 
@@ -79,7 +76,7 @@ what keeps a minute of speech from becoming five megabytes of JSON.
 function render!(nar::Narration)
     hasspeakmodel() || error("no speech synthesizer installed — see registerspeak!")
     isempty(strip(nar.text)) && error("nothing to say")
-    samples, rate = SPEAKMODEL[](nar.text, nar.voice)
+    samples, rate = INSTALLED.speak(nar.text, nar.voice)
     empty!(nar.samples); append!(nar.samples, samples)
     nar.rate = rate
     return nar

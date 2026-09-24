@@ -2,13 +2,13 @@
 #
 # With `Player(path; gpupreview = true)`, presentation runs on the GPU:
 # the decoded frame is uploaded once, motion/color tracks and the effect
-# stack run as Lava kernels (the same backend-generic GPUFiltering calls
-# the CPU path uses), the result is blitted into a `Lava.ExternalImage`,
+# stack run as GPU kernels (the same backend-generic GPUFiltering calls
+# the CPU path uses), the result is blitted into a `Mantle.ExternalImage`,
 # and GLMakie samples that memory directly through a swapped texture —
 # no CPU effect cost, no display-path copy. Measured 2.1× the CPU preview
 # at 1080p (`gpu_preview_prototype.jl`), with the CPU freed for decoding.
 #
-# Threading contract (see GPUWorker): every Lava call runs on the pinned
+# Threading contract (see GPUWorker): every GPU call runs on the pinned
 # GPU worker thread; every GL call runs on the main thread with GLMakie's
 # context current. `presentgpu!` does a synchronous round-trip per frame —
 # ~7 ms at 1080p, strictly less than the CPU path it replaces (~15 ms).
@@ -27,9 +27,9 @@ GLMakie is not showing, then swaps."
 mutable struct GPUPreview
     width::Int
     height::Int
-    # worker-owned (Lava)
-    packed::Any          # LavaArray{UInt32,1} — RGBA pack scratch for the blit
-    eimages::Vector{Any} # 2 Lava.ExternalImage back/front buffers
+    # worker-owned (the GPU device)
+    packed::Any          # a device UInt32 array — RGBA pack scratch for the blit
+    eimages::Vector{Any} # 2 Mantle.ExternalImage back/front buffers
     # main-thread-owned (GL)
     gltex::Vector{Any}   # the 2 imported GL texture wrappers
     cur::Int             # index (1/2) of the buffer GLMakie currently samples
@@ -201,10 +201,11 @@ end
 Run `f` on whichever thread owns the render engine's context.
 
 Every call into `player.engine` goes through this, presentation and card previews
-alike: a Lava `BatchQueue` binds to the thread that first touched it, and which
+alike: a Mantle `SubmitChannel` binds to the thread that first touched it, and which
 thread that was depends on what ran first — the pinned worker (analysis, the
-usual case) or main (Lava already used before this player existed). So the owner
-is *discovered*, once, from the worker's own assertion, and never configured.
+usual case) or main (the device already used before this player existed). So the owner
+is *discovered*, once, from the `Mantle.WrongThread` the worker raises, and never
+configured.
 """
 function runowned(f::Function, player::Player)
     player.engineinline && return f()
@@ -215,7 +216,7 @@ function runowned(f::Function, player::Player)
     try
         return rungpusync(f, player)
     catch e
-        if e isa AssertionError && occursin("single-writer", e.msg)
+        if e isa Mantle.WrongThread
             player.engineinline = true
             return f()
         end
@@ -231,7 +232,7 @@ target size and the preview plot has processed it (so the plot geometry is
 current before its texture is replaced).
 """
 function setupgpupreview!(player::Player, gp::GPUPreview, W::Integer, H::Integer)
-    # VideoEditor doesn't depend on Lava — reach it through the backend's module
+    # VideoEditor names no backend — reach the decoder through the backend's module
     lavamod = parentmodule(typeof(player.analysisbackend))
     fds = runowned(player) do
         backend = player.analysisbackend
@@ -298,7 +299,7 @@ packrgba(c::RGB{N0f8}) = UInt32(reinterpret(UInt8, c.r)) |
 
 """
 Present a frame through the GPU chain: the source pixels are put into the working
-buffer, motion/color tracks + the effect stack run as Lava kernels, and the result
+buffer, motion/color tracks + the effect stack run as GPU kernels, and the result
 is blitted into the shared image GLMakie samples. The source is a `GpuVideoStream`
 when given — `frameat!` decodes the owning GOP device-resident and `nv12torgb!`
 converts it in place (fully-GPU, disk→VRAM path, no CPU frame) — otherwise the
@@ -308,7 +309,7 @@ CPU frame `player.frame[]` is uploaded once. Returns `true` when on screen; `fal
 function presentgpu!(player::Player, clip::Clip, srcframe::Integer;
                      stream = nothing, source = nothing, chunks::Integer = 5)
     gp = player.gpupreview
-    # Same rule as the composite tier: a Lava-backed scene shares this device and
+    # Same rule as the composite tier: a Mantle-backed scene shares this device and
     # the shared image comes back holding other memory. See [`sharesdevice`](@ref).
     sharesdevice(clip) && return false
     try
@@ -378,7 +379,7 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer;
                               chunks::Integer = 5)
     gp = player.gpupreview
     streamed(player, clips) || return false
-    # A Lava-backed scene in the stack shares this tier's device, and the shared
+    # A Mantle-backed scene in the stack shares this tier's device, and the shared
     # image comes back holding other memory — see [`sharesdevice`](@ref). The CPU
     # tier composites the same frame correctly, so the picture is right and this
     # one clip's playback is slower until the interleaving itself is fixed.
@@ -525,9 +526,9 @@ function preloadgpu!(player::Player, source::VideoSource; key = source)
     try
         # OPENING IS GPU WORK TOO, so it belongs on the thread that owns the
         # context — the probe below always knew that, the open did not. This is
-        # called deliberately OFF the UI thread (see above), so it opened a Lava
+        # called deliberately OFF the UI thread (see above), so it opened a device
         # decode session from whichever thread happened to run it: `AssertionError:
-        # BatchQueue is single-writer; cross-thread sweep forbidden`, caught below,
+        # SubmitChannel is single-writer; cross-thread sweep forbidden`, caught below,
         # reported as "not GPU-streamable" and silently demoted to CPU decode. It
         # is not a codec problem at all. Measured consequence: the benchmark's
         # playback drop rate at 3.3% against a 3.0% floor, because playback was on
@@ -623,7 +624,7 @@ function autodetectgpu!(player::Player)
     player.gpupreview isa GPUPreview && return nothing   # already enabled (explicit gpupreview)
     capable = try
         rungpusync(player) do
-            Lava.vk_context().video_decode_available
+            Mantle.vk_context().video_decode_available
         end
     catch e
         # a silent false here is how GPU decode gets demoted to the CPU unnoticed
@@ -631,7 +632,7 @@ function autodetectgpu!(player::Player)
         false
     end
     capable || return nothing
-    player.analysisbackend = LavaBackend()               # wraps the worker-owned context
+    player.analysisbackend = Mantle.defaultbackend()               # wraps the worker-owned context
     emptyengine!(player.engine)                          # its plans hold pool regions now
     player.engine = FxEngine(player.analysisbackend)     # the engine follows the backend
     player.gpupreview = GPUPreview()

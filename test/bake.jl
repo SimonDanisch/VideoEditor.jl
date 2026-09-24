@@ -254,18 +254,23 @@ end
     @test !VE.refining(src)
 end
 
-# A Lava-backed renderer (RayMakie) shares the ONE Vulkan context the pinned GPU
-# worker owns — rendering it on thread 1 died with "BatchQueue is single-writer;
-# cross-thread sweep forbidden". The thread a scene renders on is the backend's
-# property, not the caller's: asked of the module (it binds Lava or it doesn't),
-# never hard-coded per name.
-module FakeLavaBackend
-    import Lava
+# A Mantle-backed renderer (RayMakie) shares the ONE GPU context the pinned
+# worker owns — rendering it on thread 1 died with "SubmitChannel is
+# single-writer; cross-thread sweep forbidden". The thread a scene renders on is
+# the backend's property, not the caller's: asked of the module (it binds Mantle
+# or it doesn't), never hard-coded per name.
+#
+# Asked of the RUNTIME and not of a compiler: naming the latter stopped being
+# true when RayMakie was ported to Mantle — the old check went false and every
+# scene clip silently went back to thread 1, which throws nothing and renders on
+# the wrong thread.
+module FakeGPUBackend
+    import Mantle
 end
 
 @testset "a scene renders on the thread its renderer owns" begin
     @test VE.renderthread(VE.GLMakie) == 0                          # GLMakie: thread 1
-    @test VE.renderthread(FakeLavaBackend) == Threads.nthreads() - 1   # Lava: the worker's
+    @test VE.renderthread(FakeGPUBackend) == Threads.nthreads() - 1   # GPU: the worker's
     # …and the hop lands there, from wherever it is called
     @test VE.onthread(() -> Threads.threadid(), 0) == 1
     @test VE.onworkerthread(() -> Threads.threadid()) == Threads.nthreads()

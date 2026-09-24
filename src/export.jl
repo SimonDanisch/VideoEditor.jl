@@ -21,7 +21,7 @@ Keywords:
   player.
 - `audio`: mux the sources' audio along the cut list (see [`muxaudio`](@ref));
   on by default, skipped automatically when no source has an audio stream.
-- `backend`: KA backend for the render chain. A GPU backend (e.g. `LavaBackend()`)
+- `backend`: KA backend for the render chain. A GPU backend (e.g. `Mantle.defaultbackend()`)
   runs tracks, effects, blends and the crop warp on device buffers — decode and
   encode stay on the CPU with one upload/download per frame. Same kernels either
   way, so the output is identical.

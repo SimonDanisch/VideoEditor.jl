@@ -4,7 +4,7 @@
 #   * depth threw `MethodError: depthbytes(::Array{Float16,4})` on every press —
 #     the runner returns the model's raw tensor, `depthbytes` takes a matrix
 #   * `depthblur_kernel!` and `lookmix_kernel!` both built colours with the
-#     VALIDATING `RGB{N0f8}(::Float32, …)`, which Lava rejects, so neither could
+#     VALIDATING `RGB{N0f8}(::Float32, …)`, which the shader compiler rejects, so neither could
 #     compile on the GPU they were written for (both passed every CPU test)
 #   * `WhisperRunner.transcribe` returns `(text, segments)`; iterating the tuple
 #     walked the String and died on `s.text`

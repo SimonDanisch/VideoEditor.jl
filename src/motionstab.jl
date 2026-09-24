@@ -573,18 +573,36 @@ function findloop(clip::Clip; minseconds::Real = 1.5, maxseconds::Real = 6.0,
     return (besta - 1, bestb - 1, bestscore)   # 0-based clip-relative offsets
 end
 
+"""
+    motionwarp(clip, srcframe, dims) -> Mat3f
+
+The stabilization warp for this frame at this render size, or the identity when
+there is none — no track, the frame outside it, or a frame the analysis left
+unmoved.
+
+Its own function because the RENDER PATH needs the matrix without applying it:
+the graph packs it into a `Mantle.GPURef` and gates the pass on whether it is the
+identity. Reading a track is host work — it is a host object — and this is the
+whole of that work, stated once so the pass and `applymotiontrack!` cannot
+disagree about which frame maps to which transform.
+"""
+function motionwarp(clip::Clip, srcframe::Integer, dims)
+    track = clip.motiontrack
+    track === nothing && return one(Mat3f)
+    i = srcframe - track.src_in + 1
+    1 <= i <= length(track.transforms) || return one(Mat3f)
+    M = track.transforms[i]
+    M == one(Mat3f) && return one(Mat3f)
+    s = dims[1] / clip.source.width
+    return s ≈ 1 ? M : scaletosource(M, s)
+end
+
 "Apply the clip's motion stabilization for `srcframe`: affine warp via `tmp`.
 Transforms are stored in the original source's pixels; when `buf` is a
 lower-resolution preview proxy the transform is rescaled by conjugation."
 function applymotiontrack!(buf::AnyRGBFrame, tmp::AnyRGBFrame, clip::Clip, srcframe::Integer)
-    track = clip.motiontrack
-    track === nothing && return buf
-    i = srcframe - track.src_in + 1
-    1 <= i <= length(track.transforms) || return buf
-    M = track.transforms[i]
-    M == Mat3f(1, 0, 0, 0, 1, 0, 0, 0, 1) && return buf
-    s = size(buf, 1) / clip.source.width
-    s ≈ 1 || (M = scaletosource(M, s))
+    M = motionwarp(clip, srcframe, size(buf))
+    M == one(Mat3f) && return buf
     # BLACK outside the source, not a replicated edge pixel. A stabilization warp
     # shifts and rotates the frame, so its borders sample past the picture; with
     # the kernel's default the last row/column smears across that gap in long

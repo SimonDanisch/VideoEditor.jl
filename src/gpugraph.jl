@@ -101,8 +101,8 @@ mutable struct FxState
     clip::Any
     frame::Int
     served::Base.RefValue{Int}
-    # How a host frame gets onto the device: the `Update` the source pass
-    # reserved, and whether it was fired this frame. A `copyto!` in the pass body
+    # How a host frame gets onto the device: the transient the source pass
+    # stores into, and whether it was written this frame. A `copyto!` in the pass body
     # would do the same copy — but a host→device upload inside a recorded batch
     # forces a `vkQueueSubmit`, one per layer per frame, and the CPU-decode path
     # is the one the editor falls back to whenever the Vulkan decoder is not
@@ -110,13 +110,57 @@ mutable struct FxState
     # path), and unfired for a decoder that serves device planes.
     upload::Any
     uploaded::Bool
+    # What gets stored when there is no picture. A transient keeps nothing
+    # between runs, so a frame the source could not produce must still write
+    # something or the chain reads whatever the arena last held — a flash of
+    # another layer, not a black frame. Cached because allocating a full frame
+    # of zeros per miss is the kind of per-frame allocation this path exists to
+    # avoid.
+    blank::Any
+    # Whether a frame with no host picture stores black. True for a scene, whose
+    # picture is the only writer; false for a video source, where a miss is the
+    # NORMAL case — the decoder served device planes and the conversion pass
+    # fills the buffer instead, so storing black first would be a full frame
+    # written twice per frame.
+    blankonmiss::Bool
+    # The chain's NV12 destination, see `planebuffers!`.
+    planes::Any
+    # …and its decoded picture, see `rawbuffer!`.
+    raw::Any
+    # The two frames retiming interpolates between, see `synthscratch!`.
+    synth::Any
     # The finished-output policy of the frame being rendered (see `update!`):
     # a scene reads it to decide between one progressive sample and the full
     # budget. Per frame, like `uploaded` — the pass body outlives any one frame.
     exact::Bool
 end
-FxState() = FxState(nothing, nothing, nothing, nothing, 0.0, nothing, 0, Ref(0),
-                    nothing, false, false)
+
+# By NAME, because this grew four fields during the declared-graph migration and
+# a positional list of sixteen is a bug waiting for the next one: the first
+# version of it put `false` where `planes` goes and `nothing` where `exact`
+# does, and that typechecked as far as the constructor.
+FxState(; source = nothing, decoded = nothing, decoded2 = nothing, baked = nothing,
+        phase = 0.0, clip = nothing, frame = 0, served = Ref(0), upload = nothing,
+        uploaded = false, blank = nothing, blankonmiss = false, planes = nothing,
+        raw = nothing, synth = nothing, exact = false) =
+    FxState(source, decoded, decoded2, baked, phase, clip, frame, served, upload,
+            uploaded, blank, blankonmiss, planes, raw, synth, exact)
+
+"""
+    blankpixels!(st, dims) -> Vector{PlanePixel}
+
+A frame of nothing, allocated once per chain and handed back on every miss.
+
+Transparent and not opaque black: the plane is premultiplied, so zero alpha with
+zero colour is "no picture here", and the compositor leaves whatever is under it
+alone. Opaque black would be a layer that covers the track below.
+"""
+function blankpixels!(st::FxState, dims::Tuple{Int, Int})
+    b = st.blank
+    b isa Vector{PlanePixel} && length(b) == prod(dims) && return b
+    st.blank = zeros(PlanePixel, prod(dims))
+    return st.blank
+end
 
 """
     sourcepicture!(st, dims) -> host image | nothing
@@ -151,9 +195,29 @@ hostframe(::Any, ::Any) = nothing
 """
 The 2-D view a kernel gets over a resource's 1-D storage — a transient's arena
 slice or a persistent `Mantle.Buffer`'s region alike. `KA.get_backend` walks
-`parent`, so the view resolves to the right backend on Lava and on the host.
+`parent`, so the view resolves to the right backend on the GPU and on the host.
 """
 frameview(x, dims) = reshape(Mantle.storage(x), dims)
+
+
+"""
+Fill and copy, as dispatches.
+
+The host path spelled these `fill!` and `copyto!` and the graph cannot: a pass is
+a kernel the walk reads its accesses off, and `copyto!` on two device arrays is
+the ad-hoc form that submits its own work. One kernel each, declared like
+anything else.
+"""
+@kernel function fillpixels_kernel!(dst, value)
+    I = @index(Global, Cartesian)
+    @inbounds dst[I] = value
+end
+
+@doc (@doc fillpixels_kernel!)
+@kernel function copypixels_kernel!(dst, @Const(src))
+    I = @index(Global, Cartesian)
+    @inbounds dst[I] = src[I]
+end
 
 # ---------------------------------------------------------------- effect callbacks
 
@@ -348,8 +412,7 @@ structural change, and comparing the two here makes a missed one render nothing
 rather than garbage.
 """
 struct PlaneEdge
-    buf::Any                          # the transient the plane is written into
-    update::Any                       # a Mantle UpdateRef
+    buf::Any                          # the transient the plane is stored into
     node::Any                         # Ref{<:FxNode} — the live node
     dims::Tuple{Int, Int}
     active::Base.RefValue{Bool}
@@ -358,13 +421,14 @@ end
 """
     update!(e::PlaneEdge, clip, frame) -> Bool
 
-Hand this frame's plane to the update the graph reserved for it, and say whether
-there is one.
+Store this frame's plane into the transient the chain reads it from, and say
+whether there is one.
 
 Unconditional: a new frame is a new plane, and a transient holds nothing between
 runs — the placer is free to alias its slice against anything already dead, which
 is the whole point of the plane being an ordinary resource. Fired before `run!`,
-because an `Update`'s write position is at the head of the schedule.
+because the store lands at the update pass, which the graph puts at the head of
+the schedule.
 
 The data is a view into the track, retained rather than copied until the write
 happens later in the same `run!`; nothing mutates an analysis result during a
@@ -375,7 +439,7 @@ function update!(e::PlaneEdge, clip::Clip, frame::Integer)
     d = planedata(n, clip, frame)
     e.active[] = d !== nothing && planeshape(n, clip) == e.dims
     e.active[] || return false
-    e.update(d)
+    e.buf[:] = d
     return true
 end
 
@@ -404,14 +468,65 @@ planeshape(n::FxNode, clip::Clip) = planeshape(n.op, clip)
 # missing effect.
 
 """
-What building one chain needs beyond the graph: the state its bodies read, and the
-plane bindings collected on the way out.
+What building one chain needs beyond the graph: the state its bodies read, the
+plane bindings collected on the way out, and the device parameters its dispatches
+read.
+
+`stores` is how a per-frame NUMBER reaches a recorded plan. A pass used to read
+`pr[].strength` inside its body, which worked because the body ran every frame;
+a `Dispatch` is packed with its arguments once, at `record!`, so a value that
+changes between frames has to be a [`Mantle.GPURef`](@ref) whose store lands at
+the update pass. One closure per parameter, run by [`update!`](@ref) beside the
+planes, and for the same reason: everything this frame hands the device goes the
+same way.
 """
 struct ChainBuild
     state::FxState
     edges::Vector{PlaneEdge}
+    stores::Vector{Any}                 # () -> write one device parameter
 end
-ChainBuild() = ChainBuild(FxState(), PlaneEdge[])
+ChainBuild() = ChainBuild(FxState(), PlaneEdge[], Any[])
+
+
+"""
+    param!(f, ctx, g, neutral) -> GPURef
+
+A device parameter this frame's value is stored into, and the ref the dispatches
+read it through.
+
+`f()` is called once per frame by [`update!`](@ref) and returns the value. It is a
+closure rather than a value because what it reads — a node's `Ref`, an `active`
+flag, a track at this frame — is only settled when the frame is.
+
+`neutral` is the value the ref starts at and gives the parameter its TYPE, which
+is why it is a value rather than the type: half of these are structs with no
+`zero`, and the do-nothing value is the one worth writing down anyway — it is
+what a pass reads before the first frame is stored.
+"""
+function param!(f, ctx::ChainBuild, g, neutral::T) where {T}
+    r = Mantle.GPURef(g.dev, neutral)
+    push!(ctx.stores, () -> (r[] = convert(T, f()); nothing))
+    return r
+end
+
+"""
+    gate!(f, ctx, g) -> Mantle.Buffer{UInt32}
+
+The flag a gated pass runs on: `f()` says whether this pass does anything at this
+frame, and the pass is wrapped in `Mantle.repeat!(g, 1; while_nonzero = gate)`.
+
+For a pass that writes ITS INPUT — a colour adjustment, a matte — where doing
+nothing is the correct result of being switched off. A pass that writes a
+separate destination cannot be gated this way: the destination would go unwritten
+and the next pass would read a buffer nothing filled, which is a black frame
+rather than a missing effect. Those carry their switch as a neutral PARAMETER
+instead, so the one path they have is the only path.
+"""
+function gate!(f, ctx::ChainBuild, g)
+    b = Mantle.Buffer(g.dev, UInt32[0])
+    push!(ctx.stores, () -> (b[:] = UInt32[f() ? 1 : 0]; nothing))
+    return b
+end
 
 """
 The source pass: colour-convert (or upload) the frame `decodesource` produced,
@@ -426,29 +541,128 @@ A decoded video frame is opaque: alpha 1 everywhere. Coverage enters the chain
 where something REMOVES picture — a matte, a crop, a rendered scene's background.
 """
 function chainpass!(g, ::SourceNode, ::Nothing, ::Nothing, ctx::ChainBuild, dims)
-    raw = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
-    cur = Mantle.Transient.Buffer(g, PlanePixel, prod(dims))
+    cur = Mantle.Transient.Buffer(g, PlanePixel, dims...)
     st = ctx.state
-    st.upload = Mantle.Update(g, raw)     # a host frame comes in through this
-    Mantle.custom!(g, "source") do p
-        Mantle.use(p, raw; read = true, write = true)
-        Mantle.use(p, cur; write = true)
-        () -> begin
-            d = frameview(cur, dims)
-            if st.baked !== nothing
-                copyto!(d, st.baked)     # the chain, already run — see bake.jl
-            else
-                r = frameview(raw, dims)
-                # …unless the update already put it there. Then `raw` holds this
-                # frame before the pass runs, because an `Update` writes at the
-                # head of the schedule.
-                st.uploaded || sourceinto!(r, st.source, st.decoded)
-                opaque!(d, r)
-            end
-        end
+    # The decoder's own NV12 planes are a DIFFERENT pair of buffers every frame —
+    # the ring allocates per decoded frame — so they cannot be dispatch arguments,
+    # which are packed once when the plan records. What has to be stable is the
+    # DESTINATION: these two are the chain's, declared once, and `update!` copies
+    # the chosen ring entry into them. Persistent rather than transient, because
+    # that copy happens outside the graph and a transient's storage is arena
+    # memory only valid inside a run.
+    raw = rawbuffer!(st, g.dev, dims)
+    st.upload = raw                       # a host frame is stored into this
+    luma, chroma = planebuffers!(st, g.dev, dims)
+    convert = gate!(ctx, g) do
+        st.baked === nothing && !st.uploaded && st.decoded !== nothing
     end
+    Mantle.repeat!(g, 1; while_nonzero = convert) do _
+        Mantle.dispatch!(g, GPUFiltering.nv12torgb_kernel!,
+                         (raw, luma, chroma, sourceisbt601(st)), dims; name = "source/nv12")
+    end
+    # ALWAYS, and this is the one pass the chain is guaranteed: whatever filled
+    # `raw` — a stored host frame, a stored bake, or the conversion above — a
+    # decoded frame is opaque and the chain works in premultiplied coverage.
+    Mantle.dispatch!(g, opaque_kernel!, (cur, raw), dims; name = "source")
     return cur
 end
+
+"""
+    planebuffers!(st, dev, dims) -> (luma, chroma)
+
+The chain's own NV12 planes, made once and kept.
+
+The pair a GPU-decoded frame is copied into before the run, so the conversion
+pass has a stable resource to read. Held on the state rather than rebuilt per
+frame: their address is what the recorded plan packed, and a new buffer each
+frame would be a new address the recording never sees.
+"""
+function planebuffers!(st::FxState, dev, dims::Tuple{Int, Int})
+    p = st.planes
+    p === nothing || return p
+    st.planes = (Mantle.Buffer(dev, zeros(UInt8, dims[1] * dims[2])),
+                 Mantle.Buffer(dev, zeros(UInt8, dims[1] * (dims[2] ÷ 2))))
+    return st.planes
+end
+
+"""
+    synthesize!(st, dims) -> Bool
+
+Retime this frame, writing the synthesized picture into `raw`, and say whether it
+did.
+
+Here and not in a pass because the interpolator is a MODEL — RIFE, with a plan of
+its own — and a plan cannot be a dispatch inside another. It was called from
+inside a recorded pass body through an installed global, which is exactly the
+shape `custom!` allowed and nothing else does.
+
+Nothing to do unless this timeline frame lands BETWEEN two source frames
+(`phase > 0`), the next one decoded, and an interpolator is installed. Half of a
+slowed clip's frames land exactly on a source frame and are shown as they are —
+that fallback is the normal case, not an error path.
+"""
+function synthesize!(st::FxState, dims::Tuple{Int, Int})
+    (st.phase > 0.0 && st.decoded2 !== nothing && hasinterpolator() &&
+     st.raw !== nothing && st.baked === nothing) || return false
+    a, b = synthscratch!(st, dims)
+    sourceinto!(a, st.source, st.decoded)
+    sourceinto!(b, st.source, st.decoded2)
+    INSTALLED.interpolate(Mantle.storage(st.raw), a, b, st.phase)
+    return true
+end
+
+"The two decoded frames retiming interpolates between, made once and kept."
+function synthscratch!(st::FxState, dims::Tuple{Int, Int})
+    p = st.synth
+    p === nothing || return p
+    dev = Mantle.todevice(Mantle.defaultbackend())
+    st.synth = (Mantle.storage(Mantle.Buffer(dev, RGB{N0f8}, dims)),
+                Mantle.storage(Mantle.Buffer(dev, RGB{N0f8}, dims)))
+    return st.synth
+end
+
+"""
+    rawbuffer!(st, dev, dims) -> Buffer{RGB{N0f8},2}
+
+The chain's decoded picture, before coverage — made once and kept.
+
+PERSISTENT, where every other step of the chain is a transient, and that is the
+whole design of the source pass. Three different things fill it — a stored host
+frame, the NV12 conversion pass, the retiming interpolator — and two of those
+run outside the graph. A transient's storage is arena memory valid only inside a
+run, so anything written from outside would be aliasing corruption; a buffer the
+chain owns has an address the recorded plan can name and anyone can write.
+
+One frame of VRAM per chain (6 MB at 1080p), which is what a plan that records
+costs here.
+"""
+function rawbuffer!(st::FxState, dev, dims::Tuple{Int, Int})
+    b = st.raw
+    b === nothing || return b
+    st.raw = Mantle.Buffer(dev, RGB{N0f8}, dims)
+    return st.raw
+end
+
+"""
+    copyplanes!(st, frame) -> nothing
+
+Put a decoded frame's NV12 planes where the conversion pass reads them.
+
+Outside the graph, and safely so: the destination is a persistent `Mantle.Buffer`
+the chain owns, not arena memory. A `nothing` frame or a source that serves host
+pictures is a no-op — the conversion pass is gated off in both cases.
+"""
+copyplanes!(::FxState, ::Any) = nothing
+function copyplanes!(st::FxState, f::Nv12Frame)
+    p = st.planes
+    p === nothing && return nothing
+    copyto!(Mantle.storage(p[1]), vec(f.y))
+    copyto!(Mantle.storage(p[2]), vec(f.uv))
+    return nothing
+end
+
+"Whether this source's NV12 is BT.601 — a property of the stream, read per frame."
+sourceisbt601(st::FxState) = (s = st.source; s isa GpuVideoStream ? s.bt601 : false)
 
 """
 The optical-flow source pass. Two decoded frames in, one synthesized frame out.
@@ -460,50 +674,73 @@ That fallback is not an error path: half of a slowed clip's frames land exactly
 on a source frame and must be shown as they are.
 """
 function chainpass!(g, ::SmoothSourceNode, ::Nothing, ::Nothing, ctx::ChainBuild, dims)
-    cur = Mantle.Transient.Buffer(g, PlanePixel, prod(dims))
-    raw = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
-    fa  = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
-    fb  = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(dims))
-    st = ctx.state
-    Mantle.custom!(g, "source-flow") do p
-        Mantle.use(p, cur; write = true)
-        Mantle.use(p, raw; read = true, write = true)
-        Mantle.use(p, fa; read = true, write = true)
-        Mantle.use(p, fb; read = true, write = true)
-        () -> begin
-            r = frameview(raw, dims)
-            if st.phase <= 0.0 || st.decoded2 === nothing || !hasinterpolator()
-                sourceinto!(r, st.source, st.decoded)
-            else
-                a, b = frameview(fa, dims), frameview(fb, dims)
-                sourceinto!(a, st.source, st.decoded)
-                sourceinto!(b, st.source, st.decoded2)
-                INTERPOLATOR[](r, a, b, st.phase)
-            end
-            opaque!(frameview(cur, dims), r)
-        end
-    end
-    return cur
+    # THE SAME GRAPH as the plain source. Retiming is not a different picture
+    # path, it is a different producer of the same buffer: the interpolator is a
+    # whole model with a plan of its own and cannot be a dispatch inside this
+    # one, so it runs on the host side of `update!` and writes `raw` there, the
+    # way a stored host frame and the conversion pass both do.
+    #
+    # That is what `raw` being PERSISTENT buys. Three producers, one consumer,
+    # one recorded plan — where this used to be a pass body branching three ways
+    # and calling an installed global from inside a recorded batch.
+    return chainpass!(g, SourceNode(), nothing, nothing, ctx, dims)
 end
 
+"""
+Stabilization: three dispatches behind one gate.
+
+What the host still does is LOOK THE TRACK UP — a warp matrix at this frame,
+scaled to the render size — because a track is a host object and reading it is
+not GPU work. What it no longer does is decide whether the pass runs from inside
+the pass: the matrix is a parameter and the lookup's answer feeds the gate.
+
+Clear, warp, copy back, in that order and for the reason `applymotiontrack!`
+gives: `skipoutside` leaves pixels outside the source alone, so the destination
+has to start black or the previous frame shows through the borders.
+"""
 function chainpass!(g, ::MotionNode, pr, act, cur, ctx::ChainBuild, dims)
-    tmp = Mantle.Transient.Buffer(g, PlanePixel, prod(dims))
+    tmp = Mantle.Transient.Buffer(g, PlanePixel, dims...)
     st = ctx.state
-    Mantle.custom!(g, "stabilize") do p
-        Mantle.use(p, cur; read = true, write = true)
-        Mantle.use(p, tmp; write = true)
-        () -> act[] && applymotiontrack!(frameview(cur, dims), frameview(tmp, dims),
-                                         st.clip, st.served[])
+    M = param!(ctx, g, one(Mat3f)) do
+        motionwarp(st.clip, st.served[], dims)
+    end
+    go = gate!(ctx, g) do
+        act[] && motionwarp(st.clip, st.served[], dims) != one(Mat3f)
+    end
+    Mantle.repeat!(g, 1; while_nonzero = go) do _
+        Mantle.dispatch!(g, fillpixels_kernel!, (tmp, zero(PlanePixel)), dims;
+                         name = "stabilize/clear")
+        Mantle.dispatch!(g, GPUFiltering.warp_kernel!,
+                         (tmp, cur, M, true,
+                          Vec4{Int32}(1, 1, dims[1], dims[2]), GPUFiltering.Replace()),
+                         dims; name = "stabilize/warp")
+        Mantle.dispatch!(g, copypixels_kernel!, (cur, tmp), dims; name = "stabilize/back")
     end
     return cur
 end
 
+"""
+The colour track's gain and offset at this frame, as two parameters.
+
+Same shape as stabilization: the host reads the track, the numbers are refs, and
+the gate is the same question the host used to ask inside the body. Gated rather
+than neutral-valued because it writes its input, so off is nothing done.
+"""
 function chainpass!(g, ::ColorTrackNode, pr, act, cur, ctx::ChainBuild, dims)
     st = ctx.state
-    Mantle.custom!(g, "colour track") do p
-        Mantle.use(p, cur; read = true, write = true)
-        () -> act[] && applycolortrack!(frameview(cur, dims), st.clip, st.served[];
-                                        strength = pr[].strength)
+    gain = param!(ctx, g, Vec3f(1)) do
+        first(colortrackgainoffset(st.clip, st.served[], pr[].strength))
+    end
+    offset = param!(ctx, g, Vec3f(0)) do
+        last(colortrackgainoffset(st.clip, st.served[], pr[].strength))
+    end
+    go = gate!(ctx, g) do
+        act[] && colortrackgainoffset(st.clip, st.served[], pr[].strength) !==
+                 (Vec3f(1), Vec3f(0))
+    end
+    Mantle.repeat!(g, 1; while_nonzero = go) do _
+        Mantle.dispatch!(g, GPUFiltering.channellinear_kernel!, (cur, gain, offset), dims;
+                         name = "colour track")
     end
     return cur
 end
@@ -515,17 +752,53 @@ the graph for a second input. Everything specific to the op is behind
 `applyplane!`.
 """
 function chainpass!(g, n::PlaneNode, pr, act, cur, ctx::ChainBuild, dims)
-    plane = Mantle.Transient.Buffer(g, planeeltype(n.op), prod(n.shape))
-    b = PlaneEdge(plane, Mantle.Update(g, plane), pr, n.shape, Ref(false))
+    plane = Mantle.Transient.Buffer(g, planeeltype(n.op), n.shape...; hostwritten = true)
+    b = PlaneEdge(plane, pr, n.shape, Ref(false))
     push!(ctx.edges, b)
-    st = ctx.state
-    Mantle.custom!(g, passname(n.op)) do p
-        Mantle.use(p, cur; read = true, write = true)
-        Mantle.use(p, plane; read = true)
-        () -> act[] && b.active[] &&
-              applyplane!(frameview(cur, dims), frameview(plane, n.shape), pr[].op, st.clip)
+    go = gate!(ctx, g) do
+        act[] && b.active[]
+    end
+    Mantle.repeat!(g, 1; while_nonzero = go) do _
+        planepass!(g, n.op, cur, plane, n, pr, ctx, dims)
     end
     return cur
+end
+
+"""
+    planepass!(g, op, cur, plane, node, pr, ctx, dims)
+
+The dispatch one [`PlaneOp`](@ref) renders as, declared for the graph.
+
+Dispatch on the op, exactly as `applyplane!` did — the op says which kernel reads
+its plane and what that kernel is told about this frame. It is a separate function
+and not a branch for the same reason `applyplane!` was: an op that arrives later
+adds a method and touches nothing here.
+
+These write their INPUT, so the caller gates them on `active`: switched off is
+nothing done, and there is no destination left unwritten.
+"""
+function planepass!(g, ::MatteOp, cur, plane, n, pr, ctx::ChainBuild, dims)
+    st = ctx.state
+    p = param!(ctx, g, MatteParams()) do
+        op = pr[].op
+        cr = st.clip.crop
+        MatteParams(clamp(op.strength, 0.0f0, 1.0f0), clamp(op.feather, 0.0f0, 1.0f0),
+                    Vec4f(cr[1], cr[2], cr[3], cr[4]))
+    end
+    Mantle.dispatch!(g, matte_kernel!,
+                     (cur, plane, Int32(n.shape[1]), Int32(n.shape[2]), p), dims;
+                     name = "matte")
+    return nothing
+end
+
+function planepass!(g, ::RestoreOp, cur, plane, n, pr, ctx::ChainBuild, dims)
+    s = param!(ctx, g, 0.0f0) do
+        clamp(Float32(pr[].op.strength), 0.0f0, 1.0f0)
+    end
+    Mantle.dispatch!(g, restore_kernel!,
+                     (cur, plane, Int32(n.shape[1]), Int32(n.shape[2]), s), dims;
+                     name = "restore")
+    return nothing
 end
 
 """
@@ -540,25 +813,32 @@ struct DepthBlurNode <: FxNode
 end
 planeshape(n::DepthBlurNode) = n.shape
 
+"""
+One dispatch, and the RADIUS carries the switch.
+
+Inactive means switched off, neutral, or this frame outside the depth track — and
+the picture still has to reach `dst`, or the rest of the chain reads a buffer
+nothing wrote, which is a black frame rather than a missing effect. So this
+cannot be gated, and does not need to be: at `maxr = 0` the kernel's per-pixel
+radius clamps to zero, the tap loop runs once over the pixel itself and divides
+by `n = 1`, which is the picture unchanged. An UNWEIGHTED box average is what
+makes that exact — the separable blur next door cannot do the same, because its
+taps are weighted and tap one is the far edge (see [`blurweights!`](@ref)).
+"""
 function chainpass!(g, n::DepthBlurNode, pr, act, cur, ctx::ChainBuild, dims)
-    plane = Mantle.Transient.Buffer(g, planeeltype(n.op), prod(n.shape))
-    b = PlaneEdge(plane, Mantle.Update(g, plane), pr, n.shape, Ref(false))
+    plane = Mantle.Transient.Buffer(g, planeeltype(n.op), n.shape...; hostwritten = true)
+    b = PlaneEdge(plane, pr, n.shape, Ref(false))
     push!(ctx.edges, b)
-    dst = Mantle.Transient.Buffer(g, PlanePixel, prod(dims))
-    Mantle.custom!(g, passname(n.op)) do p
-        Mantle.use(p, cur; read = true)
-        Mantle.use(p, dst; write = true)
-        Mantle.use(p, plane; read = true)
-        () -> begin
-            d, c = frameview(dst, dims), frameview(cur, dims)
-            # Inactive means switched off, neutral, or this frame is outside the
-            # depth track. The picture still has to reach `dst`, or the rest of the
-            # chain reads a buffer nothing wrote — which is a black frame, not a
-            # missing effect.
-            act[] && b.active[] ?
-                depthblur!(d, c, frameview(plane, n.shape), pr[].op) : copyto!(d, c)
-        end
+    dst = Mantle.Transient.Buffer(g, PlanePixel, dims...)
+    focus = param!(ctx, g, 0.0f0) do
+        Float32(pr[].op.focus)
     end
+    maxr = param!(ctx, g, Int32(0)) do
+        (act[] && b.active[]) ? Int32(depthblurradius(pr[].op, dims)) : Int32(0)
+    end
+    Mantle.dispatch!(g, depthblur_kernel!,
+                     (dst, cur, plane, Int32(n.shape[1]), Int32(n.shape[2]), focus, maxr),
+                     dims; name = "depth blur")
     return dst
 end
 
@@ -581,32 +861,54 @@ planeshape(n::LookNode) = (n.dim, n.dim)
 planedata(n::LookNode, clip::Clip, ::Integer) = (l = clip.look; l === nothing ? nothing : vec(l))
 planeshape(::LookNode, clip::Clip) = (d = lookdim(clip); d === nothing ? nothing : (d, d))
 
+"""
+Two dispatches and no branch: the grade, then the mix back toward the original.
+
+The STRENGTH carries the switch, and that is why this pass needs no gate. At
+`s = 0` the mix is `out = 1·img + 0·out`, which is the bypass exactly — so
+"switched off", "keyframed to nothing" and "not analysed yet" are all the same
+number rather than a second path, and there is no `copyto!` anywhere. A gate
+would not do here anyway: `dst` is a separate destination, and a gated pass that
+runs nothing leaves it unwritten, which the next pass reads as a black frame.
+
+`binsize` and `dim` are the table's, so they are constants of this graph — a clip
+graded at another table size already needs its own graph (see [`lookdim`](@ref)).
+"""
 function chainpass!(g, n::LookNode, pr, act, cur, ctx::ChainBuild, dims)
-    lut = Mantle.Transient.Buffer(g, Float32, n.dim^3 * 3)
-    b = PlaneEdge(lut, Mantle.Update(g, lut), pr, (n.dim, n.dim), Ref(false))
+    lut = Mantle.Transient.Buffer(g, Float32, n.dim, n.dim, n.dim, 3; hostwritten = true)
+    b = PlaneEdge(lut, pr, (n.dim, n.dim), Ref(false))
     push!(ctx.edges, b)
-    dst = Mantle.Transient.Buffer(g, PlanePixel, prod(dims))
-    st = ctx.state
-    Mantle.custom!(g, "look") do p
-        Mantle.use(p, cur; read = true)
-        Mantle.use(p, dst; write = true)
-        Mantle.use(p, lut; read = true)
-        () -> begin
-            d, c = frameview(dst, dims), frameview(cur, dims)
-            if !act[] || !b.active[]
-                copyto!(d, c)
-            else
-                applylook!(d, c, frameview(lut, (n.dim, n.dim, n.dim, 3)), pr[].strength)
-            end
-        end
+    dst = Mantle.Transient.Buffer(g, PlanePixel, dims...)
+    s = param!(ctx, g, 0.0f0) do
+        (act[] && b.active[]) ? clamp(Float32(pr[].strength), 0.0f0, 1.0f0) : 0.0f0
     end
+    binsize = Float32(1.000001 / (n.dim - 1))
+    Mantle.dispatch!(g, GPUFiltering.lut3d_kernel!,
+                     (dst, cur, lut, binsize, Int32(n.dim)), dims; name = "look")
+    Mantle.dispatch!(g, lookmix_kernel!, (dst, cur, s), dims; name = "look/mix")
     return dst
 end
 
+"""
+One dispatch, gated.
+
+This pass writes ITS INPUT, so "switched off" is "did nothing" and a gate says
+exactly that — no destination goes unwritten, and a discarded pass costs its
+barriers and the gate dispatch rather than a full-frame copy. The adjustment
+itself is a `GPURef`: four floats that change per frame, packed once at
+`record!` and stored per frame like every other parameter.
+"""
 function chainpass!(g, ::ColorNode, pr, act, cur, ctx::ChainBuild, dims)
-    Mantle.custom!(g, "colour") do p
-        Mantle.use(p, cur; read = true, write = true)
-        () -> act[] && coloradjust!(frameview(cur, dims), pr[].adj)
+    adj = param!(ctx, g, ColorAdjustments()) do
+        pr[].adj
+    end
+    go = gate!(ctx, g) do
+        # GPUFiltering's, qualified: `isneutral` here is the editor's, and it
+        # answers for an EFFECT rather than for an adjustment's four numbers.
+        act[] && !GPUFiltering.isneutral(pr[].adj)
+    end
+    Mantle.repeat!(g, 1; while_nonzero = go) do _
+        Mantle.dispatch!(g, GPUFiltering.coloradjust_kernel!, (cur, adj), dims; name = "colour")
     end
     return cur
 end
@@ -623,63 +925,139 @@ schedule, staged, with nothing to drain.
 [`BLURTAPS`](@ref) is fixed, because the tap count follows σ and σ is a value: a
 buffer that resized with a slider would resize the graph with it.
 """
-function blurweights!(g, pr, ctx::ChainBuild)
-    wb = Mantle.Transient.Buffer(g, Float32, BLURTAPS)
-    push!(ctx.edges, PlaneEdge(wb, Mantle.Update(g, wb), pr, (BLURTAPS, 1), Ref(false)))
-    return wb
+function blurweights!(g, pr, act, ctx::ChainBuild)
+    wb = Mantle.Transient.Buffer(g, Float32, BLURTAPS; hostwritten = true)
+    r = Mantle.GPURef(g.dev, Int32(0))
+    # ONE closure for both, because they are one decision. `convpass_kernel!`
+    # reads `weights[k + radius + 1]`, so the taps are indexed RELATIVE to the
+    # radius: a radius that does not match the weights it was built with reads
+    # the wrong end of the kernel. At radius 0 that is `weights[1]`, the far
+    # edge, whose weight is about zero — the frame would come out black rather
+    # than unblurred.
+    #
+    # So the bypass is not "radius 0" but "radius 0 AND a centre tap of one",
+    # which is the identity kernel and is what switched-off stores.
+    push!(ctx.stores, () -> begin
+        if act[]
+            w, rad = gaussianweights(pr[].σ; maxradius = (BLURTAPS - 1) ÷ 2)
+            wb[:] = w
+            r[] = Int32(rad)
+        else
+            taps = zeros(Float32, BLURTAPS)
+            taps[1] = 1.0f0
+            wb[:] = taps
+            r[] = Int32(0)
+        end
+        nothing
+    end)
+    return wb, r
 end
 
+"""
+A separable blur is two dispatches, and the RADIUS carries the switch.
+
+`convpass_kernel!` sums `2r+1` taps, so the IDENTITY KERNEL — radius 0 and a
+centre tap of one — reads the pixel under it and writes it back: the horizontal
+pass copies `cur` into `tmp` and the vertical copies `tmp` into `dst`. That is
+the bypass, exactly, with no `copyto!` and no second path — the same argument
+the look pass makes for `s = 0`, and the reason this pass needs no gate even
+though it writes a separate destination. See [`blurweights!`](@ref) for why the
+radius alone will not do it.
+
+What a switched-off blur costs is two full-frame passes reading one tap each.
+"""
 function chainpass!(g, ::BlurNode, pr, act, cur, ctx::ChainBuild, dims)
-    dst = Mantle.Transient.Buffer(g, PlanePixel, prod(dims))
-    tmp = Mantle.Transient.Buffer(g, PlanePixel, prod(dims))
-    wb = blurweights!(g, pr, ctx)
-    Mantle.custom!(g, "blur") do p
-        Mantle.use(p, cur; read = true)
-        Mantle.use(p, dst; write = true)
-        Mantle.use(p, tmp; write = true)
-        Mantle.use(p, wb; read = true)
-        () -> act[] ? gaussianblur!(frameview(dst, dims), frameview(cur, dims), pr[].σ;
-                                    tmp = frameview(tmp, dims),
-                                    weights = frameview(wb, (BLURTAPS,))) :
-                      copyto!(frameview(dst, dims), frameview(cur, dims))
-    end
+    dst = Mantle.Transient.Buffer(g, PlanePixel, dims...)
+    tmp = Mantle.Transient.Buffer(g, PlanePixel, dims...)
+    wb, r = blurweights!(g, pr, act, ctx)
+    Mantle.dispatch!(g, GPUFiltering.convpass_kernel!, (tmp, cur, wb, r, Val(1)), dims;
+                     name = "blur/h")
+    Mantle.dispatch!(g, GPUFiltering.convpass_kernel!, (dst, tmp, wb, r, Val(2)), dims;
+                     name = "blur/v")
     return dst
 end
 
+"""
+The blur, then the difference added back: three dispatches and an AMOUNT.
+
+`unsharp_kernel!` writes `img + amount·(img - blurred)`, so `amount = 0` is
+`img` whatever the blur produced — the bypass again, and the reason the blur
+underneath it need not be switched off separately. One more transient than the
+blur has, because the unsharp pass reads both the picture and its blur and may
+not write over either while doing it.
+"""
 function chainpass!(g, ::SharpenNode, pr, act, cur, ctx::ChainBuild, dims)
-    dst = Mantle.Transient.Buffer(g, PlanePixel, prod(dims))
-    tmp = Mantle.Transient.Buffer(g, PlanePixel, prod(dims))
-    wb = blurweights!(g, pr, ctx)
-    Mantle.custom!(g, "sharpen") do p
-        Mantle.use(p, cur; read = true)
-        Mantle.use(p, dst; write = true)
-        Mantle.use(p, tmp; write = true)
-        Mantle.use(p, wb; read = true)
-        () -> act[] ? unsharpmask!(frameview(dst, dims), frameview(cur, dims),
-                                   pr[].σ, pr[].amount; tmp = frameview(tmp, dims),
-                                   weights = frameview(wb, (BLURTAPS,))) :
-                      copyto!(frameview(dst, dims), frameview(cur, dims))
+    blurred = Mantle.Transient.Buffer(g, PlanePixel, dims...)
+    tmp = Mantle.Transient.Buffer(g, PlanePixel, dims...)
+    dst = Mantle.Transient.Buffer(g, PlanePixel, dims...)
+    wb, r = blurweights!(g, pr, act, ctx)
+    amount = param!(ctx, g, 0.0f0) do
+        act[] ? Float32(pr[].amount) : 0.0f0
     end
+    Mantle.dispatch!(g, GPUFiltering.convpass_kernel!, (tmp, cur, wb, r, Val(1)), dims;
+                     name = "sharpen/h")
+    Mantle.dispatch!(g, GPUFiltering.convpass_kernel!, (blurred, tmp, wb, r, Val(2)), dims;
+                     name = "sharpen/v")
+    Mantle.dispatch!(g, GPUFiltering.unsharp_kernel!, (dst, cur, blurred, amount), dims;
+                     name = "sharpen/mix")
     return dst
 end
 
+"""
+A callback effect, declared — and the CALLBACK ITSELF is the parameter.
+
+`fxkind` returns a closure over the effect's numbers (`Pointwise((c, uv) -> c * a)`
+for an opacity of `a`), and the thing worth knowing is that a new `a` is the same
+closure TYPE with a different captured value. It is isbits, so it goes in a
+`Mantle.GPURef` like any other parameter and the plan neither recompiles nor
+re-records when the slider moves. That is why this needed no change to the
+callback API: `(c, uv)` still, and the value it closes over is stored per frame.
+
+A `Stencil` reads neighbours so it cannot write its input, and a destination left
+unwritten is a black frame. Its bypass is therefore a second gated pass rather
+than a neutral value: "identity" is not expressible as a value of the effect's
+own closure type, and making it so would cost the type stability this rests on.
+"""
 function chainpass!(g, n::PixelNode, pr, act, cur, ctx::ChainBuild, dims)
+    invsz = Vec2f(1.0f0 / dims[1], 1.0f0 / dims[2])
+    f = param!(ctx, g, kindcallback(n.kind)) do
+        kindcallback(pr[].kind)
+    end
+    go = gate!(ctx, g) do
+        act[]
+    end
     if needsfresh(n.kind)
-        out = Mantle.Transient.Buffer(g, PlanePixel, prod(dims))
-        Mantle.custom!(g, "effect") do p
-            Mantle.use(p, cur; read = true)
-            Mantle.use(p, out; write = true)
-            () -> act[] ? applykind!(frameview(out, dims), frameview(cur, dims), pr[].kind) :
-                          copyto!(frameview(out, dims), frameview(cur, dims))
+        out = Mantle.Transient.Buffer(g, PlanePixel, dims...)
+        r = Int32(n.kind.radius)
+        Mantle.repeat!(g, 1; while_nonzero = go) do _
+            Mantle.dispatch!(g, GPUFiltering.stencil_kernel!,
+                             (out, cur, f, r, Int32(dims[1]), Int32(dims[2]), invsz), dims;
+                             name = "effect")
+        end
+        off = gate!(ctx, g) do
+            !act[]
+        end
+        Mantle.repeat!(g, 1; while_nonzero = off) do _
+            Mantle.dispatch!(g, copypixels_kernel!, (out, cur), dims; name = "effect/bypass")
         end
         return out
     end
-    Mantle.custom!(g, "effect") do p
-        Mantle.use(p, cur; read = true, write = true)
-        () -> act[] && applykind!(frameview(cur, dims), frameview(cur, dims), pr[].kind)
+    Mantle.repeat!(g, 1; while_nonzero = go) do _
+        Mantle.dispatch!(g, GPUFiltering.pointwise_kernel!, (cur, cur, f, invsz), dims;
+                         name = "effect")
     end
     return cur
 end
+
+"""
+    kindcallback(kind) -> f
+
+The device callback a [`FxKind`](@ref) renders with, separated from how it is
+mapped. `Pointwise` and `Stencil` differ in the kernel that maps them, not in
+what they carry, which is why the pass reads this and dispatches on the kind.
+"""
+kindcallback(k::Pointwise) = k.f
+kindcallback(k::Stencil) = k.f
 
 # ---------------------------------------------------------------- a clip's structure
 
@@ -793,12 +1171,29 @@ struct ClipChain
     params::Vector{Any}                 # Ref{<:FxNode}, parallel to `slots`
     active::Vector{Base.RefValue{Bool}} # …and so is this
     edges::Vector{PlaneEdge}
+    stores::Vector{Any}                 # per-frame device parameters, see `param!`
     state::FxState
     out::Any                            # the transient holding this clip's picture
     dims::Tuple{Int, Int}
     matrix::Base.RefValue{Mat3f}        # where the layer lands on the canvas
     bounds::Base.RefValue{NTuple{4, Int}}  # …and which part of it is picture at all
     alpha::Base.RefValue{Float32}       # the layer's opacity
+end
+
+"""
+    layerparam!(f, ch, g, neutral) -> GPURef
+
+A per-frame parameter of the COMPOSITION's pass for one layer.
+
+The same thing [`param!`](@ref) makes, hung on the chain instead of the build
+context: `buildcomposition` has no `ChainBuild` — it is stitching finished chains
+together — and `update!(ch, …)` is what runs a chain's stores, once per clip per
+frame, which is when a placement is settled.
+"""
+function layerparam!(f, ch::ClipChain, g, neutral::T) where {T}
+    r = Mantle.GPURef(g.dev, neutral)
+    push!(ch.stores, () -> (r[] = convert(T, f()); nothing))
+    return r
 end
 
 """
@@ -817,8 +1212,9 @@ function buildchain!(g, clip::Clip, fg::FxGraph)
         push!(params, pr); push!(active, act)
         cur = chainpass!(g, n, pr, act, cur, ctx, dims)
     end
-    return ClipChain(clip, fg.nodes, fg.slots, params, active, ctx.edges, ctx.state,
-                     cur, dims, Ref(one(Mat3f)), Ref((1, 1, dims[1], dims[2])), Ref(1.0f0))
+    return ClipChain(clip, fg.nodes, fg.slots, params, active, ctx.edges, ctx.stores,
+                     ctx.state, cur, dims, Ref(one(Mat3f)), Ref((1, 1, dims[1], dims[2])),
+                     Ref(1.0f0))
 end
 
 """
@@ -882,7 +1278,22 @@ function update!(ch::ClipChain, sf::Integer, phase::Real, source;
     st.exact = exact
     hf = st.upload === nothing ? nothing : sourcepicture!(st, ch.dims; exact)
     st.uploaded = hf !== nothing && size(hf) == ch.dims
-    st.uploaded && st.upload(vec(hf))
+    # UNCONDITIONAL where there is a destination: a transient holds nothing
+    # between runs, so a frame with no picture stores black rather than leaving
+    # the chain to read the arena's last tenant.
+    if st.upload !== nothing
+        st.uploaded ? (st.upload[:] = vec(hf)) :
+            st.blankonmiss && (st.upload[:] = blankpixels!(st, ch.dims))
+    end
+    # A decoder that served DEVICE planes: copy them into the chain's own, which
+    # is what the conversion pass reads. Device to device, ~3 MB at 1080p, and it
+    # buys a plan that records — the decoder's planes are a new pair of buffers
+    # every frame and a recording names one.
+    st.uploaded || copyplanes!(st, st.decoded)
+    # …and retiming, which is a MODEL and so cannot be a pass: it runs here and
+    # writes `raw` itself. Reports whether it did, because if it did there is
+    # nothing for the conversion pass to do.
+    st.uploaded |= synthesize!(st, ch.dims)
     for e in ch.edges                     # `served` is settled: the planes can be written
         update!(e, clip, st.served[])
     end
@@ -896,6 +1307,14 @@ function update!(ch::ClipChain, sf::Integer, phase::Real, source;
     prm = opacityparam(clip)
     own = prm === nothing ? 1.0 : valueat(prm, sf)
     ch.alpha[] = Float32(clamp(alpha === nothing ? own : alpha, 0.0, 1.0))
+    # LAST. Every dispatch's per-frame numbers, stored the way the planes are —
+    # and after everything they read, which is the whole of this function:
+    # `params` and `active` above, and `matrix`/`bounds`/`alpha` on the three
+    # lines before this one. Run earlier, the composition's own stores carried
+    # the PREVIOUS frame's placement and a dissolve came out one step behind.
+    for w in ch.stores
+        w()
+    end
     return nothing
 end
 
@@ -1006,11 +1425,9 @@ function buildcomposition(engine, clips, graphs, canvas::Tuple{Int, Int})
     # The CANVAS has no alpha: it is what is delivered — to the screen, to the
     # encoder — and there is nothing behind it to show through. Coverage is a
     # property of a layer on its way here, not of the finished picture.
-    accum = Mantle.Transient.Buffer(g, RGB{N0f8}, W * H)
-    Mantle.custom!(g, "canvas") do p
-        Mantle.use(p, accum; write = true)
-        () -> fill!(frameview(accum, canvas), RGB{N0f8}(0, 0, 0))
-    end
+    accum = Mantle.Transient.Buffer(g, RGB{N0f8}, W, H)
+    Mantle.dispatch!(g, fillpixels_kernel!, (accum, RGB{N0f8}(0, 0, 0)), canvas;
+                     name = "canvas")
     chains = ClipChain[]
     for (clip, fg) in zip(clips, graphs)
         ch = buildchain!(g, clip, fg)
@@ -1030,15 +1447,28 @@ function buildcomposition(engine, clips, graphs, canvas::Tuple{Int, Int})
         # This used to be three images of one fact: render the matte again into a
         # white-on-black coverage image, warp THAT through the same matrix, warp
         # the picture into a second canvas-sized buffer, and composite the two.
-        Mantle.custom!(g, "place") do p
-            Mantle.use(p, accum; read = true, write = true)
-            Mantle.use(p, ch.out; read = true)
-            () -> warp!(frameview(accum, canvas), frameview(ch.out, dims), ch.matrix[];
-                        skipoutside = true, bounds = ch.bounds[],
-                        write = Over(ch.alpha[]))
+        #
+        # The matrix, the bounds and the opacity are all per frame, so all three
+        # are parameters: `Over` carries the layer's alpha and is itself the
+        # value, which is why it goes in a ref rather than being baked at
+        # `record!` like the `skipoutside` flag beside it.
+        # The stores go on the CHAIN, because `update!(ch, …)` is what runs them
+        # and it runs once per clip per frame — which is exactly when the matrix,
+        # the crop rect and the opacity are settled.
+        M = layerparam!(ch, g, one(Mat3f)) do
+            ch.matrix[]
         end
+        rect = layerparam!(ch, g, Vec4{Int32}(1, 1, canvas[1], canvas[2])) do
+            b = ch.bounds[]
+            Vec4{Int32}(b[1], b[2], b[3], b[4])
+        end
+        over = layerparam!(ch, g, Over(1.0f0)) do
+            Over(ch.alpha[])
+        end
+        Mantle.dispatch!(g, GPUFiltering.warp_kernel!,
+                         (accum, ch.out, M, true, rect, over), canvas; name = "place")
     end
-    return Composition(chains, Mantle.Plan(g), accum, canvas,
+    return Composition(chains, Mantle.record!(Mantle.Plan(g)), accum, canvas,
                        compositionsignature(clips, graphs, canvas))
 end
 
@@ -1090,22 +1520,22 @@ layerplane(lp::LayerPlan) = frameview(lp.chain.out, lp.chain.dims)
 function buildlayer(engine, clip::Clip, fg::FxGraph)
     g = Mantle.Graph(engine.device)
     ch = buildchain!(g, clip, fg)
-    out = Mantle.Transient.Buffer(g, RGB{N0f8}, prod(ch.dims))
-    Mantle.custom!(g, "crop") do p
-        Mantle.use(p, ch.out; read = true, write = true)
-        Mantle.use(p, out; write = true)
-        () -> begin
-            # The crop REMOVES picture, and a caller handed this buffer gets the
-            # clip, not the material the crop took away. `zero(PlanePixel)` is
-            # uncovered, so this states it once and the flatten below turns it
-            # into the black a caller with nothing behind the layer expects. In a
-            # composite the placement's `bounds` say the same thing; here there is
-            # no placement to say it.
-            cropaway!(frameview(ch.out, ch.dims), ch.clip.crop)
-            flatten!(frameview(out, ch.dims), frameview(ch.out, ch.dims))
-        end
+    out = Mantle.Transient.Buffer(g, RGB{N0f8}, ch.dims...)
+    # The crop REMOVES picture, and a caller handed this buffer gets the clip,
+    # not the material the crop took away. `zero(PlanePixel)` is uncovered, so
+    # the crop states it once and the flatten turns it into the black a caller
+    # with nothing behind the layer expects. In a composite the placement's
+    # bounds say the same thing; here there is no placement to say it.
+    #
+    # Two dispatches where there was one body, and the rect is a parameter — a
+    # crop is edited, so it changes without the graph's structure changing.
+    rect = layerparam!(ch, g, Vec4{Int32}(1, 1, ch.dims[1], ch.dims[2])) do
+        x0, y0, x1, y1 = croppixels(ch.clip.crop, ch.dims)
+        Vec4{Int32}(x0, y0, x1, y1)
     end
-    return LayerPlan(ch, Mantle.Plan(g), layersignature(clip, fg), out)
+    Mantle.dispatch!(g, cropaway_kernel!, (ch.out, rect), ch.dims; name = "crop")
+    Mantle.dispatch!(g, flatten_kernel!, (out, ch.out), ch.dims; name = "flatten")
+    return LayerPlan(ch, Mantle.record!(Mantle.Plan(g)), layersignature(clip, fg), out)
 end
 
 layersignature(clip::Clip, fg::FxGraph) = (clip.id, objectid(fg))
@@ -1282,7 +1712,9 @@ function runlayer(f, engine::FxEngine, source, clip::Clip, frame::Integer;
     return f(lp)
 end
 
-@kernel function cropaway_kernel!(buf, x0::Int32, y0::Int32, x1::Int32, y1::Int32)
+@kernel function cropaway_kernel!(buf, rectp)
+    rect = paramvalue(rectp)
+    x0, y0, x1, y1 = Int32(rect[1]), Int32(rect[2]), Int32(rect[3]), Int32(rect[4])
     i, j = @index(Global, NTuple)
     @inbounds if i < x0 || i > x1 || j < y0 || j > y1
         buf[i, j] = zero(eltype(buf))
@@ -1310,8 +1742,7 @@ function cropaway!(buf, crop::NTuple{4, <:Real})
     x0, y0, x1, y1 = croppixels(crop, (w, h))
     (x0 == 1 && y0 == 1 && x1 == w && y1 == h) && return buf
     backend = KA.get_backend(buf)
-    cropaway_kernel!(backend)(buf, Int32(x0), Int32(y0), Int32(x1), Int32(y1);
-                              ndrange = (w, h))
+    cropaway_kernel!(backend)(buf, Vec4{Int32}(x0, y0, x1, y1); ndrange = (w, h))
     return buf
 end
 

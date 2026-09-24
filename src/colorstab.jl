@@ -60,6 +60,27 @@ function analyzecolor!(clip::Clip; cutoff::Real = 0.5, backend = KA.CPU(), progr
 end
 
 """
+    colortrackgainoffset(clip, srcframe, strength) -> (gain, offset)
+
+The colour track's per-channel gain and offset at this frame, or `(1, 0)` when
+there is nothing to apply.
+
+Its own function for the reason [`motionwarp`](@ref) is: the render path needs
+the numbers as parameters without running the kernel, and the pass gates on
+whether they are neutral. `strength` scales both toward neutral, so a keyframed
+strength of zero IS `(1, 0)` and the gate closes.
+"""
+function colortrackgainoffset(clip::Clip, srcframe::Integer, strength::Real)
+    track = clip.colortrack
+    track === nothing && return (Vec3f(1), Vec3f(0))
+    i = srcframe - track.src_in + 1
+    1 <= i <= length(track.gains) || return (Vec3f(1), Vec3f(0))
+    s = clamp(Float32(strength), 0.0f0, 1.0f0)
+    s <= 0.0f0 && return (Vec3f(1), Vec3f(0))
+    return (Vec3f(1.0f0 .+ s .* (track.gains[i] .- 1.0f0)), Vec3f(s .* track.offsets[i]))
+end
+
+"""
 Apply the clip's colour stabilization for `srcframe`, if analyzed. `strength`
 scales the correction toward identity; it comes from the `FlickerEffect` in the
 clip's stack, which is what the user tunes, and falls back to the track's own
@@ -72,10 +93,8 @@ function applycolortrack!(buf::AnyRGBFrame, clip::Clip, srcframe::Integer;
     track === nothing && return buf
     i = srcframe - track.src_in + 1
     1 <= i <= length(track.gains) || return buf
-    s = clamp(Float32(strength), 0.0f0, 1.0f0)
-    s <= 0.0f0 && return buf
-    g = 1.0f0 .+ s .* (track.gains[i] .- 1.0f0)
-    o = s .* track.offsets[i]
-    channellinear!(buf, Vec3f(g), Vec3f(o))
+    g, o = colortrackgainoffset(clip, srcframe, strength)
+    (g, o) === (Vec3f(1), Vec3f(0)) && return buf
+    channellinear!(buf, g, o)
     return buf
 end

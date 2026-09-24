@@ -9,7 +9,7 @@
 # what you watch is the editor being used, not a script mutating state.
 #
 # The matte is the beat to watch. Clicking the bird runs SAM 2.1 to seed a mask
-# and MatAnyone to propagate it, both on the GPU through Lava, while the CPU is
+# and MatAnyone to propagate it, both on the GPU, while the CPU is
 # busy rendering this very recording.
 
 ENV["DISPLAY"] = get(ENV, "DISPLAY", ":1")

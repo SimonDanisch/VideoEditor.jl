@@ -349,11 +349,11 @@ function postrestore!(player::Player)
 end
 
 """
-Runs GPU analyses on one pinned thread: Lava's BatchQueue is single-writer
+Runs GPU analyses on one pinned thread: Mantle's SubmitChannel is single-writer
 (the owning thread is fixed when the Vulkan context is first created), so
 every device dispatch must come from the same thread. The worker's first
 job initializes the context on its pinned thread and owns it from then on —
-don't touch Lava from other threads in the same session.
+don't touch the device from other threads in the same session.
 """
 struct GPUWorker
     jobs::Channel{Function}
@@ -389,7 +389,7 @@ end
 
 """
 Post `f` to a worker directly — for callers that own a [`GPUWorker`] but no
-`Player` (the test suite's GPU beats, which must reach Lava on the same pinned
+`Player` (the test suite's GPU beats, which must reach the device on the same pinned
 thread the editor uses, or they fix ownership on main and every later analysis
 asserts).
 
@@ -417,8 +417,8 @@ the backend is. The sources' stream rings are closed for the duration (their VRA
 starves the analysis pool otherwise: flaky pool-block OOM in `goodfeatures`) and
 re-opened afterwards.
 
-Pinned unconditionally because a `BatchQueue` belongs to the thread that first
-touched it, so a model built from `Threads.@spawn` dies on "BatchQueue is
+Pinned unconditionally because a `SubmitChannel` belongs to the thread that first
+touched it, so a model built from `Threads.@spawn` dies on "SubmitChannel is
 single-writer" — and every analysis here drives a Vulkan model.
 """
 function runanalysis(job::Function, player::Player)
@@ -1163,7 +1163,7 @@ function compositeframe!(player::Player, n::Integer, clips::Vector{Clip})
         return buf
     end
     # scenes first, on this thread (see `prerender!`): `runowned` below hands the
-    # frame to whichever thread owns the Lava context, and a GLMakie screen cannot
+    # frame to whichever thread owns the GPU context, and a GLMakie screen cannot
     # follow it there
     prerenderscenes!(clips, n)
     ok = runowned(player) do

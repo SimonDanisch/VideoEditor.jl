@@ -24,10 +24,9 @@ Any size, because the model has its own input resolution and resampling it to th
 frame is this file's business, not the caller's. Any element type, because
 normalization happens here — see [`depthbytes`](@ref) for why it has to.
 """
-const DEPTHMODEL = Ref{Any}(nothing)
 
-registerdepth!(f) = (DEPTHMODEL[] = f; nothing)
-hasdepthmodel() = DEPTHMODEL[] !== nothing
+registerdepth!(f) = (INSTALLED.depth = f; nothing)
+hasdepthmodel() = INSTALLED.depth !== nothing
 
 """
 The built-in depth model: DepthAnything V2, from `DepthAnythingRunner`.
@@ -39,7 +38,6 @@ the host because `depthbytes` normalizes over the whole frame, and a device
 reduction per frame would be a synchronize per frame for a number that then
 travels to the host anyway.
 """
-const DEPTHANYTHING = Ref{Any}(nothing)
 
 """
     dropsingletons(a) -> AbstractArray
@@ -54,10 +52,10 @@ widening every consumer to accept a 4-D array that only ever has two real axes.
 dropsingletons(a::AbstractArray) = dropdims(a; dims = Tuple(findall(==(1), size(a))))
 
 function depthanythingdepth(img)
-    if DEPTHANYTHING[] === nothing
-        DEPTHANYTHING[] = DepthAnythingRunner.depthanything(; backend = Lava.LavaBackend())
+    if INSTALLED.depthanything === nothing
+        INSTALLED.depthanything = DepthAnythingRunner.depthanything(; backend = Mantle.defaultbackend())
     end
-    d = dropsingletons(Array(DepthAnythingRunner.depthmap!(DEPTHANYTHING[], img)))
+    d = dropsingletons(Array(DepthAnythingRunner.depthmap!(INSTALLED.depthanything, img)))
     # Loud, not silent: a model whose output stops being one plane is a change the
     # editor must not paper over by guessing which axis to keep.
     ndims(d) == 2 || error("depth model returned $(ndims(d)) non-singleton axes, expected 2")
@@ -126,7 +124,7 @@ function analyzedepth!(clip::Clip, readframe; maxside::Integer = 384, progress =
     track = DepthTrack(Array{UInt8, 3}(undef, dw, dh, n), clip.src_in)
     for k in 1:n
         img = k == 1 ? f0 : readframe(clip.src_in + k - 1)
-        d = depthbytes(DEPTHMODEL[](img))
+        d = depthbytes(INSTALLED.depth(img))
         view(track.depth, :, :, k) .= depthscale(d, dw, dh)
         progress === nothing || progress(k, n)
     end
@@ -225,6 +223,27 @@ planedata(::DepthBlurOp, clip::Clip, srcframe::Integer) =
     (d = depthframe(clip, srcframe); d === nothing ? nothing : vec(d))
 
 """
+    depthblurradius(op, dims) -> Int
+
+The widest tap radius this op asks for at this frame size, or 0 when it asks for
+nothing.
+
+Capped in pixels, not by the fraction alone: the tap count is the square of this,
+so a fraction of a 4K frame would be a 40-tap radius and 6561 samples a pixel. Six
+is where defocus reads as defocus and the cost stays flat.
+
+Its own function because the RENDER PATH needs the number without running the
+blur — the graph packs it into a `Mantle.GPURef` and a radius of zero is how a
+switched-off depth blur passes the picture through (see its `chainpass!`). Two
+places computing it separately is two rules, and they would drift.
+"""
+function depthblurradius(op::DepthBlurOp, dims)
+    s = clamp(op.strength, 0.0f0, 1.0f0)
+    s <= 0.001f0 && return 0
+    return clamp(round(Int, s * 0.02 * min(dims[1], dims[2])), 1, 6)
+end
+
+"""
     depthblur!(out, img, plane, op)
 
 Defocus `img` into `out` by each pixel's distance from `op.focus` in depth.
@@ -245,10 +264,7 @@ function depthblur!(out, img, plane, op::DepthBlurOp)
         copyto!(out, img)
         return out
     end
-    # Capped in pixels, not by the fraction alone: the tap count is the square of
-    # this, so a fraction of a 4K frame would be a 40-tap radius and 6561 samples
-    # a pixel. Six is where defocus reads as defocus and the cost stays flat.
-    maxr = Int32(clamp(round(Int, s * 0.02 * min(w, h)), 1, 6))
+    maxr = Int32(depthblurradius(op, (w, h)))
     # NO synchronize. This runs inside a graph pass body, where Mantle orders the
     # passes from the `use` declarations in `chainpass!` — and the kernels that
     # already run there (`coloradjust!`, `gaussianblur!`, `unsharpmask!`) do not
@@ -291,7 +307,7 @@ and a radius is an integer by the time anything uses it.
         end
         # `unitn0f8`, NOT `RGB{N0f8}(::Float32, …)` — the latter validates and calls
         # `throw_colorerror`, which drags string building into the kernel's IR and
-        # makes Lava reject the whole thing. See the note on `unitn0f8`: the clamp
+        # makes the shader compiler reject the whole thing. See the note on `unitn0f8`: the clamp
         # IS the check. This kernel had the validating form and so never compiled,
         # which is why depth blur could not render even once depth existed.
         # Coverage is averaged with the colour: this is a box blur, both are

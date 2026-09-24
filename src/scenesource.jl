@@ -37,8 +37,8 @@ Nothing for a decoder: `decodesource` is its version of the same idea, called
 from `update!` for the reason spelled out there.
 
 A scene draws with resources that belong to ONE thread — GLMakie's screen to
-thread 1, a Lava-backed renderer's Vulkan context to the worker's — while the
-composite runs on whichever thread owns the render engine's Lava context.
+thread 1, a Mantle-backed renderer's Vulkan context to the worker's — while the
+composite runs on whichever thread owns the render engine's GPU context.
 Drawing inside the pass body therefore zigzags caller → owner → caller once per
 frame, and the hop back waits for the editor's renderloop to reach a yield.
 Measured on the lego project: 22.5 ms of waiting against 7.3 ms of drawing, and
@@ -46,7 +46,7 @@ playback of a 60 fps timeline at 10–12 fps.
 
 Called while the caller is still on thread 1, right before `runowned` hands the
 frame to the worker: the hop inside [`sceneframe!`](@ref) is then a no-op for a
-GLMakie scene and one straight hop to the worker for a Lava-backed one — the
+GLMakie scene and one straight hop to the worker for a Mantle-backed one — the
 zigzag never happens.
 """
 prerender!(::ClipSource, ::Clip, ::Integer) = nothing
@@ -513,25 +513,26 @@ sourcenode(::VideoSource, clip::Clip) =
 sourcenode(::SceneSource, ::Clip) = SceneNode()
 
 function chainpass!(g, ::SceneNode, ::Nothing, ::Nothing, ctx::ChainBuild, dims)
-    cur = Mantle.Transient.Buffer(g, PlanePixel, prod(dims))
+    cur = Mantle.Transient.Buffer(g, PlanePixel, dims...; hostwritten = true)
     st = ctx.state
-    # A scene's picture is a host frame and comes in through an `Update` for
-    # exactly the reason a decoded one does: a `copyto!` into a device transient
+    # A scene's picture is a host frame and is STORED into the transient for
+    # exactly the reason a decoded one is: a `copyto!` into a device transient
     # from inside a recorded pass body is a host→device upload mid-batch, which
-    # forces a `vkQueueSubmit` and stalls. This was the video source's bug too —
+    # forces a `vkQueueSubmit` and stalls. A store lands at the update pass
+    # instead, as a command in the run's own submission. This was the video source's bug too —
     # it is the same bug, and it survived here because the scene pass has its own
     # body. Measured on the lego project: playback of a timeline with a scene ran
     # at 10.6 fps against 32.4 without one, and baking the scene (so the body only
     # reads a PNG) changed nothing, which is what puts the cost on the upload and
     # not the drawing.
-    st.upload = Mantle.Update(g, cur)
-    Mantle.custom!(g, "scene") do p
-        Mantle.use(p, cur; read = true, write = true)
-        # …and the body only has work left when nobody filled the update: the
-        # export and the bake are single-threaded and draw right here, at the
-        # full budget `st.exact` says this frame is owed.
-        () -> st.uploaded || copyto!(frameview(cur, dims), scenepicture!(st, dims; exact = st.exact))
-    end
+    st.upload = cur
+    st.blankonmiss = true   # nothing else writes this one
+    # No pass at all. The picture is a host image and `update!` STORES it into
+    # this transient before the run, which is the whole of what the old body did
+    # — it only ever had work left when nobody had filled the update, and that
+    # case is now a store of `blankpixels!` rather than a draw inside a recorded
+    # pass. What reads `cur` is the next node in the chain, which is what gives
+    # the transient its interval.
     return cur
 end
 

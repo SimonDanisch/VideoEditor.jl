@@ -1,5 +1,5 @@
 """
-Drive the editor's matte tool with MatAnyone running on Lava.
+Drive the editor's matte tool with MatAnyone running on the GPU.
 
 Opt-in glue, deliberately not a dependency in either direction: VideoEditor owns
 the track, the UI and the render path and asks a propagator to fill in the
@@ -7,7 +7,7 @@ frames; DNNKernels knows nothing about editors. Including this file is what join
 them.
 
     include("examples/matanyone.jl")
-    usematanyone!(; backend = LavaBackend())     # once, before marking a subject
+    usematanyone!(; backend = Mantle.defaultbackend())     # once, before marking a subject
 
 After that the Matte tool's status line reads "model" instead of "built-in" and
 every propagation runs the network.
@@ -28,10 +28,10 @@ empty result. The image operand *is* 0..1, so the two use different scales.
 """
 
 using VideoEditor, MatAnyoneRunner
-using Lava: LavaBackend
+using Mantle: defaultbackend
 
 """
-    usematanyone!(; backend = LavaBackend(), graphdir, weights, warmup = 10)
+    usematanyone!(; backend = Mantle.defaultbackend(), graphdir, weights, warmup = 10)
 
 Install the MatAnyone propagator into the editor's matte tool.
 
@@ -53,7 +53,7 @@ carries the workload (`VideoEditor/src/precompile.jl`) — so there is nothing
 extra to load here. Same story as `sam2.jl`, same fix, and its docstring has the
 numbers for the segmenter half.
 """
-function usematanyone!(; backend = LavaBackend(), kwargs...)
+function usematanyone!(; backend = Mantle.defaultbackend(), kwargs...)
     propref = Ref{Any}(nothing)
     # Built on FIRST USE, not here: a Vulkan `BatchQueue` is single-writer and
     # belongs to whichever thread first touches the context, while the editor

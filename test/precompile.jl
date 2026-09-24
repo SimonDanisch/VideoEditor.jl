@@ -14,24 +14,24 @@ returns black fast is not a pass.
 using Test, VideoEditor
 
 const SUBPROCESS = """
-using VideoEditor, Lava, KernelAbstractions
+using VideoEditor, Mantle, KernelAbstractions
 const KA = KernelAbstractions; const VE = VideoEditor
 asset = VE.editorassets()
-backend = LavaBackend()
+backend = Mantle.defaultbackend()
 src = VE.VideoSource(asset); seq = VE.Sequence(src)
 engine = VE.FxEngine(backend); readers = Dict{String,Any}()
 dest = VE.RGBFrame(undef, src.width, src.height)
-Lava.frozen_reset_stats!()
+Mantle.resetkernelcompiles!(Mantle.todevice(backend))
 c0 = Base.cumulative_compile_time_ns()
 t = @elapsed begin
     VE.runeditorframe(seq, engine, readers, dest, 1)
     KA.synchronize(backend)
 end
 c1 = Base.cumulative_compile_time_ns()
-s = Lava.frozen_stats()
+s = Mantle.kernelcompiles(Mantle.todevice(backend))
 nonblack = count(c -> c != VE.RGB{VE.N0f8}(0,0,0), dest) / length(dest)
 println("RESULT ", (; wall = t, compile = (c1[1]-c0[1])/1e9, hits = s.hits,
-                     misses = s.misses, version = s.version, nonblack = nonblack))
+                     misses = s.misses, nonblack = nonblack))
 """
 
 @testset "VideoEditor: first frame does not compile" begin

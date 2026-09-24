@@ -24,10 +24,9 @@ Pluggable like the other models so the editor runs with it absent — a clip set
 `:flow` then falls back to showing the frame it has, which is what `:sample`
 would have shown anyway.
 """
-const INTERPOLATOR = Ref{Any}(nothing)
 
-registerinterpolate!(f) = (INTERPOLATOR[] = f; nothing)
-hasinterpolator() = INTERPOLATOR[] !== nothing
+registerinterpolate!(f) = (INSTALLED.interpolate = f; nothing)
+hasinterpolator() = INSTALLED.interpolate !== nothing
 
 """
 The built-in interpolator: RIFE, from `RIFERunner`. Built on first use, and
@@ -37,16 +36,14 @@ The export pins the padded frame size, so one model serves one resolution — a
 different one throws rather than producing a wrong picture, which is why the size
 is part of what is cached rather than a property assumed constant.
 """
-const RIFEMODEL = Ref{Any}(nothing)
-const RIFESIZE = Ref{Tuple{Int, Int}}((0, 0))
 
 function rifeinterpolate!(out, a, b, t::Real)
     sz = size(a)
-    if RIFEMODEL[] === nothing || RIFESIZE[] != sz
-        RIFEMODEL[] = RIFERunner.rife(; backend = Lava.LavaBackend())
-        RIFESIZE[] = sz
+    if INSTALLED.rife === nothing || INSTALLED.rifesize != sz
+        INSTALLED.rife = RIFERunner.rife(; backend = Mantle.defaultbackend())
+        INSTALLED.rifesize = sz
     end
-    RIFERunner.interpolate!(out, RIFEMODEL[], a, b; t = Float64(t))
+    RIFERunner.interpolate!(out, INSTALLED.rife, a, b; t = Float64(t))
     return out
 end
 

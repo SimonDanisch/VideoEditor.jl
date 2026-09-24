@@ -767,7 +767,7 @@ end
         @testset "the DNN kernels actually compile on the GPU" begin
             # Both of these shipped with `RGB{N0f8}(::Float32, …)`, which VALIDATES
             # and calls `throw_colorerror` — string building on an error path no
-            # input reaches, which Lava rejects, taking the whole kernel with it.
+            # input reaches, which the shader compiler rejects, taking the kernel with it.
             # They passed every CPU test and could never have run on the GPU they
             # were written for. `unitn0f8` (matte.jl) exists precisely for this and
             # documents it; I wrote both kernels without using it.

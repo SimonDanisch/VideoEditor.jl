@@ -24,17 +24,15 @@ Mono and a stated rate rather than the editor's stereo Int16: every model wants
 something different, and the conversion belongs on this side of the boundary
 where the editor's audio layout is known.
 """
-const SPEECHMODEL = Ref{Any}(nothing)
 
-registertranscribe!(f) = (SPEECHMODEL[] = f; nothing)
-hasspeechmodel() = SPEECHMODEL[] !== nothing
+registertranscribe!(f) = (INSTALLED.speech = f; nothing)
+hasspeechmodel() = INSTALLED.speech !== nothing
 
 "The built-in speech model: Whisper, from `WhisperRunner`. Built on first use."
-const WHISPER = Ref{Any}(nothing)
 
 function whispertranscribe(samples::AbstractVector{Float32}, rate::Real)
-    if WHISPER[] === nothing
-        WHISPER[] = WhisperRunner.whisper(; backend = Lava.LavaBackend())
+    if INSTALLED.whisper === nothing
+        INSTALLED.whisper = WhisperRunner.whisper(; backend = Mantle.defaultbackend())
     end
     # The runner defines its own sample rate and resamples nothing, so handing it
     # audio at another rate transcribes a pitch-shifted signal — which comes back
@@ -45,7 +43,7 @@ function whispertranscribe(samples::AbstractVector{Float32}, rate::Real)
     # pieces. Iterating the tuple walks the String first, so every run died on
     # `s.text` with "type String has no field text". The editor wants the segments:
     # a caption needs a start and a stop, which the joined text does not have.
-    _, segs = WhisperRunner.transcribe(WHISPER[], audio)
+    _, segs = WhisperRunner.transcribe(INSTALLED.whisper, audio)
     return [Caption(s.start, s.stop, strip(s.text)) for s in segs if !isempty(strip(s.text))]
 end
 
@@ -133,7 +131,7 @@ function transcribe!(seq::Sequence)
     hasspeechmodel() || error("no speech model installed — see registertranscribe!")
     audio, rate = sequenceaudio(seq)
     isempty(audio) && error("this timeline has no audio to transcribe")
-    caps = SPEECHMODEL[](audio, rate)
+    caps = INSTALLED.speech(audio, rate)
     empty!(seq.captions)                  # the field is `const`: replace contents
     append!(seq.captions, caps)
     return seq.captions

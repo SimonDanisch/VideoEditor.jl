@@ -15,7 +15,7 @@ player0 = VE.Player("/sim/Programmieren/VideoEdit/media/demo_loop.mp4")
 sleep(3.0)
 said = "the quick brown fox jumps over the lazy dog"
 # through `addnarration!`, i.e. the analysis executor — calling `render!` on the
-# main thread beside a live Player trips Lava's single-writer batch queue
+# main thread beside a live Player trips the GPU's single-writer submit channel
 VE.addnarration!(player0, said)
 for _ in 1:180
     (!isempty(player0.sequence.narration) &&

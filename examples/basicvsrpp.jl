@@ -5,7 +5,7 @@ Same opt-in shape as `matanyone.jl`: no dependency in either direction, the
 editor owns the effect and the cache, and including this file installs the model.
 
     include("examples/basicvsrpp.jl")
-    usebasicvsrpp!(; backend = LavaBackend())
+    usebasicvsrpp!(; backend = Mantle.defaultbackend())   # `using Mantle` first
 
 BasicVSR++ is temporal — it propagates along the clip in both directions — so it
 takes a *window* of frames, which is exactly the contract `registerrestore!`
@@ -18,7 +18,7 @@ match what was exported. Passing a different count silently produces a graph
 whose `select` indices run off the end, which is why this checks up front.
 """
 
-using VideoEditor, DNNKernels, KernelAbstractions
+using VideoEditor, DNNKernels, KernelAbstractions, Mantle
 using VideoEditor: RGB, N0f8, red, green, blue
 const KA = KernelAbstractions
 

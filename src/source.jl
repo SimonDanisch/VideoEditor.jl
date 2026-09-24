@@ -107,7 +107,7 @@ mutable struct SceneSource <: ClipSource
     samples::Int
     # The frame, already drawn, and which frame it is. A scene draws with GLMakie,
     # whose screen belongs to thread 1; the composite runs on whichever thread owns
-    # the Lava context, which is the pinned GPU worker. Drawing inside the pass
+    # the GPU context, which is the pinned GPU worker. Drawing inside the pass
     # body therefore goes thread 1 → worker → thread 1 → worker for every frame,
     # and the hop back waits for the editor's own renderloop to reach a yield:
     # measured on the lego project at 22.5 ms of waiting against 7.3 ms of

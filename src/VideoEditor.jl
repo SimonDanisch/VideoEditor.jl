@@ -5,7 +5,7 @@ using FixedPointNumbers
 using GeometryBasics
 using GLMakie
 using GPUFiltering
-using Lava
+using Mantle
 using Makie
 using Observables
 using SAM2Runner
@@ -57,8 +57,61 @@ picture, and it is what goes to the screen and to the encoder.
 """
 const PlanePixel = RGBA{N0f8}
 
+"""
+Everything the editor has INSTALLED, in one place.
+
+This was nineteen `Ref{Any}` globals spread over seven files — one per model,
+plus a lazily-built cache beside most of them, plus a few settings. Nineteen
+names to know, every read a dynamic lookup, and no way to ask "what does this
+editor have".
+
+Three kinds of field, and the difference is worth keeping in view:
+
+  * the HOOKS a caller registers (`speech`, `depth`, `interpolate`, `look`,
+    `matte`, `speak`, `restore`) — `nothing` means the editor runs without that
+    capability, which every call site already handles;
+  * the BUILT-INS, built on first use and kept (`whisper`, `rife`,
+    `depthanything`, `neurallut`, `kokoro`, `voices`) — memoisation, not
+    configuration. `rifesize` is part of `rife`'s key: the export pins a padded
+    frame size, so one model serves one resolution;
+  * the SETTINGS, which are concretely typed because they are numbers and
+    strings rather than models.
+
+One global rather than a field on some session object, because the models are
+genuinely process-wide: they hold GPU memory and a context, and a second editor
+in the same session shares them deliberately.
+"""
+mutable struct Installed
+    speech::Any
+    depth::Any
+    interpolate::Any
+    look::Any
+    matte::Any
+    speak::Any
+    restore::Any
+
+    whisper::Any
+    rife::Any
+    rifesize::Tuple{Int, Int}
+    depthanything::Any
+    neurallut::Any
+    kokoro::Any
+    voices::Any
+
+    restorescale::Int
+    restorewindow::Int
+    matteseed::Float64
+    mattewarmed::Bool
+    mattescratch::String
+end
+
+const INSTALLED = Installed(nothing, nothing, nothing, nothing, nothing, nothing, nothing,
+                            nothing, nothing, (0, 0), nothing, nothing, nothing, nothing,
+                            4, 5, 0.25, false, "")
+
+
 # Track/effect appliers accept this so the same code runs on CPU frames and
-# GPU-resident LavaArrays (GPUFiltering kernels are backend-generic), and on a
+# GPU-resident device arrays (GPUFiltering kernels are backend-generic), and on a
 # host RGB frame as well as a graph plane.
 const AnyRGBFrame = AbstractMatrix{<:Union{RGB{N0f8}, RGBA{N0f8}}}
 

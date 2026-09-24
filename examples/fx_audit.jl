@@ -27,7 +27,7 @@ VE.registermatte!(MatAnyoneRunner.matanyonepropagator())
 VE.installdepth!(); VE.installlook!()
 
 # NO Player: a bare engine, so nothing contends with its GPU workers.
-engine = VE.FxEngine(VE.Lava.LavaBackend())
+engine = VE.FxEngine(VE.Mantle.defaultbackend())
 src  = VE.VideoSource("/sim/Programmieren/VideoEdit/media/demo_loop.mp4")
 clip = VE.Clip(src, 0, 16, 0, (0.0, 0.0, 1.0, 1.0), 1.0)
 FRAME = 4

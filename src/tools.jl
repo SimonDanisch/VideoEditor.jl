@@ -2795,7 +2795,7 @@ least loads the model, and the first click pays for its own shape.
 """
 function warmmattepanel!(ctx::ToolContext)
     player = ctx.player
-    MATTEWARMED[] && return nothing
+    INSTALLED.mattewarmed && return nothing
     loc0 = editclip(player)
     mw, mh = loc0 === nothing ? (480, 270) : mattereadsize(loc0[1], nothing)
     # The longest wait in the editor: measured 67 s for the first matte of a
@@ -2825,7 +2825,6 @@ function warmmattepanel!(ctx::ToolContext)
 end
 
 "Seed size as a fraction of frame width — a box the user can hit by clicking."
-const MATTESEED = Ref{Float64}(0.25)
 
 """
 A selection being marked.
@@ -2870,7 +2869,7 @@ mutable struct MatteCollect
     lastmasks::Any   # per-object masks from the last preview, for the SAM 2 view
     # The post-fx frame the seed was computed from, kept so the card can draw a
     # picture without re-rendering: the render belongs to the worker that owns the
-    # Lava context, and the card is built on the UI thread.
+    # GPU context, and the card is built on the UI thread.
     lastframe::Any
 end
 
