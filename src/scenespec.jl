@@ -65,13 +65,15 @@ reordering the parts must not silently re-aim every curve in the scene. It is
 also the difference between a path a model can write (`"arm_left.angle"`) and
 one it has to count out (`"plots[4].rotation"`).
 
-`component` is `nothing` unless the path indexes one, as `offset[1]` does.
+Native lights use `lights[i]` in the scene's light order; `lights[0]` addresses
+Makie's separate ambient colour. `component` is `nothing` unless the path indexes
+one, as `offset[1]` does.
 Returns `nothing` for anything unaddressable rather than throwing: a project
 from a newer editor may name parts this one has not got, and a curve pointing
 nowhere is one to ignore, not a crash on open.
 """
 function scenepath(str::AbstractString)
-    m = match(r"^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)\])?$", String(str))
+    m = match(r"^([A-Za-z_][A-Za-z0-9_]*(?:\[\d+\])?)\.([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)\])?$", String(str))
     m === nothing && return nothing
     comp = m.captures[3] === nothing ? nothing : parse(Int, m.captures[3])
     return (Symbol(m.captures[1]), Symbol(m.captures[2]), comp)

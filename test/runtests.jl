@@ -1967,6 +1967,14 @@ end
 include("scenespec.jl")   # a scene as a clip's source: the spec, the live scene
 include("overlays.jl")    # …and the stock non-footage clips built from presets
 include("bake.jl")        # pre-rendering a clip's chain to disk
+include("preview_mode.jl") # refinement follows the backend's runtime mode
+include("renderthread.jl") # renderer handoff, failures and startup deadlines
+include("renderfarm.jl")  # saved procedural scenes, resume, audio and frame transport
+include("recordedanimation.jl") # streamed simulation arrays; GPU integration when RayMakie is loaded
+include("sceneediting.jl") # inspector, original animation, overrides and saved edits
+include("speechediting.jl") # model capabilities, approved takes and speech following cuts
+include("creative_controls.jl") # native lights and dialogue timing through edits
+include("trackpreviews.jl") # exact audio envelopes and bounded asynchronous preview work
 
 # LAST, and that is the whole point. `interactions.jl` throws at the end of the
 # file on its known failures, which aborts this one — so for as long as it was
@@ -1995,6 +2003,19 @@ include("bake.jl")        # pre-rendering a clip's chain to disk
 # makes them run to completion and lets this one throw once, at the end, with
 # everything counted.
 canui && @testset "GUI" begin
+    fakeinteraction = get(ENV,"MAKIE_FAKE_INTERACTION",
+        normpath(joinpath(@__DIR__,"..","..","Makie","docs","fake_interaction.jl")))
+    if isfile(fakeinteraction)
+        include("editing_walkthrough.jl")
+        include("trackpreview_walkthrough.jl")
+        include("animation_filter_walkthrough.jl")
+        if isdefined(Main,:RayMakie)
+            include("sceneresources.jl")
+            include("sceneediting_walkthrough.jl")
+        end
+    else
+        @test_skip isfile(fakeinteraction) # Makie's documentation helper is optional outside a checkout.
+    end
     include("fuzz.jl")            # random edit programs vs the picture (needs a Player)
     include("interactions.jl")
 end

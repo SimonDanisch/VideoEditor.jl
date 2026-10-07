@@ -9,7 +9,7 @@ using VideoEditor
 p = Player("footage.mp4")           # opens the editor window
 addsource!(p, "more.mp4")           # append another video (or drop the file onto the window)
 
-saveproject("edit.toml", p.sequence)
+saveproject("edit.videoedit", p.sequence)
 exportvideo("out.mp4", p.sequence)  # bakes crop/effects/stabilization + muxes
                                     # the sources' audio along the cut list
 
@@ -18,6 +18,12 @@ srv = mcpserve!(p)                  # expose the live editor to AI agents (see b
 
 Sequences can mix any number of sources (each decodes through its own
 background worker); resolutions may differ, framerates must match.
+
+For procedural movies, see [scene editing](docs/scene-editing.md) for colour
+controls, camera and object transforms, actor timing and expressions, keyframes,
+speech editing and restoring original motion.
+The [walkthrough regression guide](docs/testing.md) describes reproducible mouse
+and keyboard tests using Makie's existing interaction helpers.
 
 Heavy sources — above full HD, or heavyweight codecs like DNxHR/ProRes —
 automatically get a background **preview proxy** (720p h264, cached across
@@ -34,6 +40,30 @@ Renders identically to the CPU path (WYSIWYG-verified) and falls back to
 it automatically on any error.
 
 ## Keys
+
+Live RayMakie raster scenes support click selection in the preview. The inspector
+shows the picked object and its linked performance controls, including static
+transforms. **All objects** returns to the full scene and its animation filter.
+**Scene view** opens an independent orbit camera over the same GPU geometry:
+drag the coloured XYZ handles to move, rotate or scale; right-drag orbits,
+middle-drag pans, and the wheel zooms. These view controls do not edit the film
+camera. **Frame selection** brings the selected object and its handles into view.
+**Camera path** selects the shot camera in the existing left inspector and highlights
+its timeline lanes. Clicking a parameter lane or anchor scrolls to its named
+control in that inspector. Use the inspector's diamonds to add keys; dragging the camera
+or object handles edits those same fields and curves. Each drag is one Undo step.
+The animation filter shows the selected object's original animated parameters;
+turn it off to access static parameters as well. A field edited with a 3D handle
+is also shown while the filter is on.
+
+Recipes can associate numeric control groups with objects using
+`object=:pivot_plot_name`, and provide a pure `camera(frame,fps)` sampler for
+camera-path previews without rendering intermediate frames. A pure
+`sampleparams(frame,fps)` callback exposes original recipe animations in the same
+inspector and timeline without seeking or editing the scene. The existing curve
+fitter reduces procedural samples to sparse Bézier anchors before showing them.
+Untouched parameters keep following the recipe; editing a curve takes control of
+only that parameter.
 
 | Key | Action |
 |---|---|
@@ -69,8 +99,10 @@ panels share — a panel opens there instead of overlaying the preview. The tool
 icons below **arm**: split (✂) and crop (▢) change the cursor to a crosshair
 and act where you click — split cuts the timeline at the click position (not
 the playhead), crop drags a rectangle on the preview; ✕/↶/↷ (delete/undo/redo)
-act at the playhead. The timeline spans the full window width. The preview
-fills the whole available width when a crop/zoom makes it wider than the source.
+act at the playhead. The inspector occupies the full editing height, with the
+timeline below the preview area. The preview toolbar switches between the film,
+the 3D scene, or both side by side. The preview fills the available width when a
+crop/zoom makes it wider than the source.
 
 - **Bin** — imported sources, each with a first-frame thumbnail. Drop video
   files anywhere on the window (any number at once) and they land here — the
@@ -169,3 +201,10 @@ isn't available (`Player(...; audiopreview = false)` disables it).
 - preview audio has ~0.1–0.2 s of pipe latency (export stays sample-exact);
   no audio effects/crossfades
 - sources must share the sequence framerate (frame-exact model, no resampling)
+
+## Live scenes and render farms
+
+Procedural Makie scenes can be saved as timeline sources and exported through
+a resumable GPU farm. See [the scene and farm guide](docs/renderfarm.md) and
+[the BonitoAgents connection example](examples/bonito_farm.jl). Workers use ordinary
+Julia Pkg environments and compilation caches.

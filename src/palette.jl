@@ -90,13 +90,16 @@ function buildpalette!(player::Player, uicolors)
         return Consume(true)   # the palette owns the keyboard while it is open
     end
 
-    open = () -> (query[] = ""; recompute(); open!(modal))
+    open = (text = "") -> (query[] = text; recompute(); open!(modal))
     merge!(player.fxwidgets, Dict{Symbol, Any}(
         :palettemodal => modal, :palettequery => query, :paletteopen => open,
         :paletterun => (name::Symbol) -> runcommand!(player, name),
         :palettehits => hits, :paletteselected => selected))
     return open
 end
+
+opencommandpalette!(player::Player; query::AbstractString = "") =
+    player.fxwidgets[:paletteopen](String(query))
 
 "Run `cmd` from the palette (or say why it cannot run) and close it."
 function runpalette!(player::Player, modal, cmd::Command, why)

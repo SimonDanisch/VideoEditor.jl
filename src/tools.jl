@@ -46,6 +46,7 @@ cleartoolcontext!(::Nothing) = nothing
 
 "Remove everything a context put into its card and drop its listeners."
 function cleartoolcontext!(ctx::ToolContext)
+    cleartoolcards!(ctx.player,ctx.tool)
     # …including its entry in the panel index, so nothing reaches a context whose
     # card is going away: `blendseconds`, `activetool` and the tests all look it
     # up by tool name and would find one listening into a freed layout.
@@ -442,8 +443,15 @@ function toolcard!(build::Function, ctx::ToolContext; caption::AbstractString = 
     # …and the body's rows sit at the same rhythm as the pills inside them, rather
     # than at the default that made "+ object" float away from the list it adds to.
     body = GridLayout(g[2, 1]; alignmode = Makie.Outside(8, 8, 6, 8))
+    measurable!(body)
+    colsize!(body,1,Makie.Relative(1.0))
+    colsize!(g,1,Makie.Relative(1.0))
+    colsize!(head,1,Makie.Relative(1.0))
     rowgap!(body, 6)
     build(body, blocks)
+    # Optional fields leave empty rows. Anchor every row so one missing field
+    # cannot make the entire card's measured height indeterminate.
+    measurable!(body,(1:first(size(body)))...)
     return entry
 end
 
@@ -524,11 +532,11 @@ end
 
 "Remove all tool cards (kept separate from the action button so a tool can
 re-render its card list in place)."
-function cleartoolcards!(player::Player)
+function cleartoolcards!(player::Player, tool::Union{Nothing,Symbol}=nothing)
     tc = get(player.fxwidgets, :toolcards, nothing)
     tc === nothing && return nothing
     _, scene, cards = tc
-    for c in cards
+    for c in filter(c -> tool === nothing || c.tool === tool,cards)
         for b in (c.frame, c.box, c.lbl, c.im, c.rm, c.blocks...)
             b === nothing && continue
             b isa Makie.AbstractPlot ? Makie.delete!(scene, b) : Makie.delete!(b)
@@ -539,10 +547,12 @@ function cleartoolcards!(player::Player)
     # orphan: a card built but never registered, or one whose blocks list this
     # loop did not know about. An orphan does not merely leak — it keeps drawing,
     # at its old rectangle, stacked over the card that replaced it.
-    for pl in copy(scene.plots)
-        pl isa Makie.Image && Makie.delete!(scene, pl)
+    if tool === nothing
+        for pl in copy(scene.plots)
+            pl isa Makie.Image && Makie.delete!(scene, pl)
+        end
     end
-    empty!(cards)
+    filter!(c -> tool !== nothing && c.tool !== tool,cards)
     return nothing
 end
 
@@ -1675,53 +1685,187 @@ function narrationpanel!(ctx::ToolContext)
     player = ctx.player
     seq = player.sequence
     colors = player.fxwidgets[:uicolors]
-    toolcard!(ctx; caption = "new line") do g, blocks
-        box = Textbox(g[1, 1]; placeholder = "what should be said…",
-                      width = Makie.Relative(1.0), tellwidth = false,
-                      reset_on_defocus = false, fontsize = 11)
-        # Enter commits, so a line is one edit rather than one per keystroke.
+    toolcard!(ctx; caption = "Add a spoken line at the playhead") do g, blocks
+        box = Textbox(g[1,1]; placeholder="words to speak…", width=Makie.Relative(1),
+                      tellwidth=false, reset_on_defocus=false, fontsize=11)
         on(box.stored_string) do str
             (str === nothing || isempty(strip(str))) && return
-            addnarration!(player, str)
-            box.stored_string[] = nothing
+            addnarration!(player,str)
         end
-        push!(blocks, box)
-        nothing
+        push!(blocks,box)
     end
-    for (i, nar) in enumerate(seq.narration)
-        toolcard!(ctx; caption = "at $(round(nar.at; digits = 2))s",
-                  onremove = _ -> dropnarration!(player, i)) do g, blocks
-            # A Textbox, not a Label: the words are the edit, and a line you can
-            # only delete and retype is not an editable line.
-            box = Textbox(g[1, 1]; stored_string = nar.text, fontsize = 11,
-                          width = Makie.Relative(1.0), tellwidth = false,
-                          reset_on_defocus = false)
-            on(str -> str === nothing || setnarrationtext!(player, i, str), box.stored_string)
-            push!(blocks, box)
-            # Side by side, not stacked. Each line is a card in a scrolling panel
-            # and a documentary has dozens of them — three full-width controls
-            # apiece made thirty lines a scroll nobody would use.
-            brow = GridLayout(g[2, 1])
-            flat = ghostbutton(colors)
-            b  = Button(brow[1, 1]; label = isempty(nar.samples) ? "render" : "re-render", flat...)
-            mv = Button(brow[1, 2]; label = "move here", flat...)
-            on(_ -> rendernarration!(player, i), b.clicks)
-            on(_ -> movenarration!(player, i), mv.clicks)
-            push!(blocks, brow)
-            # The voice, once the synthesizer can say what it has. No menu at all
-            # rather than an empty one: a control listing nothing is worse than a
-            # control that is not there yet.
-            vs = speakvoices()
-            if !isempty(vs)
-                menu = Menu(g[3, 1]; options = vs, fontsize = 11,
-                            default = nar.voice in vs ? nar.voice : nothing,
-                            prompt = "voice: $(nar.voice)",
-                            width = Makie.Relative(1.0), tellwidth = false)
-                on(v -> v === nothing || setnarrationvoice!(player, i, v), menu.selection)
-                push!(blocks, menu)
-            end
-            nothing
+    isempty(seq.narration) && return nothing
+    # One line inspector, rather than building hundreds of widgets for a film.
+    i = clamp(get(player.fxwidgets,:narration_index,1),1,length(seq.narration))
+    player.fxwidgets[:narration_index] = i
+    nar = seq.narration[i]
+    rendering = haskey(get(player.fxwidgets,:speechjobs,IdDict()),nar)
+    toolcard!(ctx; caption="Spoken lines · $(length(seq.narration))") do g, blocks
+        options = [("$(j). $(isempty(n.label) ? n.voice : n.label) · $(round(something(narrationtime(seq,n),n.at);digits=2))s · $(first(n.text,24))",j)
+                   for (j,n) in enumerate(seq.narration)]
+        menu = Menu(g[1,1]; options, default=options[i][1], fontsize=11, searchable=true,
+                    search_placeholder="find a line…",
+                    width=Makie.Relative(1),tellwidth=false)
+        on(menu.selection) do j
+            j === nothing && return
+            selectnarration!(player,j; seek=false)
         end
+        push!(blocks,menu)
+        nav = GridLayout(g[2,1]); colgap!(nav,4)
+        for (k,label,delta) in ((1,"◀ line",-1),(2,"line ▶",1))
+            btn = Button(nav[1,k];label,fontsize=11,tellwidth=false,width=Makie.Relative(1))
+            on(btn.clicks) do _
+                selectnarration!(player,clamp(i+delta,1,length(seq.narration)); seek=false)
+            end
+        end
+        goto = Button(nav[1,3];label="Go to line",fontsize=11,tellwidth=false,width=Makie.Relative(1))
+        on(_ -> seek!(player,round(Int,something(narrationtime(seq,nar),nar.at)*seq.framerate)),goto.clicks)
+        push!(blocks,nav)
+    end
+    toolcard!(ctx; caption="$(isempty(nar.label) ? nar.voice : nar.label) · at $(round(something(narrationtime(seq,nar),nar.at);digits=2))s",
+              onremove=_ -> dropnarration!(player,i)) do g, blocks
+        function field(row,label,value,commit; placeholder="")
+            push!(blocks,Label(g[row,1],label;fontsize=10,halign=:left,tellwidth=false,color=colors.text_muted))
+            box = Textbox(g[row+1,1];stored_string=value,placeholder,fontsize=11,
+                          width=Makie.Relative(1),tellwidth=false,reset_on_defocus=false)
+            on(v -> v === nothing || commit(v),box.stored_string)
+            push!(blocks,box)
+            return box
+        end
+        field(1,"Words",nar.text,v -> setnarrationtext!(player,i,v))
+        options = [("Session default",:default); [(m.label,k) for (k,m) in speechmodels()]]
+        any(o -> o[2] === nar.speech.model,options) || push!(options,("$(nar.speech.model) · unavailable",nar.speech.model))
+        modelrow = GridLayout(g[3,1])
+        modellabel = Label(modelrow[1,1], "Voice model"; fontsize=10,halign=:left,tellwidth=false)
+        push!(blocks,modellabel)
+        modelmenu = Menu(modelrow[2,1];options,default=first(only(filter(o->o[2]===nar.speech.model,options))),
+                         fontsize=11,width=Makie.Relative(1),tellwidth=false,searchable=true,
+                         search_placeholder="find a voice model…")
+        on(k -> k === nothing || setnarrationspeech!(player,i;model=k),modelmenu.selection)
+        push!(blocks,modelmenu)
+        model = speechmodel(nar)
+        refs = Pair{String,Tuple{String,String,String}}["No reference" => ("","",nar.voice)]
+        for n in seq.narration
+            isempty(n.speech.reference) && continue
+            value = (n.speech.reference,n.speech.reference_text,n.voice)
+            any(r -> r.second[1] == value[1],refs) || push!(refs,
+                "$(n.voice) · $(basename(value[1]))" => value)
+        end
+        current = findfirst(r->r.second[1]==nar.speech.reference,refs)
+        refmenu = Menu(g[4,1]; options=[(r.first,j) for (j,r) in enumerate(refs)],
+                       default=refs[something(current,1)].first,fontsize=11,searchable=true,
+                       search_placeholder="find a reference voice…",
+                       width=Makie.Relative(1),tellwidth=false)
+        on(refmenu.selection) do j
+            j === nothing && return
+            reference,reference_text,voice = refs[j].second
+            setnarrationspeech!(player,i;reference,reference_text,voice)
+        end
+        push!(blocks,refmenu)
+        if model !== nothing && model.reference
+            push!(blocks,Label(g[5,1],"Voice identity comes from the reference clip above.";
+                              fontsize=10,tellwidth=false,halign=:left,color=colors.text_muted))
+        else
+            field(5,"Voice ID",nar.voice,v -> setnarrationvoice!(player,i,v))
+        end
+        field(7,"Regie · delivery instructions",nar.speech.direction,
+              v -> setnarrationspeech!(player,i;direction=v);placeholder="quiet, hesitant, then increasingly angry…")
+        field(9,"Reference transcript (Fish uses this)",nar.speech.reference_text,
+              v -> setnarrationspeech!(player,i;reference_text=v))
+        footer = GridLayout(g[0,1]);colgap!(footer,4)
+        for (k,label,action) in ((1,rendering ? "Rendering…" : isempty(nar.samples) ? "Render take" : "Re-render take",()->rendernarration!(player,i)),
+                                 (2,"Listen",()->listennarration!(player,i)),
+                                 (3,"Move here",()->movenarration!(player,i)),
+                                 (4,"Reference…",()->choosenarrationreference!(player,i)))
+            btn = Button(footer[div(k-1,2)+1,mod(k-1,2)+1];label,fontsize=11,tellwidth=false,width=Makie.Relative(1))
+            on(_->action(),btn.clicks)
+        end
+        push!(blocks,footer)
+        note = rendering ? "Generating this take · you can continue editing." : isempty(nar.samples) ? "Not rendered · render to hear these settings." :
+               "Take ready · $(round(length(nar.samples)/nar.rate;digits=2))s · included in preview and export."
+        push!(blocks,Label(g[12,1],note;fontsize=10,tellwidth=false,halign=:left,color=colors.text_muted))
+        if model === nothing || !model.direction
+            push!(blocks,Label(g[13,1],"This model cannot use Regie; choose VoxCPM2 or Fish for directed delivery.";
+                  fontsize=10,tellwidth=false,halign=:left,color=colors.text_muted))
+        end
+    end
+    return nothing
+end
+
+function listennarration!(player::Player,i::Integer)
+    1 <= i <= length(player.sequence.narration) || return nothing
+    n = player.sequence.narration[i]
+    isempty(n.samples) && return setstatus!(player,"render this take before listening")
+    Sys.which("pw-cat") === nothing && return setstatus!(player,"audio preview needs pw-cat")
+    setstatus!(player,"playing this take…")
+    Threads.@spawn try
+        run(pipeline(audiocommand(`pw-cat --playback --raw --rate $(n.rate) --channels 1 --format f32 -`);
+                     stdin=IOBuffer(reinterpret(UInt8,n.samples)),stdout=devnull,stderr=devnull))
+        setstatus!(player,"played this take")
+    catch e
+        setstatus!(player,"could not play this take: $(briefly(e))")
+    end
+    return nothing
+end
+
+function setnarrationspeech!(player::Player,i::Integer;voice=nothing,kw...)
+    1 <= i <= length(player.sequence.narration) || return nothing
+    old = player.sequence.narration[i]
+    settings = SpeechSettings(; (k => getfield(old.speech,k) for k in fieldnames(SpeechSettings))...,kw...)
+    newvoice = voice === nothing ? old.voice : String(voice)
+    all(k->getfield(settings,k)==getfield(old.speech,k),fieldnames(SpeechSettings)) && newvoice == old.voice && return nothing
+    snapshot!(player)
+    player.sequence.narration[i] = narrationcopy(old;speech=settings,voice=newvoice)
+    speechchanged!(player)
+    setstatus!(player,"voice settings changed — render a take; Undo restores the previous performance")
+    return nothing
+end
+
+"Audio edits do not invalidate the raytraced picture; rebuild after the input callback completes."
+function speechchanged!(player::Player)
+    player.edited[] += 1
+    put!(player.uiqueue,()->rebuildtoolcard!(player,:narration))
+    return nothing
+end
+
+"Select the existing take from either its timeline block or the speech picker."
+function selectnarration!(player::Player, i::Integer; seek=true)
+    1 <= i <= length(player.sequence.narration) || return nothing
+    player.fxwidgets[:narration_index] = Int(i)
+    selected = get(player.fxwidgets,:dialogue_selected,nothing)
+    selected === nothing || (selected[] = Int(i))
+    opendock!(player,:effects)
+    if haskey(player.fxpanel.toolcards,:narration)
+        rebuildtoolcard!(player,:narration)
+    else
+        opentool!(player,:narration)
+    end
+    Makie.set!(player.fxwidgets[:fxfilterbox],"narration")
+    player.fxpanel.toolcards[:narration].open = true
+    if seek
+        n = player.sequence.narration[i]
+        seek!(player,round(Int,something(narrationtime(player.sequence,n),n.at)*player.sequence.framerate))
+    end
+    showspeechline!(player)
+    put!(player.uiqueue,()->showspeechline!(player))
+    return nothing
+end
+
+"Bring the selected line's words and model into view above add/picker controls."
+function showspeechline!(player::Player)
+    cards = filter(c->c.tool===:narration,player.fxwidgets[:toolcards][3])
+    length(cards) >= 3 || return nothing
+    scrollinspectorto!(player,last(cards).frame)
+    return nothing
+end
+
+function choosenarrationreference!(player::Player,i::Integer)
+    Threads.@spawn try
+        path = Makie.choose_file_dialogue()
+        path === nothing && return
+        put!(player.uiqueue,()->setnarrationspeech!(player,i;reference=String(path),reference_text=""))
+    catch e
+        setstatus!(player,"voice reference dialog failed: $(briefly(e))")
     end
     return nothing
 end
@@ -1729,38 +1873,22 @@ end
 """
     addnarration!(player, text) -> nothing
 
-Add a spoken line at the playhead and synthesize it.
-
-On the analysis executor: Kokoro is ~0.5 s of model time for a sentence warm and
-far more cold, and the UI thread must stay answerable — the same reason the matte
-and the depth run there.
+Add an editable spoken line at the playhead. Choose its voice and direction
+before explicitly rendering a take.
 """
 function addnarration!(player::Player, text::AbstractString)
     hasspeakmodel() || return setstatus!(player, "narration: no synthesizer installed")
     seq = player.sequence
     at = player.playhead[] / (seq.framerate > 0 ? seq.framerate : 25.0)
     snapshot!(player)
-    nar = Narration(String(text), at)
+    previous = isempty(seq.narration) ? nothing : seq.narration[clamp(get(player.fxwidgets,:narration_index,1),1,length(seq.narration))]
+    nar = previous === nothing ? Narration(String(text), at) :
+        Narration(String(text), at, previous.voice; speech=previous.speech,
+                  mix=VoiceMix(gain=previous.mix.gain,pan=previous.mix.pan,filter=previous.mix.filter))
     push!(seq.narration, nar)
-    redraw!(player)
-    rebuildtoolcard!(player, :narration)   # the card lists the lines
-    setstatus!(player, "narration: speaking…")
-    runanalysis(player) do
-        try
-            render!(nar)
-            put!(player.uiqueue, () -> begin
-                redraw!(player)
-                rebuildtoolcard!(player, :narration)
-                setstatus!(player, "narration added at $(round(at; digits = 2))s")
-            end)
-        catch e
-            bt = catch_backtrace()
-            put!(player.uiqueue, () -> begin
-                setstatus!(player, "narration failed: $(briefly(e))")
-                @error "narration failed" exception = (e, bt)
-            end)
-        end
-    end
+    player.fxwidgets[:narration_index] = length(seq.narration)
+    speechchanged!(player)
+    setstatus!(player, "line added — choose the voice and direction, then render a take")
     return nothing
 end
 
@@ -1780,8 +1908,8 @@ function setnarrationtext!(player::Player, i::Integer, text::AbstractString)
     old = seq.narration[i]
     strip(String(text)) == strip(old.text) && return nothing
     snapshot!(player)
-    seq.narration[i] = Narration(String(text), old.at, old.voice)
-    redraw!(player)
+    seq.narration[i] = narrationcopy(old; text=String(text))
+    speechchanged!(player)
     setstatus!(player, "narration reworded — press render to speak it")
     return nothing
 end
@@ -1802,8 +1930,8 @@ function setnarrationvoice!(player::Player, i::Integer, voice::AbstractString)
     old = seq.narration[i]
     String(voice) == old.voice && return nothing
     snapshot!(player)
-    seq.narration[i] = Narration(old.text, old.at, String(voice))
-    redraw!(player)
+    seq.narration[i] = narrationcopy(old; voice=String(voice))
+    speechchanged!(player)
     setstatus!(player, "narration voice $(voice) — press render to hear it")
     return nothing
 end
@@ -1825,11 +1953,9 @@ function movenarration!(player::Player, i::Integer)
     old = seq.narration[i]
     at = player.playhead[] / (seq.framerate > 0 ? seq.framerate : 25.0)
     snapshot!(player)
-    fresh = Narration(old.text, at, old.voice)
-    append!(fresh.samples, old.samples)
-    fresh.rate = old.rate
+    fresh = narrationcopy(old; at, anchor=nothing, audio=true)
     seq.narration[i] = fresh
-    redraw!(player)
+    speechchanged!(player)
     setstatus!(player, "narration moved to $(round(at; digits = 2))s")
     return nothing
 end
@@ -1839,19 +1965,33 @@ function rendernarration!(player::Player, i::Integer)
     seq = player.sequence
     1 <= i <= length(seq.narration) || return nothing
     nar = seq.narration[i]
+    jobs = get!(()->IdDict{Narration,Nothing}(),player.fxwidgets,:speechjobs)
+    haskey(jobs,nar) && return setstatus!(player,"this take is already rendering")
+    jobs[nar] = nothing
+    speechchanged!(player)
     setstatus!(player, "narration: speaking…")
     runanalysis(player) do
         try
             # Replace, never `render!` in place — see `render`. The undo stack
             # shares this object.
             fresh = render(nar)
-            put!(player.uiqueue, () -> (i <= length(seq.narration) &&
-                                        (seq.narration[i] = fresh)))
-            put!(player.uiqueue, () -> (redraw!(player);
-                                        setstatus!(player, "narration rendered")))
+            put!(player.uiqueue, () -> begin
+                delete!(jobs,nar)
+                # An edit, Undo or deletion while synthesis runs supersedes it.
+                if !(i <= length(seq.narration) && seq.narration[i] === nar)
+                    setstatus!(player, "take finished; the line changed meanwhile, so it was not replaced")
+                    return nothing
+                end
+                snapshot!(player)
+                seq.narration[i] = fresh
+                speechchanged!(player)
+                setstatus!(player, "narration rendered — Undo restores the previous take")
+            end)
         catch e
             bt = catch_backtrace()
             put!(player.uiqueue, () -> begin
+                delete!(jobs,nar)
+                speechchanged!(player)
                 setstatus!(player, "narration failed: $(briefly(e))")
                 @error "narration render failed" exception = (e, bt)
             end)
@@ -1866,8 +2006,7 @@ function dropnarration!(player::Player, i::Integer)
     1 <= i <= length(seq.narration) || return nothing
     snapshot!(player)
     deleteat!(seq.narration, i)
-    redraw!(player)
-    rebuildtoolcard!(player, :narration)
+    speechchanged!(player)
     setstatus!(player, "narration line removed")
     return nothing
 end
@@ -1875,20 +2014,47 @@ end
 """
     lookbody!(ctx)
 
-The look card's body: learn the grade, or learn it again somewhere else.
-
-Re-learning matters more than it sounds. The LUT is fitted from ONE frame, so
-which frame you were parked on when you pressed it is the whole result — and the
-only way to find that out is to try another one. Offering "Learn from this frame"
-again on a clip that already has a look is the difference between a dial you can
-work with and a one-shot you have to undo.
+The colour-grade card: preserve a saved curve, open ordinary colour controls,
+or explicitly replace the curve with an AI prediction from the playhead frame.
 """
 function lookbody!(ctx)
     player = ctx.player
     loc = editclip(player)
     loc === nothing && return nothing
-    label = loc[1].look === nothing ? "Learn look from this frame" : "Re-learn from this frame"
+    toollabel!(ctx, loc[1].look === nothing ? "No colour curve assigned." :
+                    "Saved curve · applied throughout this clip.")
+    toolaction!(ctx, "Open colour adjustments", () -> begin
+        clip = loc[1]
+        fx = findslot(clip, :color)
+        fx === nothing && (addeffect!(player, :color); fx = findslot(clip, :color))
+        fx === nothing || (fx.card.open = true; selectfxcard!(player, (:fx, fx.id)))
+    end)
+    label = loc[1].look === nothing ? "Generate AI grade from this frame" :
+                                    "Replace curve with AI grade"
     toolaction!(ctx, label, () -> runlook!(player))
+    loc[1].source isa SceneSource && toolaction!(ctx, "Apply grading to all scene clips",
+                            () -> copygrading!(player, loc[1]))
+    return nothing
+end
+
+"Copy just the grade and colour adjustments to clips sharing the same scene."
+function copygrading!(player::Player, source::Clip)
+    snapshot!(player)
+    slots = [copy(fx) for fx in source.effects if fx.kind in (:look, :color)]
+    targets = [c for c in player.sequence.clips if c !== source && c.source === source.source]
+    for clip in targets
+        for i in reverse(eachindex(clip.effects))
+            clip.effects[i].kind in (:look, :color) && removeslotat!(clip, i)
+        end
+        clip.look = source.look
+        for fx in slots
+            addslot!(clip, copy(fx; id = freshid()))
+        end
+        bakedirty!(clip)
+    end
+    bindinputs!(player.sequence)
+    redraw!(player)
+    setstatus!(player, "Grading applied to $(length(targets) + 1) scene clips (Ctrl+Z restores)")
     return nothing
 end
 
@@ -2031,7 +2197,7 @@ registertool!(:timeinterp, "Time interpolation",
     panel = timeinterppanel!)
 
 registertool!(:narration, "Narration",
-    "Type a line, press Enter, and Kokoro speaks it at the playhead. Mixed over " *
+    "Edit spoken lines, reference voices, speech models and delivery instructions. Mixed over " *
     "the timeline in the preview and in the export.";
     activate = ctx -> setstatus!(ctx.player, "narration: type a line in the card and press Enter"),
     panel = narrationpanel!)
@@ -2253,7 +2419,7 @@ function runlook!(player::Player)
                     addslot!(clip, Effect(LookEffect()))
                 redraw!(player)
                 showplayhead!(player)
-                setstatus!(player, "look applied — Look is keyframable in the inspector")
+                setstatus!(player, "AI colour grade applied — Strength can be keyframed")
             end)
         catch e
             bt = catch_backtrace()

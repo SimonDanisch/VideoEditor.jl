@@ -393,7 +393,7 @@ function presentgpucomposite!(player::Player, clips::Vector{Clip}, n::Integer;
         nxt = gp.doublebuffer ? 3 - gp.cur : gp.cur   # same switch as presentgpu!
         # the GPU tier of ONE composite (see `composite`): its only job is to
         # name each layer's stream and to blit the finished canvas
-        prerenderscenes!(clips, n)
+        prerenderscenes!(clips, n; pixel_scale = player.previewscale[])
         ok = runowned(player) do
             composite(player.engine, clips, n,
                       # only a decoding layer is asked; a scene brings its own
@@ -650,17 +650,14 @@ end
 "Close every source's GPU stream (frees its VRAM ring + unmaps its bitstream) and the
 effect graph's buffer pool."
 function freegpucache!(player::Player)
-    gp = player.gpupreview
     # TEARDOWN REPORTS. Every one of these used to be `try … catch; end`: a free
     # that failed left VRAM held with nothing said, and the next symptom was an
     # out-of-memory somewhere unrelated. Freeing continues past a failure — that is
     # what the `try` is for — but never silently.
-    if gp isa GPUPreview
-        try
-            rungpusync(player) do; emptyengine!(player.engine); end
-        catch e
-            @warn "could not empty the effect graph's buffer pool" exception = (e, catch_backtrace())
-        end
+    try
+        runowned(player) do; emptyengine!(player.engine); end
+    catch e
+        @warn "could not empty the effect graph's buffer pool" exception = (e, catch_backtrace())
     end
     isempty(player.gpucache) && return nothing
     for s in values(player.gpucache)

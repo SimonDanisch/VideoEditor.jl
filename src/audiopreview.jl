@@ -30,10 +30,18 @@ mutable struct AudioPreview
 end
 AudioPreview() = AudioPreview(Dict{String, Union{PCMTrack, Nothing}}(), nothing, nothing, false, true)
 
+"Use the user's PipeWire socket when a headless Julia session lacks desktop env variables."
+function audiocommand(cmd::Cmd)
+    Sys.islinux() || return cmd
+    runtime = get(ENV,"XDG_RUNTIME_DIR",joinpath("/run/user",string(Base.Libc.getuid())))
+    return isdir(runtime) ? addenv(cmd,"XDG_RUNTIME_DIR"=>runtime) : cmd
+end
+
 "Scratch-cached PCM path for `source` (same identity key scheme as proxies)."
-function pcmpath(source::VideoSource)
-    st = stat(source.path)
-    key = string(hash((abspath(source.path), st.size, st.mtime, :pcm48)), base = 16)
+function pcmpath(source::ClipSource)
+    path = audiopath(source)
+    st = stat(path)
+    key = string(hash((abspath(path), st.size, st.mtime, :pcm48)), base = 16)
     return joinpath(cachedir("pcm"), key * ".s16")
 end
 
@@ -41,15 +49,25 @@ end
 Extract and mmap `source`'s audio (blocking; run on a background thread).
 Returns `nothing` when the source has no audio stream.
 """
-function loadpcm(source::VideoSource)
-    hasaudio(sourcepath(source)) || return nothing
+const PCM_EXTRACT_LOCKS = [ReentrantLock() for _ in 1:32]
+
+function loadpcm(source::ClipSource)
+    hasaudio(audiopath(source)) || return nothing
     path = pcmpath(source)
-    if !isfile(path)
-        tmp = path * ".part"
-        run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -i $(source.path)
-                      -f s16le -ac 2 -ar $(AUDIORATE) $tmp`,
-                     stdout = devnull, stderr = devnull))
-        mv(tmp, path; force = true)
+    # Playback and timeline analysis can ask for the same file together. Share
+    # its extraction; striped locks stay bounded even across many open projects.
+    lock(PCM_EXTRACT_LOCKS[Int(mod(hash(path),UInt(length(PCM_EXTRACT_LOCKS))))+1]) do
+        if !isfile(path)
+            tmp = tempname(dirname(path)) * ".s16"
+            try
+                run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -i $(audiopath(source))
+                              -f s16le -ac 2 -ar $(AUDIORATE) $tmp`,
+                             stdout = devnull, stderr = devnull))
+                mv(tmp, path; force = true)
+            finally
+                isfile(tmp) && rm(tmp;force=true)
+            end
+        end
     end
     n = filesize(path) ÷ 4  # 2 channels × 2 bytes
     io = open(path, "r")
@@ -89,7 +107,7 @@ function fillaudio!(out::AbstractMatrix{Int16}, seq::Sequence,
         # samples left inside this clip on the timeline
         clipendsample = ceil(Int, clipend(clip) / fps * AUDIORATE)
         span = min(blocklen - pos, max(clipendsample - tsample, 1))
-        track = get(tracks, sourcepath(clip.source), nothing)
+        track = get(tracks, audiopath(clip.source), nothing)
         if track === nothing
             fill!(view(out, :, (pos + 1):(pos + span)), Int16(0))
         else
@@ -115,26 +133,18 @@ function fillaudio!(out::AbstractMatrix{Int16}, seq::Sequence,
     return out
 end
 
-"""
-A source with no soundtrack: nothing to extract, and saying so is the whole
-method. `Clip.source` is abstract — a scene renders its frames and has no file to
-pull audio out of — and without this, pressing PLAY on a timeline holding a scene
-clip died with `MethodError: no method matching ensurepcm!(::Player, ::SceneSource)`
-from inside `startaudio!`. Found by opening a real project, not by the suite: no
-test PLAYS a timeline that has a scene on it.
-"""
-ensurepcm!(::Player, ::ClipSource) = nothing
-
 "Ensure `source`'s PCM is loaded (kicks off background extraction once)."
-function ensurepcm!(player::Player, source::VideoSource)
+function ensurepcm!(player::Player, source::ClipSource)
     ap = player.audio
-    haskey(ap.tracks, source.path) && return nothing
-    ap.tracks[source.path] = nothing  # pending / no audio
+    path = audiopath(source)
+    isempty(path) && return nothing
+    haskey(ap.tracks, path) && return nothing
+    ap.tracks[path] = nothing  # pending / no audio
     Threads.@spawn try
         track = loadpcm(source)
-        track === nothing || (ap.tracks[source.path] = track)
+        track === nothing || (ap.tracks[path] = track)
     catch e
-        @error "audio extraction failed" source = source.path exception = e
+        @error "audio extraction failed" source = path exception = e
     end
     return nothing
 end
@@ -153,7 +163,7 @@ function startaudio!(player::Player)
         return nothing
     end
     foreach(c -> ensurepcm!(player, c.source), player.sequence.clips)
-    proc = open(pipeline(`pw-cat -p --raw --rate $(AUDIORATE) --channels 2 --format s16 -`,
+    proc = open(pipeline(audiocommand(`pw-cat -p --raw --rate $(AUDIORATE) --channels 2 --format s16 -`),
                          stderr = devnull), "w")
     ap.proc = proc
     ap.feeder = Threads.@spawn try

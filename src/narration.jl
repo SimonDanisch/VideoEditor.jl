@@ -21,7 +21,25 @@ rate)`, mono.
 """
 
 registerspeak!(f; voices = nothing) = (INSTALLED.speak = f; INSTALLED.voices = voices; nothing)
-hasspeakmodel() = INSTALLED.speak !== nothing
+hasspeakmodel() = INSTALLED.speak !== nothing || !isempty(SPEECH_MODELS)
+
+struct SpeechModel
+    label::String
+    synthesize::Any
+    voices::Any
+    direction::Bool
+    reference::Bool
+end
+const SPEECH_MODELS = Dict{Symbol,SpeechModel}()
+
+"Register a lazy speech provider: `synthesize(narration) -> (mono_samples, rate)`."
+function registerspeechmodel!(name::Symbol, label, synthesize;
+                              voices=() -> String[], direction=false, reference=false)
+    SPEECH_MODELS[name] = SpeechModel(String(label), synthesize, voices, direction, reference)
+    return nothing
+end
+speechmodels() = sort!(collect(SPEECH_MODELS); by=p -> p.second.label)
+speechmodel(n::Narration) = get(SPEECH_MODELS, n.speech.model, nothing)
 
 """
     INSTALLED.voices
@@ -62,7 +80,11 @@ kokorovoices() = INSTALLED.kokoro === nothing ? String[] :
                 startswith(v, "bf_") || startswith(v, "bm_"),
            KokoroRunner.voices(INSTALLED.kokoro))
 
-installspeak!() = registerspeak!(kokorospeak; voices = kokorovoices)
+function installspeak!()
+    registerspeak!(kokorospeak; voices = kokorovoices)
+    registerspeechmodel!(:kokoro, "Kokoro · English", n -> kokorospeak(n.text, n.voice);
+                         voices=kokorovoices)
+end
 
 """
     render!(nar) -> nar
@@ -76,7 +98,22 @@ what keeps a minute of speech from becoming five megabytes of JSON.
 function render!(nar::Narration)
     hasspeakmodel() || error("no speech synthesizer installed — see registerspeak!")
     isempty(strip(nar.text)) && error("nothing to say")
-    samples, rate = INSTALLED.speak(nar.text, nar.voice)
+    settings = nar.speech
+    model = speechmodel(nar)
+    if settings.model === :default
+        INSTALLED.speak === nothing && error("the project's default speech model is not installed")
+        isempty(settings.direction) && isempty(settings.reference) ||
+            error("the default speech provider does not support delivery instructions or reference audio")
+        samples, rate = INSTALLED.speak(nar.text, nar.voice)
+    else
+        model === nothing && error("speech model $(settings.model) is not registered in this session")
+        model.direction || isempty(settings.direction) || error("$(model.label) does not support delivery instructions")
+        model.reference || isempty(settings.reference) || error("$(model.label) does not support reference audio")
+        isempty(settings.reference) || isfile(settings.reference) || error("voice reference is missing: $(settings.reference)")
+        samples, rate = Base.invokelatest(model.synthesize, nar)
+    end
+    rate > 0 && !isempty(samples) && all(isfinite, samples) || error("speech provider returned invalid audio")
+    samples = filtervoice(samples, rate, nar.mix.filter)
     empty!(nar.samples); append!(nar.samples, samples)
     nar.rate = rate
     return nar
@@ -95,7 +132,15 @@ inside every undo step that held it. Re-rendering a line already in the sequence
 therefore REPLACES the element; `render!` stays for the line being built, which
 nothing else can be holding yet.
 """
-render(nar::Narration) = render!(Narration(nar.text, nar.at, nar.voice))
+render(nar::Narration) = render!(narrationcopy(nar))
+
+function filtervoice(samples, rate, filter)
+    isempty(filter) && return Float32.(samples)
+    raw = reinterpret(UInt8, Float32.(samples))
+    bytes = read(pipeline(`$(FFMPEG_jll.ffmpeg()) -v error -f f32le -ar $rate -ac 1 -i -
+                           -af $filter -f f32le -ar $rate -ac 1 -`; stdin=IOBuffer(raw)))
+    return collect(reinterpret(Float32, bytes))
+end
 
 """
     narrate!(seq, text; at = 0.0, voice = "af_heart") -> Narration
@@ -108,6 +153,20 @@ function narrate!(seq::Sequence, text::AbstractString; at::Real = 0.0,
     render!(nar)
     push!(seq.narration, nar)
     return nar
+end
+
+"Timeline time of a source-anchored line after cuts, or `nothing` when cut away."
+function narrationtime(seq::Sequence,n::Narration)
+    n.anchor === nothing && return n.at
+    stop = n.rate > 0 ? n.at + min(length(n.samples)/n.rate,n.mix.stop) : n.at
+    for c in sort(seq.clips;by=c->c.start)
+        c.source === n.anchor || continue
+        a,b = c.src_in/c.source.framerate,c.src_out/c.source.framerate
+        (a <= n.at < b || n.at < a < stop) || continue
+        speed = c.rate*seq.framerate/c.source.framerate
+        return c.start/seq.framerate + (max(n.at,a)-a)/speed
+    end
+    return nothing
 end
 
 """
@@ -126,25 +185,47 @@ did; clipping is audible and localized, and the fix is the user's volume.
 function mixnarration!(out::AbstractMatrix{Int16}, seq::Sequence, startsample::Integer;
                        rate::Integer = AUDIORATE)
     isempty(seq.narration) && return out
-    blocklen = size(out, 2)
     for nar in seq.narration
-        isempty(nar.samples) && continue          # never rendered
-        # Narration samples run at the model's rate; the block is at the mixer's.
-        step = nar.rate / rate
-        base = nar.at * rate                      # where it starts, in block samples
-        for i in 1:blocklen
-            t = (startsample + i - 1) - base
-            t < 0 && continue
-            j = t * step + 1
-            j >= length(nar.samples) && continue
-            k = floor(Int, j)
-            f = Float32(j - k)
-            a = nar.samples[k]
-            b = nar.samples[min(k + 1, length(nar.samples))]
-            v = round(Int, ((1 - f) * a + f * b) * 32767)
-            @inbounds for ch in 1:size(out, 1)
-                out[ch, i] = Int16(clamp(Int(out[ch, i]) + v, -32768, 32767))
-            end
+        nar.anchor === nothing || continue
+        mixvoiceblock!(out,nar,startsample,rate,0.0,1.0,0.0,Inf)
+    end
+    # Only the picture clips intersecting this audio block can contribute
+    # anchored speech. No per-sample clip lookup, and no separate cut clock.
+    blockend = (startsample+size(out,2))/rate
+    for c in seq.clips
+        a,b = c.start/seq.framerate,clipend(c)/seq.framerate
+        (a < blockend && b > startsample/rate) || continue
+        speed = c.rate*seq.framerate/c.source.framerate
+        offset = c.src_in/c.source.framerate - a*speed
+        for nar in seq.narration
+            nar.anchor === c.source || continue
+            mixvoiceblock!(out,nar,startsample,rate,offset,speed,a,b)
+        end
+    end
+    return out
+end
+
+function mixvoiceblock!(out,nar,startsample,rate,offset,speed,beginat,endat)
+    isempty(nar.samples) && return out
+    # Restrict work to the audible intersection of take, picture and block.
+    firstsample = max(startsample,ceil(Int,beginat*rate),ceil(Int,(nar.at-offset)/speed*rate))
+    stop = nar.at + min(length(nar.samples)/nar.rate,nar.mix.stop)
+    lastsample = min(startsample+size(out,2)-1,(isfinite(endat) ? ceil(Int,endat*rate)-1 : typemax(Int)),
+                     ceil(Int,(stop-offset)/speed*rate)-1)
+    firstsample <= lastsample || return out
+    left = sqrt(2)*cos((clamp(nar.mix.pan,-1,1)+1)*pi/4)
+    right = sqrt(2)*sin((clamp(nar.mix.pan,-1,1)+1)*pi/4)
+    for absolute in firstsample:lastsample
+        seconds = offset + absolute/rate*speed - nar.at
+        j = max(1.0,seconds*nar.rate+1)
+        k = min(floor(Int,j),length(nar.samples)); f = Float32(j-k)
+        a,b = nar.samples[k],nar.samples[min(k+1,length(nar.samples))]
+        gain = nar.mix.gain * (1+(nar.mix.ramp-1)*Float32(j/length(nar.samples)))
+        isfinite(nar.mix.stop) && (gain *= clamp((nar.mix.stop-seconds)*rate/480,0,1))
+        v = ((1-f)*a+f*b)*gain*32767
+        i = absolute-startsample+1
+        for ch in axes(out,1)
+            out[ch,i] = Int16(clamp(Int(out[ch,i])+round(Int,v*(ch==1 ? left : right)),-32768,32767))
         end
     end
     return out

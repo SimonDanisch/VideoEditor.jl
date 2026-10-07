@@ -50,18 +50,21 @@ Build the Effects panel into `gridpos`.
 
 Layout, top to bottom: the title with the keyframe overview, "+ Add effect…", the
 filter box, which clip is being edited, the bake row, then the card stack, then
-the tool-only cards. Everything below the title scrolls.
+the tool-only cards. Navigation and effect search stay visible; clip controls scroll.
 """
 function buildfxpanel!(player::Player, gridpos, uicolors)
-    fxscroll = Subfigure(gridpos; scroll_speed = 70, scrollbar_size = 9,
+    outer = GridLayout(gridpos)
+    colsize!(outer, 1, Makie.Relative(1.0))
+    fxscroll = Subfigure(outer[4, 1]; scroll_speed = 70, scrollbar_size = 9,
                          scrollbar_color = (uicolors.background, 0.55),
                          scrollbar_thumb_color = Makie.lerp_oklab(RGBf(Makie.to_color(uicolors.background)),
                                                                   RGBf(1, 1, 1), 0.34),
                          scrollbar_thumb_color_active = uicolors.accent)
+    rowsize!(outer, 4, Makie.Auto(false))  # remaining height after navigation/search
     player.fxwidgets[:uicolors] = uicolors   # tool card bodies draw in the editor's palette
     wiretoolcards!(player)
     panel = GridLayout(fxscroll[1, 1]; valign = :top)
-    head = GridLayout(panel[1, 1])
+    head = GridLayout(outer[1, 1])
     Label(head[1, 1], "Effects"; font = :bold, halign = :left, tellwidth = false)
     # The eye bypasses the whole stack: the compare-with-the-original toggle,
     # the per-card eye one level up.
@@ -94,7 +97,7 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     # The menu is the only way to reach a tool-only kind, so its options are
     # exposed for the tests to assert on rather than read off the widget.
     player.fxwidgets[:fxmenuopts] = menuopts
-    addmenu = Menu(panel[2, 1]; prompt = "+  Add effect…", default = nothing,
+    addmenu = Menu(outer[2, 1]; prompt = "+  Add effect…", default = nothing,
                    searchable = true, search_placeholder = "type to filter…",
                    options = menuopts(), tellwidth = false)
     # A kind registered at run time changes what can be ADDED, and nothing else:
@@ -122,7 +125,7 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
 
     # ------------------------------------------------------------------ filter
     query = Observable("")
-    filterrow = GridLayout(panel[3, 1])
+    filterrow = GridLayout(outer[3, 1])
     filterbox = Textbox(filterrow[1, 1]; placeholder = "filter effects…", width = Makie.Relative(1.0),
                         tellwidth = false, reset_on_defocus = false)
     on(filterbox.stored_string) do s
@@ -132,6 +135,26 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     countlabel = Label(filterrow[2, 1], ""; halign = :left, fontsize = 10,
                        color = uicolors.text_muted, tellwidth = false)
     player.fxwidgets[:fxfilterbox] = filterbox
+    modes = GridLayout(head[2,1:3]); colgap!(modes,4)
+    for (i,label,q) in ((1,"Scene","scene"),(2,"Colour","color"),(3,"Speech","narration"),(4,"All",""))
+        btn = Button(modes[1,i];label,fontsize=11,height=22,
+                     width=Makie.Relative(1),tellwidth=false,buttoncolor=uicolors.surface)
+        on(btn.clicks) do _
+            if q == "narration" && !isempty(player.sequence.narration)
+                selectnarration!(player,get(player.fxwidgets,:narration_index,1);seek=false)
+                return
+            end
+            q == "narration" && !haskey(player.fxpanel.toolcards,:narration) && opentool!(player,:narration)
+            Makie.set!(filterbox,q)
+            q == "scene" && openscenecontrols!(player, "")
+        end
+    end
+    for (i, label, query) in ((1, "Camera", "camera"), (2, "Animation", "acting"),
+                              (3, "Light", "lighting"))
+        btn = Button(modes[2,i]; label, fontsize=11, height=24,
+            width=Makie.Relative(1), tellwidth=false, buttoncolor=uicolors.surface)
+        on(_ -> openscenecontrols!(player, query), btn.clicks)
+    end
 
     # …and which clip this all applies to labels the stack, right above it. Its
     # text names the clip's SPAN, so it follows three different facts: which clip
@@ -142,14 +165,14 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     title = Observable(cliptitle(player))
     player.fxwidgets[:cliptitle] = title
     onany((_...) -> retitle!(player), player.playhead, player.timeline.selected)
-    Label(panel[4, 1], title; halign = :left, fontsize = 11, color = uicolors.accent,
+    Label(panel[1, 1], title; halign = :left, fontsize = 11, color = uicolors.accent,
           tellwidth = false)
 
     # One bake row per clip, for scenes and ordinary footage alike: the state
     # ("no bake" / "in use" / "out of date"), the on/off switch for it, and the
     # rendering dialog — preview and bake settings are the same question at two
     # timescales, so they share one dialog with two tabs.
-    bakerow = GridLayout(panel[5, 1])
+    bakerow = GridLayout(panel[2, 1])
     bakelabel = Label(bakerow[1, 1], ""; halign = :left, fontsize = 10,
                       color = uicolors.text_muted, tellwidth = false)
     bakeuse = Button(bakerow[1, 2]; label = "use", width = 42, height = 18, fontsize = 10)
@@ -172,12 +195,12 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     #
     # Row 0 as well as row 1: that is where `showemptystate!` puts its labels, and
     # taking them away again left the row behind with nothing in it.
-    stackgl = measurable!(GridLayout(panel[6, 1]; valign = :top, default_rowgap = 0), 0, 1)
+    stackgl = measurable!(GridLayout(panel[3, 1]; valign = :top, default_rowgap = 0), 0, 1)
     colsize!(stackgl, 1, Makie.Relative(1.0))
     # …and below the clip's own effects, the tools that are not clip effects. Its
     # own layout, because those cards belong to the panel rather than to any clip:
     # the crop scope and the transcript stay put when the playhead crosses a cut.
-    toolgl = measurable!(GridLayout(panel[7, 1]; valign = :top, default_rowgap = 0))
+    toolgl = measurable!(GridLayout(panel[4, 1]; valign = :top, default_rowgap = 0))
     colsize!(toolgl, 1, Makie.Relative(1.0))
 
     player.fxpanel = FxPanel(fxscroll, stackgl, toolgl, query, countlabel, uicolors)
@@ -187,6 +210,10 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     # Esc clears the filter — the one key everyone tries first.
     on(events(player.fig).keyboardbutton; priority = 26) do ev
         (ev.key == Keyboard.escape && ev.action == Keyboard.press) || return Consume(false)
+        # Cancel an active tool before clearing the inspector's search. A text
+        # field also owns Escape while it is being edited.
+        (player.tool[] !== :none || activetool(player) !== nothing ||
+         editingtext(player.fig.scene)) && return Consume(false)
         isempty(query[]) && return Consume(false)
         player.dockopen[] === :effects || return Consume(false)
         query[] = ""
@@ -203,7 +230,7 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
         :stabopen => () -> showkind!(player, :stabilize)))
     rowgap!(panel, 10)
     colsize!(panel, 1, Makie.Relative(1.0))
-    return panel
+    return outer
 end
 
 # ---------------------------------------------------------------- card ownership
@@ -316,7 +343,10 @@ function buildcard!(player::Player, clip::Clip, fx::Effect)
     # undeletable and still drawing — and still taking clicks, at the very
     # rectangle its replacement occupies.
     fx.card === nothing || dropcard!(fx)
-    clip.cardlayout === nothing && buildcards!(player, clip)
+    if clip.cardlayout === nothing
+        buildcards!(player, clip)
+        return fx.card
+    end
     row = something(findfirst(s -> s === fx, clip.effects), length(clip.effects))
     # …and this row can be emptied again, by `dropcard!` — anchor it, so removing
     # the effect above another one does not cost the panel its scrollbar.
@@ -363,8 +393,23 @@ function cliptitle(player::Player)
     c === nothing && return "▸ no clip selected"
     i = something(findfirst(x -> x === c, player.sequence.clips), 0)
     fps = player.sequence.framerate
-    return "▸ clip $i · $(basename(sourcepath(c.source))) " *
+    return "▸ clip $i · $(clipname(c)) " *
            "($(timestring(c.start / fps))–$(timestring(clipend(c) / fps)))"
+end
+
+"A scene marker names its shot through trims and cuts; footage uses its filename."
+function clipname(clip::Clip)
+    src = clip.source
+    src isa SceneSource || return basename(sourcepath(src))
+    if src.build isa AbstractDict
+        markers = get(src.build, "markers", ())
+        matching = [m for m in markers if Int(m["frame"]) <= clip.src_in]
+        if !isempty(matching)
+            marker = matching[argmax(Int(m["frame"]) for m in matching)]
+            return String(marker["label"])
+        end
+    end
+    return src.root isa SceneProgram ? splitext(basename(src.root.file))[1] : "Scene"
 end
 
 """
@@ -680,14 +725,14 @@ function withtoolslots!(build::Function, player::Player, ctx::EffectContext, gri
     # button in a tool card was.
     span!(g) = (g.width[] = Makie.Relative(1.0); g.halign[] = :left;
                 colsize!(g, 1, Makie.Relative(1.0)); g)
-    gl = span!(GridLayout(gridpos))
-    slots[1][ctx.tool] = span!(measurable!(GridLayout(gl[1, 1])))
+    gl = span!(measurable!(GridLayout(gridpos),1,2,3,4))
+    slots[1][ctx.tool] = span!(measurable!(GridLayout(gl[1, 1]; default_rowgap = 4)))
     slots[2][ctx.tool] = span!(measurable!(GridLayout(gl[2, 1])))
     cards[1][ctx.tool] = span!(measurable!(GridLayout(gl[3, 1])))
     # …and one below the cards, for the action that acts on the whole list: "Apply
     # matte to clip" above the marked frames reads as a control for something
     # further up.
-    slots[3][ctx.tool] = span!(measurable!(GridLayout(gl[4, 1])))
+    slots[3][ctx.tool] = span!(measurable!(GridLayout(gl[4, 1]; default_rowgap = 4)))
     # The four slots sit nearly flush. GridLayout's default rowgap of 16 is ~48 px
     # of empty band under every tool card's header, paid whether or not the slots
     # below hold anything. The content separates itself (a card has padding,
@@ -878,9 +923,12 @@ so nothing else would ever replace it, and the card built while the tool was off
 went on offering to turn it on: the second "Find" switched the tool back off.
 """
 function rebuildtoolcard!(player::Player, name::Symbol)
+    scroll = player.fxpanel.scroll.scroll[]
     if droptoolcard!(player, name)
         k = kindbyname(name)
         k === nothing || placetoolcard!(player, k)
+        player.fxpanel.scroll.scroll[] = scroll
+        put!(player.uiqueue,() -> (player.fxpanel.scroll.scroll[] = scroll))
         return nothing
     end
     clip = player.shownclip
@@ -940,6 +988,8 @@ function toolonlycard!(player::Player, toolgl, row::Integer, kind, uicolors)
                 strokecolor = uicolors.border,
                 selectioncolor = uicolors.select,
                 titlecolor = uicolors.text)
+    measurable!(card.body)
+    colsize!(card.body,1,Makie.Relative(1.0))
     acc = GridLayout(card_accessory(card))
     flat = (buttoncolor = (:transparent, 0.0), strokewidth = 0, cornerradius = 3,
             height = 20, buttoncolor_hover = uicolors.accent_subtle)
@@ -1000,14 +1050,16 @@ an effect is a write, not a rebuild of the stack.
 """
 function fxcard!(player::Player, stackgl, row::Integer, clip::Clip, slot::Effect, uicolors)
     kind = kindofslot(slot)
-    title = kind === nothing ? String(slot.kind) : kind.label
+    title = slot.kind === :scene && clip.source isa SceneSource &&
+            clip.source.root isa SceneProgram ? "Camera, animation & light" :
+            kind === nothing ? String(slot.kind) : kind.label
     key = (:fx, slot.id)
     # Derived, and unhooked with the card: `player.fxselection` and `slot.enabled`
     # both outlive it, and `map` would leave a listener on each per card ever
     # built. Measured before this: 20 rebuilds of one card left 20 listeners on
     # `fxselection` and 40 on `enabled`.
     selected, selreg = derive(s -> s == key, player.fxselection)
-    card = Card(stackgl[row, 1]; title, selected,
+    card = Card(stackgl[row, 1]; title, selected, open = slot.kind !== :scene,
                 backgroundcolor = Makie.lerp_oklab(RGBf(Makie.to_color(uicolors.background)),
                                                    RGBf(1, 1, 1), 0.075),
                 headercolor = uicolors.surface,
@@ -1045,6 +1097,7 @@ function fxcard!(player::Player, stackgl, row::Integer, clip::Clip, slot::Effect
     on(eye.clicks) do _           # off keeps the parameters; every render path skips it
         snapshot!(player)
         slot.enabled[] = !slot.enabled[]
+        slot.kind === :scene && invalidatescene!(clip)
         showplayhead!(player)
     end
     player.fxwidgets[Symbol(:fxeye_, slot.id)] = eye
@@ -1077,14 +1130,25 @@ function fxcard!(player::Player, stackgl, row::Integer, clip::Clip, slot::Effect
     # grouping gets one section per group and a filter box over them. For the ten
     # kinds that declare a flat list of scalars it is exactly the rows it always
     # drew.
+    # A lazy scene still needs a measurable body while its first render builds.
+    measurable!(card.body)
+    colsize!(card.body, 1, Makie.Relative(1.0))
     # Ask `paramsections` what there is to show rather than reading `slot.params`.
     # For the ten kinds that declare scalars it hands back exactly those; for a
     # scene the rows come from the realized scene and the parameters are made from
     # them, so a freshly inserted scene clip has empty `params` and a full card.
     # Testing `isempty(slot.params)` skipped the build that creates them.
     secs = paramsections(clip, slot)
+    slot.kind === :scene &&
+        (player.fxwidgets[Symbol(:scene_ready_, slot.id)] = !isempty(secs))
+    if slot.kind === :scene && isempty(secs)
+        r += 1
+        player.fxwidgets[Symbol(:scene_placeholder_, slot.id)] =
+            Label(card[r, 1], "Scene controls appear after the first preview frame.";
+                  tellwidth = false, fontsize = 11, color = uicolors.text_muted)
+    end
     isempty(secs) ||
-        (r += 1; sectionform!(player, card[r, 1], clip, slot, uicolors; sections = secs))
+        (r += 1; sectionform!(player, card[r, 1], clip, slot, uicolors; sections = secs, parentcard = card))
     # The whole card's lanes, in the header's leftmost accessory cell. Not an ◉/○:
     # that pair means "is this effect applied" two buttons to the right, and in the
     # panel's own header — see `laneeye!`.
@@ -1133,6 +1197,63 @@ function fxcard!(player::Player, stackgl, row::Integer, clip::Clip, slot::Effect
     return card, ctx
 end
 
+"Populate a lazy scene inspector once the first preview has realized its objects."
+function refreshsceneinspector!(player::Player)
+    clip = player.shownclip
+    (clip === nothing || !(clip.source isa SceneSource) || clip.source.live === nothing) &&
+        return nothing
+    fx = findslot(clip, :scene)
+    (fx === nothing || fx.card === nothing) && return nothing
+    if !get(player.fxwidgets, Symbol(:scene_ready_, fx.id), false) &&
+       !isempty(sceneattributes(clip.source))
+        # Realization fills the existing card; replacing its header needlessly
+        # invalidates selection/focus and can leave an old header in a rendered frame.
+        placeholder = pop!(player.fxwidgets, Symbol(:scene_placeholder_, fx.id), nothing)
+        placeholder === nothing || Makie.delete!(placeholder)
+        sections = paramsections(clip, fx)
+        sectionform!(player, fx.card[1, 1], clip, fx, player.fxpanel.uicolors;
+                     sections, parentcard = fx.card)
+        player.fxwidgets[Symbol(:scene_ready_, fx.id)] = true
+        placelanes!(player.timeline, clip)
+    end
+    # These numeric controls have fixed widths. They update their own glyphs;
+    # changed values do not require a layout pass over the inspector.
+    for p in fx.params
+        if isfollowing(p) && p.view !== nothing
+            showvalue!(p.view.control, valueat(p, playheadframe(player, clip)))
+        end
+    end
+    sections = get(player.fxwidgets, Symbol(:fxsections_, fx.id), nothing)
+    sections === nothing || get(sections, :refreshactivity, () -> nothing)()
+    return nothing
+end
+
+"Remove one editor override and follow this property's original animation again."
+function followscene!(player::Player, clip::Clip, p::Param)
+    build = clip.source.build
+    file = build isa AbstractDict ? get(get(build,"recordings",Dict()),String(p.name),nothing) : nothing
+    if !(eltype(p) <: Real) && file === nothing
+        setstatus!(player,"$(p.label): original data unavailable")
+        return nothing
+    end
+    snapshot!(player)
+    if eltype(p) <: Real
+        clearkeys!(p, playheadframe(player, clip))
+        p.input = ParamInput(:copy, SceneRef(p.name))
+    else
+        curve = AnimCurve{Any}(); push!(curve.keys,Keyframe{Any}(0,nothing,:hold))
+        p.input = ParamInput(:copy,RecordedRef(file))
+        # Bind the new input before notifying its lane/summary listeners.
+        bindinputs!(player.sequence)
+        p.curve[] = curve
+    end
+    bindinputs!(player.sequence)
+    p.visible[] = false
+    editedcurve!(player, clip; parameter = p)
+    setstatus!(player, "$(p.label): following the original animation (Ctrl+Z restores the edit)")
+    return nothing
+end
+
 # There is no `overlaycard!` and no `overlaysat`.
 #
 # An overlay's card was this file's second card builder: same header, same eye,
@@ -1152,21 +1273,38 @@ actionlabel(kind::EffectKind) =
     kind.name === :loopfinder ? "Find similar frames" : "Run $(kind.label)"
 
 """
-    showvalue!(control, value) -> nothing
+    showvalue!(control, value) -> Bool
 
-Put `value` on the widget that shows it. A no-op where a parameter has no widget
-— a driven one shows the edge's value and owns nothing.
+Put `value` on the widget that shows it and report whether it changed. A no-op
+where a parameter has no widget — a driven one shows the edge's value and owns
+nothing. The scene inspector uses this to skip layout work for unchanged frames.
 
 Dispatch rather than a type test at the call site, and no cast: each method takes
 the parameter's own value and converts what its widget needs.
 """
-showvalue!(::Nothing, value) = nothing
-showvalue!(sl::Makie.Slider, value) = (Makie.set_close_to!(sl, value); nothing)
-showvalue!(cb::Makie.Checkbox, value) = (cb.checked[] = Bool(value); nothing)
+showvalue!(::Nothing, value) = false
+function showvalue!(sl::Makie.Slider, value)
+    previous = sl.value[]
+    Makie.set_close_to!(sl, value)
+    return sl.value[] != previous
+end
+function showvalue!(cb::Makie.Checkbox, value)
+    previous = cb.checked[]
+    cb.checked[] = Bool(value)
+    return cb.checked[] != previous
+end
+function showvalue!(tb::Makie.Textbox, value)
+    tb.focused[] && return false
+    text = string(round(Float64(value); digits = 5))
+    tb.stored_string[] == text && return false
+    Makie.set!(tb, text)
+    return true
+end
 function showvalue!(m::Makie.Menu, value)
     i = findfirst(o -> o === value || o == value, Makie.to_value(m.options))
-    i === nothing || (m.i_selected[] = i)
-    return nothing
+    (i === nothing || m.i_selected[] == i) && return false
+    m.i_selected[] = i
+    return true
 end
 
 """
@@ -1182,7 +1320,7 @@ the card.
 function wireedit!(player::Player, target, p::Param, sl::Makie.Slider, derived)
     push!(derived, on(sl.value) do v
         sl.dragging[] || return nothing        # …not a gesture, just the display
-        isdriven(p) && return nothing          # its value comes down an edge
+        isdriven(p) && !isfollowing(p) && return nothing
         editparam!(player, target, p, v; frame = playheadframe(player, target))
     end)
     return nothing
@@ -1190,13 +1328,26 @@ end
 
 function wireedit!(player::Player, target, p::Param, cb::Makie.Checkbox, derived)
     push!(derived, on(cb.checked) do v
-        isdriven(p) || editparam!(player, target, p, v;
+        (isdriven(p) && !isfollowing(p)) || editparam!(player, target, p, v;
                                   frame = playheadframe(player, target))
     end)
     return nothing
 end
 
 wireedit!(::Player, target, ::Param, ::Any, derived) = nothing
+
+function wireedit!(player::Player, target, p::Param, tb::Makie.Textbox, derived)
+    push!(derived, on(tb.stored_string) do text
+        text === nothing && return nothing
+        v = tryparse(Float64, text)
+        (v === nothing || !isfinite(v) || (isdriven(p) && !isfollowing(p))) && return nothing
+        # Display synchronization reports the value already in the document.
+        v == round(Float64(valueat(p, playheadframe(player, target))); digits = 5) &&
+            return nothing
+        editparam!(player, target, p, v; frame = playheadframe(player, target))
+    end)
+    return nothing
+end
 
 """
     laneeye!(player, gridpos, p::Param, uicolors, sink; kw...) -> Button
@@ -1296,7 +1447,23 @@ function paramform!(player::Player, pos, target, fx::Effect, uicolors;
     # timeline lane and the ◆ overview show, where there is no heading.
     fieldsym(p) = Symbol(labels(p))
     frame() = playheadframe(player, target)
-    spec = NamedTuple(fieldsym(p) => (Float64(valueat(p, frame())),
+    numeric(p) = fx.kind === :scene
+    datarow(p) = !(eltype(p) <: Real)
+    datasummary(p) = begin
+        track = recordedinput(p)
+        if track === nothing
+            "Data unavailable"
+        else
+            i = searchsortedfirst(track.frames,frame())
+            if i > length(track.frames) || track.frames[i] != frame()
+                "Sample unavailable"
+            else
+                "$(join(track.shapes[i],"×")) · $(length(track.frames))f"
+            end
+        end
+    end
+    spec = NamedTuple(fieldsym(p) => (datarow(p) ? datasummary(p) : Float64(valueat(p, frame())),
+                                      datarow(p) ? (_ -> false) : numeric(p) ? (v -> isfinite(v)) :
                                       Makie.Between(p.range[1], p.range[2]))
                       for p in params)
     kfbuttons = Dict{Symbol, Any}()
@@ -1324,7 +1491,8 @@ function paramform!(player::Player, pos, target, fx::Effect, uicolors;
         # the timeline can be traced back to the row that owns it.
         own = paramcolor(p)
         function kfglyph(c, n)
-            isdriven(p) && return ("⇥", own)
+            isfollowing(p) && return ("◇", uicolors.text_muted)
+            isdriven(p) && !isfollowing(p) && return ("⇥", own)
             animated = length(c.keys) > 1
             here = animated && any(k -> k.frame == sourceframe(target, n), c.keys)
             return (here ? "◆" : "◇",
@@ -1344,10 +1512,18 @@ function paramform!(player::Player, pos, target, fx::Effect, uicolors;
         # button cuts the edge and keeps the value it was showing.
         on(_ -> gotokey!(player, target, p, -1), prevb.clicks)
         on(kf.clicks) do _
-            isdriven(p) ? unbindinput!(player, target, fx, p) :
+            datarow(p) ? setstatus!(player,"$(p.label): recorded array samples; trim or retime the clip") :
+            isdriven(p) && !isfollowing(p) ? unbindinput!(player, target, fx, p) :
                           togglekey!(player, target, p)
         end
         on(_ -> gotokey!(player, target, p, 1), nextb.clicks)
+        if fx.kind === :scene && target isa Clip && target.source.root isa SceneProgram
+            reset = Button(acc[1, 5]; label = "↺", width = 18, height = 22, fontsize = 12)
+            on(_ -> followscene!(player, target, p), reset.clicks)
+            tips = get(player.fxwidgets, :tips, nothing)
+            tips === nothing || (tips[reset] = "Restore the original animation for this property")
+            player.fxwidgets[Symbol(:scene_reset_, fx.id, :_, p.name)] = reset
+        end
         kfbuttons[fieldsym(p)] = kf
         player.fxwidgets[Symbol(:kfacc_, fx.id, :_, p.name)] = (prevb, kf, nextb)
         player.fxwidgets[Symbol(:kflane_, fx.id, :_, p.name)] = laneb
@@ -1365,7 +1541,8 @@ function paramform!(player::Player, pos, target, fx::Effect, uicolors;
     # the trio measure: 16 + 16 + 22 + 16 plus three 1 px gaps.
     pf = Makie.ParamForm(pos, spec, accessory; labelwidth = labelwidth,
                          widgetwidth = widgetwidth,
-                         accessorywidth = 73, rowgap = 4, halign = :left,
+                         accessorywidth = fx.kind === :scene ? 92 : 73,
+                         rowgap = 4, halign = :left,
                          labelcolor = labelcolor)
     for p in params
         w = get(pf.widgets, fieldsym(p), nothing)
@@ -1384,9 +1561,22 @@ function paramform!(player::Player, pos, target, fx::Effect, uicolors;
     for p in params
         ctrl = p.view === nothing ? nothing : p.view.control
         ctrl === nothing && continue
+        if datarow(p)
+            tips = get(player.fxwidgets,:tips,nothing)
+            tips === nothing || (tips[ctrl] = "Recorded array: dimensions · source-frame sample count. Trim or retime its clip.")
+            append!(derived,onany(p.curve,player.playhead) do _...
+                text = datasummary(p)
+                ctrl.stored_string[] == text || (ctrl.stored_string[] = text)
+            end)
+            push!(derived,on(ctrl.focused) do focused
+                focused && Makie.defocus!(ctrl)
+            end)
+            continue
+        end
         append!(derived, onany(p.curve, player.playhead) do c, _
-            showvalue!(ctrl, valueat(c, frame()))
+            showvalue!(ctrl, valueat(p, frame()))
         end)
+        showvalue!(ctrl, valueat(p, frame()))
         wireedit!(player, target, p, ctrl, derived)
     end
     append!(pf.blockscene.deregister_callbacks, derived)
@@ -1410,16 +1600,40 @@ function bindparamview!(player::Player, clip, p::Param, control, kf::Makie.Butto
     # drawn on it, and the registration has to come off with this one.
     selkey, reg = derive(s -> s !== nothing && s[1] === p ? s[2] : 0,
                          player.selectedkey)
-    lane = lanecurve!(player.timeline.axis, p.curve;
-                      valuerange = p.range,
+    vis = Observable(p.visible[] && (!(clip isa Clip) || player.timeline.selected[] == clip.id))
+    visregs = onany(p.visible, player.timeline.selected) do on, selected
+        vis[] = on && (!(clip isa Clip) || selected == clip.id)
+    end
+    lanedata = Observable{Any}(something(recordedinput(p),p.curve[]))
+    lanereg = on(p.curve) do curve
+        lanedata[] = something(recordedinput(p),curve)
+    end
+    lane = lanecurve!(player.timeline.axis, lanedata;
+                      valuerange = control isa Makie.Textbox ? paramdisplayrange(p) : p.range,
                       viewrange = player.timeline.viewrange,
                       pixelspersecond = player.timeline.pps,
-                      visible = p.visible,
+                      visible = vis,
                       selectedkey = selkey,
+                      highlighted = clip isa Clip && clip.source isa SceneSource &&
+                          scenepath(p.name) !== nothing &&
+                          first(scenepath(p.name)) in selectedscenesections(player, clip),
                       color = paramcolor(p))
     translate!(lane, 0, 0, 3)          # over the filmstrip, under the playhead
-    p.view = ParamView(control, kf, lane, Observables.ObserverFunction[reg])
+    p.view = ParamView(control, kf, lane, Observables.ObserverFunction[reg; lanereg; visregs])
     return p.view
+end
+
+"Keep numeric scene keys visible even when typed values exceed the initial slider span."
+function paramdisplayrange(p::Param)
+    p.range === nothing && return nothing
+    lo, hi = p.range
+    values = Float64[k.value for k in p.curve[].keys]
+    low, high = min(lo, minimum(values)), max(hi, maximum(values))
+    if low < lo || high > hi
+        padding = max(0.01, 0.05(high - low))
+        return (low - padding, high + padding)
+    end
+    return p.range
 end
 
 # --------------------------------------------------- parameters, in sections
@@ -1475,9 +1689,27 @@ function sceneparamsections(clip::Clip, fx::Effect)
     (fx.kind === :scene && clip.source isa SceneSource) || return nothing
     out = NamedTuple[]
     for obj in sceneattributes(clip.source)
-        ps = Param[sceneparam!(fx, r) for r in obj.rows if r.kind === :number]
-        isempty(ps) || push!(out, (label = obj.label, detail = obj.detail, params = ps))
+        ps = Param[sceneparam!(fx, r; follow = clip.source.root isa SceneProgram)
+                   for r in obj.rows if r.kind === :number]
+        if clip.source.live.target isa ProgramInstance
+            tracks = scenerecordings!(clip.source.live.target,clip.source)
+            if tracks !== nothing
+                for row in obj.rows
+                    row.kind === :data && haskey(tracks,row.path) || continue
+                    p = param(fx,row.path)
+                    if p === nothing
+                        c = AnimCurve{Any}(); push!(c.keys,Keyframe{Any}(0,nothing,:hold))
+                        p = Param{Any}(row.path,row.label,Observable(c),Observable(false),nothing,
+                            ParamInput(:copy,RecordedRef(tracks[row.path].path)),nothing)
+                        push!(fx.params,p)
+                    end
+                    push!(ps,p)
+                end
+            end
+        end
+        isempty(ps) || push!(out, (name = obj.name, label = obj.label, detail = obj.detail, params = ps))
     end
+    clip.sequence === nothing || bindinputs!(clip.sequence)
     return out
 end
 
@@ -1490,12 +1722,14 @@ Kept on the effect, so a keyframe outlives the scene: a project is loaded long
 before anything is rendered and its curves have to be waiting when the scene is
 built. An existing parameter is returned untouched — its curve is the edit.
 """
-function sceneparam!(fx::Effect, row)
+function sceneparam!(fx::Effect, row; follow = false)
     v = Float64(row.value)
-    span = (min(0.0, 2v), max(1.0, 2v))
+    span = occursin(".rotation[", String(row.path)) ? (-180.0, 180.0) :
+           (min(0.0, 2v), max(1.0, 2v))
     i = findfirst(q -> q.name === row.path, fx.params)
     i === nothing || return withspan!(fx, i, span, row.label)
-    fresh = Param(row.path, row.label, v; range = span)
+    fresh = Param(row.path, row.label, v; range = span,
+                  input = follow ? ParamInput(:copy, SceneRef(row.path)) : nothing)
     push!(fx.params, fresh)
     return fresh
 end
@@ -1527,6 +1761,28 @@ function withspan!(fx::Effect, i::Integer, span, label::AbstractString)
     return fresh
 end
 
+"Properties varying around the playhead, bounded by this selected clip's source range."
+function activeanimationparams(clip::Clip, fx::Effect, frame::Integer)
+    clip.start <= frame < clipend(clip) || return Set{Symbol}()
+    sf = sourceframe(clip, frame)
+    a, b = max(clip.src_in, sf - 1), min(clip.src_out - 1, sf + 1)
+    original = clip.source.live === nothing ? Set{Symbol}() :
+        Set{Symbol}(programactiveparams(clip.source.live.target, a, b, clip.source.framerate))
+    target = clip.source.live === nothing ? nothing : clip.source.live.target
+    if target isa ProgramInstance
+        tracks = scenerecordings!(target,clip.source)
+        if tracks !== nothing
+            for p in fx.params
+                recordedactive(tracks,p.name,a,b) && push!(original,p.name)
+            end
+        end
+    end
+    return Set(p.name for p in fx.params if isfollowing(p) || followsrecording(clip.source,p) ? p.name in original :
+        recordedinput(p) !== nothing ? recordedchanged(recordedinput(p),a,b) :
+        isanimated(p) ? first(p.curve[].keys).frame <= sf <= last(p.curve[].keys).frame :
+        isdriven(p) && !isequal(valueat(p, a), valueat(p, b)))
+end
+
 """
     sectionform!(player, gridpos, target, fx, uicolors) -> blocks
 
@@ -1540,28 +1796,86 @@ mechanism and the same speed as the panel's own filter over the effect cards.
 Rebuilding the rows per keystroke instead was measured at 433 ms against 14 ms.
 """
 function sectionform!(player::Player, gridpos, target, fx::Effect, uicolors;
-                      sections = nothing, lazyabove = 60)
+                      sections = nothing, lazyabove = 60, parentcard = fx.card)
     secs = sections === nothing ? paramsections(target, fx) : sections
     isempty(secs) && return Any[]
     if length(secs) == 1 && isempty(secs[1].label)
         return Any[paramform!(player, gridpos, target, fx, uicolors;
                               params = secs[1].params)]
     end
-    gl = GridLayout(gridpos)
+    gl = measurable!(GridLayout(gridpos))
+    gl.width[] = Makie.Relative(1.0)
+    colsize!(gl, 1, Makie.Relative(1.0))
     filterrow = GridLayout(gl[1, 1])
+    filterrow.width[] = Makie.Relative(1.0)
+    colsize!(filterrow, 1, Makie.Relative(1.0))
     box = Textbox(filterrow[1, 1]; placeholder = "filter objects…",
                   width = Makie.Relative(1.0), tellwidth = false,
                   reset_on_defocus = false)
-    count = Label(filterrow[2, 1], ""; halign = :left, fontsize = 10,
+    picker = Menu(filterrow[2,1]; prompt = "Choose camera, light or actor…",
+        options = [("All objects", ""); [(sec.label, lowercase(sec.label)) for sec in secs]],
+        default = nothing, searchable = true, fontsize = 11,
+        width = Makie.Relative(1), tellwidth = false)
+    syncingpicker = Ref(false)
+    selectingfrompicker = Ref(false)
+    on(picker.selection) do q
+        syncingpicker[] && return
+        q === nothing && return
+        if target isa Clip && target.source isa SceneSource && fx.kind === :scene
+            i = findfirst(sec -> lowercase(sec.label) == q, secs)
+            object = i === nothing ? nothing : secs[i].name
+            if object !== nothing && target.source.live !== nothing &&
+               target.source.live.target isa ProgramInstance
+                groups = target.source.live.target.controls
+                group = findfirst(g -> g.name === object, groups)
+                group === nothing || (object = groups[group].object)
+            end
+            selectingfrompicker[] = true
+            try
+                selectsceneobject!(player, object; clip=target)
+            finally
+                selectingfrompicker[] = false
+            end
+        end
+        Makie.set!(box,q)
+        scrollinspectorto!(player,box)
+    end
+    sceneform = target isa Clip && target.source isa SceneSource && fx.kind === :scene
+    onlyactive = sceneform ? get!(() -> Observable(true), player.fxwidgets, :activeanimation_only) : Observable(false)
+    activecheck = nothing
+    if sceneform
+        checkrow = GridLayout(filterrow[3, 1])
+        activecheck = Checkbox(checkrow[1, 1]; checked = onlyactive, size = 16)
+        push!(parentcard.blockscene.deregister_callbacks, on(activecheck.checked) do checked
+            onlyactive[] == checked || (onlyactive[] = checked)
+        end)
+        Label(checkrow[1, 2], "Animated parameters only"; halign = :left,
+              fontsize = 11, tellwidth = false)
+        colsize!(checkrow, 1, Makie.Fixed(20))
+        colsize!(checkrow, 2, Makie.Relative(1))
+    end
+    count = Label(filterrow[4, 1], ""; halign = :left, fontsize = 10,
                   color = uicolors.text_muted, tellwidth = false)
     stack = measurable!(GridLayout(gl[2, 1]; valign = :top, default_rowgap = 0))
+    stack.width[] = Makie.Relative(1.0)
     nparams = sum(length(sec.params) for sec in secs)
 
     cards = Card[]
     eyes = Makie.Button[]
+    forms = Any[nothing for _ in secs]
+    active = Ref(Set{Symbol}())
+    activitykey = Ref{Any}(nothing)
+    category = Ref("")
+    # Picking is an explicit request to edit an object, including its static
+    # transform. The animation filter remains the default for the full scene.
+    pickednames() = sceneform ? selectedscenesections(player, target) : Set{Symbol}()
+    selectednames = Ref(pickednames())
+    selectedanimated = Ref(false)
+    wanted(p) = !onlyactive[] || p.name in active[] ||
+        ((!selectedanimated[] || isanimated(p) || p.visible[]) && scenepath(p.name) !== nothing && first(scenepath(p.name)) in selectednames[])
     for (i, sec) in enumerate(secs)
         title = isempty(sec.detail) ? sec.label : "$(sec.label)   ·   $(sec.detail)"
-        card = Card(stack[i, 1]; title, open = false,
+        card = Card(stack[i, 1]; title, open = sec.label == "Camera",
                     backgroundcolor = (:transparent, 0.0),
                     headercolor = uicolors.surface_subtle,
                     headercolor_selected = uicolors.surface_subtle,
@@ -1569,6 +1883,8 @@ function sectionform!(player::Player, gridpos, target, fx::Effect, uicolors;
                     titlefont = :regular, titlesize = 11, titleoffset = 6,
                     titlecolor = uicolors.text_muted,
                     bodypadding = (10, 2, 4, 2), spacing = 2)
+        colsize!(card.body, 1, Makie.Relative(1.0))
+        measurable!(card.body)
         # One object's lanes as a group: on a scene clip a section IS a plot, which
         # is the unit you want off the timeline while you work on another one.
         push!(eyes,
@@ -1592,9 +1908,9 @@ function sectionform!(player::Player, gridpos, target, fx::Effect, uicolors;
         function buildrows!()
             built[] && return nothing
             built[] = true
-            paramform!(player, card[1, 1], target, fx, uicolors;
+            forms[i] = paramform!(player, card[1, 1], target, fx, uicolors;
                        params = sec.params, labels = q -> chopprefix(q.label, sec.label * " · "),
-                       labelwidth = 84, widgetwidth = 124)
+                       labelwidth = 120, widgetwidth = 88)
             # …and the lanes those rows just created get the clip's placement
             target isa Clip && placelanes!(player.timeline, target)
             return nothing
@@ -1608,30 +1924,157 @@ function sectionform!(player::Player, gridpos, target, fx::Effect, uicolors;
         push!(cards, card)
     end
     colsize!(stack, 1, Makie.Relative(1.0))
+    function applyrows(i)
+        form, card, sec = forms[i], cards[i], secs[i]
+        (form === nothing || !card.visible[] || !card.open[] ||
+         (parentcard !== nothing && (!parentcard.open[] || !parentcard.visible[]))) && return
+        bylabel = Dict(Symbol(chopprefix(p.label, sec.label * " · ")) => wanted(p) for p in sec.params)
+        Makie.filter_fields!(field -> bylabel[field], form)
+    end
 
     function apply()
         q = lowercase(something(box.stored_string[], ""))
-        shown = 0
-        filter_cards!(stack, cards) do card
-            sec = secs[findfirst(c -> c === card, cards)::Int]
-            keep = isempty(q) || occursin(q, lowercase(sec.label)) ||
-                   occursin(q, lowercase(sec.detail)) ||
-                   any(p -> occursin(q, lowercase(p.label)), sec.params)
-            # a section the query singled out opens, so filtering to one object is
-            # one gesture rather than two
-            keep && !isempty(q) && (card.open = true)
-            keep && (shown += length(sec.params))
-            keep
+        selectednames[] = pickednames()
+        selectedanimated[] = any(p -> isanimated(p) && scenepath(p.name) !== nothing &&
+            first(scenepath(p.name)) in selectednames[], fx.params)
+        key = (player.playhead[], player.edited[], onlyactive[])
+        if sceneform && onlyactive[] && activitykey[] != key
+            active[] = activeanimationparams(target, fx, player.playhead[])
         end
-        n = isempty(q) ? length(secs) : count_shown(cards)
-        count.text[] = (isempty(q) ? "$nparams parameters" : "$shown of $nparams parameters") *
-                       " · $n object" * (n == 1 ? "" : "s")
+        activitykey[] = key
+        Makie.GridLayoutBase.with_updates_suspended(gl) do
+            shown = 0
+            eligible = [sec for sec in secs if
+                (category[] == "camera" ? sec.label == "Camera" :
+                 category[] == "acting" ? sec.detail == "Performance" :
+                 category[] == "lighting" ? sec.detail == "Lighting" : true)]
+            # The picker is how users reach static objects while the animation
+            # filter is on. Keep its choices independent of the selected object's
+            # row mask, rather than rebuilding the menu on each pick.
+            options = [(sec.label, lowercase(sec.label)) for sec in eligible]
+            category[] in ("camera", "acting", "lighting") || pushfirst!(options, ("All objects", ""))
+            picker.options[] == options || (picker.options[] = options)
+            if !isempty(selectednames[]) && isempty(q)
+                owned = filter(sec -> sec.name in selectednames[], eligible)
+                i = findfirst(sec -> sec.detail == "Performance", owned)
+                section = isempty(owned) ? nothing : owned[something(i, 1)]
+                index = section === nothing ? 0 : something(findfirst(o -> last(o) == lowercase(section.label), options), 0)
+                syncingpicker[] = true
+                try
+                    picker.i_selected[] == index || (picker.i_selected[] = index)
+                finally
+                    syncingpicker[] = false
+                end
+            end
+            filter_cards!(stack, cards; compact = true) do card
+                sec = secs[findfirst(c -> c === card, cards)::Int]
+                owners = selectednames[]
+                keep = (isempty(owners) || !isempty(q) || get(sec,:name,nothing) in owners) &&
+                       (isempty(q) || occursin(q, lowercase(sec.label)) ||
+                       occursin(q, lowercase(sec.detail)) ||
+                       any(p -> occursin(q, lowercase(p.label)), sec.params)) && any(wanted, sec.params)
+                # a section the query singled out opens, so filtering to one object is
+                # one gesture rather than two
+                keep && (!isempty(q) || !isempty(owners)) && !card.open[] && (card.open = true)
+                keep && (shown += Base.count(wanted, sec.params))
+                keep
+            end
+            # Folding/unfolding a Card restores its children; reapply each form's
+            # row mask afterward, retaining widgets and keys across filter changes.
+            foreach(applyrows, eachindex(secs))
+            n = count_shown(cards)
+            text = (shown == 0 && onlyactive[] ?
+                           "No animation at playhead.\nUncheck to show all parameters." :
+                           "$shown of $nparams parameters") *
+                           " · $n object" * (n == 1 ? "" : "s")
+            count.text[] == text || (count.text[] = text)
+        end
         return
     end
     on(_ -> apply(), box.stored_string)
+    if sceneform
+        push!(parentcard.blockscene.deregister_callbacks, on(sceneselection(player)) do _
+            target === player.shownclip || return
+            # Choosing within Camera/Animation/Light keeps that menu's scope.
+            # A pick in the preview instead exposes the object's full inspector.
+            selectingfrompicker[] || (category[] = "")
+            if box.stored_string[] == ""
+                apply()
+            else
+                Makie.set!(box, "") # Its existing listener applies the new filter.
+            end
+        end)
+    end
+    function refreshactivity()
+        target === player.shownclip || return nothing
+        onlyactive[] || return nothing
+        key = (player.playhead[], player.edited[], onlyactive[])
+        activitykey[] == key && return nothing
+        next = activeanimationparams(target, fx, player.playhead[])
+        activitykey[] = key
+        next == active[] && return nothing
+        active[] = next
+        apply()
+    end
+    if sceneform
+        for event in (onlyactive, player.edited)
+            push!(parentcard.blockscene.deregister_callbacks, on(event) do _
+                target === player.shownclip && parentcard.open[] && parentcard.visible[] &&
+                    (event === onlyactive ? apply() : refreshactivity())
+            end)
+        end
+        push!(parentcard.blockscene.deregister_callbacks, on(o -> o && apply(), parentcard.open))
+        push!(parentcard.blockscene.deregister_callbacks, on(o -> o && apply(), parentcard.visible))
+        for (i, card) in enumerate(cards)
+            push!(parentcard.blockscene.deregister_callbacks, on(o -> o && applyrows(i), card.open))
+        end
+    end
     apply()
-    player.fxwidgets[Symbol(:fxsections_, fx.id)] = (; box, cards, eyes, sections = secs, apply)
+    player.fxwidgets[Symbol(:fxsections_, fx.id)] = (; box, picker, cards, eyes,
+        sections = secs, forms, activecheck, onlyactive, active, category, refreshactivity, apply)
     return Any[gl]
+end
+
+"Expose the requested scene controls without requiring a second disclosure click."
+function openscenecontrols!(player::Player, query::AbstractString; keepselection = false)
+    if !keepselection && sceneselection(player)[] !== nothing
+        sceneselection(player)[] = nothing
+    end
+    opendock!(player, :effects)
+    Makie.set!(player.fxwidgets[:fxfilterbox], "scene")
+    clip = player.shownclip
+    clip === nothing && return nothing
+    fx = findslot(clip, :scene)
+    (fx === nothing || fx.card === nothing) && return nothing
+    fx.card.open = true
+    sections = get(player.fxwidgets, Symbol(:fxsections_,fx.id), nothing)
+    if sections !== nothing
+        sections.category[] = String(query)
+        sections.picker.i_selected[] = 0
+        # Start with one performance, rather than expanding every actor's form.
+        sections.apply()
+        i = query == "acting" ? findfirst(s -> s.detail == "Performance" &&
+            any(p -> !sections.onlyactive[] || p.name in sections.active[], s.params), sections.sections) : nothing
+        if i === nothing
+            Makie.set!(sections.box, query)
+        else
+            label = lowercase(sections.sections[i].label)
+            sections.picker.i_selected[] = findfirst(o -> last(o) == label, sections.picker.options[])
+        end
+    end
+    player.fxpanel.scroll.scroll[] = Makie.Vec2f(0,0)
+    sections === nothing || scrollinspectorto!(player,sections.box)
+    return nothing
+end
+
+"Bring the selected form to the top of the inspector's visible area."
+function scrollinspectorto!(player::Player, block)
+    scroll = player.fxpanel.scroll
+    viewport = scroll.layoutobservables.computedbbox[]
+    bounds = block.layoutobservables.computedbbox[]
+    offset = viewport.origin[2] + viewport.widths[2] - bounds.origin[2] - bounds.widths[2] - 6
+    scroll.scroll[] = Makie.Vec2f(0, max(0, scroll.scroll[][2] + offset))
+    return nothing
 end
 
 "How many of `cards` are currently shown — what the section count label reports."
@@ -1688,7 +2131,9 @@ function buildkeyframemodal!(player::Player, uicolors)
                      width = 24, buttoncolor = (:transparent, 0.0), strokewidth = 0)
             Label(row[1, 2], p.label; halign = :left, tellwidth = false,
                   color = isanimated(p) ? uicolors.text : uicolors.text_muted)
-            Label(row[1, 3], isanimated(p) ? "$(length(p.curve[].keys)) keys" : "static";
+            recording = recordedinput(p)
+            Label(row[1, 3], recording !== nothing ? "$(length(recording.frames)) samples" :
+                isanimated(p) ? "$(length(p.curve[].keys)) keys" : "static";
                   halign = :right, fontsize = 10, color = uicolors.text_muted)
             push!(player.fxwidgets[:kflanerows], row)
         end

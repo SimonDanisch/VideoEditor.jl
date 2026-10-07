@@ -36,17 +36,16 @@ function exportvideo(path::AbstractString, seq::Sequence;
                      encoder_options::NamedTuple = (crf = 20, preset = "medium"),
                      pixel_format = VideoIO.AV_PIX_FMT_YUV420P,
                      audio::Bool = true,
-                     backend = KA.CPU(),
+                     backend = Mantle.defaultbackend(),
                      progress = nothing)
     total = seqlength(seq)
     total > 0 || error("empty sequence")   # before canvassize: it indexes clips[1]
     canvas = something(size, canvassize(seq))
-    wantaudio = audio && any(hasaudio,
-                             unique(sourcepath(c.source) for c in seq.clips if decodable(c.source)))
+    wantaudio = audio && (any(hasaudio, unique(audiopath(c.source) for c in seq.clips)) ||
+                         any(n -> !isempty(n.samples), seq.narration))
     videopath = wantaudio ? tempname() * ".mp4" : path
 
     outbuf = alloccanvas(backend, (canvas[1], canvas[2]))
-    layerbuf = allocframe(backend, (canvas[1], canvas[2]))   # one track layer while compositing
     hostout = zeros(RGB{N0f8}, canvas[1], canvas[2])         # encode staging (download target)
     blackhost = zeros(RGB{N0f8}, canvas[1], canvas[2])       # gap/composite base for device canvases
     readers = Dict{String, Any}()   # per-source decoder: GpuVideoStream or SequentialReader
@@ -61,10 +60,12 @@ function exportvideo(path::AbstractString, seq::Sequence;
                                     encoder_options = encoder_options,
                                     target_pix_fmt = pixel_format)
     try
-        for n in 0:(total - 1)
-            renderframe!(outbuf, seq, n, readers, engine; black = blackhost)
-            writeframe!(writer, outbuf, hostout, backend)
-            progress === nothing || n % 30 == 0 && progress(n + 1, total)
+        withfinalscenes(seq) do
+            for n in 0:(total - 1)
+                renderframe!(outbuf, seq, n, readers, engine; black = blackhost)
+                writeframe!(writer, outbuf, hostout, backend)
+                progress === nothing || n % 30 == 0 && progress(n + 1, total)
+            end
         end
     finally
         VideoIO.close_video_out!(writer)
@@ -91,7 +92,7 @@ once, `n` repeats `n` extra times.
 """
 function exportgif(path::AbstractString, seq::Sequence; fps::Real = 15,
                    loop::Integer = 0, width::Union{Nothing, Integer} = nothing,
-                   backend = KA.CPU(), progress = nothing)
+                   backend = Mantle.defaultbackend(), progress = nothing)
     seqlength(seq) > 0 || error("empty sequence")
     tmp = tempname() * ".mp4"
     palette = tempname() * ".png"

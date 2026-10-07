@@ -28,6 +28,25 @@ scenespecof(clip::Clip) = scenespecof(clip.source)
 scenespecof(src::SceneSource) = src.root
 scenespecof(::ClipSource) = nothing
 
+"Release a source's live render resources; its saved recipe can be realized again."
+function Base.close(src::SceneSource)
+    live=src.live
+    if live!==nothing
+        closeretired!(live)
+        onthread(renderthread(getbackend(live.backend))) do
+            lock(SCENELOCK) do
+                applicable(close,live.screen) && close(live.screen)
+            end
+        end
+        src.live=nothing
+    end
+    src.pending=nothing
+    src.pendingat=-1
+    src.at=-1
+    src.samples=0
+    return nothing
+end
+
 """
     prerender!(source, clip, frame) -> nothing
 
@@ -51,13 +70,14 @@ zigzag never happens.
 """
 prerender!(::ClipSource, ::Clip, ::Integer) = nothing
 
-function prerender!(src::SceneSource, clip::Clip, sf::Integer)
+function prerender!(src::SceneSource, clip::Clip, sf::Integer; pixel_scale::Real = 1,
+                    detail_scale::Real = pixel_scale)
     # Between frames, on thread 1: the one point where a screen a backend switch
     # replaced can be destroyed without taking GL objects out from under a frame
     # that is being drawn. See [`closeretired!`](@ref).
     closeretired!(src.live)
     updatesource!(src, clip, sf)          # settles `at`, and resets the sample count
-    src.pending = sceneframe!(src, clip, (src.width, src.height))
+    src.pending = sceneframe!(src, clip, (src.width, src.height); pixel_scale,detail_scale)
     src.pendingat = Int(sf)
     return nothing
 end
@@ -72,9 +92,13 @@ before they do — `compositeframe!`, `presentclipframe!` and `presentgpu!`. Not
 inside `composite`: by then the thread has already changed, which is the whole
 problem this avoids.
 """
-function prerenderscenes!(clips, n::Integer)
+function prerenderscenes!(clips, n::Integer; pixel_scale::Real = 1)
     for clip in clips
-        prerender!(clip.source, clip, sourceframe(clip, n))
+        if clip.source isa SceneSource
+            prerender!(clip.source, clip, sourceframe(clip, n); pixel_scale)
+        else
+            prerender!(clip.source, clip, sourceframe(clip, n))
+        end
     end
     return nothing
 end
@@ -106,7 +130,7 @@ throws `no recording is open on this channel` from inside a render that was
 otherwise fine.
 
 `onthread` does not prevent it. When the caller is already on the render thread
-it runs INLINE, and when it is not it waits in a `sleep` loop — which yields, so
+it runs INLINE, and when it is not it waits on a channel — which yields, so
 the other task runs on the same thread and interleaves anyway.
 
 Held across the whole render, not just the emit: building the screen and writing
@@ -130,7 +154,7 @@ sample per read instead — a playhead move must not block on a path tracer's
 whole budget — and accumulates the rest while the playhead stands still.
 """
 function sceneframe!(src::SceneSource, clip::Clip, dims::Tuple{Int, Int};
-                     exact::Bool = false)
+                     exact::Bool = false, pixel_scale::Real = 1,detail_scale::Real = pixel_scale)
     # On the thread the renderer's resources belong to, wherever the composite
     # runs — see [`renderthread`](@ref). Everything from here down touches the
     # screen: building it, writing this frame's numbers onto its plots (which
@@ -138,19 +162,25 @@ function sceneframe!(src::SceneSource, clip::Clip, dims::Tuple{Int, Int};
     # film back.
     name = renderwith(src)
     backend = getbackend(name)
-    img = lock(SCENELOCK) do; onthread(renderthread(backend)) do
+    img = onthread(renderthread(backend)) do; lock(SCENELOCK) do
         # The bake backend is a different renderer, so it is a different standing
         # scene: `livescene!` rebuilds when the backend changes, which is exactly
         # what switching modes is.
         src.live = livescene!(src.live, src.root, dims, name, backend;
                               opts = renderopts(src))
+        quality_changed = preparepreview!(src.live.target, exact ? 1.0 : detail_scale)
+        changed = updatesceneprogram!(src.live.target, src, clip, src.at, src.framerate;
+                                      reset = src.samples == 0 || exact || src.mode === :bake || quality_changed)
+        changed && syncsceneinputs!(src, clip)
         # …and now there is a scene to write this frame's numbers onto.
-        applysceneparams!(src, clip, src.at)
+        # Refinement adds samples to the same scene; applying grouped transforms
+        # again would do extra work and accumulate floating-point roundoff.
+        (changed || !(src.live.target isa ProgramInstance)) && applysceneparams!(src, clip, src.at)
         # The first read at a position clears the film; every read after it adds
         # to it. Without the clear a path tracer would keep averaging the previous
         # frame's picture into this one and the animation would smear.
         liveframe!(src.live; clear = src.samples == 0,
-                   samples = exact ? nothing : 1)
+                   samples = exact ? nothing : 1, pixel_scale = exact ? 1 : pixel_scale)
     end; end
     src.samples += 1
     return img
@@ -242,11 +272,72 @@ function applysceneparams!(src::SceneSource, clip::Clip, sf::Integer)
     src.live === nothing && return nothing
     fx = findslot(clip, :scene)
     fx === nothing && return nothing
+    fx.enabled[] || return nothing
     applyscenecamera!(src)          # the eye first: a path may then move it
     for p in fx.params
-        setscenevalue!(src, p.name, valueat(p, sf))
+        (isfollowing(p) || followsrecording(src,p)) && continue
+        setscenevalue!(src, p.name, valueat(p, sf)) && remembersceneoverride!(src, p.name)
     end
     applyjoints!(src, fx, sf)       # …and the rig, once every number is known
+    return nothing
+end
+
+"Read an editable scalar without changing the scene or advancing its animation."
+function scenevalue(src::SceneSource, path::Symbol)
+    a = scenepath(path)
+    a === nothing && return nothing
+    name, key, comp = a
+    if name === :camera && src.camera !== nothing && haskey(CAMERAFIELDS, key)
+        v = getfield(src.camera, key)
+    else
+        src.live === nothing && return nothing
+        group = programcontrol(src.live.target, name)
+        if group !== nothing
+            haskey(group.values, key) || return nothing
+            v = group.values[key]
+            comp === nothing || (v = v isa Colorant ?
+                (red(v), green(v), blue(v), alpha(v))[comp] : v[comp])
+            return v isa Real ? Float64(v) : nothing
+        end
+        light = scenelight(targetscene(src.live.target), name)
+        plot = light === nothing ? Makie.findplot(targetscene(src.live.target), name) : nothing
+        if light !== nothing
+            hasfield(typeof(light), key) || return nothing
+            v = Makie.to_value(getfield(light, key))
+        elseif plot === nothing
+            return nothing
+        elseif key in (:translation, :scale)
+            v = getproperty(plot.transformation, key)[]
+        elseif key === :rotation
+            v = rotationdegrees(plot.transformation.rotation[])
+        elseif haskey(plot.attributes.inputs, key)
+            v = Makie.to_value(plot.attributes[key])
+        else
+            return nothing
+        end
+    end
+    if comp !== nothing
+        v = v isa Colorant ? (red(v), green(v), blue(v), alpha(v))[comp] : v[comp]
+    end
+    return v isa Real ? Float64(v) : nothing
+end
+
+"Sample source inputs after the original animation and before editor overrides."
+function syncsceneinputs!(src::SceneSource, clip::Clip)
+    fx = findslot(clip, :scene)
+    fx === nothing && return nothing
+    for p in fx.params
+        isfollowing(p) || continue
+        n = p.input
+        v = scenevalue(src, only(n.inputs).path)
+        v === nothing && continue
+        isempty(n.resolved) || !(n.resolved[1] isa SceneValue) || (n.resolved[1].value = v)
+        # The curve remains a fallback when the scene has not been realized yet.
+        # Do not notify widgets from the render thread; publication does that.
+        # A selected recipe property can carry a sampled original curve for the
+        # timeline. Its input still follows the recipe until an actual edit.
+        length(p.curve[].keys) == 1 && movekey!(p.curve[], 1, 0, v)
+    end
     return nothing
 end
 
@@ -279,7 +370,9 @@ function sceneplots(scene)
     out = Pair{Symbol, Any}[]
     walk(p) = begin
         n = Makie.to_value(get(p.attributes, :name, nothing))
-        n isa Symbol && push!(out, n => p)
+        # Recipe internals can retain the unresolved default. It is not an
+        # addressable object name and would alias unrelated child plots.
+        n isa Symbol && n !== :automatic && push!(out, n => p)
         foreach(walk, p.plots)
     end
     walkscene(sc) = (foreach(walk, sc.plots); foreach(walkscene, sc.children))
@@ -305,9 +398,20 @@ rowkind(::Colorant) = :colour
 rowkind(::GeometryBasics.Vec) = :vector
 rowkind(::GeometryBasics.Point) = :vector
 rowkind(::AbstractMatrix{<:Colorant}) = :data
+rowkind(::AbstractArray{<:Number}) = :data
+rowkind(::AbstractArray{<:Colorant}) = :data
 rowkind(::GeometryBasics.Mesh) = :data
 rowkind(::AbstractVector{<:GeometryBasics.Point}) = :data
 rowkind(::Any) = :none
+
+# Makie currently also registers the transformation's derived matrix/function as
+# graph inputs. Edit the transformation itself, never its computed result.
+# `:cycled` is an unset input, not an explicit colour. Restoring its computed
+# palette colour would override a material that never requested that colour.
+sceneinputkeys(plot) = filter(k -> k ∉ (:name,:transformation,:dim_conversions,:cycle,
+                                      :model,:transform_func) &&
+                                  plot.attributes.inputs[k].value !== :cycled,
+                             collect(keys(plot.attributes.inputs)))
 
 "How many numbers a row kind has, and what they are called."
 rowcomponents(::Val{:number}, v) = ((Symbol(""), Float64(v)),)
@@ -336,8 +440,15 @@ function sceneattributes(src::SceneSource)
                     rows = vcat([comprows(:camera, f, n, getfield(src.camera, f))
                                  for (f, n) in pairs(CAMERAFIELDS)]...)))
     end
-    for (name, plot) in sceneplots(targetscene(src.live.target))
+    objects = sceneobjects(src)
+    for object in objects
+        name, plot = object.name, object.plot
         rows = NamedTuple[]
+        # Transformations are not plot attributes, but they are the primary
+        # editable numbers of a procedural actor or prop.
+        append!(rows, comprows(name, :translation, 3, plot.transformation.translation[]))
+        append!(rows, comprows(name, :rotation, 3, rotationdegrees(plot.transformation.rotation[])))
+        append!(rows, comprows(name, :scale, 3, plot.transformation.scale[]))
         # A joint's rows come from the description, not from the plot: `angle` and
         # `offset` are not attributes Makie knows, they are how the part is hung.
         # Their values live in the parameters, so a fresh row starts at rest.
@@ -352,8 +463,8 @@ function sceneattributes(src::SceneSource)
         # and a slider on an answer is a slider that will be overwritten. The
         # graph already distinguishes the two; asking it is one rule rather than a
         # list of exceptions to keep up to date.
-        for key in sort!(collect(keys(plot.attributes.inputs)))
-            key in (:name, :transformation, :arg1, :dim_conversions, :cycle) && continue
+        for key in sort!(sceneinputkeys(plot))
+            object.attributes === nothing || String(key) in object.attributes || continue
             v = Makie.to_value(plot.attributes[key])
             kind = rowkind(v)
             kind === :none && continue
@@ -369,16 +480,115 @@ function sceneattributes(src::SceneSource)
             end
         end
         isempty(rows) ||
-            push!(out, (name = name, label = String(name),
+            push!(out, (name = name, label = object.label,
                         detail = string(nameof(typeof(plot))), rows = rows))
+    end
+    if src.live.target isa ProgramInstance
+        for group in src.live.target.controls
+            motion = (:animation_time,:time,:local_position,:position,:translation,
+                      :yaw_degrees,:lean_degrees,:roll_degrees,:rotation,:scale,:grow,:squash)
+            order = key -> (something(findfirst(==(key),motion),length(motion)+1),String(key))
+            fields = sort!(collect(keys(group.values)); by = order)
+            assigned = Set{Symbol}()
+            for section in group.sections, field in section.fields
+                field in assigned && error("duplicate inspector field $(group.name).$field")
+                push!(assigned, field)
+            end
+            sections = [(label = group.label, fields = filter(k -> k ∉ assigned, fields)); group.sections]
+            for section in sections
+                rows = NamedTuple[]
+                for key in section.fields
+                    haskey(group.values, key) || continue
+                    v = group.values[key]
+                    for (suffix, num) in rowcomponents(Val(rowkind(v)), v)
+                        push!(rows, (path = Symbol(group.name, ".", key, suffix),
+                            label = string(titlecase(replace(String(key), '_' => ' ')), " ", suffix),
+                            kind = :number, value = num))
+                    end
+                end
+                isempty(rows) || push!(out, (name = group.name, label = section.label,
+                    detail = "Performance", rows = rows))
+            end
+        end
+    end
+    scene = targetscene(src.live.target)
+    for (i, light) in [(0, Makie.AmbientLight(scene.compute[:ambient_color][]));
+                       collect(enumerate(Makie.get_lights(scene)))]
+        rows = NamedTuple[]
+        name = Symbol("lights[$i]")
+        for key in fieldnames(typeof(light))
+            value = Makie.to_value(getfield(light, key))
+            kind = rowkind(value)
+            kind in (:number, :vector, :colour) || continue
+            for (suffix, num) in rowcomponents(Val(kind), value)
+                kind === :colour && suffix === Symbol("[4]") && continue
+                push!(rows, (path = Symbol(name, ".", key, suffix),
+                    label = titlecase(replace(String(key), "_" => " ")) * String(suffix),
+                    kind = :number, value = num))
+            end
+        end
+        title = replace(String(nameof(typeof(light))), "Light" => "")
+        push!(out, (name, label = "Light · $title" * (i == 0 ? "" : " $i"),
+                    detail = "Lighting", rows))
     end
     return out
 end
 
+"Authored object groups keep an actor's body, face and parts together in the inspector."
+function sceneobjects(src::SceneSource)
+    scene = targetscene(src.live.target)
+    descriptions = src.build isa AbstractDict ? get(src.build, "objects", nothing) : nothing
+    if descriptions === nothing
+        return [(name = name, plot = plot, label = String(name), attributes = nothing)
+                for (name, plot) in sceneplots(scene)]
+    end
+    out = NamedTuple[]
+    grouped = Set{Symbol}()
+    for d in descriptions
+        union!(grouped, Symbol.(d["plots"]))
+        name = Symbol(first(d["plots"]))
+        plot = Makie.findplot(scene, name)
+        plot === nothing && continue
+        push!(out, (name = name, plot = plot, label = String(d["label"]),
+                    attributes = get(d, "attributes", nothing)))
+    end
+    # Groups consolidate known actors; they must not hide other named geometry.
+    for (name,plot) in sceneplots(scene)
+        name in grouped && continue
+        push!(out,(;name,plot,label=String(name),attributes=nothing))
+    end
+    return out
+end
+
+function sceneobjectplots(src::SceneSource, name::Symbol)
+    scene = targetscene(src.live.target)
+    descriptions = src.build isa AbstractDict ? get(src.build, "objects", ()) : ()
+    for d in descriptions
+        Symbol(first(d["plots"])) === name || continue
+        return filter(!isnothing, [Makie.findplot(scene, Symbol(n)) for n in d["plots"]])
+    end
+    plot = Makie.findplot(scene, name)
+    return plot === nothing ? Makie.Plot[] : [plot]
+end
+
+"XYZ angles in degrees, composed as Z * Y * X. The stored plot rotation stays a quaternion."
+function rotationdegrees(q)
+    x, y, z, w = q.data
+    return Vec3f(rad2deg(atan(2(w*x + y*z), 1 - 2(x*x + y*y))),
+                 rad2deg(asin(clamp(2(w*y - z*x), -1, 1))),
+                 rad2deg(atan(2(w*z + x*y), 1 - 2(y*y + z*z))))
+end
+rotationfromdegrees(v) = Makie.qrotation(Vec3f(0, 0, 1), deg2rad(v[3])) *
+                         Makie.qrotation(Vec3f(0, 1, 0), deg2rad(v[2])) *
+                         Makie.qrotation(Vec3f(1, 0, 0), deg2rad(v[1]))
+
 "`n` numbered rows for one compound value — a joint's offset, the camera's eye."
 comprows(name, field::Symbol, n::Integer, v) =
     NamedTuple[(path = Symbol(name, ".", field, "[", i, "]"),
-                label = string(titlecase(String(field)), " ", ("X", "Y", "Z")[i]),
+                label = string(field === :eye ? "Position" : field === :lookat ? "Target" :
+                               field === :translation ? "Position" :
+                               field === :rotation ? "Rotation °" : titlecase(String(field)),
+                               " ", ("X", "Y", "Z")[i]),
                 kind = :number, value = Float64(v[i])) for i in 1:n]
 
 # `scenepath` itself is in scenespec.jl and is unchanged: `"plot.attribute[i]"`
@@ -475,8 +685,47 @@ function setscenevalue!(src::SceneSource, path, v)
         return true
     end
     src.live === nothing && return false
+    scene = targetscene(src.live.target)
+    light = scenelight(scene, name)
+    if light !== nothing
+        hasfield(typeof(light), key) || return false
+        old = Makie.to_value(getfield(light, key))
+        new = comp === nothing ? convert(typeof(old), v) : withcomponent(old, comp, v)
+        setscenelight!(scene, name, key, new)
+        return true
+    end
     plot = Makie.findplot(targetscene(src.live.target), name)
     plot === nothing && return false
+    if key in (:translation, :rotation, :scale)
+        plots = sceneobjectplots(src, name)
+        pivot = plot.transformation.translation[]
+        if key === :rotation
+            old = plot.transformation.rotation[]
+            angles = rotationdegrees(old)
+            new = rotationfromdegrees(comp === nothing ? Vec3f(v) : withcomponent(angles, comp, v))
+            delta = new * inv(old)
+            for part in plots
+                Makie.translate!(part, pivot + delta * (part.transformation.translation[] - pivot))
+                Makie.rotate!(part, delta * part.transformation.rotation[])
+            end
+            return true
+        end
+        old = getproperty(plot.transformation, key)[]
+        new = comp === nothing ? Vec3f(v) : withcomponent(old, comp, v)
+        if key === :translation
+            delta = new - old
+            for part in plots
+                Makie.translate!(part, part.transformation.translation[] + delta)
+            end
+        else
+            ratio = Vec3f(ntuple(i -> abs(old[i]) < 1f-8 ? 1f0 : new[i] / old[i], 3))
+            for part in plots
+                Makie.translate!(part, pivot + (part.transformation.translation[] - pivot) .* ratio)
+                Makie.scale!(part, part === plot ? new : part.transformation.scale[] .* ratio)
+            end
+        end
+        return true
+    end
     haskey(plot.attributes.inputs, key) || return false
     old = Makie.to_value(plot.attributes[key])
     new = comp === nothing ? convert(typeof(old), v) : withcomponent(old, comp, v)
@@ -485,6 +734,26 @@ function setscenevalue!(src::SceneSource, path, v)
     # recompute. Writing the dict entry would leave the derived values stale.
     Makie.update!(plot; NamedTuple{(key,)}((new,))...)
     return true
+end
+
+"Native Makie lights addressed by index; zero is Makie's separate ambient light."
+function scenelight(scene, name::Symbol)
+    m = match(r"^lights\[(\d+)\]$", String(name))
+    m === nothing && return nothing
+    i = parse(Int, m[1])
+    i == 0 && return Makie.AmbientLight(scene.compute[:ambient_color][])
+    lights = Makie.get_lights(scene)
+    return i <= length(lights) ? lights[i] : nothing
+end
+
+function setscenelight!(scene, name::Symbol, key::Symbol, value)
+    i = parse(Int, match(r"^lights\[(\d+)\]$", String(name))[1])
+    if i == 0
+        Makie.set_ambient_light!(scene, value)
+    else
+        Makie.set_light!(scene, i; NamedTuple{(key,)}((value,))...)
+    end
+    return nothing
 end
 
 "Where a 3-D scene looks from — the three vectors `cam3d!` is told after the fact."
@@ -519,7 +788,9 @@ The source pass of a clip that renders its frames. No decode, no upload of a
 decoded picture — the renderer hands back a host image in the plane's own format
 and it goes straight in.
 """
-struct SceneNode <: FxNode end
+struct SceneNode <: FxNode
+    inputdims::Tuple{Int, Int}
+end
 
 """
     sourcenode(clip) -> FxNode
@@ -530,10 +801,20 @@ Which source pass this clip's chain begins with. Dispatch on the source, because
 sourcenode(clip::Clip) = sourcenode(clip.source, clip)
 sourcenode(::VideoSource, clip::Clip) =
     clip.timeinterp === :flow ? SmoothSourceNode() : SourceNode()
-sourcenode(::SceneSource, ::Clip) = SceneNode()
+sourcenode(src::SceneSource, ::Clip) = SceneNode((src.width, src.height))
 
-function chainpass!(g, ::SceneNode, ::Nothing, ::Nothing, ctx::ChainBuild, dims)
-    cur = Mantle.Transient.Buffer(g, PlanePixel, dims...; hostwritten = true)
+function previewnode(clip::Clip, sf::Integer; exact::Bool = false)
+    src = clip.source
+    if !exact && src isa SceneSource && src.pending !== nothing && src.pendingat == sf &&
+       !hasbakedframe(clip, sf)
+        return SceneNode(size(src.pending))
+    end
+    return sourcenode(clip)
+end
+
+function chainpass!(g, node::SceneNode, ::Nothing, ::Nothing, ctx::ChainBuild, dims)
+    inputdims = node.inputdims
+    cur = Mantle.Transient.Buffer(g, PlanePixel, inputdims...; hostwritten = true)
     st = ctx.state
     # A scene's picture is a host frame and is STORED into the transient for
     # exactly the reason a decoded one is: a `copyto!` into a device transient
@@ -546,6 +827,7 @@ function chainpass!(g, ::SceneNode, ::Nothing, ::Nothing, ctx::ChainBuild, dims)
     # reads a PNG) changed nothing, which is what puts the cost on the upload and
     # not the drawing.
     st.upload = cur
+    st.uploaddims = inputdims
     st.blankonmiss = true   # nothing else writes this one
     # No pass at all. The picture is a host image and `update!` STORES it into
     # this transient before the run, which is the whole of what the old body did
@@ -553,7 +835,16 @@ function chainpass!(g, ::SceneNode, ::Nothing, ::Nothing, ctx::ChainBuild, dims)
     # case is now a store of `blankpixels!` rather than a draw inside a recorded
     # pass. What reads `cur` is the next node in the chain, which is what gives
     # the transient its interval.
-    return cur
+    inputdims == dims && return cur
+    # Upscale once on the GPU, before effects. Their pixel units, the clip's
+    # placement and editor hit coordinates keep their full-resolution meaning.
+    out = Mantle.Transient.Buffer(g, PlanePixel, dims...)
+    sx, sy = Float32(inputdims[1] / dims[1]), Float32(inputdims[2] / dims[2])
+    matrix = Mat3f(sx, 0, 0, 0, sy, 0, (1 - sx) / 2, (1 - sy) / 2, 1)
+    Mantle.dispatch!(g, GPUFiltering.warp_kernel!,
+        (out, cur, matrix, false, Vec4{Int32}(1, 1, inputdims...), GPUFiltering.Replace()),
+        dims; name = "scene/preview upscale")
+    return out
 end
 
 """

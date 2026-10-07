@@ -6,13 +6,14 @@ border and a single composed thumbnail strip. All tile logic lives here and
 is reused for every clip — the timeline just creates one `ClipView` per
 clip and feeds shared view observables.
 
-Tiles are anchored at the clip start and clamped to its extent (they never
+Tiles are anchored to source time and clamped to the clip extent (they never
 cross a cut). The visible tiles are composed into one image (film-strip
-style, partial tail tile sliced), so each clip costs two draw calls
-regardless of zoom.
+style, partial tail tile sliced), with one additional waveform plot per clip
+regardless of zoom. A waveform provider reserves its band before analysis finishes;
+loading its samples must not change the thumbnail grid.
 
 `state` is `:idle`, `:hovered` or `:selected`; `thumbs` is a function
-`second::Int -> Union{Nothing, Matrix}` (missing seconds render as
+`second::Real -> Union{Nothing, Matrix}` (missing seconds render as
 placeholder and are expected to be requested by the provider itself).
 Bump `refresh` to re-pull thumbnails after asynchronous loads.
 """
@@ -25,6 +26,13 @@ Bump `refresh` to re-pull thumbnails after asynchronous loads.
     bandheight = 72.0
     "Source time in seconds at the clip's first frame (thumbnail keying)."
     sourcestart = 0.0
+    sourcespeed = 1.0
+    sourcebounds = (-Inf, Inf)
+    thumbinterval = 1.0
+    "Source frame duration: no more than one thumbnail per source frame."
+    frameinterval = 1 / 30
+    "Non-blocking waveform provider (range, viewport, pixels/sec, y0, y1)."
+    waveform = nothing
     "Interaction state: :idle, :hovered or :selected."
     state = :idle
     "Thumbnail provider `second -> Union{Nothing, Matrix{RGB{N0f8}}}`."
@@ -52,6 +60,9 @@ Bump `refresh` to re-pull thumbnails after asynchronous loads.
 end
 
 function Makie.plot!(p::ClipView)
+    map!(p, [:timerange,:viewrange,:pixelspersecond,:bandlo,:bandhi,:waveform,:refresh,:sourcestart,:sourcespeed], :wavepoints) do tr,vr,pps,lo,hi,wave,_,_,_
+        wave === nothing ? Point2f[] : wave(tr,vr,pps,lo+.04*(hi-lo),lo+.30*(hi-lo))
+    end
     map!(p, [:timerange, :bandlo, :bandhi], :bandrect) do (t0, t1), lo, hi
         return Rect2f(t0, lo, t1 - t0, hi - lo)
     end
@@ -60,23 +71,25 @@ function Makie.plot!(p::ClipView)
         return state === :selected ? selected : state === :hovered ? hovered : idle
     end
     map!(p, [:timerange, :viewrange, :pixelspersecond, :bandheight, :sourcestart,
-             :thumbs, :thumbsize, :color, :refresh, :bandshare],
-         [:strip, :stripx, :stripvisible]) do trange, vrange, pps, bh, s0, thumbs, tsize, color, _, share
-        return composetiles(trange, vrange, pps, bh * share, s0, thumbs, tsize, to_color(color))
+             :thumbs, :thumbsize, :color, :refresh, :bandshare,:sourcespeed,:sourcebounds,:thumbinterval,:frameinterval,:waveform],
+         [:strip, :stripx, :stripvisible]) do trange, vrange, pps, bh, s0, thumbs, tsize, color, _, share,speed,bounds,interval,frameinterval,wave
+        return composetiles(trange, vrange, pps, bh * share * (wave === nothing ? 1 : .65), s0, thumbs, tsize, to_color(color);speed,bounds,interval,frameinterval)
     end
     # thumbnails inset inside the band (same 0.04/0.94 proportion as the full-height band)
-    map!(p, [:bandlo, :bandhi], :stripy) do lo, hi
+    map!(p, [:bandlo, :bandhi,:waveform], :stripy) do lo, hi,wave
         inset = 0.04 / 0.94 * (hi - lo)
-        return (hi - inset, lo + inset)
+        return (hi - inset, lo + (wave === nothing ? inset : .34*(hi-lo)))
     end
 
     poly!(p, p.bandrect; color = p.color, strokecolor = p.bandstroke, strokewidth = 2)
     image!(p, p.stripx, p.stripy, p.strip; interpolate = true, visible = p.stripvisible)
+    linesegments!(p,p.wavepoints;color=RGBf(.4,.75,.85),linewidth=1)
     return p
 end
 
 "Compose the clip's visible tiles into one image (see [`ClipView`](@ref))."
-function composetiles(trange, vrange, pps, bandheight, s0, thumbs, (tw, th), fallback)
+function composetiles(trange, vrange, pps, bandheight, s0, thumbs, (tw, th), fallback;
+                      speed=1.0,bounds=(-Inf,Inf),interval=1.0,frameinterval=1/30)
     fill3 = RGB{N0f8}(red(fallback), green(fallback), blue(fallback))
     placeholder() = fill(fill3, tw, th)
     t0, t1 = trange
@@ -86,24 +99,50 @@ function composetiles(trange, vrange, pps, bandheight, s0, thumbs, (tw, th), fal
     # a gapless, UNDISTORTED filmstrip: every tile keeps the frame's aspect at
     # the lane height, so the tile pitch (in seconds) is exactly the width an
     # aspect-correct lane-height tile covers on screen — zooming in repeats
-    # frames, zooming out skips them, tiles always butt against each other
-    pitch = max(bandheight, 8.0) * (tw / th) / pps
+    # frames up to frame resolution; further zoom leaves space between frames.
+    sourcepitch = max(max(bandheight, 8.0) * (tw / th) / pps * speed, frameinterval)
+    pitch = sourcepitch / speed
     # …and the grid is anchored to the MEDIA, not to the clip: `origin` is where
     # this source's time 0 would sit on the timeline. Trimming the head moves the
     # clip start and `s0` by the SAME amount, so the grid does not move and the
     # picture stays exactly where it was — you just see less of it. Anchored at the
     # clip start instead, every head trim re-sliced the whole strip, which is what
     # made trimming the left edge look like the far end was being cut.
-    origin = t0 - s0
+    origin = t0 - s0/speed
     firsttile = floor(Int, (lo - origin) / pitch)
     lasttile = floor(Int, (hi - origin - 1.0e-9) / pitch)
     lasttile = min(lasttile, firsttile + 600)   # runaway guard at absurd zoom
+    if frameinterval > max(bandheight, 8.0) * (tw / th) / pps * speed
+        # Beyond frame resolution, draw one aspect-correct thumbnail per frame.
+        # Allocate only the visible band, even when a frame is thousands of
+        # pixels wide; centre its thumbnail in the visible portion of that frame.
+        density = pps * th / max(bandheight, 8.0)
+        width = max(1, ceil(Int, (hi - lo) * density))
+        strip = fill(fill3, width, th)
+        for k in firsttile:lasttile
+            time = clamp(floor(nextfloat(k * (sourcepitch / interval))) * interval, bounds...)
+            second = interval == 1.0 ? floor(Int, time) : time
+            img = thumbs === nothing ? nothing : thumbs(second)
+            img === nothing && continue
+            a = max(lo, origin + k * pitch)
+            b = min(hi, origin + (k + 1) * pitch)
+            left = round(Int, ((a + b) / 2 - lo) * density - size(img, 1) / 2)
+            firstcol = max(1, ceil(Int, (a - lo) * density))
+            lastcol = min(width, floor(Int, (b - lo) * density))
+            for x in max(firstcol, left + 1):min(lastcol, left + size(img, 1))
+                strip[x, :] .= view(img, x - left, :)
+            end
+        end
+        return (strip, (lo, hi), true)
+    end
     parts = Matrix{RGB{N0f8}}[]
     xstart = origin + firsttile * pitch         # exact edges of what we KEEP, so the
     xend = origin + (lasttile + 1) * pitch      # image maps back onto the same pixels
     for k in firsttile:lasttile
-        second = floor(Int, k * pitch)          # source second under this tile
-        img = something(thumbs === nothing ? nothing : thumbs(second), placeholder())
+        time = clamp(floor(nextfloat(k * (sourcepitch / interval))) * interval, bounds...)
+        second = interval == 1.0 ? floor(Int,time) : time
+        img = thumbs === nothing ? nothing : thumbs(second)
+        img === nothing && (img = placeholder())
         tilestart = origin + k * pitch
         tileend = tilestart + pitch
         if tilestart < t0 || tileend > t1       # partial tile at either cut: slice
@@ -121,7 +160,7 @@ function composetiles(trange, vrange, pps, bandheight, s0, thumbs, (tw, th), fal
             k == firsttile && (xstart = tilestart + (i0 - 1) / w * pitch)
             k == lasttile && (xend = tilestart + i1 / w * pitch)
         end
-        push!(parts, collect(img))
+        push!(parts, img)
     end
     isempty(parts) && return (placeholder(), (t0, t0 + 1.0e-6), false)
     strip = vcat(parts...)  # (w, h) layout: horizontal concat is along dim 1
