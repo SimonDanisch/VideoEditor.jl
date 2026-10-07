@@ -1,5 +1,5 @@
 """
-The editor's kernels, frozen.
+The editor's kernels, precompiled.
 
 Same mechanism as `SAM2Runner` and `MatAnyoneRunner`, pointed at the editor
 instead of a network. The editor compiles a lot of kernels — decode, the effect
@@ -8,7 +8,7 @@ worst possible moment, which is the first time the user asks for a picture.
 
 The workload drives [`renderframe!`](@ref), deliberately: since the render
 unification that is the *one* orchestration behind preview, scrub and export, so
-freezing its kernels covers all three. Around it the workload adds the effects
+precompiling its kernels covers all three. Around it the workload adds the effects
 whose kernels would otherwise compile the first time somebody drags a slider.
 
 This was a separate package (`VideoEditorRunner`) downstream of the editor, and
@@ -20,9 +20,9 @@ it itself the far side — the workload lives here and the wrapper package is
 gone. It is `include`d last for the other half of that rule: a workload has to
 come after everything it calls is defined.
 
-Sharing `DNNKernels.KERNELS_VERSION` with the networks is the point rather than an
-accident: the editor and the models both broadcast over device arrays, and one
-frozen entry serves both.
+A kernel compiled in the workload is kept with its `CodeInstance`
+(`Lava.compile_or_lookup`), so its SPIR-V goes into this package's image along
+with the inferred host code.
 """
 
 # Only the workload below needs the matte propagator — the editor itself takes
@@ -30,23 +30,17 @@ frozen entry serves both.
 import MatAnyoneRunner
 using Mantle: @setup_workload, @compile_workload
 
-"""`DNNKernels.KERNELS_VERSION` — one generation for the whole runtime. Read
-through `SAM2Runner` (already a dependency, and it defines the constant as
-exactly that) so the editor shares the generation without depending on the
-kernel package directly."""
-const KERNELS_VERSION = SAM2Runner.KERNELS_VERSION
-
 """
     editorassets() -> String
 
 The clip the workload renders, out of this package's own artifact. Any short clip
-will do; what is being frozen is the code path, not the content.
+will do; what is being precompiled is the code path, not the content.
 
 Neither an environment variable nor a walk up the filesystem, which is what was
 here — and not a reach into `DNNKernels` for either, which is what it used. Both
 mechanisms are the ones `DNNKernels/src/assets.jl` records as deleted, for the
 reason it gives: a walk answers on the machine that happens to have the tree and
-nowhere else, so this froze the editor's kernels for one checkout and silently
+nowhere else, so this precompiled the editor's kernels for one checkout and silently
 covered nothing for every other. A package owns its assets through its own
 `Artifacts.toml`, exactly as each model runner owns its weights, and nothing
 outside it constructs a path into them.
@@ -82,10 +76,8 @@ function runeditorframe(seq, engine, readers, dest, n::Integer)
     return dest
 end
 
-# The editor's only `__init__`, and this is what it exists for: point the runtime at the
-# frozen cache the workload below fills, before anything asks for a kernel.
+# The editor's only `__init__`.
 function __init__()
-    Mantle.use_frozen_kernels(KERNELS_VERSION)
     # Install the matte propagator here, and never from the workload below. The
     # workload's closure has already run, so its `modelref` holds a built model —
     # and a built model holds device arrays whose context belongs to the
@@ -129,14 +121,14 @@ end
 
             # The matte tool's segmenter path. Covered here rather than in
             # `SAM2Runner` because it is the *editor* side that is expensive:
-            # with every kernel already frozen, the first click still cost 41 s,
+            # with every kernel already compiled, the first click still cost 41 s,
             # 97% of it Julia inferring `seedmask` and the segmenter it calls.
             samready = isfile(joinpath(SAM2Runner.assetdir(), "weights.safetensors"))
             matready = isdir(MatAnyoneRunner.assetdir()) && isfile(MatAnyoneRunner.weightpath())
             markframe = framereader(clip, engine)(1)
             marks = [(0.5, 0.5, true), (0.2, 0.2, false)]
 
-            @compile_workload KERNELS_VERSION begin
+            @compile_workload begin
                 # Building the model is INSIDE the traced block, and only here:
                 # in `@setup_workload` its inference is not captured, and reading
                 # the graph plus 900 MB of weights is ~3 s of Julia on the first

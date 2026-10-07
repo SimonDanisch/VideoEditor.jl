@@ -1,5 +1,5 @@
 """
-Does the frozen cache in `src/precompile.jl` actually hold?
+Does the precompile workload in `src/precompile.jl` actually hold?
 
 Same shape as the model runners' tests, and for the same reason: compile time is
 per-process, so the claim can only be checked in a fresh one — which is why this
@@ -49,6 +49,5 @@ println("RESULT ", (; wall = t, compile = (c1[1]-c0[1])/1e9, hits = s.hits,
         @test r.misses == 0
         @test r.compile < 5.0
         @test r.wall < 20.0
-        @test r.version == VideoEditor.KERNELS_VERSION
     end
 end
