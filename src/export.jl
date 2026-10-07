@@ -195,6 +195,11 @@ the declared lane fails the export loudly instead of silently switching.
 """
 opendecoder(source::VideoSource, ::KA.CPU) = SequentialReader(source)
 function opendecoder(source::VideoSource, backend)
+    # The capability the docstring promises. Without it a Metal export reached
+    # `openstream`, whose decoder is Vulkan Video, failed with an `UndefVarError`
+    # on `Mantle.vk_context` and landed on the CPU through the `catch` below,
+    # warning once per source.
+    Mantle.videodecodes(backend) || return SequentialReader(source)
     videocodec(source.path) in (:h264, :hevc) || return SequentialReader(source)
     # A mezzanine, when one exists, IS the decodable version of this source — the
     # streaming preview already opens on it, and this path did not, so a source

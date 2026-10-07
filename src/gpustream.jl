@@ -82,6 +82,9 @@ caller falls back to CPU decode) rather than thrash.
 """
 function openstream(backend::KA.GPU, path::AbstractString, width::Integer, height::Integer;
                     capacity::Integer = 120, vrambudget::Integer = 3 * 2^30)
+    Mantle.videodecodes(backend) || throw(ArgumentError(
+        "openstream: $(nameof(typeof(backend))) has no hardware video decode " *
+        "session. Ask `Mantle.videodecodes(backend)` first and read on the CPU."))
     codec = videocodec(path)
     codec in (:h264, :hevc) ||
         error("GPU stream: codec $codec has no hardware decode session yet — transcode first")
