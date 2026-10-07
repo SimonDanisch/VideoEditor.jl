@@ -113,7 +113,7 @@ function farminputs(seq::Sequence, extra)
             isempty(p) || push!(files, p)
         end
         c.source isa SceneSource || continue
-        c.source.root isa SceneProgram && push!(files, c.source.root.file)
+        c.source.root isa SceneProgram && isempty(c.source.root.package) && push!(files, c.source.root.file)
         c.source.build isa AbstractDict && append!(files,String.(collect(values(get(c.source.build,"recordings",Dict())))))
     end
     return sort!(unique(files))
@@ -134,9 +134,47 @@ function farmidentity(project, canvas, files; pathmap = Dict())
     end
     document = isempty(sidecars) ? filehash(project) :
                bytes2hex(SHA.sha256(MsgPack.pack((filehash(project), sort!(sidecars)))))
+    # Package recipes travel as code in each worker's environment, not as job
+    # files: their content is part of what a frame is, so it is part of the job.
+    packages = [(name, packagehash(name)) for name in projectpackages(project)]
     # Sort all input pairs: Dict iteration order is not a transport protocol.
     value = (document, canvas, string(VERSION), [(p, hashes[p]) for p in sort!(collect(keys(hashes)))])
+    isempty(packages) || (value = (value..., packages))
     return bytes2hex(SHA.sha256(MsgPack.pack(value))), hashes
+end
+
+"The packages a saved project's scene recipes are loaded from, sorted."
+function projectpackages(project::AbstractString)
+    dict = MsgPack.unpack(read(project))
+    names = String[]
+    for sd in get(dict, "sources", Any[])
+        scene = get(sd, "scene", nothing)
+        scene isa AbstractDict || continue
+        build = get(scene, "build", nothing)
+        build isa AbstractDict && haskey(build, "package") && push!(names, String(build["package"]))
+    end
+    return sort!(unique(names))
+end
+
+"""
+    packagehash(name) -> String
+
+The content of a recipe package as a worker loads it: its `Project.toml` and
+every file under `src/` and `ext/`, by relative path. Equal on two machines
+exactly when they would build the same scenes.
+"""
+function packagehash(name::AbstractString)
+    dir = pkgdir(recipemodule(name))
+    files = [joinpath(dir, "Project.toml")]
+    for sub in ("src", "ext")
+        root = joinpath(dir, sub)
+        isdir(root) || continue
+        for (parent, _, names) in walkdir(root), file in names
+            push!(files, joinpath(parent, file))
+        end
+    end
+    entries = sort!([(replace(relpath(f, dir), '\\' => '/'), filehash(f)) for f in files])
+    return bytes2hex(SHA.sha256(MsgPack.pack(entries)))
 end
 
 """

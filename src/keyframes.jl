@@ -122,9 +122,13 @@ end
 Base.isempty(c::AnimCurve) = isempty(c.keys)
 Base.length(c::AnimCurve) = length(c.keys)
 
-"Effective ease of key `k` on curve `c` — the legacy curve-wide `:smooth` still
-eases every key, a per-key mode wins otherwise."
+"""
+Effective ease of key `k` on curve `c` — the legacy curve-wide `:smooth` still
+eases every key, a per-key mode wins otherwise. A curve-wide `:hold` is a
+discrete parameter (a count, a switch, `visible`): every key it gains steps.
+"""
 keyease(c::AnimCurve, k::Keyframe) =
+    c.interp === :hold ? :hold :
     k.ease === :linear && c.interp === :smooth ? :smooth : k.ease
 
 "Interpolated value at absolute source frame `f`, or `nothing` if the curve is empty."

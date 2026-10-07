@@ -261,7 +261,8 @@ function rigscene(d::AbstractDict)
     cd_ = get(d, "camera", Dict{String, Any}())
     cam = (eye = Vec3f(Tuple(get(cd_, "eye", (3.0, 3.0, 3.0)))),
            lookat = Vec3f(Tuple(get(cd_, "lookat", (0.0, 0.0, 0.0)))),
-           up = Vec3f(Tuple(get(cd_, "up", (0.0, 0.0, 1.0)))))
+           up = Vec3f(Tuple(get(cd_, "up", (0.0, 0.0, 1.0)))),
+           fov = Float32(get(cd_, "fov", 45.0)))
     root = Makie.SpecApi.Scene(; camera = Makie.cam3d!, lights = lights, plots = plots)
     return (root = root, joints = joints, camera = cam)
 end

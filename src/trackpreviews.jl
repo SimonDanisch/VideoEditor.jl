@@ -323,7 +323,7 @@ end
 
 function scenepreviewidentity(src::SceneSource)
     root=src.root
-    recipe=root isa SceneProgram ? (root.file,root.entry,root.args) : root
+    recipe=root isa SceneProgram ? (root.file,root.package,root.entry,root.args) : root
     return hash((recipe,src.build,src.backend,src.screenopts,src.width/src.height,src.framerate))
 end
 function scenethumbdims(src::SceneSource)

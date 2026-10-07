@@ -1974,6 +1974,7 @@ include("recordedanimation.jl") # streamed simulation arrays; GPU integration wh
 include("sceneediting.jl") # inspector, original animation, overrides and saved edits
 include("speechediting.jl") # model capabilities, approved takes and speech following cuts
 include("creative_controls.jl") # native lights and dialogue timing through edits
+include("sceneargs.jl") # recipe arguments, held steps, nested cameras and seeded keys
 include("trackpreviews.jl") # exact audio envelopes and bounded asynchronous preview work
 
 # LAST, and that is the whole point. `interactions.jl` throws at the end of the

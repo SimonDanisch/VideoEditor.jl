@@ -271,16 +271,24 @@ skipped, which is what makes a project from a newer editor open rather than thro
 function applysceneparams!(src::SceneSource, clip::Clip, sf::Integer)
     src.live === nothing && return nothing
     fx = findslot(clip, :scene)
-    fx === nothing && return nothing
-    fx.enabled[] || return nothing
+    if fx === nothing || !fx.enabled[]
+        # A bypassed scene effect shows the recipe's own arguments.
+        src.live.target isa ProgramInstance && applyargs!(src.live.target, nothing, sf)
+        return nothing
+    end
     applyscenecamera!(src)          # the eye first: a path may then move it
     for p in fx.params
-        (isfollowing(p) || followsrecording(src,p)) && continue
+        (isfollowing(p) || followsrecording(src,p) || isargpath(p.name)) && continue
         setscenevalue!(src, p.name, valueat(p, sf)) && remembersceneoverride!(src, p.name)
     end
     applyjoints!(src, fx, sf)       # …and the rig, once every number is known
+    # Arguments last and whole: one write per argument, after every number of it
+    # is known, so a plot derived from it recomputes once.
+    src.live.target isa ProgramInstance && applyargs!(src.live.target, fx, sf)
     return nothing
 end
+
+isargpath(path::Symbol) = startswith(String(path), "args.")
 
 "Read an editable scalar without changing the scene or advancing its animation."
 function scenevalue(src::SceneSource, path::Symbol)
@@ -289,6 +297,9 @@ function scenevalue(src::SceneSource, path::Symbol)
     name, key, comp = a
     if name === :camera && src.camera !== nothing && haskey(CAMERAFIELDS, key)
         v = getfield(src.camera, key)
+    elseif name === :args
+        target = src.live === nothing ? nothing : src.live.target
+        return target isa ProgramInstance ? argnumber(target, key, comp) : nothing
     else
         src.live === nothing && return nothing
         group = programcontrol(src.live.target, name)
@@ -436,9 +447,17 @@ function sceneattributes(src::SceneSource)
     # The camera first, then the plots — reading order for a scene: where you look
     # from, then what is there.
     if src.camera !== nothing
-        push!(out, (name = :camera, label = "Camera", detail = "eye · look-at · up",
-                    rows = vcat([comprows(:camera, f, n, getfield(src.camera, f))
-                                 for (f, n) in pairs(CAMERAFIELDS)]...)))
+        rows = vcat([comprows(:camera, f, n, getfield(src.camera, f))
+                     for (f, n) in pairs(CAMERAFIELDS) if n == 3]...)
+        push!(rows, (path = Symbol("camera.fov"), label = "Field of view °", kind = :number,
+                     value = Float64(src.camera.fov)))
+        push!(out, (name = :camera, label = "Camera", detail = "eye · look-at · up · fov",
+                    rows = rows))
+    end
+    target = src.live.target
+    if target isa ProgramInstance && !isempty(target.args)
+        push!(out, (name = :args, label = "Arguments", detail = "Scene inputs",
+                    rows = argrows(target)))
     end
     objects = sceneobjects(src)
     for object in objects
@@ -466,6 +485,12 @@ function sceneattributes(src::SceneSource)
         for key in sort!(sceneinputkeys(plot))
             object.attributes === nothing || String(key) in object.attributes || continue
             v = Makie.to_value(plot.attributes[key])
+            if key === :visible && v isa Bool
+                # Shown/hidden is keyed as a held step, never blended.
+                push!(rows, (path = Symbol(name, ".visible"), label = "Visible", kind = :number,
+                             value = Float64(v), discrete = true))
+                continue
+            end
             kind = rowkind(v)
             kind === :none && continue
             if kind === :data
@@ -533,6 +558,37 @@ function sceneattributes(src::SceneSource)
     end
     return out
 end
+
+"""
+    argrows(target) -> Vector{NamedTuple}
+
+Inspector rows for a recipe's arguments: one per keyframable number (see
+[`argleaves`](@ref)), `discrete` for those that key as held steps, and one data
+row for an argument without numbers (an array, a mesh).
+"""
+function argrows(target::ProgramInstance)
+    rows = NamedTuple[]
+    for (name, obs) in target.args
+        v = obs[]
+        leaves = argleaves(v)
+        if isempty(leaves)
+            push!(rows, (path = Symbol("args.", name), label = argtitle(name), kind = :data, value = v))
+            continue
+        end
+        for (field, component, number, discrete) in leaves
+            label = join(argtitle.(filter(!=(Symbol("")), [name; Symbol.(split(String(field), '.'))])), " · ")
+            component === nothing ||
+                (label *= " " * (getfieldpath(v, field) isa Colorant ?
+                                 ("R", "G", "B", "A") : ("X", "Y", "Z", "W"))[component])
+            push!(rows, (path = argpath(name, field, component), label = label, kind = :number,
+                         value = number, discrete = discrete))
+        end
+    end
+    return rows
+end
+argtitle(s) = titlecase(replace(String(s), '_' => ' '))
+getfieldpath(v, field::Symbol) =
+    field === Symbol("") ? v : foldl(getfield, Symbol.(split(String(field), '.')); init = v)
 
 "Authored object groups keep an actor's body, face and parts together in the inspector."
 function sceneobjects(src::SceneSource)
@@ -679,12 +735,22 @@ function setscenevalue!(src::SceneSource, path, v)
     if name === :camera && src.camera !== nothing
         haskey(CAMERAFIELDS, key) || return false
         old = getfield(src.camera, key)
-        new = comp === nothing ? Vec3f(v) : withcomponent(old, comp, v)
+        new = comp !== nothing ? withcomponent(old, comp, v) : old isa Real ? leafvalue(old, v) : Vec3f(v)
         src.camera = merge(src.camera, NamedTuple{(key,)}((new,)))
         applyscenecamera!(src)
         return true
     end
     src.live === nothing && return false
+    if name === :args
+        target = src.live.target
+        target isa ProgramInstance || return false
+        arg, fields = argaddress(key)
+        obs = recipeargument(target, arg)
+        obs === nothing && return false
+        new = Base.invokelatest(withleaf, obs[], fields, comp, v)
+        Base.invokelatest(isequal, obs[], new) || (obs[] = new)
+        return true
+    end
     scene = targetscene(src.live.target)
     light = scenelight(scene, name)
     if light !== nothing
@@ -728,7 +794,8 @@ function setscenevalue!(src::SceneSource, path, v)
     end
     haskey(plot.attributes.inputs, key) || return false
     old = Makie.to_value(plot.attributes[key])
-    new = comp === nothing ? convert(typeof(old), v) : withcomponent(old, comp, v)
+    new = comp === nothing ? leafvalue(old, v) : withcomponent(old, comp, v)
+    isequal(old, new) && return true
     # `update!`, not an assignment into the graph: a plot's attributes are a
     # `ComputeGraph`, and setting an input is what makes everything derived from it
     # recompute. Writing the dict entry would leave the derived values stale.
@@ -756,16 +823,38 @@ function setscenelight!(scene, name::Symbol, key::Symbol, value)
     return nothing
 end
 
-"Where a 3-D scene looks from — the three vectors `cam3d!` is told after the fact."
-const CAMERAFIELDS = (eye = 3, lookat = 3, up = 3)
+"""
+Where a 3-D scene looks from: the three vectors `cam3d!` is told after the fact,
+and its vertical field of view in degrees. The number is how many components
+each has.
+"""
+const CAMERAFIELDS = (eye = 3, lookat = 3, up = 3, fov = 1)
+
+"The camera of a scene with a `Camera3D`, as the editor keys it."
+function cameravalues(scene::Makie.Scene)
+    c = Makie.cameracontrols(scene)
+    return (eye = Vec3f(c.eyeposition[]), lookat = Vec3f(c.lookat[]),
+            up = Vec3f(c.upvector[]), fov = Float32(c.fov[]))
+end
+
+"Place `v` (see [`cameravalues`](@ref)) on the scene's `Camera3D`."
+function setcameravalues!(scene::Makie.Scene, v)
+    c = Makie.cameracontrols(scene)
+    c.fov[] = v.fov
+    Makie.update_cam!(scene, c, v.eye, v.lookat, v.up)
+    return scene
+end
+
+"The scene holding a source's 3D camera, if it has one."
+camerascene(target::ProgramInstance) = target.camerascene
+camerascene(target) = camerascene(targetscene(target))
 
 "Place the source's camera on its live scene, if it has both."
 function applyscenecamera!(src::SceneSource)
     (src.live === nothing || src.camera === nothing) && return src
-    sc = targetscene(src.live.target)
-    c = Makie.cameracontrols(sc)
-    c isa Makie.Camera3D || return src
-    Makie.update_cam!(sc, c, src.camera.eye, src.camera.lookat, src.camera.up)
+    sc = camerascene(src.live.target)
+    sc === nothing && return src
+    setcameravalues!(sc, src.camera)
     return src
 end
 
@@ -901,6 +990,48 @@ function sceneclip(built; build = nothing, start::Integer = 0, frames::Integer =
     # the project file, whichever comes first.
     addslot!(clip, Effect(freshid(), :scene, true, Param[]))
     return clip
+end
+
+"""
+    keyframes!(clip, path, keys; ease = :smooth, discrete = false, label) -> Vector{Param}
+
+Key scene numbers from code, exactly as the inspector would: `path` names them
+as the inspector does (`"camera.eye[1]"`, `"camera.fov"`, `"callout.alpha"`,
+`"args.time"`, `"args.pose.eye[2]"`), `keys` are `frame => value` pairs in the
+clip's source frames, or `(frame, value, ease)` triples. A `Vec`, `Point` or
+colour value keys every component (`path[1]`, `path[2]`, …). Existing keys on
+those paths are replaced.
+
+`ease` is a key's kind (see [`Keyframe`](@ref)): `:smooth` eases in and out,
+`:linear` is a constant rate, `:hold` steps. `discrete` makes the whole curve
+step, for counts, switches and `visible`. The scene need not be built yet: the
+keys wait on the clip's scene effect and are saved with the project.
+"""
+function keyframes!(clip::Clip, path, keys; ease::Symbol = :smooth, discrete::Bool = false,
+                    label::AbstractString = String(path))
+    fx = findslot(clip, :scene)
+    fx === nothing && error("clip has no scene effect to key")
+    entries = [k isa Pair ? (k.first, k.second, ease) : k for k in keys]
+    isempty(entries) && error("no keys for $path")
+    first(entries)[2] isa Union{GeometryBasics.Vec, GeometryBasics.Point, Colorant} ||
+        return [keyscalar!(fx, Symbol(path), entries, discrete, label)]
+    n = first(entries)[2] isa Colorant ? 4 : length(first(entries)[2])
+    return [keyscalar!(fx, Symbol(path, "[", i, "]"),
+                       [(f, v isa Colorant ? (red(v), green(v), blue(v), alpha(v))[i] : v[i], e)
+                        for (f, v, e) in entries], discrete, "$label[$i]") for i in 1:n]
+end
+
+function keyscalar!(fx::Effect, path::Symbol, entries, discrete::Bool, label::AbstractString)
+    ks = sort!([Keyframe{Float64}(Int(f), Float64(v), e) for (f, v, e) in entries]; by = k -> k.frame)
+    allunique(k.frame for k in ks) || error("two keys on one frame for $path")
+    values = [k.value for k in ks]
+    span = occursin(".rotation[", String(path)) ? (-180.0, 180.0) :
+           (min(0.0, 2minimum(values)), max(1.0, 2maximum(values)))
+    fresh = Param(path, label, first(values); curve = AnimCurve{Float64}(ks, discrete ? :hold : :linear),
+                  range = span)
+    i = findfirst(q -> q.name === path, fx.params)
+    i === nothing ? push!(fx.params, fresh) : (fx.params[i] = fresh)
+    return fresh
 end
 
 # ---------------------------------------------------------------- the kind

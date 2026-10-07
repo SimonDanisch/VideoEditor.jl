@@ -11,9 +11,8 @@ end
 function replayrecordedscene!(target::ProgramInstance,src::SceneSource,frame)
     tracks = scenerecordings!(target,src)
     tracks === nothing && return false
-    camera = Makie.cameracontrols(target.scene)
-    if src.camera === nothing && camera isa Makie.Camera3D
-        src.camera = (eye=Vec3f(camera.eyeposition[]),lookat=Vec3f(camera.lookat[]),up=Vec3f(camera.upvector[]))
+    if src.camera === nothing && target.camerascene !== nothing
+        src.camera = cameravalues(target.camerascene)
     end
     for (path,track) in tracks
         setscenevalue!(src,path,valueat(track,frame)) ||
@@ -57,10 +56,9 @@ function readsceneproperty(scene,path)
     address === nothing && error("invalid scene property path: $path")
     name,key,component = address
     if name === :camera
-        camera = Makie.cameracontrols(scene)
-        camera isa Makie.Camera3D || error("recorded camera requires a 3D camera")
-        property = Dict(:eye=>:eyeposition,:lookat=>:lookat,:up=>:upvector)[key]
-        value = getproperty(camera,property)[]
+        camscene = camerascene(scene)
+        camscene === nothing && error("recorded camera requires a 3D camera")
+        value = getfield(cameravalues(camscene),key)
     else
         light = scenelight(scene,name)
         if light !== nothing
@@ -106,10 +104,10 @@ function recordsceneanimation!(clip::Clip,directory::AbstractString;
                 # separately editable and apply after these recorded values.
                 unkeyed = Clip(src)
                 candidates = Symbol[]
-                camera = Makie.cameracontrols(scene)
-                if camera isa Makie.Camera3D
-                    for field in keys(CAMERAFIELDS), i in 1:3
-                        push!(candidates,Symbol("camera.$field[$i]"))
+                if camerascene(scene) !== nothing
+                    for (field,n) in pairs(CAMERAFIELDS)
+                        n == 1 ? push!(candidates,Symbol("camera.$field")) :
+                            append!(candidates,[Symbol("camera.$field[$i]") for i in 1:n])
                     end
                 end
                 for (name,plot) in sceneplots(scene)

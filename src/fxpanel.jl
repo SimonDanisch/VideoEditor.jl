@@ -409,7 +409,8 @@ function clipname(clip::Clip)
             return String(marker["label"])
         end
     end
-    return src.root isa SceneProgram ? splitext(basename(src.root.file))[1] : "Scene"
+    src.root isa SceneProgram || return "Scene"
+    return isempty(src.root.package) ? splitext(basename(src.root.file))[1] : String(src.root.entry)
 end
 
 """
@@ -1727,8 +1728,15 @@ function sceneparam!(fx::Effect, row; follow = false)
     span = occursin(".rotation[", String(row.path)) ? (-180.0, 180.0) :
            (min(0.0, 2v), max(1.0, 2v))
     i = findfirst(q -> q.name === row.path, fx.params)
-    i === nothing || return withspan!(fx, i, span, row.label)
-    fresh = Param(row.path, row.label, v; range = span,
+    if i !== nothing
+        # A one-key parameter is saved as its value alone, so a reopened discrete
+        # parameter gets its hold mode back from the row.
+        get(row, :discrete, false) && (fx.params[i].curve[].interp = :hold)
+        return withspan!(fx, i, span, row.label)
+    end
+    # A discrete row (a count, a switch, `visible`) keys as held steps.
+    curve = get(row, :discrete, false) ? AnimCurve{Float64}(Keyframe{Float64}[], :hold) : nothing
+    fresh = Param(row.path, row.label, v; range = span, curve,
                   input = follow ? ParamInput(:copy, SceneRef(row.path)) : nothing)
     push!(fx.params, fresh)
     return fresh
