@@ -2,7 +2,9 @@ using VideoEditor
 using Test
 import VideoEditor as VE
 import VideoEditor.VideoIO as VideoIO
-import FFMPEG_jll
+# Through VideoEditor, like VideoIO above: the environment that runs the suite
+# need not list FFMPEG_jll itself, and none of the workers' environments do.
+import VideoEditor.FFMPEG_jll as FFMPEG_jll
 using LinearAlgebra: I        # refactor.jl builds identity MotionTracks
 
 testvideo = joinpath(mktempdir(), "test.mp4")
