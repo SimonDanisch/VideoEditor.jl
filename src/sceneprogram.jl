@@ -70,6 +70,9 @@ the clip's ordinary scene keyframes, which can override values.
 Optional `objects` describes inspector groups as dictionaries with `label`,
 `plots` (stable names; first is the pivot), and optional `attributes` to expose.
 Transforms move group members together. Omit it to expose all named plots.
+The builder may return the same `objects` (NamedTuples or dictionaries) beside
+its scene instead, where the code that names the plots also groups them; groups
+saved with the recipe take precedence.
 
 The builder may also return `controls`: groups with `name`, `label`,
 `sample(frame, fps)` returning a NamedTuple of numeric/vector/colour values, and
@@ -82,6 +85,8 @@ Set a control group's optional `object` to the stable name of its object's pivot
 plot to show those controls when that object is picked in a preview. Optional
 `sections = [(label = "Face", fields = [:smile, :eyeopen])]` separates related
 controls in the inspector without changing their saved parameter paths.
+Optional `detail` says what the group is (`"Material"`); the default,
+`"Performance"`, is what the inspector's Animation view lists.
 
 An optional `preview!(pixel_scale)` callback can adjust expensive procedural
 detail when preview quality changes. It runs before the next animation update,
@@ -128,6 +133,7 @@ mutable struct ProgramControlGroup
     values::Dict{Symbol, Any}
     object::Union{Nothing, Symbol}
     sections::Vector{NamedTuple}
+    detail::String
 end
 
 mutable struct ProgramInstance
@@ -142,6 +148,9 @@ mutable struct ProgramInstance
     # built with: what an argument returns to when its keys are removed.
     args::Vector{Pair{Symbol, Observable}}
     argdefaults::Dict{Symbol, Any}
+    # Inspector groups the builder returned (see `programscene`), in the saved
+    # form: `label`, `plots` and optional `attributes`, as strings.
+    objects::Vector{Dict{String, Any}}
     # The scene whose 3D camera the editor animates: the root, or the first
     # `LScene`-like child of a figure. `nothing` for a scene without one.
     camerascene::Union{Nothing, Makie.Scene}
@@ -195,10 +204,25 @@ function programcontrols(built, scene)
         push!(groups, ProgramControlGroup(name, String(c.label), c.sample, c.apply!, Dict(),
                                           owner === nothing ? nothing : Symbol(owner),
                                           NamedTuple[(label = String(s.label), fields = Symbol.(collect(s.fields)))
-                                              for s in get(c, :sections, ())]))
+                                              for s in get(c, :sections, ())],
+                                          String(get(c, :detail, "Performance"))))
     end
     return groups
 end
+
+"""
+    programobjects(objects) -> Vector{Dict{String, Any}}
+
+Inspector groups a builder returned, in the form a saved recipe holds them.
+"""
+programobjects(objects) = Dict{String, Any}[programobject(o) for o in objects]
+function programobject(o)
+    d = Dict{String, Any}("label" => String(o[:label]), "plots" => String.(collect(o[:plots])))
+    attributes = get(o, :attributes, nothing)
+    attributes === nothing || (d["attributes"] = String.(collect(attributes)))
+    return d
+end
+programobject(o::AbstractDict) = programobject((; (Symbol(k) => v for (k, v) in o)...))
 
 programcontrol(::Any, name) = nothing
 function programcontrol(p::ProgramInstance, name)
@@ -436,7 +460,8 @@ function realize(root::SceneProgram, canvas::NTuple{2, Int})
     defaults = Dict{Symbol, Any}(name => deepcopy(obs[]) for (name, obs) in args)
     instance = ProgramInstance(built.scene, SceneUpdater(updater, built.scene), -1,
                                programcontrols(built, built.scene), get(built, :preview!, nothing), NaN,
-                               Dict{Symbol,RecordedTrack}(), args, defaults, camerascene(built.scene))
+                               Dict{Symbol,RecordedTrack}(), args, defaults,
+                               programobjects(get(built, :objects, ())), camerascene(built.scene))
     return built.scene, instance
 end
 
@@ -532,6 +557,7 @@ end
 leafvalue(old::Bool, x) = x >= 0.5
 leafvalue(old::Integer, x) = round(typeof(old), x)
 leafvalue(old::Enum, x) = typeof(old)(round(Int, x))
+leafvalue(old::AbstractString, x::AbstractString) = String(x)
 leafvalue(old, x) = convert(typeof(old), x)
 
 argfieldpath(key::Symbol) = key === Symbol("") ? () : Tuple(Symbol.(split(String(key), '.')))

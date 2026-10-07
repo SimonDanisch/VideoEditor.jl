@@ -426,6 +426,7 @@ unreadably for anything else.
 jsonvalue(v::Bool) = v
 jsonvalue(v::Real) = Float64(v)
 jsonvalue(v::Symbol) = String(v)
+jsonvalue(v::AbstractString) = String(v)
 jsonvalue(v::GeometryBasics.Vec) = Float64[Float64(x) for x in v]   # Vec2f, Vec3f, …
 jsonvalue(v::Color3) = Float64[red(v), green(v), blue(v)]
 jsonvalue(v::TransparentColor) = Float64[red(v), green(v), blue(v), alpha(v)]

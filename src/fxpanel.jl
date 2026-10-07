@@ -1294,6 +1294,12 @@ function showvalue!(cb::Makie.Checkbox, value)
     cb.checked[] = Bool(value)
     return cb.checked[] != previous
 end
+function showvalue!(tb::Makie.Textbox, value::AbstractString)
+    tb.focused[] && return false
+    tb.stored_string[] == value && return false
+    Makie.set!(tb, value)
+    return true
+end
 function showvalue!(tb::Makie.Textbox, value)
     tb.focused[] && return false
     text = string(round(Float64(value); digits = 5))
@@ -1336,6 +1342,16 @@ function wireedit!(player::Player, target, p::Param, cb::Makie.Checkbox, derived
 end
 
 wireedit!(::Player, target, ::Param, ::Any, derived) = nothing
+
+function wireedit!(player::Player, target, p::Param{String}, tb::Makie.Textbox, derived)
+    push!(derived, on(tb.stored_string) do text
+        (text === nothing || (isdriven(p) && !isfollowing(p))) && return nothing
+        # Display synchronization reports the text already in the document.
+        text == valueat(p, playheadframe(player, target)) && return nothing
+        editparam!(player, target, p, text; frame = playheadframe(player, target))
+    end)
+    return nothing
+end
 
 function wireedit!(player::Player, target, p::Param, tb::Makie.Textbox, derived)
     push!(derived, on(tb.stored_string) do text
@@ -1449,7 +1465,8 @@ function paramform!(player::Player, pos, target, fx::Effect, uicolors;
     fieldsym(p) = Symbol(labels(p))
     frame() = playheadframe(player, target)
     numeric(p) = fx.kind === :scene
-    datarow(p) = !(eltype(p) <: Real)
+    textrow(p) = eltype(p) <: AbstractString
+    datarow(p) = !(eltype(p) <: Real) && !textrow(p)
     datasummary(p) = begin
         track = recordedinput(p)
         if track === nothing
@@ -1463,7 +1480,9 @@ function paramform!(player::Player, pos, target, fx::Effect, uicolors;
             end
         end
     end
-    spec = NamedTuple(fieldsym(p) => (datarow(p) ? datasummary(p) : Float64(valueat(p, frame())),
+    spec = NamedTuple(fieldsym(p) => (textrow(p) ? valueat(p, frame()) :
+                                      datarow(p) ? datasummary(p) : Float64(valueat(p, frame())),
+                                      textrow(p) ? (_ -> true) :
                                       datarow(p) ? (_ -> false) : numeric(p) ? (v -> isfinite(v)) :
                                       Makie.Between(p.range[1], p.range[2]))
                       for p in params)
@@ -1691,7 +1710,7 @@ function sceneparamsections(clip::Clip, fx::Effect)
     out = NamedTuple[]
     for obj in sceneattributes(clip.source)
         ps = Param[sceneparam!(fx, r; follow = clip.source.root isa SceneProgram)
-                   for r in obj.rows if r.kind === :number]
+                   for r in obj.rows if r.kind in (:number, :text)]
         if clip.source.live.target isa ProgramInstance
             tracks = scenerecordings!(clip.source.live.target,clip.source)
             if tracks !== nothing
@@ -1724,6 +1743,7 @@ before anything is rendered and its curves have to be waiting when the scene is
 built. An existing parameter is returned untouched — its curve is the edit.
 """
 function sceneparam!(fx::Effect, row; follow = false)
+    row.kind === :text && return textparam!(fx, row; follow)
     v = Float64(row.value)
     span = occursin(".rotation[", String(row.path)) ? (-180.0, 180.0) :
            (min(0.0, 2v), max(1.0, 2v))
@@ -1737,6 +1757,23 @@ function sceneparam!(fx::Effect, row; follow = false)
     # A discrete row (a count, a switch, `visible`) keys as held steps.
     curve = get(row, :discrete, false) ? AnimCurve{Float64}(Keyframe{Float64}[], :hold) : nothing
     fresh = Param(row.path, row.label, v; range = span, curve,
+                  input = follow ? ParamInput(:copy, SceneRef(row.path)) : nothing)
+    push!(fx.params, fresh)
+    return fresh
+end
+
+"""
+    textparam!(fx, row; follow) -> Param{String}
+
+The parameter for a scene text (a label's words), made if it is not there yet.
+Keyed as held steps: a text does not blend, it changes at its key. No range, so
+its lane runs at mid height and marks where the words change.
+"""
+function textparam!(fx::Effect, row; follow = false)
+    i = findfirst(q -> q.name === row.path, fx.params)
+    i === nothing || return fx.params[i]
+    fresh = Param(row.path, row.label, String(row.value);
+                  curve = AnimCurve{String}(Keyframe{String}[], :hold),
                   input = follow ? ParamInput(:copy, SceneRef(row.path)) : nothing)
     push!(fx.params, fresh)
     return fresh
@@ -1762,9 +1799,11 @@ things missing, and the built scene knows both.
 """
 function withspan!(fx::Effect, i::Integer, span, label::AbstractString)
     p = fx.params[i]
-    p.range === nothing || return p
+    # Keys written before the scene was built (`keyframes!` from a recipe's own
+    # animation) name the parameter by its path; the scene knows its name.
+    (p.range === nothing || p.label == String(p.name)) || return p
     fresh = Param(p.name, label, valueat(p, 0); curve = p.curve[], visible = p.visible[],
-                  range = span, input = p.input)
+                  range = something(p.range, span), input = p.input)
     fx.params[i] = fresh
     return fresh
 end
@@ -1879,8 +1918,14 @@ function sectionform!(player::Player, gridpos, target, fx::Effect, uicolors;
     pickednames() = sceneform ? selectedscenesections(player, target) : Set{Symbol}()
     selectednames = Ref(pickednames())
     selectedanimated = Ref(false)
+    # The Camera view always shows the camera: its few rows are what the button
+    # asks for, whether or not a key spans the playhead.
+    # A picked object's words are offered even when its other static rows are
+    # not: a label is picked to change what it says.
     wanted(p) = !onlyactive[] || p.name in active[] ||
-        ((!selectedanimated[] || isanimated(p) || p.visible[]) && scenepath(p.name) !== nothing && first(scenepath(p.name)) in selectednames[])
+        (category[] == "camera" && scenepath(p.name) !== nothing && first(scenepath(p.name)) === :camera) ||
+        ((!selectedanimated[] || isanimated(p) || p.visible[] || eltype(p) <: AbstractString) &&
+         scenepath(p.name) !== nothing && first(scenepath(p.name)) in selectednames[])
     for (i, sec) in enumerate(secs)
         title = isempty(sec.detail) ? sec.label : "$(sec.label)   ·   $(sec.detail)"
         card = Card(stack[i, 1]; title, open = sec.label == "Camera",
@@ -1954,7 +1999,7 @@ function sectionform!(player::Player, gridpos, target, fx::Effect, uicolors;
             shown = 0
             eligible = [sec for sec in secs if
                 (category[] == "camera" ? sec.label == "Camera" :
-                 category[] == "acting" ? sec.detail == "Performance" :
+                 category[] == "acting" ? animationsection(sec) :
                  category[] == "lighting" ? sec.detail == "Lighting" : true)]
             # The picker is how users reach static objects while the animation
             # filter is on. Keep its choices independent of the selected object's
@@ -2043,6 +2088,16 @@ function sectionform!(player::Player, gridpos, target, fx::Effect, uicolors;
     return Any[gl]
 end
 
+"""
+    animationsection(section) -> Bool
+
+Whether the inspector's Animation view lists a scene section: an actor's
+performance, the recipe's own arguments, or an object with keys of its own. The
+camera and the lights have views of their own.
+"""
+animationsection(sec) = sec.detail == "Performance" || sec.detail == "Scene inputs" ||
+    (sec.label != "Camera" && sec.detail != "Lighting" && any(isanimated, sec.params))
+
 "Expose the requested scene controls without requiring a second disclosure click."
 function openscenecontrols!(player::Player, query::AbstractString; keepselection = false)
     if !keepselection && sceneselection(player)[] !== nothing
@@ -2061,7 +2116,7 @@ function openscenecontrols!(player::Player, query::AbstractString; keepselection
         sections.picker.i_selected[] = 0
         # Start with one performance, rather than expanding every actor's form.
         sections.apply()
-        i = query == "acting" ? findfirst(s -> s.detail == "Performance" &&
+        i = query == "acting" ? findfirst(s -> animationsection(s) &&
             any(p -> !sections.onlyactive[] || p.name in sections.active[], s.params), sections.sections) : nothing
         if i === nothing
             Makie.set!(sections.box, query)

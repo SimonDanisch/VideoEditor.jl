@@ -274,7 +274,8 @@ end
 const PARAMTYPES = Dict{String, Type}(
     "Any" => Any,
     "Float64" => Float64, "Float32" => Float32, "Int64" => Int64, "Bool" => Bool,
-    "Vec2f" => Vec2f, "Vec3f" => Vec3f, "RGBf" => RGBf, "RGBAf" => RGBAf)
+    "Vec2f" => Vec2f, "Vec3f" => Vec3f, "RGBf" => RGBf, "RGBAf" => RGBAf,
+    "String" => String)
 
 paramtypename(::Type{T}) where {T} = findfirst(==(T), PARAMTYPES)
 

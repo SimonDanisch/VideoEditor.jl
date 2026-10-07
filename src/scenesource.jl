@@ -327,6 +327,7 @@ function scenevalue(src::SceneSource, path::Symbol)
             return nothing
         end
     end
+    v isa AbstractString && return comp === nothing ? String(v) : nothing
     if comp !== nothing
         v = v isa Colorant ? (red(v), green(v), blue(v), alpha(v))[comp] : v[comp]
     end
@@ -405,6 +406,7 @@ we have never heard of gets the right row because of what it IS.
 # `jointbase` describe how a joint moves, not where it is now.
 rowkind(::Real) = :number
 rowkind(::Bool) = :none                     # `visible` is a toggle, not a slider
+rowkind(::AbstractString) = :text           # a label's words: a text field, keyed as held steps
 rowkind(::Colorant) = :colour
 rowkind(::GeometryBasics.Vec) = :vector
 rowkind(::GeometryBasics.Point) = :vector
@@ -431,6 +433,23 @@ rowcomponents(::Val{:vector}, v) =
 rowcomponents(::Val{:colour}, v) =
     ((Symbol("[1]"), Float64(red(v))), (Symbol("[2]"), Float64(green(v))),
      (Symbol("[3]"), Float64(blue(v))), (Symbol("[4]"), Float64(alpha(v))))
+# An opaque colour has no alpha to key.
+rowcomponents(::Val{:colour}, v::Color) =
+    ((Symbol("[1]"), Float64(red(v))), (Symbol("[2]"), Float64(green(v))),
+     (Symbol("[3]"), Float64(blue(v))))
+
+"""
+    rowlabel(name, suffix, value) -> String
+
+A row's label: the field's name and, for one component of a value, which one
+in the value's own terms: R G B A of a colour, X Y Z W of a vector. A plain
+number is its name alone.
+"""
+rowlabel(name::AbstractString, suffix::Symbol, v) =
+    suffix === Symbol("") ? String(name) :
+    string(name, " ", componentname(v, parse(Int, strip(String(suffix), ['[', ']']))))
+componentname(::Colorant, i::Integer) = ("R", "G", "B", "A")[i]
+componentname(::Any, i::Integer) = ("X", "Y", "Z", "W")[i]
 
 """
     sceneattributes(src) -> Vector{NamedTuple}
@@ -493,6 +512,11 @@ function sceneattributes(src::SceneSource)
             end
             kind = rowkind(v)
             kind === :none && continue
+            if kind === :text
+                push!(rows, (path = Symbol(name, ".", key), label = titlecase(String(key)),
+                             kind = kind, value = String(v)))
+                continue
+            end
             if kind === :data
                 push!(rows, (path = Symbol(name, ".", key), label = titlecase(String(key)),
                              kind = kind, value = v))
@@ -500,7 +524,7 @@ function sceneattributes(src::SceneSource)
             end
             for (suffix, num) in rowcomponents(Val(kind), v)
                 push!(rows, (path = Symbol(name, ".", key, suffix),
-                             label = string(titlecase(String(key)), " ", suffix),
+                             label = rowlabel(titlecase(String(key)), suffix, v),
                              kind = :number, value = num))
             end
         end
@@ -527,12 +551,12 @@ function sceneattributes(src::SceneSource)
                     v = group.values[key]
                     for (suffix, num) in rowcomponents(Val(rowkind(v)), v)
                         push!(rows, (path = Symbol(group.name, ".", key, suffix),
-                            label = string(titlecase(replace(String(key), '_' => ' ')), " ", suffix),
+                            label = rowlabel(titlecase(replace(String(key), '_' => ' ')), suffix, v),
                             kind = :number, value = num))
                     end
                 end
                 isempty(rows) || push!(out, (name = group.name, label = section.label,
-                    detail = "Performance", rows = rows))
+                    detail = group.detail, rows = rows))
             end
         end
     end
@@ -590,10 +614,23 @@ argtitle(s) = titlecase(replace(String(s), '_' => ' '))
 getfieldpath(v, field::Symbol) =
     field === Symbol("") ? v : foldl(getfield, Symbol.(split(String(field), '.')); init = v)
 
+"""
+    objectdescriptions(src) -> descriptions or `nothing`
+
+The inspector groups of a scene: saved with its recipe, or else returned by its
+builder (see `programscene`). `nothing` when there are none.
+"""
+function objectdescriptions(src::SceneSource)
+    saved = src.build isa AbstractDict ? get(src.build, "objects", nothing) : nothing
+    saved === nothing || return saved
+    target = src.live === nothing ? nothing : src.live.target
+    return target isa ProgramInstance && !isempty(target.objects) ? target.objects : nothing
+end
+
 "Authored object groups keep an actor's body, face and parts together in the inspector."
 function sceneobjects(src::SceneSource)
     scene = targetscene(src.live.target)
-    descriptions = src.build isa AbstractDict ? get(src.build, "objects", nothing) : nothing
+    descriptions = objectdescriptions(src)
     if descriptions === nothing
         return [(name = name, plot = plot, label = String(name), attributes = nothing)
                 for (name, plot) in sceneplots(scene)]
@@ -618,8 +655,7 @@ end
 
 function sceneobjectplots(src::SceneSource, name::Symbol)
     scene = targetscene(src.live.target)
-    descriptions = src.build isa AbstractDict ? get(src.build, "objects", ()) : ()
-    for d in descriptions
+    for d in something(objectdescriptions(src), ())
         Symbol(first(d["plots"])) === name || continue
         return filter(!isnothing, [Makie.findplot(scene, Symbol(n)) for n in d["plots"]])
     end

@@ -1,6 +1,7 @@
 using Test
 import VideoEditor as VE
 import RayMakie
+VE.usebackend!(RayMakie)
 
 @testset "closed raster sources release resources and can reopen" begin
     mktempdir() do dir

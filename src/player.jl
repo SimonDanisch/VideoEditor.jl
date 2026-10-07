@@ -4206,7 +4206,10 @@ function buildkeyframeeditor!(player::Player)
                     return Consume(true)
                 end
                 focuslanecontrol!(player, p)
-                if !(eltype(p) <: Real)
+                if eltype(p) <: AbstractString
+                    setstatus!(player, "$(p.label): type the words in its field to key them here")
+                    return Consume(true)
+                elseif !(eltype(p) <: Real)
                     setstatus!(player,"$(p.label): recorded arrays use source time; trim or retime the clip")
                     return Consume(true)
                 end
@@ -4296,7 +4299,9 @@ function buildkeyframeeditor!(player::Player)
         sx, _ = axisperpixel(player)
         phf = clamp(playheadframe(player, clip), clip.src_in, clip.src_out)
         abs(t - timelineframe(clip, phf) / fps) / sx < 12 && (f = phf)
-        v = lanevalue(lane.band[], lane.valuerange[], y)
+        # A number takes the height it is dragged to; a text has no height, so its
+        # key only moves in time.
+        v = eltype(p) <: Real ? lanevalue(lane.band[], lane.valuerange[], y) : p.curve[].keys[i].value
         movekey!(p, i, f, v)
         j = findfirst(k -> k.frame == f, p.curve[].keys)
         # `movekey!` re-sorts, so the index can move under us — the selection has to
@@ -4307,7 +4312,7 @@ function buildkeyframeeditor!(player::Player)
         end
         dragtippos[] = Point2f(timelineframe(clip, f) / fps,
                                laney(lane.band[], lane.valuerange[], v))
-        dragtiptext[] = "$(p.label)  $(round(Float64(v); digits = 2)) · " *
+        dragtiptext[] = "$(p.label)  $(v isa Real ? round(Float64(v); digits = 2) : repr(v)) · " *
                         timestring(timelineframe(clip, f) / fps)
         dragtip.visible = true
         editedcurve!(player, clip)

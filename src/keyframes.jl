@@ -568,9 +568,9 @@ struct SceneRef <: InputRef
     path::Symbol
 end
 
-"A scene input sampled by the renderer before it applies editor curves."
-mutable struct SceneValue
-    value::Float64
+"A scene input sampled by the renderer before it applies editor curves: a number, or a text."
+mutable struct SceneValue{T}
+    value::T
 end
 readinput(v::SceneValue, ::Integer) = v.value
 

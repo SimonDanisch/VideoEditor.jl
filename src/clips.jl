@@ -965,8 +965,8 @@ function resolveinput(::Sequence, ::Clip, ::Effect, p::Param, r::RecordedRef)
     return openrecording(r.path)
 end
 resolveinput(seq::Sequence, ::Clip, ::Effect, ::Param, r::ClipRef) = clipbyid(seq, r.clip)
-resolveinput(::Sequence, clip::Clip, ::Effect, p::Param, ::SceneRef) =
-    clip.source isa SceneSource ? SceneValue(Float64(valueat(p.curve[], 0))) : nothing
+resolveinput(::Sequence, clip::Clip, ::Effect, p::Param{T}, ::SceneRef) where {T} =
+    clip.source isa SceneSource ? SceneValue{T}(convert(T, valueat(p.curve[], 0))) : nothing
 
 """
 A clip's picture is not a value but a transient that exists while a composition

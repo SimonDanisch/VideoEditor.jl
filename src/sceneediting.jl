@@ -106,7 +106,7 @@ function samplesceneparams!(player, clip, params)
                 values[p.name]
             elseif startswith(String(p.name), "camera.")
                 _, field, component = scenepath(p.name)
-                getfield(scenecamerasample(clip, f), field)[component]
+                cameracomponent(getfield(scenecamerasample(clip, f), field), component)
             else
                 nothing
             end
@@ -219,7 +219,12 @@ function sceneviewselection(view)
     return s !== nothing && s.clip == view.clip.id ? s.object : nothing
 end
 
-"Pure camera sampling; recipe values first, then the clip's existing overrides."
+"""
+    scenecamerasample(clip, frame) -> (; eye, lookat, up, fov) or nothing
+
+Pure camera sampling; recipe values first, then the clip's existing overrides.
+A recipe camera without a field of view keeps the scene's.
+"""
 function scenecamerasample(clip::Clip, frame::Int)
     src = clip.source
     baseline = src.camera
@@ -232,19 +237,24 @@ function scenecamerasample(clip::Clip, frame::Int)
     end
     baseline === nothing && return nothing
     fx = findslot(clip, :scene)
-    return NamedTuple{(:eye, :lookat, :up)}(
+    function sampled(name, original)
+        p = fx === nothing ? nothing : param(fx, name)
+        return p === nothing || isfollowing(p) ? original : valueat(p, frame)
+    end
+    vectors = NamedTuple{(:eye, :lookat, :up)}(
         ntuple(3) do j
             field = (:eye, :lookat, :up)[j]
             original = get(baseline, field, Vec3f(0, 0, 1))
-            Vec3f(
-                ntuple(3) do i
-                    p = fx === nothing ? nothing : param(fx, Symbol("camera.", field, "[", i, "]"))
-                    p === nothing || isfollowing(p) ? original[i] : valueat(p, frame)
-                end
-            )
+            Vec3f(ntuple(i -> sampled(Symbol("camera.", field, "[", i, "]"), original[i]), 3))
         end
     )
+    fov = get(baseline, :fov, src.camera === nothing ? 45.0f0 : src.camera.fov)
+    return (; vectors..., fov = Float32(sampled(Symbol("camera.fov"), fov)))
 end
+
+"`value`'s component `i`; a scalar field (`camera.fov`) has none."
+cameracomponent(value, i::Int) = value[i]
+cameracomponent(value::Real, ::Nothing) = value
 
 function scenevieworigin(view, name)
     src = view.clip.source
