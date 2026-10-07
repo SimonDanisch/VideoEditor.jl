@@ -517,7 +517,15 @@ function Base.close(s::GpuVideoStream)
     s.feedgop = 0
     for f in values(s.ring); Mantle.unsafe_free!(f.y); Mantle.unsafe_free!(f.uv); end
     empty!(s.ring); empty!(s.resident)
-    finalize(s.bitstream)                       # unmap
+    # Unmap NOW, through the array's `Memory`: that is where `Mmap.mmap` attaches
+    # the unmapping finalizer, so `finalize(s.bitstream)` on the `Vector` ran
+    # nothing and the mapping lived until the GC found the Memory. Windows cannot
+    # delete a mapped file, so the `rm` below failed with EACCES and took every
+    # GPU-decode export and analysis down on LapWin (2026-10-07); elsewhere the
+    # file was unlinked while still mapped. The emptied field keeps the stream from
+    # pointing at unmapped bytes.
+    finalize(s.bitstream.ref.mem)
+    s.bitstream = UInt8[]
     isfile(s.tmpfile) && rm(s.tmpfile; force = true)
     return nothing
 end
