@@ -286,9 +286,12 @@ end
     # error therefore looked alarming and harmless at once. The failure it is
     # actually for — an owning thread that never yields, so the pinned task never
     # runs — is unchanged.
+    # The run outlasts the deadline, which is what shows the deadline is on
+    # starting. 0.5 s to start, not 0.05: a 32-thread Windows laptop mid-suite
+    # missed 50 ms of scheduling latency on a thread that was not stuck.
     tid = Threads.nthreads() - 1                          # a real hop, not the caller
-    @test VE.onthread(tid; startwithin = 0.05) do
-        sleep(0.3)                                        # running, just not finished
+    @test VE.onthread(tid; startwithin = 0.5) do
+        sleep(1.5)                                        # running, just not finished
         :rendered
     end === :rendered
 end
