@@ -26,7 +26,7 @@ import VideoEditor.Makie.SpecApi as S
     @test fx !== nothing && !VE.renderable(fx)
     @test isempty(VE.graphof!(clip, (64, 48)).slots)   # …so the chain has no effect pass
 
-    engine = VE.FxEngine(VE.KA.CPU())
+    engine = VE.FxEngine(LVP)
     img = Ref{Any}(nothing)
     VE.render(engine, clip.source, clip, 0) do o; img[] = copy(o); end
     @test size(img[]) == (64, 48)
@@ -48,7 +48,7 @@ end
     # and that is why the card is lazy rather than eager
     @test isempty(VE.sceneattributes(src))
 
-    engine = VE.FxEngine(VE.KA.CPU())
+    engine = VE.FxEngine(LVP)
     VE.render(engine, src, clip, 0) do _; nothing end
     objs = VE.sceneattributes(src)
     @test !isempty(objs)
@@ -86,7 +86,7 @@ end
     clip = VE.sceneclip((root = spec, joints = Dict{Symbol, Any}(), camera = nothing);
                         frames = 30, canvas = (64, 48))
     src = clip.source
-    engine = VE.FxEngine(VE.KA.CPU())
+    engine = VE.FxEngine(LVP)
     VE.render(engine, src, clip, 0) do _; nothing end
     live1 = src.live
     @test live1 !== nothing
@@ -153,7 +153,7 @@ end
 
     clip = VE.sceneclip(built; frames = 20, canvas = (64, 48))
     fx = VE.findslot(clip, :scene)
-    engine = VE.FxEngine(VE.KA.CPU())
+    engine = VE.FxEngine(LVP)
     VE.render(engine, clip.source, clip, 0) do _; nothing end
 
     objs = VE.sceneattributes(clip.source)

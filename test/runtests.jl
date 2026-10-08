@@ -6,6 +6,15 @@ import VideoEditor.VideoIO as VideoIO
 # need not list FFMPEG_jll itself, and none of the workers' environments do.
 import VideoEditor.FFMPEG_jll as FFMPEG_jll
 using LinearAlgebra: I        # refactor.jl builds identity MotionTracks
+using Lavapipe_jll
+
+# The device the tests' engines and analyses run on: lavapipe, a Vulkan device in
+# software, reached through the same Mantle path as a GPU. Not `KA.CPU()`, which
+# is POCL since KernelAbstractions 0.10, a second compiler the editor never uses
+# on a GPU (it crashed on macOS and tracked a frame wrong on Zen 3). And not the
+# GPU: rendering there from the test thread takes the GPU's context, and the
+# editor's GPU worker then cannot submit to it.
+const LVP = VE.Mantle.backend(VE.Mantle.Device("lavapipe"))
 
 testvideo = joinpath(mktempdir(), "test.mp4")
 run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -f lavfi -i testsrc2=size=320x180:rate=30 -t 4 -c:v libx264 -g 30 -pix_fmt yuv420p $testvideo`,
@@ -432,7 +441,7 @@ end
                               curve = curve))
     @test VE.param(fx, Symbol("dot.markersize[1]")).range === nothing
 
-    engine = VE.FxEngine(VE.KA.CPU())
+    engine = VE.FxEngine(LVP)
     VE.render(o -> nothing, engine, clip.source, clip, 0)   # the scene has to exist
     secs = VE.sceneparamsections(clip, fx)
     @test secs !== nothing && !isempty(secs)
@@ -460,7 +469,7 @@ end
     left = Clip(src; src_in = 0, src_out = 40, start = 0)
     right = Clip(src; src_in = 40, src_out = 80, start = 40)
     seq = Sequence([left, right], 30.0)
-    engine = VE.FxEngine(VE.KA.CPU())
+    engine = VE.FxEngine(LVP)
 
     # THE MATH, with the layers handed in as flat colours so the answer is exact.
     # `B` over `A` at α, with B opaque, is α·B + (1−α)·A — which is what the host
@@ -1009,7 +1018,7 @@ end
     end
     src = VideoSource(flicker)
     clip = Clip(src)
-    track = analyzecolor!(clip)
+    track = analyzecolor!(clip; backend = LVP)
     @test track !== nothing
     @test length(track.gains) == src.nframes
 
@@ -1085,7 +1094,7 @@ end
 
     src = VideoSource(shaky)
     clip = Clip(src)
-    track = analyzemotion!(clip)  # :similarity default — the NCC camera lock
+    track = analyzemotion!(clip; backend = LVP)  # :similarity default — the NCC camera lock
     @test track !== nothing
     @test track.mode === :similarity
     maxrot = maximum(M -> abs(atand(M[2, 1], M[1, 1])), track.transforms)
@@ -1158,10 +1167,10 @@ end
     srcp = VideoSource(keystone)
     clipp = Clip(srcp)
     clipa = Clip(srcp)
-    trackp = analyzemotion!(clipp; mode = :perspective)
+    trackp = analyzemotion!(clipp; mode = :perspective, backend = LVP)
     @test trackp !== nothing
     @test maximum(M -> max(abs(M[3, 1]), abs(M[3, 2])), trackp.transforms) > 2e-5
-    analyzemotion!(clipa; mode = :tripod)
+    analyzemotion!(clipa; mode = :tripod, backend = LVP)
 
     # corner regions inset from the replicate borders — exactly where an
     # affine lock leaves keystoned footage swimming
@@ -1200,7 +1209,7 @@ end
         end
     end
     clip2 = Clip(VideoSource(shaky2))
-    track2 = analyzemotion!(clip2; mode = :smooth)
+    track2 = analyzemotion!(clip2; mode = :smooth, backend = LVP)
     @test track2 !== nothing
     corr = [(-M[1, 3], -M[2, 3]) for M in track2.transforms]
     inner = 31:(n2 - 30)  # filtfilt boundary transients excluded
@@ -1269,7 +1278,7 @@ end
         end
     end
     clip = Clip(VideoSource(moving))
-    track = analyzeobject!(clip, blobpos(1) .+ 20.0)  # click the blob center
+    track = analyzeobject!(clip, blobpos(1) .+ 20.0; backend = LVP)  # click the blob center
     @test track !== nothing
     # translationmatrix(x1 - px, ...) stores the drift: T[1,3] = px - x1
     for k in (30, 60, 90)
@@ -1309,7 +1318,7 @@ end
     end
     rclip = Clip(VideoSource(rolling))
     rpoint = (cx + 60.0, cy + 30.0)        # off-center: rotation moves it
-    @test analyzeobject!(rclip, rpoint) !== nothing
+    @test analyzeobject!(rclip, rpoint; backend = LVP) !== nothing
     sr = VE.SequentialReader(rclip.source)
     r1 = VE.RGBFrame(undef, W, H); VE.readframe!(r1, sr, 0)
     rk = VE.RGBFrame(undef, W, H); VE.readframe!(rk, sr, 11)  # ≈ peak roll
@@ -1545,7 +1554,7 @@ end
     @test node isa VE.PlaneNode{VE.MatteOp}
     @test node.shape == VE.mattesize(clip.mattetrack)
 
-    engine = VE.FxEngine(VE.KA.CPU())
+    engine = VE.FxEngine(LVP)
     out = Ref{Any}(nothing)
     VE.render(engine, frame, clip, f0) do o; out[] = Array(o); end
     @test out[] == VE.applymatte!(copy(frame), clip, f0; strength = 1.0)
@@ -1587,7 +1596,7 @@ end
     VE.addslot!(top, VE.Effect(MatteEffect(; strength = 1.0)))
     red  = fill(VE.RGB{VE.N0f8}(1, 0, 0), dims...)
     blue = fill(VE.RGB{VE.N0f8}(0, 0, 1), dims...)
-    eng2 = VE.FxEngine(VE.KA.CPU())
+    eng2 = VE.FxEngine(LVP)
     canvas = Ref{Any}(nothing)
     @test VE.composite(eng2, [base, top], 0, (c, sf) -> c === base ? red : blue;
                        canvas = dims) do cv
@@ -1862,7 +1871,7 @@ end
     stack = VE.clipsat(seq, 30)
     @test length(stack) == 2 && stack[end].source.width == 180   # top layer differs
 
-    engine = VE.FxEngine(VE.KA.CPU())
+    engine = VE.FxEngine(LVP)
     readers = Dict{String, Any}()
     dest = VE.RGBFrame(undef, canvas...)
     VE.renderframe!(dest, seq, 30, readers, engine)
@@ -1888,7 +1897,7 @@ end
 @testset "letterbox: material of another shape is fitted, not stretched" begin
     land = VideoSource(testvideo)      # 320×180
     port = VideoSource(testvideo15)    # 180×320, and half the rate
-    engine = VE.FxEngine(VE.KA.CPU())
+    engine = VE.FxEngine(LVP)
     readers = Dict{String, Any}()
     black = VE.RGB{VE.N0f8}(0, 0, 0)
 

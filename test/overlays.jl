@@ -39,7 +39,7 @@ end
     # count. The scene still drew on exactly 9238 pixels of the lego canvas, the
     # same number as before the rebuild, which is what made the number look like
     # proof that nothing had changed.
-    engine = VE.FxEngine(VE.KA.CPU())
+    engine = VE.FxEngine(LVP)
     canvas = (400, 200)
     drawnhalves(img) = (h = size(img, 2);
                         (count(!=(VE.RGB{VE.N0f8}(0, 0, 0)), view(img, :, 1:(h ÷ 2))),
@@ -109,7 +109,7 @@ end
     bar.track = 2
     seq = Sequence([base, bar], 30.0)
 
-    engine = VE.FxEngine(VE.KA.CPU())
+    engine = VE.FxEngine(LVP)
     grey = fill(VE.RGB{VE.N0f8}(0.5, 0.5, 0.5), dims...)
     with = Ref{Any}(nothing); without = Ref{Any}(nothing)
     @test VE.composite(engine, [base, bar], 0, (c, sf) -> grey; canvas = dims) do cv

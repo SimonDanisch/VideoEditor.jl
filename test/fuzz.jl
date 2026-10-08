@@ -177,7 +177,7 @@ function fuzzactions(player, rng)
 end
 
 @testset "fuzz: random edits keep preview and export the same picture" begin
-    engine = VE.FxEngine(VE.KA.CPU())
+    engine = VE.FxEngine(LVP)
     readers = Dict{String, Any}()
     player = Player(testvideo; gpupreview = false)
     try

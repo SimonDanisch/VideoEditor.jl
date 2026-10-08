@@ -9,7 +9,7 @@
 @testset "a bake is read instead of running the graph" begin
     build = VE.scenebuild(:bar, (64, 48); opacity = 1.0, height = 0.5)
     clip = VE.sceneclip(VE.buildscene(build); build, frames = 10, canvas = (64, 48))
-    engine = VE.FxEngine(VE.KA.CPU())
+    engine = VE.FxEngine(LVP)
     dir = joinpath(mktempdir(), "b")
 
     b = VE.bakeclip!(clip, engine; frames = 2:6, dir = dir)
@@ -23,7 +23,7 @@
     # THE PROOF that the bake is read and the graph is not: overwrite one baked
     # frame with something the scene would never draw, and look for it.
     VE.PNGFiles.save(VE.bakeframefile(b, 4), fill(VE.PlanePixel(1, 0, 0, 1), 64, 48))
-    eng2 = VE.FxEngine(VE.KA.CPU())                  # fresh plans
+    eng2 = VE.FxEngine(LVP)                  # fresh plans
     o = Ref{Any}(nothing)
     VE.render(eng2, clip.source, clip, 4) do x; o[] = copy(x); end
     @test count(==(VE.RGB{VE.N0f8}(1, 0, 0)), o[]) == length(o[])
@@ -38,7 +38,7 @@ end
 @testset "an edit switches a bake off and deletes nothing" begin
     build = VE.scenebuild(:bar, (64, 48))
     clip = VE.sceneclip(VE.buildscene(build); build, frames = 10, canvas = (64, 48))
-    engine = VE.FxEngine(VE.KA.CPU())
+    engine = VE.FxEngine(LVP)
     b = VE.bakeclip!(clip, engine; frames = 0:4, dir = joinpath(mktempdir(), "b"))
     n = length(readdir(b.dir))
 
@@ -64,7 +64,7 @@ end
     clip = VE.sceneclip(VE.buildscene(build); build, frames = 10, canvas = (64, 48))
     clip.track = 2
     seq = Sequence([Clip(src; src_in = 0, src_out = 10, start = 0), clip], 30.0)
-    engine = VE.FxEngine(VE.KA.CPU())
+    engine = VE.FxEngine(LVP)
 
     # baked BEFORE the project has a path: it goes to a temp directory, and saving
     # is what brings it in — without that it was recorded as if it were beside the
@@ -96,7 +96,7 @@ end
 @testset "the canvas is the size the clip renders at" begin
     build = VE.scenebuild(:bar, (64, 48))
     clip = VE.sceneclip(VE.buildscene(build); build, frames = 6, canvas = (64, 48))
-    engine = VE.FxEngine(VE.KA.CPU())
+    engine = VE.FxEngine(LVP)
     b = VE.bakeclip!(clip, engine; frames = 0:2, canvas = (32, 24),
                      dir = joinpath(mktempdir(), "b"))
     # ONE size, not one per consumer: the bake cannot end up at a resolution the

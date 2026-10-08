@@ -42,10 +42,11 @@ Tar = "a4e569a6-e804-4fa4-b0f3-eef7a1d5b13e"
 VideoIO = "d6d074c3-1acf-5d4c-9a43-ef38773959a2"
 
 [extras]
+Lavapipe_jll = "89601188-ea2b-501d-a121-fa144db6cabf"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["LinearAlgebra", "Random", "Statistics", "Test"]
+test = ["Lavapipe_jll", "LinearAlgebra", "Random", "Statistics", "Test"]
