@@ -1227,7 +1227,9 @@ end
     old = joinpath(dir, "prunetest_old.mp4")
     new = joinpath(dir, "prunetest_new.mp4")
     write(old, zeros(UInt8, 1000)); write(new, zeros(UInt8, 1000))
-    run(`touch -d "30 days ago" $old`)   # age it: pruning is LRU by mtime
+    # age it: pruning is LRU by mtime. `-t` is the POSIX form; `-d "30 days ago"`
+    # is GNU only and macOS's touch refuses it.
+    run(`touch -t $(Libc.strftime("%Y%m%d%H%M.%S", time() - 30 * 86400)) $old`)
     before = sum(filesize, readdir(dir; join = true); init = 0) +
              sum(filesize, readdir(VE.cachedir("pcm"); join = true); init = 0)
     VE.prunecache!(maxbytes = before - 500)   # force removal of ≥1 file

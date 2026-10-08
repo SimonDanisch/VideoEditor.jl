@@ -1274,7 +1274,9 @@ end
             VE.mixnarration!(blk, seq, 24_000; rate = 48_000)   # inside its span
             @test all(>(Int16(100)), blk)
 
-            # the WORDS round-trip through a project file; the samples do not
+            # the words round-trip through a project file, and so does the rendered
+            # take: a farm worker plays the approved performance and has no speech
+            # model to synthesize it again (project.jl, renderfarm.jl)
             snap0 = VE.docsnapshot(p)
             path = joinpath(mktempdir(), "nar.vedit")
             VE.saveproject(path, seq)
@@ -1282,7 +1284,8 @@ end
             @test length(back.narration) == 1
             @test back.narration[1].text == "hello there"
             @test back.narration[1].at == 0.5
-            @test isempty(back.narration[1].samples)
+            @test back.narration[1].samples == nar.samples
+            @test back.narration[1].rate == 48_000
             # RESTORE first, then clear: `docrestore!` now puts the narration back
             # (that is the undo fix), so clearing before it restored the very line
             # this testset added and leaked it into the next one.
@@ -3131,7 +3134,11 @@ end
         @test !any(c -> c.visible[], bright.view.lane.plots)
         tap!(eye(bright))
         @test bright.visible[]
-        @test all(c -> c.visible[], bright.view.lane.plots)
+        # every plot that draws the curve is shown; the backdrop under it is drawn
+        # only for the lanes of a selected scene object (`highlighted`)
+        lane = bright.view.lane
+        @test all(c -> c.visible[], filter(c -> !(c isa Makie.Poly), lane.plots))
+        @test only(filter(c -> c isa Makie.Poly, lane.plots)).visible[] == lane.highlighted[]
 
         tap!(eye(sat))
         @test drawn() == Set([:brightness, :saturation])
