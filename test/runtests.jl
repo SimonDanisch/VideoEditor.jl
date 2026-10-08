@@ -898,7 +898,7 @@ end
 
     # GIF export (palettegen/paletteuse) with looping
     gif = joinpath(mktempdir(), "out.gif")
-    exportgif(gif, seq; fps = 10, loop = 0)
+    exportgif(gif, seq; fps = 10, loop = 0, backend = LVP)
     @test isfile(gif)
     @test filesize(gif) > 0
     hdr = read(gif, 6)  # GIF89a magic
