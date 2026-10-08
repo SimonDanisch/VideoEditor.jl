@@ -142,7 +142,9 @@ function pinnedsource!(problems, name, path)
     end
     remote = first(split(first(holders), '/'))
     source = Dict{String, Any}("url" => git(path, "remote", "get-url", remote), "rev" => head)
-    subdir = relpath(path, top)
+    # `top` comes from git, which resolves symlinks: on macOS a temp dir under
+    # `/var` is `/private/var` to git, and the unresolved path climbed to `/`.
+    subdir = relpath(realpath(path), top)
     subdir == "." || (source["subdir"] = replace(subdir, '\\' => '/'))
     return source
 end

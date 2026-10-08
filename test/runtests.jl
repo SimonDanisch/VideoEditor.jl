@@ -15,6 +15,7 @@ using Lavapipe_jll
 # GPU: rendering there from the test thread takes the GPU's context, and the
 # editor's GPU worker then cannot submit to it.
 const LVP = VE.Mantle.backend(VE.Mantle.Device("lavapipe"))
+lvp(x::AbstractArray) = VE.Mantle.devicearray(LVP, x)
 
 testvideo = joinpath(mktempdir(), "test.mp4")
 run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -f lavfi -i testsrc2=size=320x180:rate=30 -t 4 -c:v libx264 -g 30 -pix_fmt yuv420p $testvideo`,
@@ -1433,12 +1434,12 @@ end
 
     # --- applying: same function the GPU node calls
     frame = reader(0)
-    keyed = VideoEditor.applymatte!(copy(frame), clip, 0; strength = 1.0)
+    keyed = Array(VideoEditor.applymatte!(lvp(frame), clip, 0; strength = 1.0))
     @test size(keyed) == size(frame)
     # strength 0 is an exact no-op, so a keyframe can fade the matte in from nothing
-    @test VideoEditor.applymatte!(copy(frame), clip, 0; strength = 0.0) == frame
+    @test Array(VideoEditor.applymatte!(lvp(frame), clip, 0; strength = 0.0)) == frame
     # a frame outside the analyzed range is untouched, not blacked out
-    @test VideoEditor.applymatte!(copy(frame), clip, 999; strength = 1.0) == frame
+    @test Array(VideoEditor.applymatte!(lvp(frame), clip, 999; strength = 1.0)) == frame
     # somewhere the matte actually darkened the background
     @test any(keyed[i] != frame[i] for i in eachindex(frame))
 
@@ -1454,8 +1455,8 @@ end
         a = zeros(UInt8, mw, mh, 1)
         a[1:(mw ÷ 2), :, 1] .= 0xff
         cl.mattetrack = VideoEditor.MatteTrack(a, 0)
-        buf = fill(RGB{N0f8}(1, 1, 1), 480, 270)
-        VideoEditor.applymatte!(buf, cl, 0; strength = 1.0, feather = 1.0)
+        buf = Array(VideoEditor.applymatte!(lvp(fill(RGB{N0f8}(1, 1, 1), 480, 270)), cl, 0;
+                                            strength = 1.0, feather = 1.0))
         row = [Float32(buf[i, 135].r) for i in 1:480]
         findlast(>(0.02f0), row) - findfirst(<(0.98f0), row) + 1
     end
@@ -1557,7 +1558,9 @@ end
     engine = VE.FxEngine(LVP)
     out = Ref{Any}(nothing)
     VE.render(engine, frame, clip, f0) do o; out[] = Array(o); end
-    @test out[] == VE.applymatte!(copy(frame), clip, f0; strength = 1.0)
+    # The reference is the kernel run directly ON THE ENGINE'S DEVICE: two devices
+    # round the matte edge's exact ties (230 × 0.75 = 172.5) differently.
+    @test out[] == Array(VE.applymatte!(lvp(frame), clip, f0; strength = 1.0))
     @test out[][3, 3] == VE.RGB{VE.N0f8}(0, 0, 0)                # background keyed
     @test out[][src.width ÷ 2, src.height ÷ 2] != VE.RGB{VE.N0f8}(0, 0, 0)
 
@@ -1579,7 +1582,7 @@ end
     VE.setvalue!(VE.param(clip.effects[end], :strength), 1.0, 0)
     fresh = Ref{Any}(nothing)
     VE.render(engine, frame, clip, f0) do o; fresh[] = Array(o); end
-    @test fresh[] == VE.applymatte!(copy(frame), clip, f0; strength = 1.0)
+    @test fresh[] == Array(VE.applymatte!(lvp(frame), clip, f0; strength = 1.0))
     @test fresh[] != out[]
 
     # outside the analysed range the node renders nothing — not the last plane
@@ -1722,15 +1725,12 @@ end
         @test size(img) == (2 * src.width, 2 * src.height)
 
         # applying: same function the graph node calls
-        frame = copy(rd(0))
-        orig = copy(frame)
-        applyrestore!(frame, clip, 0; strength = 1.0)
+        orig = copy(rd(0))
+        frame = Array(applyrestore!(lvp(orig), clip, 0; strength = 1.0))
         @test any(frame[i] != orig[i] for i in eachindex(frame))
         # strength 0 and an un-restored frame are both exact no-ops
-        f2 = copy(orig); applyrestore!(f2, clip, 0; strength = 0.0)
-        @test f2 == orig
-        f3 = copy(orig); applyrestore!(f3, clip, 5; strength = 1.0)
-        @test f3 == orig
+        @test Array(applyrestore!(lvp(orig), clip, 0; strength = 0.0)) == orig
+        @test Array(applyrestore!(lvp(orig), clip, 5; strength = 1.0)) == orig
 
         # the cache is bounded and evicts oldest-first
         c = VideoEditor.RestoreCache(2)

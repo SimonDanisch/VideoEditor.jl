@@ -177,9 +177,11 @@ function fuzzactions(player, rng)
 end
 
 @testset "fuzz: random edits keep preview and export the same picture" begin
-    engine = VE.FxEngine(LVP)
     readers = Dict{String, Any}()
     player = Player(testvideo; gpupreview = false)
+    # The export through the player's own backend: preview and export are the
+    # same picture only on the same device, which rounds the same way.
+    engine = VE.FxEngine(player.analysisbackend)
     try
         sleep(1.0)
         seq = player.sequence

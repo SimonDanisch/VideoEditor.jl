@@ -190,9 +190,9 @@ end
 """
     applyrestore!(buf, clip, srcframe; strength)
 
-The host-side form: restore a HOST buffer straight from the clip's cache. A miss
-is a no-op, not an error — the frame renders as decoded until its window has been
-restored.
+The direct form: restore `buf`, on the host or a device, straight from the clip's
+cache. A miss is a no-op, not an error — the frame renders as decoded until its
+window has been restored.
 
 In the render path the plane is a graph resource and the node calls
 [`applyplane!`](@ref); this exists for the same reason `applymatte!` does, so a
@@ -203,5 +203,5 @@ function applyrestore!(buf::AnyRGBFrame, clip::Clip, srcframe::Integer;
     op = RestoreOp(Float32(clamp(strength, 0.0, 1.0)))
     d = planedata(op, clip, srcframe)
     d === nothing && return buf
-    return applyplane!(buf, reshape(d, planeshape(op, clip)), op, clip)
+    return applyplane!(buf, planeon(buf, reshape(d, planeshape(op, clip))), op, clip)
 end

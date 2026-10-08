@@ -218,11 +218,21 @@ end
 
 
 """
+    planeon(buf, plane)
+
+A per-frame plane where `buf` is: the plane itself for a host frame, a device
+copy for a device one. The graph uploads its own planes; this is for the direct
+forms below, which key one frame without a graph.
+"""
+planeon(::Array, plane) = plane
+planeon(buf, plane) = Mantle.devicearray(KA.get_backend(buf), collect(plane))
+
+"""
     applymatte!(buf, clip, srcframe; strength, feather)
 
-The host-side form: key a host buffer straight from the clip's track. A no-op
-when the clip has no matte or the frame is outside it, so scrubbing past the
-analyzed range shows the plain frame rather than a hole.
+The direct form: key `buf`, on the host or a device, straight from the clip's
+track. A no-op when the clip has no matte or the frame is outside it, so
+scrubbing past the analyzed range shows the plain frame rather than a hole.
 
 In the render path the plane is a graph resource and the node calls
 [`applyplane!`](@ref); this exists so a tool or a test can key one frame without
@@ -233,7 +243,7 @@ function applymatte!(buf::AnyRGBFrame, clip::Clip, srcframe::Integer;
     op = MatteOp(Float32(clamp(strength, 0.0, 1.0)), Float32(clamp(feather, 0.0, 1.0)))
     d = planedata(op, clip, srcframe)
     d === nothing && return buf
-    return applyplane!(buf, reshape(d, planeshape(op, clip)), op, clip)
+    return applyplane!(buf, planeon(buf, reshape(d, planeshape(op, clip))), op, clip)
 end
 
 
