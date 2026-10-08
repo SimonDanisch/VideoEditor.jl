@@ -1974,6 +1974,9 @@ include("bake.jl")        # pre-rendering a clip's chain to disk
 include("preview_mode.jl") # refinement follows the backend's runtime mode
 include("renderthread.jl") # renderer handoff, failures and startup deadlines
 include("renderfarm.jl")  # saved procedural scenes, resume, audio and frame transport
+include("farmenv.jl")     # a job's pinned environment, and the farm's messages over TCP
+# farm daemons render through their own processes; the first run compiles a job environment
+get(ENV, "VIDEOEDITOR_FARM_TEST", "") == "1" && isdefined(Main, :RayMakie) && include("farmdaemon.jl")
 include("recordedanimation.jl") # streamed simulation arrays; GPU integration when RayMakie is loaded
 include("sceneediting.jl") # inspector, original animation, overrides and saved edits
 include("speechediting.jl") # model capabilities, approved takes and speech following cuts

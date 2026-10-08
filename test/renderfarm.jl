@@ -62,7 +62,11 @@ Base.close(r::OwnedTestFrames) = (r.closed[] = true; nothing)
         VE.fillaudio!(block, opened, tracks, 6500)
         @test block == pcm.samples[:, 6501:7500]
 
-        job = VE.renderjob(path, joinpath(dir, "job"))
+        # `portable = false`: this machine's checkouts need not be pushed for a test
+        newjob(name) = VE.renderjob(path, joinpath(dir, name); portable = false)
+        job = newjob("job")
+        @test isfile(joinpath(job.directory, "job", "environment", "Project.toml"))
+        @test "GLMakie" in job.backends
         renderer = VE.farmrenderer(job)
         try
             a, b, again = VE.farmframes!(renderer, [3, 1, 3])
@@ -77,18 +81,17 @@ Base.close(r::OwnedTestFrames) = (r.closed[] = true; nothing)
             VE.farmframes!(renderer, [4])
             @test renderer.sequence.clips[2].source.live === held
 
-            bundle = VE.bundlefarm(job, joinpath(dir, "bundle"); root=dir)
-            moved = joinpath(dir, "relocated-bundle")
-            cp(bundle.directory, moved)
-            bundled = VE.openfarmbundle(moved)
+            # A job directory is self-contained: copied anywhere (a worker's
+            # disk), it renders the same frames from its own files.
+            moved = joinpath(dir, "relocated-job")
+            cp(job.directory, moved)
+            relocated = VE.farmrenderer(moved)
             try
-                @test only(VE.farmframes!(bundled, [3])).png == a.png
-                @test bundled.sequence.clips[1].source.root.file == joinpath(moved, "data", "scene.jl")
+                @test only(VE.farmframes!(relocated, [3])).png == a.png
+                @test relocated.sequence.clips[1].source.root.file == joinpath(moved, "job", "data", "scene.jl")
             finally
-                VE.closefarm!(bundled)
+                VE.closefarm!(relocated)
             end
-            write(joinpath(moved, "data", "scene.jl"), "changed")
-            @test_throws ErrorException VE.openfarmbundle(moved)
 
             attempts = Ref(0)
             failing = VE.FarmWorker("fails once", ids -> begin
@@ -112,19 +115,19 @@ Base.close(r::OwnedTestFrames) = (r.closed[] = true; nothing)
             @test VE.hasaudio(mp4)
             @test isfile(VE.encodefarm!(job.directory, joinpath(dir, "movie.mkv"); preset="fast"))
 
-            ownedjob = VE.renderjob(path, joinpath(dir, "ownedjob"))
+            ownedjob = newjob("ownedjob")
             closed = Ref(false)
             owned = VE.FarmWorker("owned", OwnedTestFrames(ids -> VE.farmframes!(renderer, ids), closed))
             @test VE.renderfarm!(ownedjob, [owned];frames=0:1)["completed"] == 2
             @test closed[]
 
-            reportjob = VE.renderjob(path, joinpath(dir, "reportjob"))
+            reportjob = newjob("reportjob")
             @test_throws Exception VE.renderfarm!(reportjob, [worker];
                 progress=(done,total) -> done == 1 && error("progress listener failed"))
-            @test count(n -> VE.farmcomplete(reportjob.directory,n,reportjob.identity), 0:5) == 1
+            @test count(n -> VE.farmcomplete(reportjob.directory,n,reportjob.key), 0:5) == 1
             @test VE.renderfarm!(reportjob,[worker])["completed"] == 6
 
-            pausejob = VE.renderjob(path, joinpath(dir, "pausejob"))
+            pausejob = newjob("pausejob")
             pauseworker = VE.FarmWorker("pause", ids -> begin
                 VE.pausefarm!(pausejob.directory)
                 VE.farmframes!(renderer, ids)
@@ -134,17 +137,26 @@ Base.close(r::OwnedTestFrames) = (r.closed[] = true; nothing)
             rm(joinpath(pausejob.directory, "pause.requested"))
             @test VE.renderfarm!(pausejob, [worker])["completed"] == 6
 
-            wrongjob = VE.renderjob(path, joinpath(dir, "wrongjob"))
-            wrong = VE.FarmWorker("wrong", ids -> [merge(only(VE.farmframes!(renderer, ids)), (identity="other",))])
+            wrongjob = newjob("wrongjob")
+            wrong = VE.FarmWorker("wrong", ids -> [merge(only(VE.farmframes!(renderer, ids .+ 1)), (frame = only(ids),))
+                                                   for _ in 1:2])
             @test_throws ErrorException VE.renderfarm!(wrongjob, [wrong]; retries=1)
             @test !isfile(VE.farmreceiptpath(wrongjob.directory, 0))
+            # The same edit resumes its job; a changed one is refused, not mixed in.
+            @test VE.renderjob(path, job.directory; portable = false).key == job.key
             mkpath(path * ".mattes")
             write(joinpath(path * ".mattes", "test.bin"), "sidecar changed")
-            @test_throws ErrorException VE.renderjob(path,job.directory)
+            @test_throws ErrorException VE.renderjob(path, job.directory; portable = false)
             rm(path * ".mattes"; recursive=true)
             write(script, read(script, String) * "\n# changed input\n")
-            @test_throws ErrorException VE.farmrenderer(job)
-            @test_throws ErrorException VE.renderjob(path, job.directory)
+            @test_throws ErrorException VE.renderjob(path, job.directory; portable = false)
+            # …and the job keeps rendering what it was made from
+            fresh = VE.farmrenderer(job)
+            try
+                @test only(VE.farmframes!(fresh, [3])).png == a.png
+            finally
+                VE.closefarm!(fresh)
+            end
         finally
             VE.closefarm!(renderer)
         end

@@ -103,6 +103,9 @@ change; editing a recorded native transform or attribute needs no resimulation.
 
 ## Jobs and workers
 
+A job is a snapshot of everything its frames are made of, so a worker renders
+exactly what the coordinator would, with nothing to compare afterwards:
+
 ```julia
 job = renderjob("movie.videoedit", "renders/job-001";
                 inputs=["included.jl", "model.glb"])
@@ -116,73 +119,95 @@ finally
 end
 ```
 
-Prepare the same ordinary Julia Pkg environment on each worker, with VideoEditor,
-RayMakie and the scene's imports. `Pkg.instantiate()` installs the Manifest's
-versions; Julia manages compilation caches. Cold startup includes compilation.
-Keep this environment across jobs, and pin/release a shared runtime when its
-versions are stable. The farm does not resolve package dependencies, manage
-compiled caches, or install models.
+`renderjob` writes `renders/job-001/job/`: the project and its sidecars, the
+files it reads (soundtracks, recordings, scene scripts, and declared `inputs`;
+files under `root`, the project's folder by default, keep their relative paths
+so `include` works) and `environment/Project.toml`, the code. That Project.toml
+pins every package the job loads (VideoEditor, the scenes' final backends, the
+packages scene recipes come from, and everything they need) to what this
+machine runs: a package developed from a git checkout is a `[sources]` entry
+with its remote's `url`, the commit as `rev` and its `subdir` in a monorepo;
+a registered package an exact `[compat]` version; Julia its exact version; and
+the environment's package preferences come along. A checkout with uncommitted
+changes or a commit on no remote branch cannot be fetched by a worker:
+`renderjob` names every such package and stops. `portable = false` pins
+developed packages by `path` instead, for farm daemons on this machine only.
 
-`bundlefarm(job, "renders/job-001.bundle"; root=projectroot)` copies only the job
-and declared animation inputs, preserving relative paths. Sync that directory;
-in the worker's prepared environment use `openfarmbundle(worker_bundle)`.
-Packages remain in the worker's environment. Select the GPU and register RayMakie
-before opening the renderer. Each GPU needs a separate process/session.
+The same edit asked for again resumes its job; a changed edit, file or package
+is refused for that directory (make a new job), so frames never mix.
 
-Transport callbacks accept indices and return `farmframes!` results: PNG bytes,
-job identity and timings. Scenes, decoders and GPU objects stay in the worker.
-RPCs can run on arbitrary threads; rendering is routed to the GPU's owning thread.
-A callable worker may implement `Base.close`, which the coordinator invokes at
-completion, pause or failure. Plain functions leave resource ownership to callers.
+Transport callbacks accept indices and return `farmframes!` results: PNG bytes
+and timings. Scenes, decoders and GPU objects stay in the worker. RPCs can run
+on arbitrary threads; rendering is routed to the GPU's owning thread. A callable
+worker may implement `Base.close`, which the coordinator invokes at completion,
+pause or failure. Plain functions leave resource ownership to callers.
 
-## BonitoAgents and the editor button
+## Farm daemons: other machines and other GPUs
 
-Include `examples/bonito_farm.jl` in a BonitoAgents session. Its adapter transfers
-job inputs through `remote_session` and uses existing worker environments:
+Every machine that renders runs a farm daemon, a standard-library-only Julia
+script, with a config naming its GPUs (`farm/farmd.example.toml`):
 
-`remote_session` is injected into the chat's primary BonitoAgents Julia session.
-It opens Julia RPC over the existing worker relay and server connection; it
-starts the target environment if necessary. The coordinator calls it directly,
-so rendering needs no `bt_julia_eval` tool calls or agent turns. Both Julia
-sessions must have the same Julia version. The project's remote-Julia setting
-must permit the connection.
-Remote eval hosts answer these RPCs; they cannot initiate another worker
-connection through the same chat relay.
-
-A plain Julia REPL does not get this connection from `using VideoEditor`.
-Standalone editor connection setup is not implemented yet. An application that
-already has a BonitoAgents connection can provide its equivalent session factory
-as `bonitofarm(...; sessionfor=connected_session_factory)`. The farm renderer and
-job scheduler are independent of the transport.
-
-```julia
-slots = [(name="Bosgame GPU", worker="Bosgame",
-    directory="/home/sim/Programmieren/VideoEditor-farm/jobs",
-    env_path="/home/sim/Programmieren/VideoEditor-renderfarm-20261004/demo/editor_env",
-    selector=nothing, resource="bosgame-gpu")]
-registerfarm!(:shared, "shared GPU farm";
-    directory=joinpath(projectroot,"renders","farm"),
-    inputs=scene_inputs,
-    connect=job -> bonitofarm(job; root=projectroot,slots))
+```sh
+julia farm/farmd.jl ~/.videoeditor/farmd.toml
 ```
 
-`inputs` is a file list or a function of the saved project path. Both projects
-should use the same slot definitions and GPU `resource` names. Standard PID locks
-in `~/.videoeditor/farm-locks` prevent simultaneous ownership of a GPU. Busy/offline
-slots are skipped. Separate directories and environments identify different GPUs
-on the same machine. The adapter closes renderers and releases locks after dispatch.
+```toml
+token = "a shared secret"
+[[slot]]
+name = "RX 7900 XTX"
+device = "7900"          # MANTLE_DEVICE: part of the GPU's name, or its index
+[[slot]]
+name = "RTX 4000 Ada"
+device = "NVIDIA"
+```
 
-**Export → Render on farm…** and **Ctrl+P → Render on shared GPU farm** invoke the
-same registered command. It snapshots the edit, shows progress, then uses the
-Export panel's chosen file, H.264/H.265, quality, preset and audio settings. Farm
-output supports MP4/MKV/MOV. GIF still uses the local export action.
+One slot per GPU, so a second GPU is a second slot. The coordinator lists the
+machines in `~/.videoeditor/farm.toml`:
+
+```toml
+token = "a shared secret"
+[[machine]]
+host = "sim-bosgame.fritz.box"
+[[machine]]
+host = "localhost"       # this machine's own daemon: its second GPU
+```
+
+```julia
+workers = farmworkers(job, farmmachines())
+renderfarm!(job, workers)
+encodefarm!(job.directory, "movie.mp4")
+```
+
+`farmworkers` asks every daemon for its free slots and opens each for the job
+over TCP, in parallel: it sends the snapshot; the daemon unpacks it, instantiates
+`environment/Project.toml` with the job's Julia version (`julia +<version>`
+through juliaup, or the configured `julia` if it is that version; automatic
+precompilation off) and starts a renderer on the slot's GPU in it
+(`VideoEditor.farmchild`, the GPU chosen by `MANTLE_DEVICE`), then relays frames.
+Environments are kept by their Project.toml and reused; packages and compiled
+code live in the daemon user's ordinary Julia depot, shared by jobs with the
+same versions. The first job on a machine installs and compiles, which takes
+minutes. A slot that cannot be opened is reported and left out. Closing a slot,
+or a dropped connection, ends its renderer and frees the GPU; a lock file per
+slot keeps two daemons from sharing one.
+
+Messages are TOML headers with byte payloads, not Julia serialization, so the
+coordinator, daemon and renderer may run different Julia or VideoEditor
+versions. The connection is plain TCP with a shared token: run daemons on a
+network you trust.
+
+With `~/.videoeditor/farm.toml` present, every `Player` offers **Export →
+Render on farm…** and **Ctrl+P → Render on LAN farm** (`registerlanfarm!`). It
+snapshots the edit, renders on every free slot, shows progress, then uses the
+Export panel's chosen file, H.264/H.265, quality, preset and audio settings.
+Farm output supports MP4/MKV/MOV. GIF still uses the local export action.
+`registerfarm!` registers any other transport the same way.
 
 ## Resume and verification
 
 Faster workers take more frames. A failed worker retries unfinished requests;
-completed PNGs have atomic commits and checksummed receipts. Run `renderfarm!`
-again on the same job to resume. Different documents, settings, declared inputs,
-sidecar contents or Julia versions cannot be mixed into an existing job.
+completed PNGs have atomic commits and receipts naming the job and the PNG's
+hash. Run `renderfarm!` again on the same job to resume.
 
 `pausefarm!(job.directory)` stops new dispatch after current frames finish.
 Remove `pause.requested` before resuming. `farmstatus` reads progress/errors;
@@ -207,9 +232,9 @@ GLMakie to test scheduling, receipts, transfer and encoding; it does not verify
 GPU ray tracing.
 
 Resume currently reuses verified frames from the **same immutable job**. It does
-not automatically reuse frames between edited documents. The job identity includes
-the complete project and its audio sidecars, so even an audio-only edit creates a
-different identity. An editor curve change invalidates its entire clip-level bake;
+not automatically reuse frames between edited documents. A job's snapshot holds
+the complete project and its audio sidecars, so even an audio-only edit makes a
+different job. An editor curve change invalidates its entire clip-level bake;
 the scheduler does not calculate which curve segments changed. Supplying a frame
 subset to `renderfarm!` is possible, but is not automatic edit invalidation.
 

@@ -34,6 +34,8 @@ import MsgPack
 import Scratch
 import Statistics: median, mean
 import SHA
+import Tar
+using Sockets: connect, TCPSocket
 
 const RGBFrame = Matrix{RGB{N0f8}}
 
@@ -160,8 +162,10 @@ include("scenesource.jl") # a scene AS A CLIP: the source pass, and making one
 include("recordedscene.jl") # record and replay the real scene's animation inputs
 include("overlays.jl")   # the stock non-footage clips, each as a SceneSpec preset
 include("bake.jl")       # pre-rendering a clip's chain to disk
-include("renderfarm.jl") # persistent timeline renderers and resumable frame jobs
-include("farmbundle.jl") # relocate jobs and their declared animation inputs
+include("farmwire.jl")   # the farm's messages: TOML headers and byte payloads
+include("farmenv.jl")    # a job's code, as a pinned environment
+include("renderfarm.jl") # job snapshots, persistent timeline renderers and resumable frame jobs
+include("farmnet.jl")    # farm daemons' GPU slots over TCP, and the renderer they start
 include("commands.jl") # everything the editor can do, as data
 include("fxpanel.jl")  # THE effects panel: one card list for the selected clip
 include("trackpreviews.jl") # bounded background scene thumbnails and audio envelopes
@@ -195,7 +199,7 @@ export registerplugin!, registereffect!, EffectKind, FxParam, Pointwise, Stencil
 export SceneSource, SceneSpec, sceneclip, textscene, barscene, timecodescene, curvescene
 export programscene, RenderJob, renderjob, FarmWorker, FarmRenderer, farmrenderer, renderfarm!,
        farmframes!, closefarm!, encodefarm!, farmstatus, pausefarm!, registerfarm!,
-       bundlefarm, openfarmbundle
+       farmenvironment, FarmMachine, farmmachines, farmslots, farmworkers, farmchild, registerlanfarm!
 export registertool!, ToolContext, toolplot!, ontool!, tooltime, toolband
 export activatetool!, deactivatetool!
 export repairmattecollect!, brushmatte!, matteframe

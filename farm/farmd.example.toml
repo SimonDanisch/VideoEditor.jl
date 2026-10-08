@@ -1,0 +1,29 @@
+# The farm daemon's config (`~/.videoeditor/farmd.toml` by default):
+#
+#     julia farmd.jl ~/.videoeditor/farmd.toml
+#
+# Coordinators list this machine in their `~/.videoeditor/farm.toml`:
+#
+#     [[machine]]
+#     host = "this-machine.local"
+#     token = "the same token"
+
+# Required: coordinators send it with every request.
+token = "change-me"
+
+# Optional, shown with their defaults.
+# port = 7600
+# bind = "::"                      # all interfaces, IPv6 and IPv4
+# root = "~/.videoeditor/farm"     # job snapshots, environments, logs
+# julia = "julia"                  # with juliaup, `julia +<version>` is tried first
+# threads = "auto"
+
+# One slot per GPU. `device` selects it (`MANTLE_DEVICE`: part of its name, or
+# its index); without one the default GPU renders. A second GPU is a second slot.
+[[slot]]
+name = "RX 7900 XTX"
+device = "7900"
+
+[[slot]]
+name = "RTX 4000 Ada"
+device = "NVIDIA"

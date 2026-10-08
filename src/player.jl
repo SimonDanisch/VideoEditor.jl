@@ -473,6 +473,8 @@ function Player(path::AbstractString; capacity::Integer = 64,
                 audiopreview::Bool = true, previewscale::Real = 1,
                 proxyheight::Integer = 720, proxythreshold::Integer = 2_100_000,
                 effects::EffectRegistry = EFFECTS)
+    # the farm daemons this machine renders on, when it lists any
+    isfile(farmconfig()) && !any(c -> c.name === :farm_lan, COMMANDS) && registerlanfarm!()
     # GPU playback is the default: leaving both `analysisbackend` and `gpupreview`
     # unset auto-detects a video-capable Vulkan device (below) and, if present, runs
     # decode + effects on the GPU. Pass either to force the choice.

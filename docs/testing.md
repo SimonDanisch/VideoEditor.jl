@@ -141,31 +141,11 @@ never call `Pkg.precompile()` or run a separate precompile pass. Keep the enviro
 for later runs, and pin its versions when the runtime stabilizes. Each test closes
 its editor window in `finally`.
 
-The CrawCity `tools/videoeditor_ray_farm_check.jl` checks final GPU ray tracing
-through the farm scheduler, rather than the GLMakie fixture in
-`test/renderfarm.jl`. Run it on Bosgame in the prepared environment:
-
-```julia
-using Test
-include("/path/to/CrawCity/tools/videoeditor_ray_farm_check.jl")
-@testset "GPU ray farm" begin
-    VideoEditorRayFarmCheck.run("/path/to/a/new/qa-directory")
-end
-```
-
-It acquires the shared Bosgame GPU PID lease and starts a separate Julia process
-in the same ordinary Pkg environment. A portable bundle supplies an animated 3D
-scene. Assertions inspect the worker's actual RayMakie screen: GPU device,
-`rasterize=false`, eight samples, twelve committed timeline frames, verified
-receipts, zero renders on exact-job resume, and an MP4 with audio passing full
-decode. `result.json`, `ray_farm.mp4` and the frame PNGs retain the evidence.
-Both the renderer process and GPU lease are released in `finally`.
-This is a one-GPU, separate-process RPC check; it does not test the BonitoAgents
-relay or distribution across different machines. It also records current cache
-limitations: an audio edit changes the job identity and a visual edit disables
-the whole clip bake. The 2026-10-06 Bosgame run passed all fourteen assertions;
-CrawCity's `renders/videoeditor_ray_farm_20261006` retains the reviewed frame,
-movie and report.
+`test/farmdaemon.jl` checks the farm across processes: it starts a farm daemon
+(`farm/farmd.jl`) with a slot per GPU of this machine, makes a job with a
+`portable = false` environment, opens every slot over TCP and renders through
+the daemons' own renderer processes. Set `VIDEOEDITOR_FARM_TEST=1` to run it:
+the first run instantiates the job environment and compiles VideoEditor in it.
 
 `test/sceneediting.jl` also covers opening projects with different canvas sizes
 and discarding a render when its destination changes during composition.

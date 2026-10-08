@@ -99,16 +99,18 @@ if haskey(VE.BACKENDS,:RayMakie)
         LAST_RECORDED_PROJECT[]=path
         back=VE.loadproject(path)
         @test VE.valueat(VE.param(VE.findslot(only(back.clips),:scene),data.name),3) == fill(VE.RGBAf(4/12,.2,.3,1),4,4)
-        job=VE.renderjob(path,joinpath(tmp,"job"))
-        @test all(track.path in keys(job.inputs) for track in values(tracks))
-        bundle=VE.bundlefarm(job,joinpath(tmp,"bundle");root=tmp)
-        renderer=VE.openfarmbundle(bundle.directory)
+        job=VE.renderjob(path,joinpath(tmp,"job");portable=false)
+        # the recordings travel inside the job, which renders from its own copies
+        @test all(ispath(joinpath(job.directory,"job",job.relocations[tmp],relpath(track.path,tmp)))
+                  for track in values(tracks))
+        moved=joinpath(tmp,"relocated-job"); cp(job.directory,moved)
+        renderer=VE.farmrenderer(moved)
             a,b,again=VE.farmframes!(renderer,[11,0,11])
             @test a.png == again.png
             @test a.png != b.png
             src=only(renderer.sequence.clips).source
             @test Base.invokelatest(getproperty,parentmodule(src.root.builder),:steps)[] == 0
-            @test startswith(first(values(src.live.target.recordings)).path,bundle.directory)
+            @test startswith(first(values(src.live.target.recordings)).path,moved)
         finally
             renderer===nothing || VE.closefarm!(renderer)
             close(clip.source)

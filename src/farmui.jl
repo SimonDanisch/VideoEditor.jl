@@ -1,14 +1,15 @@
 """
-    registerfarm!(name, label; directory, connect, inputs=[]) -> Command
+    registerfarm!(name, label; directory, connect, inputs=[], root=nothing) -> Command
 
 Add a render farm to the editor's command palette and Export panel.
 `connect(job)` prepares independent renderer sessions and returns `FarmWorker`s.
 The connection owns machine discovery, file synchronization, and GPU selection;
 VideoEditor owns the saved job, timeline rendering, resume, progress, and encode.
-`inputs` can be a file list or a function of the saved project path.
+`inputs` can be a file list or a function of the saved project path; files under
+`root` keep their relative paths in the job (see [`renderjob`](@ref)).
 """
 function registerfarm!(name::Symbol, label::AbstractString;
-                       directory::AbstractString, connect, inputs = String[])
+                       directory::AbstractString, connect, inputs = String[], root = nothing)
     return registercommand!(Command(Symbol("farm_", name), "Render on $label";
         category = :renderfarm, keywords = ["export", "render", "farm", "gpu"],
         enabled = p -> isempty(p.sequence.clips) ? "the timeline is empty" :
@@ -33,7 +34,7 @@ function registerfarm!(name::Symbol, label::AbstractString;
             project = joinpath(dir, "edit.videoedit")
             saveproject(project, player.sequence)
             extra = inputs isa Function ? inputs(project) : inputs
-            job = renderjob(project, dir; inputs = extra)
+            job = renderjob(project, dir; inputs = extra, root = something(root, dir))
             player.jobprogress[] = 0.0
             setstatus!(player, "connecting to $label…")
             @async try
@@ -70,4 +71,22 @@ function choosefarm!(player::Player)
     length(farms) == 1 && return runcommand!(player, only(farms).name)
     opencommandpalette!(player; query = "render on")
     return nothing
+end
+
+"""Where a coordinator's farm config lives: the machines it renders on (see `farmmachines`)."""
+farmconfig() = joinpath(homedir(), ".videoeditor", "farm.toml")
+
+"""
+    registerlanfarm!(; config = farmconfig(), directory = ~/.videoeditor/farm-jobs, inputs = []) -> Command
+
+"Render on LAN farm": every free GPU slot of the farm daemons `config` lists
+(see `farmmachines`), read when a render starts; `inputs` and `root` as for
+[`registerfarm!`](@ref). A `Player` registers it by itself when the config
+exists and nothing has registered it before.
+"""
+function registerlanfarm!(; config::AbstractString = farmconfig(),
+                          directory::AbstractString = joinpath(homedir(), ".videoeditor", "farm-jobs"),
+                          inputs = String[], root = nothing)
+    return registerfarm!(:lan, "LAN farm"; directory, inputs, root,
+                         connect = job -> farmworkers(job, farmmachines(config)))
 end
