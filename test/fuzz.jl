@@ -213,7 +213,10 @@ end
                 cs = clipsat(seq, n)
                 isempty(cs) && continue          # a gap shows black, nothing to compare
                 settleon!(player, n) || continue # decoder not there yet — not a picture bug
-                expect = exportframe(seq, n, engine, readers)
+                # On the thread that owns the device, as the player's own renders are.
+                expect = VE.onthread(VE.mantlethread(VE.Mantle)) do
+                    exportframe(seq, n, engine, readers)
+                end
                 expect === nothing && continue
                 checked += 1
                 length(cs) > 1 && (composites += 1)
@@ -267,6 +270,6 @@ end
     finally
         close(player)
         foreach(close, values(readers))
-        VE.emptyengine!(engine)
+        VE.onthread(VE.mantlethread(VE.Mantle)) do; VE.emptyengine!(engine); end
     end
 end

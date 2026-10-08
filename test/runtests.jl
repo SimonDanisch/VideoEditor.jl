@@ -17,6 +17,13 @@ using Lavapipe_jll
 const LVP = VE.Mantle.backend(VE.Mantle.Device("lavapipe"))
 lvp(x::AbstractArray) = VE.Mantle.devicearray(LVP, x)
 
+# The process's GPU device is made on the editor's GPU worker, as the editor makes
+# it (`autodetectgpu!`): the worker's jobs (export, matte, bake) submit to it, and
+# a device belongs to the thread that made it. A test that renders on it from this
+# thread then fails where it does so, instead of every GPU job after it failing
+# with `SubmitChannel is single-writer`.
+VE.onworkerthread(() -> (VE.Mantle.Device(); nothing))
+
 testvideo = joinpath(mktempdir(), "test.mp4")
 run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -f lavfi -i testsrc2=size=320x180:rate=30 -t 4 -c:v libx264 -g 30 -pix_fmt yuv420p $testvideo`,
              stdout = devnull, stderr = devnull))
@@ -795,7 +802,7 @@ end
 
     # export walks both sources, scaling the second onto the first's canvas
     out = joinpath(mktempdir(), "multi.mp4")
-    exportvideo(out, seq; encoder_options = (crf = 18, preset = "fast"))
+    exportvideo(out, seq; encoder_options = (crf = 18, preset = "fast"), backend = LVP)
     probe = VideoSource(out)
     @test probe.nframes == 210
     @test (probe.width, probe.height) == (320, 180)
@@ -878,7 +885,7 @@ end
     seq.clips[1].crop = (0.25, 0.25, 0.5, 0.5)  # 160x90 canvas
     seteffect!(seq.clips[1], ColorEffect(saturation = 0.0))  # grayscale
     out = joinpath(mktempdir(), "out.mp4")
-    exportvideo(out, seq; encoder_options = (crf = 18, preset = "fast"))
+    exportvideo(out, seq; encoder_options = (crf = 18, preset = "fast"), backend = LVP)
     @test isfile(out)
     probe = VideoSource(out)
     @test probe.nframes == 40
@@ -904,7 +911,7 @@ end
     kcurve = opacitycurve!(kseq.clips[1])
     VE.setkey!(kcurve, 0, 0.1); VE.setkey!(kcurve, 119, 1.0)
     kout = joinpath(mktempdir(), "kf.mp4")
-    exportvideo(kout, kseq; audio = false, encoder_options = (crf = 18, preset = "fast"))
+    exportvideo(kout, kseq; audio = false, encoder_options = (crf = 18, preset = "fast"), backend = LVP)
     luma(f) = mean(Float32(px.r) + px.g + px.b for px in f) / 3
     kr = VideoIO.openvideo(kout)
     lo = luma(read(kr))                       # frame 0: opacity ~0.1 (dark)
@@ -933,7 +940,7 @@ end
     push!(seq.clips, VE.Clip(src2, 0, 30, 45, (0.0, 0.0, 1.0, 1.0)))
     push!(seq.clips, VE.Clip(VideoSource(testvideo), 0, 15, 75, (0.0, 0.0, 1.0, 1.0)))
     out = joinpath(dir, "with_audio.mp4")
-    exportvideo(out, seq)
+    exportvideo(out, seq; backend = LVP)
     @test VE.hasaudio(out)
 
     # per-segment dominant frequency via zero crossings on the decoded PCM
@@ -952,7 +959,7 @@ end
 
     # when no source has audio the mux is skipped and the file has no track
     out2 = joinpath(dir, "silent.mp4")
-    exportvideo(out2, Sequence(VideoSource(testvideo)))
+    exportvideo(out2, Sequence(VideoSource(testvideo)); backend = LVP)
     @test !VE.hasaudio(out2)
     @test VideoSource(out2).nframes == 120
 end

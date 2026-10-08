@@ -487,28 +487,33 @@ function renderpreview(player::Player, t::Float64, width::Int)
         time() > deadline && error("frame $srcframe not decodable within 3s")
     end
     # the same graph as preview/export; a private engine on the declared backend —
-    # this runs on the MCP task, the player's engine pool belongs to the render thread
-    engine = FxEngine(player.analysisbackend)
-    try
-        render(engine, scratch, clip, Int(srcframe)) do out
-            # `preview` is the HOST frame the MCP encodes, and `out` lives on
-            # `player.analysisbackend`. `warp!` runs on the source's backend, so
-            # the two cannot be spanned in one call — with a GPU analysis backend
-            # this handed a host `Matrix` to a GPU kernel and failed inside
-            # GPUCompiler. Crop on the device, then bring the result down.
-            b = KA.get_backend(out)
-            if typeof(b) === typeof(KA.get_backend(preview))
-                warp!(preview, out, clip.crop)
-                KA.synchronize(b)
-            else
-                tmp = KA.allocate(b, eltype(preview), size(preview)...)
-                warp!(tmp, out, clip.crop)
-                KA.synchronize(b)
-                copyto!(preview, tmp)
+    # this runs on the MCP task, the player's engine pool belongs to the render thread.
+    # Built, run and freed on the thread that owns the device, like the track
+    # previews: rendered on the MCP task, it died on `WrongThread` whenever the
+    # GPU worker owned the device, which is how the editor sets it up.
+    return onthread(mantlethread(Mantle)) do
+        engine = FxEngine(player.analysisbackend)
+        try
+            render(engine, scratch, clip, Int(srcframe)) do out
+                # `preview` is the HOST frame the MCP encodes, and `out` lives on
+                # `player.analysisbackend`. `warp!` runs on the source's backend, so
+                # the two cannot be spanned in one call — with a GPU analysis backend
+                # this handed a host `Matrix` to a GPU kernel and failed inside
+                # GPUCompiler. Crop on the device, then bring the result down.
+                b = KA.get_backend(out)
+                if typeof(b) === typeof(KA.get_backend(preview))
+                    warp!(preview, out, clip.crop)
+                    KA.synchronize(b)
+                else
+                    tmp = KA.allocate(b, eltype(preview), size(preview)...)
+                    warp!(tmp, out, clip.crop)
+                    KA.synchronize(b)
+                    copyto!(preview, tmp)
+                end
             end
+        finally
+            emptyengine!(engine)
         end
-    finally
-        emptyengine!(engine)
+        preview
     end
-    return preview
 end

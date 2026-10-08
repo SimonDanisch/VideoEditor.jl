@@ -1551,7 +1551,7 @@ end
             @test cw > src.width && ch > src.height        # it GREW
 
             out = joinpath(mktempdir(), "outward.mp4")
-            VE.exportvideo(out, seq)
+            VE.exportvideo(out, seq; backend = LVP)
             rd = VE.VideoIO.openvideo(out); f = VE.VideoIO.read(rd); close(rd)
             # `size` is (h, w); `canvassize` is (w, h). Not a transposition bug —
             # checking the wrong way round is how it first looked like one.
@@ -1562,7 +1562,7 @@ end
             # …and an explicit canvas beats whatever clip 1 would have implied
             seq.canvas = (640, 360)
             out2 = joinpath(mktempdir(), "explicit.mp4")
-            VE.exportvideo(out2, seq)
+            VE.exportvideo(out2, seq; backend = LVP)
             rd2 = VE.VideoIO.openvideo(out2); f2 = VE.VideoIO.read(rd2); close(rd2)
             @test size(f2) == (360, 640)
         end
