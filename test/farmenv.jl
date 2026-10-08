@@ -108,3 +108,21 @@ end
     wait(echo)
     close(server)
 end
+
+# FarmClient is a package of its own, standard library only: loaded here from source.
+isdefined(Main, :FarmClient) || include(joinpath(pkgdir(VE), "FarmClient", "src", "FarmClient.jl"))
+
+@testset "farm client: addresses and GPU selectors" begin
+    @test FarmClient.splitaddress("192.168.178.92:8080") == ("192.168.178.92", 8080)
+    @test FarmClient.splitaddress("bosgame.local") == ("bosgame.local", VE.FARM_PORT)
+    @test FarmClient.splitaddress("[fe80::1]:7601") == ("fe80::1", 7601)
+    @test_throws ArgumentError FarmClient.splitaddress("a:b:c")
+    gpus = [Dict{String, Any}("index" => 1, "name" => "AMD Radeon RX 7900 XTX (RADV NAVI31)"),
+            Dict{String, Any}("index" => 2, "name" => "NVIDIA RTX 4000 Ada Generation"),
+            Dict{String, Any}("index" => 3, "name" => "llvmpipe (LLVM 23.1.1, 256 bits)")]
+    pick(s) = [g["index"] for g in FarmClient.selected(s, gpus)]
+    @test pick("7900") == pick("radeon") == [1]
+    @test pick("nvidia") == pick("2") == [2]
+    @test pick("3") == [3]                       # an index, not the 3 in NAVI31 or LLVM 23
+    @test pick("4000") == [2] && isempty(pick("matrox"))
+end

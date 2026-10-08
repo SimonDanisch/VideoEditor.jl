@@ -1,15 +1,15 @@
 # The render farm's wire format: a message is a TOML header and a byte payload,
-# each length-prefixed. Plain TOML and bytes rather than Julia serialization, so a
-# coordinator, a machine's farm daemon and the renderer it starts (each possibly
+# each length-prefixed. Plain TOML and bytes rather than Julia serialization, so
+# the editor, a machine's farm client and the renderers it starts (each possibly
 # another Julia version or VideoEditor commit) still read each other.
 #
-# Standard library only: `farm/farmd.jl` includes this file without loading
-# VideoEditor, whose version is the job's to choose.
+# Standard library only, and shared: FarmClient includes it, and so does
+# VideoEditor (`include`d from this repository's `FarmClient/src`).
 
-"""The version of the farm's messages; a daemon refuses another."""
-const FARM_PROTOCOL = 1
+"""The version of the farm's messages; the farm server refuses a client speaking another."""
+const FARM_PROTOCOL = 2
 
-"""The port farm daemons listen on unless told otherwise."""
+"""The port the farm server listens on unless told otherwise."""
 const FARM_PORT = 7600
 
 """
@@ -44,5 +44,5 @@ function readexactly(io::IO, n::Integer)
     return bytes
 end
 
-"""A message's error, if it reports one: what a daemon or renderer sends instead of a result."""
+"""A message's error, if it reports one: what a client, server or renderer sends instead of a result."""
 farmerror(header::AbstractDict) = get(header, "error", nothing)

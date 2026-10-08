@@ -36,7 +36,7 @@ import Statistics: median, mean
 import SHA
 import Tar
 import Pkg
-using Sockets: connect, TCPSocket
+using Sockets: Sockets, TCPSocket, IPAddr, @ip_str, listen, accept, getsockname, getpeername, getipaddr
 
 const RGBFrame = Matrix{RGB{N0f8}}
 
@@ -163,10 +163,10 @@ include("scenesource.jl") # a scene AS A CLIP: the source pass, and making one
 include("recordedscene.jl") # record and replay the real scene's animation inputs
 include("overlays.jl")   # the stock non-footage clips, each as a SceneSpec preset
 include("bake.jl")       # pre-rendering a clip's chain to disk
-include("farmwire.jl")   # the farm's messages: TOML headers and byte payloads
+include(joinpath(@__DIR__, "..", "FarmClient", "src", "wire.jl"))  # the farm's messages, shared with FarmClient
 include("farmenv.jl")    # a job's code, as a pinned environment
 include("renderfarm.jl") # job snapshots, persistent timeline renderers and resumable frame jobs
-include("farmnet.jl")    # farm daemons' GPU slots over TCP, and the renderer they start
+include("farmnet.jl")    # the farm server: GPUs that farm clients offer, and the renderer they start
 include("commands.jl") # everything the editor can do, as data
 include("fxpanel.jl")  # THE effects panel: one card list for the selected clip
 include("trackpreviews.jl") # bounded background scene thumbnails and audio envelopes
@@ -200,7 +200,7 @@ export registerplugin!, registereffect!, EffectKind, FxParam, Pointwise, Stencil
 export SceneSource, SceneSpec, sceneclip, textscene, barscene, timecodescene, curvescene
 export programscene, RenderJob, renderjob, FarmWorker, FarmRenderer, farmrenderer, renderfarm!,
        farmframes!, closefarm!, encodefarm!, farmstatus, pausefarm!, registerfarm!,
-       farmenvironment, FarmMachine, farmmachines, farmslots, farmworkers, farmchild, registerlanfarm!
+       farmenvironment, FarmServer, farmserver, farmworkers, farmchild, registerlanfarm!
 export registertool!, ToolContext, toolplot!, ontool!, tooltime, toolband
 export activatetool!, deactivatetool!
 export repairmattecollect!, brushmatte!, matteframe

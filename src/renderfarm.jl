@@ -5,7 +5,7 @@
 # coordinator hands out frames, keeps what comes back, resumes, and encodes.
 #
 # The transport is the caller's: `FarmWorker`s are frame callbacks, local
-# (`farmframes!`) or over the network (`farmworkers`, farm daemons on other
+# (`farmframes!`) or over the network (`farmworkers`, farm clients on other
 # machines). No GPU object, decoder or live Makie scene crosses that boundary.
 
 struct FarmWorker{F}
@@ -69,7 +69,7 @@ Snapshot the saved `project` into `directory/job`: the project and its
 sidecars, the files it reads (soundtracks, recordings, scene scripts, and the
 includes and assets declared in `inputs`), and the environment of its code
 (`farmenvironment` of the packages it loads; `portable = false` for farm
-daemons on this machine only). Files under `root` keep their relative paths,
+clients on this machine only). Files under `root` keep their relative paths,
 so a script's `include`s still work; others are kept by content.
 
 Narration must be rendered first, so workers need no speech model. Asked again
@@ -266,9 +266,10 @@ pausefarm!(dir::AbstractString) = write(joinpath(dir, "pause.requested"), "pause
 
 Distribute timeline frames dynamically, one request at a time per worker.
 Each `FarmWorker(name, callback)` accepts frame indices and returns the result
-of `farmframes!`. Faster workers take more work; a failed worker retries up to
-`retries` times and returns unfinished frames to the queue. Workers must each
-own a separate process when using GPUs (see `farmworkers`).
+of `farmframes!`. `workers` is a collection, or a `Channel` they arrive on while
+the render runs (as `farmworkers` delivers them). Faster workers take more work;
+a failed worker retries up to `retries` times and returns unfinished frames to
+the queue. Workers must each own a separate process when using GPUs.
 The callback may be a callable resource implementing `close`; it is closed when
 dispatch finishes, including on pause or failure. Plain functions have no cleanup.
 
@@ -279,10 +280,9 @@ performs the final encode and audio mix.
 """
 function renderfarm!(job::RenderJob, workers; frames = nothing,
                      retries::Integer = 3, progress = nothing)
-    isempty(workers) && error("no farm workers supplied")
+    workers isa Channel || isempty(workers) && error("no farm workers supplied")
     retries > 0 || error("retries must be positive")
-    names = [w.name for w in workers]
-    length(unique(names)) == length(names) || error("farm worker names must be unique")
+    pool = workerchannel(workers)
     dir, total, canvas, key = job.directory, job.total, job.canvas, job.key
     wanted = frames === nothing ? collect(0:total-1) : sort!(unique(Int.(collect(frames))))
     all(n -> 0 <= n < total, wanted) || error("invalid farm frame range")
@@ -290,11 +290,12 @@ function renderfarm!(job::RenderJob, workers; frames = nothing,
     lockdir = joinpath(dir, "coordinator.lock")
     ispath(lockdir) && error("farm directory already has a coordinator: $lockdir")
     mkdir(lockdir)
+    joined = FarmWorker[]                    # every worker that arrived: closed at the end
     try
         mkpath(joinpath(dir, "frames"))
         pending = reverse([n for n in wanted if !farmcomplete(dir, n, key)])
         completed = length(wanted) - length(pending)
-        counts = Dict(name => 0 for name in names)
+        counts = Dict{String, Int}()
         errors = Dict{String, String}()
         active = Set{String}()
         guard = ReentrantLock()
@@ -307,16 +308,31 @@ function renderfarm!(job::RenderJob, workers; frames = nothing,
             farmwritejson(joinpath(dir, "status.json"), data)
             progress === nothing || progress(completed, length(wanted))
         end
+        paused() = isfile(joinpath(dir, "pause.requested"))
+        # No worker left with anything to do: stop waiting for more to arrive.
+        finished() = isempty(active) && (isempty(pending) || paused()) && close(pool)
         report()
-        @sync for worker in workers
+        finished()
+        @sync for worker in pool
+            fresh = lock(guard) do
+                if haskey(counts, worker.name)
+                    errors[worker.name] = "a second worker of this name joined and was left out"
+                    return false
+                end
+                counts[worker.name] = 0
+                push!(joined, worker)
+                push!(active, worker.name)
+                report()
+                return true
+            end
+            fresh || (closeworker!(worker); continue)
             @async begin
                 failures = 0
-                lock(guard) do; push!(active, worker.name); report(); end
                 try
                     while true
                         ids = lock(guard) do
                             isempty(pending) && return Int[]
-                            isfile(joinpath(dir, "pause.requested")) && return Int[]
+                            paused() && return Int[]
                             [pop!(pending)]
                         end
                         isempty(ids) && break
@@ -353,16 +369,20 @@ function renderfarm!(job::RenderJob, workers; frames = nothing,
                         yield()
                     end
                 finally
-                    lock(guard) do; delete!(active, worker.name); report(); end
+                    lock(guard) do; delete!(active, worker.name); report(); finished(); end
                 end
             end
         end
-        if !isempty(pending) && !isfile(joinpath(dir, "pause.requested"))
+        if !isempty(pending) && !paused()
             error("farm incomplete: $(length(pending)) frames remain; inspect status.json and resume")
         end
         return farmstatus(dir)
     finally
-        for worker in workers
+        close(pool)
+        while isready(pool)                  # arrived, but never started
+            push!(joined, take!(pool))
+        end
+        for worker in joined
             try
                 closeworker!(worker)
             catch e
@@ -371,6 +391,15 @@ function renderfarm!(job::RenderJob, workers; frames = nothing,
         end
         rm(lockdir; recursive = true)
     end
+end
+
+"""The workers of a render as the channel it takes them from: a collection's, all there from the start."""
+workerchannel(workers::Channel) = workers
+function workerchannel(workers)
+    pool = Channel{FarmWorker}(Inf)
+    foreach(w -> put!(pool, w), workers)
+    close(pool)
+    return pool
 end
 
 "Encode all committed timeline frames, mix the saved edit's audio, and verify the full decode."

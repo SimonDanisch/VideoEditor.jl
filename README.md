@@ -205,6 +205,6 @@ isn't available (`Player(...; audiopreview = false)` disables it).
 ## Live scenes and render farms
 
 Procedural Makie scenes can be saved as timeline sources and exported through
-a resumable GPU farm: a farm daemon (`farm/farmd.jl`) on every machine offers
-its GPUs, and each job carries a pinned environment of its code for the workers
-to instantiate. See [the scene and farm guide](docs/renderfarm.md).
+a resumable GPU farm: the editor runs a farm server, every machine that renders
+offers its GPUs with `julia -m FarmClient all <server>`, and each job carries a
+pinned environment of its code for the clients to instantiate. See [the scene and farm guide](docs/renderfarm.md).

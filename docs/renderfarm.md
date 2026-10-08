@@ -131,7 +131,7 @@ a registered package an exact `[compat]` version; Julia its exact version; and
 the environment's package preferences come along. A checkout with uncommitted
 changes or a commit on no remote branch cannot be fetched by a worker:
 `renderjob` names every such package and stops. `portable = false` pins
-developed packages by `path` instead, for farm daemons on this machine only.
+developed packages by `path` instead, for farm clients on this machine only.
 
 The same edit asked for again resumes its job; a changed edit, file or package
 is refused for that directory (make a new job), so frames never mix.
@@ -142,65 +142,60 @@ on arbitrary threads; rendering is routed to the GPU's owning thread. A callable
 worker may implement `Base.close`, which the coordinator invokes at completion,
 pause or failure. Plain functions leave resource ownership to callers.
 
-## Farm daemons: other machines and other GPUs
+## Farm clients: other machines and every GPU
 
-Every machine that renders runs a farm daemon, a standard-library-only Julia
-script, with a config naming its GPUs (`farm/farmd.example.toml`):
+The editor runs a farm server; every `Player` starts one and logs the command
+that offers a machine's GPUs to it:
 
 ```sh
-julia farm/farmd.jl ~/.videoeditor/farmd.toml
+julia -m FarmClient all 192.168.178.92:7600
+julia -m FarmClient 7900,NVIDIA 192.168.178.92:7600   # only these GPUs
 ```
 
-```toml
-token = "a shared secret"
-[[slot]]
-name = "RX 7900 XTX"
-device = "7900"          # MANTLE_DEVICE: part of the GPU's name, or its index
-[[slot]]
-name = "RTX 4000 Ada"
-device = "NVIDIA"
-```
-
-One slot per GPU, so a second GPU is a second slot. The coordinator lists the
-machines in `~/.videoeditor/farm.toml`:
-
-```toml
-token = "a shared secret"
-[[machine]]
-host = "sim-bosgame.fritz.box"
-[[machine]]
-host = "localhost"       # this machine's own daemon: its second GPU
-```
+`FarmClient` is a standard-library-only package in this repository. Install it
+once per machine that renders, into the default environment:
 
 ```julia
-workers = farmworkers(job, farmmachines())
+import Pkg
+Pkg.add(url = "https://github.com/SimonDanisch/VideoEditor.jl", subdir = "FarmClient")
+```
+
+The first argument picks GPUs: `all` discrete and integrated ones, or a
+comma-separated list of indices or parts of their names. Run a client on the
+editor's own machine as well for its GPUs. A client waits for the server and
+reconnects when the editor restarts, so it can keep running.
+
+```julia
+workers = farmworkers(job)       # this session's server: farmserver()
 renderfarm!(job, workers)
 encodefarm!(job.directory, "movie.mp4")
 ```
 
-`farmworkers` asks every daemon for its free slots and opens each for the job
-over TCP, in parallel: it sends the snapshot; the daemon unpacks it, instantiates
-`environment/Project.toml` with the job's Julia version (`julia +<version>`
-through juliaup, or the configured `julia` if it is that version; automatic
-precompilation off) and starts a renderer on the slot's GPU in it
-(`VideoEditor.farmchild`, the GPU chosen by `MANTLE_DEVICE`), then relays frames.
-Environments are kept by their Project.toml and reused; packages and compiled
-code live in the daemon user's ordinary Julia depot, shared by jobs with the
-same versions. The first job on a machine installs and compiles, which takes
-minutes. A slot that cannot be opened is reported and left out. Closing a slot,
-or a dropped connection, ends its renderer and frees the GPU; a lock file per
-slot keeps two daemons from sharing one.
+`farmworkers` sends every connected client the job's snapshot. The client
+unpacks it, instantiates `environment/Project.toml` with the job's Julia
+version (`julia +<version>` through juliaup, or its own Julia if it is that
+version; automatic precompilation off), asks the job's VideoEditor which GPUs
+there are (`farmgpus`) and starts a renderer per GPU in it (`farmchild`, the
+GPU chosen by index). Each renderer, once ready, connects back to the server and
+joins the running render, so frames start on the first GPU while slower
+machines still install or compile. Environments are kept by their Project.toml
+under `~/.videoeditor/farm` and reused; packages and compiled code live in the
+ordinary Julia depot. The first job on a machine installs and compiles, which
+takes minutes. A GPU that cannot be opened is reported and left out. Closing a
+GPU's worker, or a dropped connection, ends its renderer and frees the GPU; a
+lock file per GPU keeps two jobs from sharing one.
 
 Messages are TOML headers with byte payloads, not Julia serialization, so the
-coordinator, daemon and renderer may run different Julia or VideoEditor
-versions. The connection is plain TCP with a shared token: run daemons on a
-network you trust.
+editor, client and renderer may run different Julia or VideoEditor versions.
+The connections are plain TCP without authentication: a client renders what
+the server it was pointed at sends, and the server hands every connected client
+the job's files. Run the farm on a network you trust.
 
-With `~/.videoeditor/farm.toml` present, every `Player` offers **Export →
-Render on farm…** and **Ctrl+P → Render on LAN farm** (`registerlanfarm!`). It
-snapshots the edit, renders on every free slot, shows progress, then uses the
-Export panel's chosen file, H.264/H.265, quality, preset and audio settings.
-Farm output supports MP4/MKV/MOV. GIF still uses the local export action.
+Every `Player` offers **Export → Render on farm…** and **Ctrl+P → Render on LAN
+farm** (`registerlanfarm!`), enabled while a client is connected. It snapshots
+the edit, renders on every offered GPU, shows progress, then uses the Export
+panel's chosen file, H.264/H.265, quality, preset and audio settings. Farm
+output supports MP4/MKV/MOV. GIF still uses the local export action.
 `registerfarm!` registers any other transport the same way.
 
 ## Resume and verification

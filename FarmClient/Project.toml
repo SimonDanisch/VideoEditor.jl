@@ -1,0 +1,18 @@
+name = "FarmClient"
+uuid = "87cf041e-6eec-46f9-9557-632c0edf82e2"
+version = "0.1.0"
+
+[deps]
+FileWatching = "7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+Tar = "a4e569a6-e804-4fa4-b0f3-eef7a1d5b13e"
+
+[compat]
+FileWatching = "1"
+SHA = "0.7, 1"
+Sockets = "1"
+TOML = "1"
+Tar = "1"
+julia = "1.11"

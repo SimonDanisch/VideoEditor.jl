@@ -23,7 +23,7 @@ and weak dependencies as the active manifest resolved them, each pinned.
   - The environment's package preferences come along, as `[preferences]`.
 
 With `portable = false`, developed packages are `path` sources instead: an
-environment for farm daemons on this machine only (its second GPU), which can
+environment for farm clients on this machine only (its own GPUs), which can
 render what is not committed yet.
 """
 function farmenvironment(roots; project::AbstractString = Base.active_project(), portable::Bool = true)

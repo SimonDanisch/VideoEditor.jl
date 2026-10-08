@@ -141,11 +141,11 @@ never call `Pkg.precompile()` or run a separate precompile pass. Keep the enviro
 for later runs, and pin its versions when the runtime stabilizes. Each test closes
 its editor window in `finally`.
 
-`test/farmdaemon.jl` checks the farm across processes: it starts a farm daemon
-(`farm/farmd.jl`) with a slot per GPU of this machine, makes a job with a
-`portable = false` environment, opens every slot over TCP and renders through
-the daemons' own renderer processes. Set `VIDEOEDITOR_FARM_TEST=1` to run it:
-the first run instantiates the job environment and compiles VideoEditor in it.
+`test/farmclient.jl` checks the farm across processes: it starts a farm server
+and a farm client offering every GPU of this machine, makes a job with a
+`portable = false` environment and renders it through the client's renderer
+processes, one per GPU. Set `VIDEOEDITOR_FARM_TEST=1` to run it: the first run
+instantiates the job environment and compiles VideoEditor in it.
 
 `test/sceneediting.jl` also covers opening projects with different canvas sizes
 and discarding a render when its destination changes during composition.
