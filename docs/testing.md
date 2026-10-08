@@ -39,20 +39,14 @@ backward seeking, cuts and save/reopen. After including the core test with
 It saves an MP4 and screenshots and checks GPU raster configuration and preview
 pixels; this small fixture does not establish full telescope-movie performance.
 
-CrawCity's `tools/telescope_videoeditor_port` is the adapter and integration QA
-for Science4Makie's actual `sharpness/shot_arrival`. Copy it to
-`sharpness/videoeditor`; its README describes recording and bundle inputs. The
-reference check records the full scientific grid, seeks out of order and compares
-three checkpoints with the original shot. Its farm check starts a separate Julia
-process and verifies three actual GPU-traced frames and exact-job resume. Supply
-`rayreferences` to compare traced PNGs with independently rendered original
-checkpoints at the same settings. The check rejects duplicated face lights or
-emission textures after retained scene updates. The
-walkthrough edits camera and ambient light by mouse/keyboard, checks Undo, cuts,
-save/reopen and the displayed preview, and retains screenshots and an MP4.
-This fourteen-second shot has no dialogue; these checks do not port or validate
-the other telescope-film shots. Unset Makie cycled colours are excluded from
-recording so replay cannot turn palette defaults into explicit material overrides.
+The telescope film lives in Makie4Science's `Telescope` package, every part a
+scene built once and animated by keyframes. Its tests build every part and check
+that every key names a plot, an argument or the camera of what was built (the
+editor skips a key that names nothing); they need a GPU and the film's
+artifacts. `Telescope/tools/make_project.jl` writes the whole film as a project
+with its approved narration, which a render farm uses without a speech model.
+Unset Makie cycled colours are excluded from recording so replay cannot turn
+palette defaults into explicit material overrides.
 
 The recordings cover preview resolution selection, camera keys, actor transform keys, grading, cuts,
 cross-dissolve Undo, ripple deletion, crop cancellation, speech text, reference
