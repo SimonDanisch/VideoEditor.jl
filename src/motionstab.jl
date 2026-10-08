@@ -223,7 +223,17 @@ function cameralock!(clip::Clip; point = nothing, window::Integer = 96,
     # small sources get proportionally smaller patches and searches
     window = clamp(min(Int(window), source.width ÷ 3, source.height ÷ 3), 24, Int(window))
     iseven(window) || (window -= 1)
-    lostradius = min(Int(lostradius), window)
+    # …and so does the reacquisition search, which sets the margin patches are
+    # detected inside (`window ÷ 2 + reacqradius + 4`): at most a third of the
+    # short side, which leaves a 1080p source at the defaults. Unscaled, a 320×180
+    # source had a margin of 97, more than half its height, so every patch came
+    # from one band through the middle; a subject crossing it covered them all,
+    # and the scene lock coasted from frame 19 on a velocity fitted to three
+    # patches (14 px/frame on Metal). The object patch absorbed that, slipping
+    # 1-2 px by an amount that depended on the device.
+    reacqradius = clamp(min(source.width, source.height) ÷ 3 - window ÷ 2 - 4,
+                        min(Int(searchradius), Int(reacqradius)), Int(reacqradius))
+    lostradius = min(Int(lostradius), window, reacqradius)
     searchradius = min(Int(searchradius), lostradius)
     dec = graysource(backend, source)   # GPU decode+grayscale on a GPU backend
     # the frame stays on the analysis backend end-to-end: the stream grays it
