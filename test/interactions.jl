@@ -1855,6 +1855,14 @@ end
         end
 
         @testset "a matte repair is visible and droppable" begin
+            # Opening the matte tool earlier warms the propagation model on the
+            # GPU worker, in the background: 67 s on the dev machine, past the
+            # 150 s `GPUWAIT` on legion-boi. Every frame this test presents queues
+            # behind it, so it waits for the worker first. A job posted now runs
+            # after the warm-up: the queue is FIFO.
+            idle = Threads.Atomic{Bool}(false)
+            VE.rungpu(() -> (idle[] = true), p)
+            @test waitfor(() -> idle[]; s = 900)
             clip = p.sequence.clips[1]
             reps = VE.matterepairs(p, clip)
             @test isempty(reps)
