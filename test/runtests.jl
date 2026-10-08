@@ -473,7 +473,10 @@ end
                            (c, _) -> c === left ? red : blue;
                            canvas = dims,
                            alphafor = (c, _) -> c === right ? α : nothing) do canvas
-            out[] = copy(canvas)
+            # `Array`, not `copy`: the canvas is the render device's array. Metal's
+            # shared storage let the host index a copy in place; a Vulkan buffer
+            # is device memory, and indexing it is scalar indexing.
+            out[] = Array(canvas)
         end
         px = out[][dims[1] ÷ 2, dims[2] ÷ 2]
         @test Float32(VE.ColorTypes.red(px))  ≈ 1 - α atol = 0.01
@@ -506,7 +509,7 @@ end
                      (c, _) -> get!(() -> VE.opendecoder(c.source, engine.backend),
                                     readers, VE.sourcepath(c.source));
                      canvas = dims, exact = true) do canvas
-            o[] = copy(canvas)
+            o[] = Array(canvas)
         end
         return o[]
     end
@@ -1544,7 +1547,7 @@ end
 
     engine = VE.FxEngine(VE.KA.CPU())
     out = Ref{Any}(nothing)
-    VE.render(engine, frame, clip, f0) do o; out[] = copy(o); end
+    VE.render(engine, frame, clip, f0) do o; out[] = Array(o); end
     @test out[] == VE.applymatte!(copy(frame), clip, f0; strength = 1.0)
     @test out[][3, 3] == VE.RGB{VE.N0f8}(0, 0, 0)                # background keyed
     @test out[][src.width ÷ 2, src.height ÷ 2] != VE.RGB{VE.N0f8}(0, 0, 0)
@@ -1555,7 +1558,7 @@ end
     g = clip.graph
     VE.setvalue!(VE.param(clip.effects[end], :strength), 0.5, 0)
     half = Ref{Any}(nothing)
-    VE.render(engine, frame, clip, f0) do o; half[] = copy(o); end
+    VE.render(engine, frame, clip, f0) do o; half[] = Array(o); end
     @test clip.graph === g
     @test length(engine.layers) == 1
     @test half[] != out[]
@@ -1566,13 +1569,13 @@ end
     clip.mattetrack = MatteTrack(alpha2, clip.src_in, [clip.src_in])
     VE.setvalue!(VE.param(clip.effects[end], :strength), 1.0, 0)
     fresh = Ref{Any}(nothing)
-    VE.render(engine, frame, clip, f0) do o; fresh[] = copy(o); end
+    VE.render(engine, frame, clip, f0) do o; fresh[] = Array(o); end
     @test fresh[] == VE.applymatte!(copy(frame), clip, f0; strength = 1.0)
     @test fresh[] != out[]
 
     # outside the analysed range the node renders nothing — not the last plane
     outside = Ref{Any}(nothing)
-    VE.render(engine, frame, clip, f0 + 50) do o; outside[] = copy(o); end
+    VE.render(engine, frame, clip, f0 + 50) do o; outside[] = Array(o); end
     @test outside[] == frame
 
     # KEYING WRITES COVERAGE, not black: where the matte removed the background the
@@ -1588,7 +1591,7 @@ end
     canvas = Ref{Any}(nothing)
     @test VE.composite(eng2, [base, top], 0, (c, sf) -> c === base ? red : blue;
                        canvas = dims) do cv
-        canvas[] = copy(cv)
+        canvas[] = Array(cv)
     end
     @test canvas[][src.width ÷ 2, src.height ÷ 2] == VE.RGB{VE.N0f8}(0, 0, 1)
     @test canvas[][3, 3] == VE.RGB{VE.N0f8}(1, 0, 0)
