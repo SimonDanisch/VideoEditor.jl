@@ -18,6 +18,8 @@ and weak dependencies as the active manifest resolved them, each pinned.
   - A package added from a repository is pinned to its commit the same way;
     one that follows a branch is refused (the branch moves).
   - A registered package gets an exact `[compat]` version, and so does Julia.
+    Compat cannot name a build (a JLL's `+2`); a JLL whose build is not the
+    newest of its version is pinned by `[sources]` at its release tag.
   - The environment's package preferences come along, as `[preferences]`.
 
 With `portable = false`, developed packages are `path` sources instead: an
@@ -46,8 +48,17 @@ function farmenvironment(roots; project::AbstractString = Base.active_project(),
                 push!(problems, "$name follows \"$rev\" of $(entry["repo-url"]): add it at a commit, or develop it")
             sources[name] = Dict{String, Any}("url" => entry["repo-url"], "rev" => rev)
         else
-            # a build number (a JLL's `+1`) has no place in compat; the version is exact
-            compat[name] = "=" * first(split(entry["version"], '+'))
+            version = VersionNumber(entry["version"])
+            compat[name] = "=" * string(VersionNumber(version.major, version.minor, version.patch))
+            # Compat names a version, not its build (a JLL's `+2`): it admits every
+            # build of it, and a worker would install the newest. Not ours when the
+            # registry has a newer one, so then the build is pinned at its release tag.
+            repo = newerbuild(entry["uuid"], version)
+            if repo !== nothing
+                endswith(name, "_jll") ||
+                    push!(problems, "$name $version is not the newest build of its version, and only a JLL's tag can be named")
+                sources[name] = Dict{String, Any}("url" => repo, "rev" => "$(chopsuffix(name, "_jll"))-v$version")
+            end
         end
     end
     isempty(problems) || error("the farm can only render code a worker can fetch:\n  " * join(problems, "\n  "))
@@ -87,6 +98,22 @@ function dependencyclosure(entries, roots)
         end
     end
     return seen
+end
+
+"""
+The repository of the registered package `uuid` if a registry has a newer build
+of `version` (same major, minor and patch) than it; `nothing` otherwise.
+"""
+function newerbuild(uuid::AbstractString, version::VersionNumber)
+    isempty(version.build) && return nothing
+    for registry in Pkg.Registry.reachable_registries()
+        entry = get(registry, Base.UUID(uuid), nothing)
+        entry === nothing && continue
+        info = Pkg.Registry.registry_info(entry)
+        same(v) = (v.major, v.minor, v.patch) == (version.major, version.minor, version.patch)
+        any(v -> same(v) && v > version, keys(info.version_info)) && return info.repo
+    end
+    return nothing
 end
 
 """A standard library: a manifest entry with no tree hash, path or repository of its own."""

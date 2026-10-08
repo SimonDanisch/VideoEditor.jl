@@ -41,7 +41,7 @@ gitin(dir, args...) = run(pipeline(`git -C $dir -c user.email=farm@test -c user.
         julia_version = "$VERSION"
         manifest_format = "2.0"
         [[deps.Probe]]
-        deps = ["Rexported", "Dates"]
+        deps = ["Rexported", "Dates", "libpng_jll"]
         path = "../monorepo/Probe"
         uuid = "$uuid"
         version = "0.1.0"
@@ -52,11 +52,20 @@ gitin(dir, args...) = run(pipeline(`git -C $dir -c user.email=farm@test -c user.
         [[deps.Dates]]
         uuid = "ade2ca70-3891-5945-98fb-dc099432e06a"
         version = "1.11.0"
+        [[deps.libpng_jll]]
+        git-tree-sha1 = "32781be40fe86735af02eae0dd22754e4b5f779d"
+        uuid = "b53b4c65-9356-5827-b1ea-8c7a1a84506f"
+        version = "1.6.59+0"
         """)
         project = joinpath(env, "Project.toml")
         pinned = VE.farmenvironment(["Probe"]; project)
         @test pinned["sources"]["Probe"] == Dict("url" => remote, "rev" => head, "subdir" => "Probe")
         @test pinned["compat"]["Rexported"] == "=2.3.4"          # a build number cannot be a compat entry
+        # …so a JLL whose build is not its version's newest (1.6.59+1 is registered)
+        # is pinned at its release tag
+        @test pinned["compat"]["libpng_jll"] == "=1.6.59"
+        @test pinned["sources"]["libpng_jll"] ==
+              Dict("url" => "https://github.com/JuliaBinaryWrappers/libpng_jll.jl.git", "rev" => "libpng-v1.6.59+0")
         @test pinned["compat"]["julia"] == "=$(VERSION.major).$(VERSION.minor).$(VERSION.patch)"
         @test !haskey(pinned["deps"], "Dates")                   # standard libraries come with Julia
         @test pinned["preferences"]["Probe"]["quality"] == "high"
@@ -86,7 +95,7 @@ end
         end
         close(peer)
     end)
-    sock = connect(ip"127.0.0.1", port)
+    sock = Sockets.connect(ip"127.0.0.1", port)
     big = rand(UInt8, 3_000_000)                          # a frame's PNG is megabytes
     VE.sendmessage(sock, Dict{String, Any}("command" => "frames", "frames" => [3, 1]), big)
     header, payload = VE.receivemessage(sock)

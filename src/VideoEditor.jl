@@ -35,6 +35,7 @@ import Scratch
 import Statistics: median, mean
 import SHA
 import Tar
+import Pkg
 using Sockets: connect, TCPSocket
 
 const RGBFrame = Matrix{RGB{N0f8}}
