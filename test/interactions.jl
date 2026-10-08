@@ -2111,13 +2111,21 @@ end
             press(Point2f(bb.origin .+ bb.widths ./ 2)); release()
             @test menu.is_open[]
             rects = menuscene.plots[1][1][]
-            tr = Makie.translation(menuscene)[]
-            row1 = Point2f(sum(extrema(rects[1])) ./ 2 .+ Point2f(tr[1], tr[2]))
+            tr = Point2f(Makie.translation(menuscene)[][1], Makie.translation(menuscene)[][2])
             # The overlap is REAL — the whole point of the regression. What sits
             # under the dropdown is the filter box now (the compare button moved
             # below it), and the rule is the same: a widget drawn under an open
-            # menu must not swallow the row you click.
-            @test row1 in p.fxwidgets[:fxfilterbox].layoutobservables.computedbbox[]
+            # menu must not swallow the row you click. So the press goes where the
+            # row is OVER the box. The row's centre was used, which is over the box
+            # only while the gap between the menu and the box is less than half a
+            # row; on the Mac it is 1.65 px short of that, and the row is no less
+            # covering the box for it.
+            box = p.fxwidgets[:fxfilterbox].layoutobservables.computedbbox[]
+            lo = max.(Point2f(minimum(rects[1])) .+ tr, Point2f(minimum(box)))
+            hi = min.(Point2f(maximum(rects[1])) .+ tr, Point2f(maximum(box)))
+            @test all(lo .< hi)
+            row1 = Point2f((lo .+ hi) ./ 2)
+            @test row1 in box
             press(row1); release(); sleep(0.3)
             @test !menu.is_open[]
             @test length(clip.effects) == nfx + 1
@@ -3371,7 +3379,9 @@ end
             sleep(0.25)
         end
         @test rows() > 0
-        @test any(q -> q.view !== nothing && q.view.control isa Makie.Slider, fx.params)
+        # a scene's numbers are typed, not slid: every numeric row of a `:scene`
+        # card is a number entry (`numeric` in `paramform!`, sceneediting.jl)
+        @test any(q -> q.view !== nothing && q.view.control isa Makie.Textbox, fx.params)
         @test fx !== nothing && !isempty(fx.params)
         @test all(q -> q.range !== nothing, fx.params)   # every row is buildable
 
@@ -3447,19 +3457,26 @@ end
         @test w.tabs.active[] == 2
         go = first(b for b in allblocks(p.fxwidgets[:bakemodal].body)
                    if b isa Makie.Button && b.label[] == "Bake")
-        click(ctr(go.layoutobservables.computedbbox[]))
 
-        # The spinner runs WHILE it renders — polled, because a bake this short can
-        # finish between two `sleep`s and an assertion on one sample would be a
-        # coin toss.
-        spun = false
+        # The spinner runs WHILE it renders — watched from before the press, because
+        # a bake this short can be over before the click itself returns: on the Mac
+        # the sixty frames took 0.29 s and were done inside the click's 0.3 s settle,
+        # so a watch that started after it never saw the bar.
+        spun = Ref(false)
+        watching = Ref(true)
+        watch = @async while watching[]
+            isnan(p.jobprogress[]) || (spun[] = true)
+            sleep(0.001)
+        end
+        click(ctr(go.layoutobservables.computedbbox[]))
         t0 = time()
         while c.bake === nothing && time() - t0 < 60
-            isnan(p.jobprogress[]) || (spun = true)
             sleep(0.02)
         end
+        watching[] = false
+        wait(watch)
         @test c.bake !== nothing
-        @test spun                                   # footer spinner + bar animated
+        @test spun[]                                 # footer spinner + bar animated
         @test waitfor(() -> isnan(p.jobprogress[]); s = 10)          # …and stopped
         @test waitfor(() -> startswith(p.fxwidgets[:bakelabel].text[], "bake in use"))
         @test p.fxwidgets[:bakeuse].label[] == "off"
@@ -3542,8 +3559,13 @@ end
         c.source.backend = :GLMakie
         VE.seek!(p, 0); sleep(0.5)
     finally
-        delete!(VE.BACKENDS, :FakeProgressiveBackend)
-        close(p)
+        # The player first: the timeline's track previews hold a scene source of
+        # their own, and closing it asks its backend to close the screen it made.
+        try
+            close(p)
+        finally
+            delete!(VE.BACKENDS, :FakeProgressiveBackend)
+        end
     end
 end
 
