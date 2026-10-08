@@ -72,7 +72,7 @@ mutable struct FarmRenderer
     closed::Bool
 end
 function farmthread(renderer::FarmRenderer)
-    queue = Mantle.batchqueue(renderer.engine.device)
+    queue = Mantle.batchqueue(enginedevice(renderer.engine))
     return hasproperty(queue, :thread) ? queue.thread - 1 : 0
 end
 

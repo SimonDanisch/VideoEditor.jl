@@ -1422,7 +1422,7 @@ them bottom to top by itself — the stacking order is the declaration order and
 there is nothing else stating it.
 """
 function buildcomposition(engine, clips, graphs, canvas::Tuple{Int, Int})
-    g = Mantle.Graph(engine.device)
+    g = Mantle.Graph(enginedevice(engine))
     W, H = canvas
     # The CANVAS has no alpha: it is what is delivered — to the screen, to the
     # encoder — and there is nothing behind it to show through. Coverage is a
@@ -1520,7 +1520,7 @@ bake keeps, so a pre-rendered scene still shows the clip underneath it."
 layerplane(lp::LayerPlan) = frameview(lp.chain.out, lp.chain.dims)
 
 function buildlayer(engine, clip::Clip, fg::FxGraph)
-    g = Mantle.Graph(engine.device)
+    g = Mantle.Graph(enginedevice(engine))
     ch = buildchain!(g, clip, fg)
     out = Mantle.Transient.Buffer(g, RGB{N0f8}, ch.dims...)
     # The crop REMOVES picture, and a caller handed this buffer gets the clip,
@@ -1546,7 +1546,7 @@ layersignature(clip::Clip, fg::FxGraph) = (clip.id, objectid(fg))
 
 """
 Owns the render resources so callers pass one handle. `device` is the Mantle
-device — it owns the pool every transient comes from — and `compositions` /
+device, see [`enginedevice`](@ref) — it owns the pool every transient comes from — and `compositions` /
 `layers` hold the compiled graphs.
 
 There is no store beside them. Everything a render touches is a resource of the
@@ -1559,8 +1559,26 @@ mutable struct FxEngine
     compositions::Dict{Any, Composition}
     layers::Dict{Any, LayerPlan}
 end
-FxEngine(backend) = FxEngine(backend, Mantle.Device(backend),
-                             Dict{Any, Composition}(), Dict{Any, LayerPlan}())
+FxEngine(backend) = FxEngine(backend, nothing, Dict{Any, Composition}(), Dict{Any, LayerPlan}())
+
+"""
+    enginedevice(engine) -> Mantle device
+
+The device `engine` renders on, made by its first render rather than with the
+engine. A Vulkan context belongs to the thread that touches it first, and an
+engine is built wherever its owner is — a `Player` on thread 1 — while it renders
+on the thread [`mantlethread`](@ref) answers.
+
+The device of the analysis backend, and the default device for the CPU one:
+analysis kernels run on the CPU there, and effects are rendered by Mantle, which
+has no host device.
+"""
+function enginedevice(e::FxEngine)
+    e.device === nothing && (e.device = renderdevice(e.backend))
+    return e.device
+end
+renderdevice(backend) = Mantle.Device(backend)
+renderdevice(::KA.CPU) = Mantle.Device()
 
 """
 Give every compiled composition's regions back to the pool. Explicit — Mantle

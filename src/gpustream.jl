@@ -41,7 +41,7 @@ frames by display index via [`frameat!`](@ref); the ring keeps recently-used GOP
 frames VRAM-resident up to `capacity` frames. `close` frees the ring and unmaps the
 bitstream.
 """
-mutable struct GpuVideoStream{B<:KA.GPU}
+mutable struct GpuVideoStream{B<:KA.Backend}
     backend   ::B
     codec     ::Symbol                    # :h264 | :hevc — selects parser + decode session
     tmpfile   ::String                    # demux temp file (mmap-backed); removed on close
@@ -80,7 +80,7 @@ driver reports enough free device memory (a stingy default must not hitch a 20 G
 card). If even one GOP exceeds the final budget the stream refuses to open (the
 caller falls back to CPU decode) rather than thrash.
 """
-function openstream(backend::KA.GPU, path::AbstractString, width::Integer, height::Integer;
+function openstream(backend::KA.Backend, path::AbstractString, width::Integer, height::Integer;
                     capacity::Integer = 120, vrambudget::Integer = 3 * 2^30)
     Mantle.videodecodes(backend) || throw(ArgumentError(
         "openstream: $(nameof(typeof(backend))) has no hardware video decode " *
@@ -141,7 +141,7 @@ Free device-local VRAM in bytes — the driver's budget minus its usage
 (VK_EXT_memory_budget); half the heap size when the extension is missing,
 0 when no context is up (callers treat that as "don't grow").
 """
-function freedevicevram(backend::KA.GPU)
+function freedevicevram(backend::KA.Backend)
     try
         heaps = Mantle.probe_device_memory_budget(Mantle.vk_context())
         free = 0

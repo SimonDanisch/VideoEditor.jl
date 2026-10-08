@@ -270,7 +270,9 @@ end
 
 @testset "a scene renders on the thread its renderer owns" begin
     @test VE.renderthread(VE.GLMakie) == 0                          # GLMakie: thread 1
-    @test VE.renderthread(FakeGPUBackend) == Threads.nthreads() - 1   # GPU: the worker's
+    # GPU: the thread that owns the device's submit channel, asked of Mantle
+    queue = FakeGPUBackend.Mantle.batchqueue(FakeGPUBackend.Mantle.Device())
+    @test VE.renderthread(FakeGPUBackend) == (hasproperty(queue, :thread) ? queue.thread - 1 : 0)
     # …and the hop lands there, from wherever it is called
     @test VE.onthread(() -> Threads.threadid(), 0) == 1
     @test VE.onworkerthread(() -> Threads.threadid()) == Threads.nthreads()
