@@ -3547,8 +3547,16 @@ end
         c.source.backend = :FakeProgressiveBackend
         VE.redraw!(p)
         counts = Int[]
+        # Waited for, not slept for: the count is a rate, and a fixed 1.2 s held
+        # fewer than 64 samples on Windows, where the refiner's waits are coarser.
+        # What has to hold is that it gets past 64 at each new position at all.
         for n in (20, 50, 80)
-            VE.seek!(p, n); sleep(1.2)
+            VE.seek!(p, n)
+            t0 = time()
+            while !(c.source.at == VE.sourceframe(c, n) && c.source.samples > 64) &&
+                  time() - t0 < 10
+                sleep(0.1)
+            end
             @test c.source.at == VE.sourceframe(c, n)
             push!(counts, c.source.samples)
         end
