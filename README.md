@@ -196,6 +196,45 @@ into PipeWire (`pw-cat`) while playing — cuts, trims, gaps and mute sources
 all follow the edit. Zero extra dependencies; silently off when PipeWire
 isn't available (`Player(...; audiopreview = false)` disables it).
 
+## Frame-granular track caches
+
+Raytraced scenes also retain a separate, lossless Float32 HDR source master
+with albedo, normal, depth and coverage planes and separate raster overlays.
+`LinearGradeEffect`, `HDRDenoiseEffect` and `ToneMapEffect` operate
+non-destructively before the display-referred GPU chain. Effect changes dirty
+only derived track/composite frames, not the traced source. The source master
+and its mutation metadata persist alongside the project.
+
+The current source format is uncompressed (roughly 55 MB per 720p frame);
+plan disk space accordingly. The spatial denoiser is a reference filter.
+Native `OIDNDenoiseEffect` is supplied by the optional OIDNRunner extension,
+including guide prefiltering. Hikari extracts material-aware albedo and world
+normals; obsolete guides are refused. `refreshguides!(clip,sf)` updates guides
+with primary rays only, retaining the original radiance and coverage.
+
+`enabletrackcache!(seq, directory)` enables independent post-effect RGBA caches
+per track and a separate composite cache. Dirty source frames are recorded by
+mutation hooks, not inferred by comparing edit histories. Cached planes and
+dirty-frame metadata persist through `saveproject` / `loadproject`.
+
+Makie scene clips default to raster. Use
+`setrenderconfig!(clip; raytrace=true, samples=256)` to opt into raytracing.
+Put transparent raster labels on a separate track: changing their parameters or
+`setsceneargs!` does not rerender the underlying scene. `setframevalue!`
+changes exactly one discrete frame of a hold/linear parameter curve; ordinary
+interpolated key edits invalidate their affected segments.
+
+For external mutations, declare their scope with
+`mutateframe!(callback, seq, track, timelineframe)`,
+`mutateframes!`, or `invalidateclip!(clip; frames=sourceframes)`.
+Filesystem writes and nested array changes do not emit mutation events.
+Moving a clip reuses its source planes; extending its out-point renders only
+new frames when the existing animation remains unchanged.
+
+Regression checks: run `test/trackcache.jl` in an environment providing
+VideoEditor, RayMakie and Mantle. They exercise one-frame edits, extensions,
+placement changes, save/reopen and mutation during an in-flight render.
+
 ## Known limitations
 
 - preview audio has ~0.1–0.2 s of pipe latency (export stays sample-exact);

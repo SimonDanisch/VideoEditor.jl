@@ -779,6 +779,8 @@ mutable struct Param{T}
     # not something a curve can say.
     input::Union{Nothing, ParamInput}
     view::Union{Nothing, ParamView}       # while its card is on screen
+    owner::Any
+    changedframes::Union{Nothing,UnitRange{Int}}
 end
 
 """
@@ -797,7 +799,18 @@ function Param(name::Symbol, label::AbstractString, value::T;
     return Param{T}(name, String(label), Observable(c), Observable(visible),
                     range === nothing ? nothing :
                     (Float64(range[1]), Float64(range[2])),
-                    input, nothing)
+                    input, nothing, nothing, nothing)
+end
+
+Param{T}(name,label,curve,visible,range,input,view) where {T} =
+    Param{T}(name,label,curve,visible,range,input,view,nothing,nothing)
+
+function Base.setproperty!(p::Param,name::Symbol,value)
+    if name === :input && p.owner !== nothing
+        sceneparam=any(fx.kind===:scene && any(x->x===p,fx.params) for fx in p.owner.effects)
+        invalidateclip!(p.owner;source=sceneparam)
+    end
+    return setfield!(p,name,convert(fieldtype(typeof(p),name),value))
 end
 
 """
@@ -964,21 +977,58 @@ site used to spell that fork out, and the two halves wrote to different places.
 """
 function setvalue!(p::Param{T}, value, frame::Integer) where {T}
     isfollowing(p) && (p.input = nothing)
+    affected=isanimated(p) ? keyaffected(p,frame) : nothing
     c = p.curve[]
     if isanimated(p)
         setkey!(c, frame, value)
     else
         movekey!(c, 1, c.keys[1].frame, value)
     end
-    notify(p.curve)
+    notifyparam!(p,affected)
     return p
 end
 
 "Insert or replace `p`'s key at `frame` (see [`setkey!`](@ref AnimCurve))."
-setkey!(p::Param, frame::Integer, value) =
-    (isfollowing(p) && (p.input = nothing); setkey!(p.curve[], frame, value); notify(p.curve); p)
-setkey!(p::Param, frame::Integer, value, ease::Symbol) =
-    (isfollowing(p) && (p.input = nothing); setkey!(p.curve[], frame, value, ease); notify(p.curve); p)
+function setkey!(p::Param,frame::Integer,value)
+    isfollowing(p) && (p.input = nothing)
+    affected=keyaffected(p,frame)
+    setkey!(p.curve[],frame,value); notifyparam!(p,affected)
+    return p
+end
+function setkey!(p::Param,frame::Integer,value,ease::Symbol)
+    isfollowing(p) && (p.input = nothing)
+    affected=keyaffected(p,frame)
+    setkey!(p.curve[],frame,value,ease); notifyparam!(p,affected)
+    return p
+end
+function notifyparam!(p::Param,frames=nothing)
+    p.changedframes=frames
+    try
+        notify(p.curve)
+    finally
+        p.changedframes=nothing
+    end
+    return p
+end
+function keyaffected(p::Param,frame::Integer)
+    p.owner === nothing && return nothing
+    ks=p.curve[].keys; length(ks)<2 && return nothing
+    prev=findlast(k -> k.frame<frame,ks); next=findfirst(k -> k.frame>frame,ks)
+    # A held predecessor is unchanged before the edited key. Interpolated
+    # segments change only strictly after their unchanged endpoint.
+    lo=prev === nothing ? 0 : (ks[prev].ease === :hold ? Int(frame) : ks[prev].frame+1)
+    hi=next === nothing ? p.owner.src_out-1 : ks[next].frame-1
+    return Int(lo):Int(hi)
+end
+function setframevalue!(p::Param{T},frame::Integer,value) where {T}
+    p.input === nothing || error("detach a driven parameter before making a frame override")
+    c=p.curve[]
+    any(k.ease ∉ (:hold, :linear) for k in c.keys) && error("frame overrides require a hold or linear curve")
+    before,after=valueat(c,frame-1),valueat(c,frame+1)
+    setkey!(c,frame-1,before); setkey!(c,frame,convert(T,value),:hold); setkey!(c,frame+1,after)
+    notifyparam!(p,Int(frame):Int(frame))
+    return p
+end
 
 """
     removekey!(p, frame) -> Bool
@@ -990,9 +1040,10 @@ last is where animation stops.
 """
 function removekey!(p::Param, frame::Integer)
     length(p.curve[].keys) > 1 || return false
+    affected=keyaffected(p,frame)
     removekey!(p.curve[], frame) || return false
     isfollowing(p) && (p.input = nothing)
-    notify(p.curve)
+    notifyparam!(p,affected)
     return true
 end
 
@@ -1000,8 +1051,9 @@ function removekeyat!(p::Param, i::Integer)
     ks = p.curve[].keys
     length(ks) > 1 || return false
     isfollowing(p) && (p.input = nothing)
+    affected=keyaffected(p,ks[i].frame)
     deleteat!(ks, i)
-    notify(p.curve)
+    notifyparam!(p,affected)
     return true
 end
 
@@ -1023,8 +1075,13 @@ function clearkeys!(p::Param{T}, frame::Integer) where {T}
 end
 
 "Move `p`'s `i`-th key to `(frame, value)` — see [`movekey!`](@ref AnimCurve)."
-movekey!(p::Param, i::Integer, frame::Integer, value) =
-    (isfollowing(p) && (p.input = nothing); movekey!(p.curve[], i, frame, value); notify(p.curve); p)
+function movekey!(p::Param,i::Integer,frame::Integer,value)
+    isfollowing(p) && (p.input = nothing)
+    a=keyaffected(p,p.curve[].keys[i].frame); b=keyaffected(p,frame)
+    affected=a === nothing || b === nothing ? nothing : (min(first(a),first(b)):max(last(a),last(b)))
+    movekey!(p.curve[],i,frame,value); notifyparam!(p,affected)
+    return p
+end
 
 "Set the ease mode of `p`'s `i`-th key."
 setease!(p::Param, i::Integer, mode::Symbol) =

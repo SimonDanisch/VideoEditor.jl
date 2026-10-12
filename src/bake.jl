@@ -27,7 +27,8 @@ describes the clip is a wrong picture. Kept, because the frames may be exactly
 what was wanted and re-rendering costs minutes — `dirty` stays set, the panel says
 so, and switching it back on is one click.
 """
-function bakedirty!(clip::Clip)
+function bakedirty!(clip::Clip;frames=clip.src_in:(clip.src_out-1))
+    invalidateclip!(clip;frames,source=false)
     b = clip.bake
     b === nothing && return clip
     b.dirty = true
@@ -98,6 +99,8 @@ function hasbakedframe(clip::Clip, sf::Integer)
 end
 
 function bakedframe(clip::Clip, sf::Integer)
+    cached = cachedtrackframe(clip, sf)
+    cached === nothing || return cached
     hasbakedframe(clip, sf) || return nothing
     b = clip.bake
     f = bakeframefile(b, sf)

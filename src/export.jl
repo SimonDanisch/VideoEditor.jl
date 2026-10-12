@@ -251,7 +251,7 @@ its own compositor — render both sides into host buffers, lerp on the host. A
 dissolve is two layers of the ONE composite now, so nothing here needs a second
 canvas.
 """
-function renderframe!(dest::AnyRGBFrame, seq::Sequence, n::Integer,
+function renderuncachedframe!(dest::AnyRGBFrame, seq::Sequence, n::Integer,
                       readers::Dict{String, Any}, engine::FxEngine;
                       black::Union{Nothing, AbstractMatrix} = nothing)
     tr = transitionat(seq, n)

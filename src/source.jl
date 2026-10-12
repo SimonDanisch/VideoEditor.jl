@@ -121,8 +121,8 @@ mutable struct SceneSource <: ClipSource
     soundtrack::String
 end
 SceneSource(root; joints::Dict{Symbol, Any} = Dict{Symbol, Any}(), camera = nothing,
-            build = nothing, backend::Symbol = :GLMakie,
-            screenopts::Dict{Symbol, Any} = Dict{Symbol, Any}(),
+            build = nothing, backend::Symbol = defaultscenebackend(),
+            screenopts::Dict{Symbol, Any} = Dict{Symbol, Any}(:rasterize=>true,:samples=>1),
             width::Integer = 1920, height::Integer = 1080,
             framerate::Real = 30.0, nframes::Integer = 90,
             bakewith::Symbol = :auto,

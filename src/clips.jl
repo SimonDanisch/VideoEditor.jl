@@ -585,6 +585,9 @@ that has a matte, which renders a plausible picture with the effect absent.
 const PLACEFIELDS = (:start, :src_in, :src_out, :track, :rate)
 
 function Base.setproperty!(clip::Clip, name::Symbol, x)
+    oldspan=name in PLACEFIELDS ? (clip.start:(clipend(clip)-1)) : nothing
+    oldtrack=clip.track
+    oldend=name === :src_out ? clipend(clip) : nothing
     name in STRUCTURALFIELDS && setfield!(clip, :graph, nothing)
     # the convert the default `setproperty!` would have done, which overloading
     # takes away: `clip.crop = corner` hands an `NTuple{4, Float32}` to an
@@ -608,6 +611,16 @@ function Base.setproperty!(clip::Clip, name::Symbol, x)
     # …and the panel's bake row follows the field it reports on, for the same
     # reason: a bake finishing, an undo, a project load all just write this.
     name === :bake && showbake!(clip)
+    if name in PLACEFIELDS
+        if name === :src_out && clip.sequence isa Sequence
+            newend=clipend(clip)
+            invalidatecomposite!(clip.sequence,min(oldend,newend):(max(oldend,newend)-1))
+        else
+            placementchanged!(clip,oldtrack,oldspan,name)
+        end
+    elseif name in STRUCTURALFIELDS || name === :crop
+        invalidateclip!(clip;source=name===:source)
+    end
     return r
 end
 
@@ -624,7 +637,7 @@ addslot!(clip::Clip, fx::Effect) =
     # clip knows the editor it is open in. Whichever route put the effect here —
     # the add menu, `seteffect!`, an undo, a project being read — the card comes
     # with it, and nothing goes looking afterwards for effects that lack one.
-    (push!(clip.effects, fx); buildcardfor!(clip, fx); dirtygraph!(clip); fx)
+    (push!(clip.effects, fx); bindcacheparams!(clip,fx); buildcardfor!(clip, fx); dirtygraph!(clip); fx)
 
 """
 Every slot off the clip at once.
@@ -791,6 +804,8 @@ mutable struct Sequence <: Edit
     # when a `Player` opens it, and read by every clip in it. Not saved and not
     # copied: it is what the document is being looked at through, not part of it.
     editor::Union{Nothing, Editor}
+    const trackcaches::Dict{Int,TrackCache}
+    compositecache::Union{Nothing,TrackCache}
 
     function Sequence(clips::Vector{Clip}, framerate::Real,
                       transitions::Vector{Transition}, captions::Vector{Caption},
@@ -798,7 +813,7 @@ mutable struct Sequence <: Edit
                       canvas::Union{Nothing, Tuple{Int, Int}},
                       trackheights::Vector{Float64}, solo::Integer)
         seq = new(clips, Float64(framerate), transitions, captions, narration,
-                  canvas, trackheights, Int(solo), nothing)
+                  canvas, trackheights, Int(solo), nothing,Dict{Int,TrackCache}(),nothing)
         # the clips handed in join it exactly as a later one does — see `addclip!`
         foreach(c -> (c.sequence = seq), clips)
         return seq
@@ -821,6 +836,13 @@ Sequence(source::ClipSource) = Sequence([Clip(source)], source.framerate)
 
 editorof(seq::Sequence) = seq.editor
 
+function Base.setproperty!(seq::Sequence,name::Symbol,value)
+    if name in (:canvas,:framerate)
+        invalidatecomposite!(seq,0:max(seqlength(seq)-1,0))
+    end
+    return setfield!(seq,name,convert(fieldtype(Sequence,name),value))
+end
+
 """
     addclip!(seq, clip) -> clip
     addclip!(seq, i, clip) -> clip
@@ -838,6 +860,7 @@ function addclip!(seq::Sequence, clip::Clip)
     clip.sequence = seq
     push!(seq.clips, clip)
     bindinputs!(seq)
+    invalidatecomposite!(seq, clip.start:(clipend(clip) - 1))
     buildclipview!(clip)
     restack!(seq)
     return clip
@@ -846,6 +869,7 @@ function addclip!(seq::Sequence, i::Integer, clip::Clip)
     clip.sequence = seq
     insert!(seq.clips, i, clip)
     bindinputs!(seq)
+    invalidatecomposite!(seq, clip.start:(clipend(clip) - 1))
     buildclipview!(clip)
     restack!(seq)
     return clip
@@ -863,6 +887,7 @@ the same statement [`removeslotat!`](@ref) makes about a card.
 """
 function removeclip!(seq::Sequence, i::Integer)
     clip = seq.clips[i]
+    invalidatecomposite!(seq,clip.start:(clipend(clip)-1))
     deleteat!(seq.clips, i)
     bindinputs!(seq)
     dropclipview!(clip)
@@ -880,6 +905,7 @@ function restack!(seq::Sequence)
 end
 
 function Base.empty!(seq::Sequence)
+    invalidatecomposite!(seq,0:max(seqlength(seq)-1,0))
     foreach(dropclipview!, seq.clips)
     foreach(c -> (c.sequence = nothing), seq.clips)
     empty!(seq.clips)
@@ -913,6 +939,7 @@ at each read: this runs once per edit, `valueat` per parameter per frame.
 """
 function bindinputs!(seq::Sequence)
     for clip in seq.clips, fx in clip.effects, p in fx.params
+        bindcacheparam!(clip,p)
         n = p.input
         n === nothing && continue
         n.to = clip

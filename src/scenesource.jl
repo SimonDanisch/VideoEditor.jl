@@ -72,6 +72,8 @@ prerender!(::ClipSource, ::Clip, ::Integer) = nothing
 
 function prerender!(src::SceneSource, clip::Clip, sf::Integer; pixel_scale::Real = 1,
                     detail_scale::Real = pixel_scale)
+    cache = trackcache(clip)
+    cache === nothing || !cachevalid(cache, clip.id, sf) || return nothing
     # Between frames, on thread 1: the one point where a screen a backend switch
     # replaced can be destroyed without taking GL objects out from under a frame
     # that is being drawn. See [`closeretired!`](@ref).
@@ -160,14 +162,20 @@ function sceneframe!(src::SceneSource, clip::Clip, dims::Tuple{Int, Int};
     # screen: building it, writing this frame's numbers onto its plots (which
     # walks Makie's compute graph and can reach the renderer), and reading the
     # film back.
+    raw = cachedsourceframe(clip, src.at)
+    raw === nothing || return hdrpicture(raw, clip, src.at)
     name = renderwith(src)
     backend = getbackend(name)
     img = onthread(renderthread(backend)) do; lock(SCENELOCK) do
         # The bake backend is a different renderer, so it is a different standing
         # scene: `livescene!` rebuilds when the backend changes, which is exactly
         # what switching modes is.
-        src.live = livescene!(src.live, src.root, dims, name, backend;
-                              opts = renderopts(src))
+        opts = renderopts(src)
+        rawcapture = isdefined(backend, :renderbuffers) && !get(opts, :rasterize, false)
+        rawcapture && (opts[:denoise] = false)
+        rawcache = rawcapture && exact ? ensuresourcecache!(clip) : nothing
+        rawrevision = rawcache === nothing ? UInt64(0) : get(rawcache.revisions, (clip.id, src.at), UInt64(0))
+        src.live = livescene!(src.live, src.root, dims, name, backend; opts)
         quality_changed = preparepreview!(src.live.target, exact ? 1.0 : detail_scale)
         changed = updatesceneprogram!(src.live.target, src, clip, src.at, src.framerate;
                                       reset = src.samples == 0 || exact || src.mode === :bake || quality_changed)
@@ -179,8 +187,14 @@ function sceneframe!(src::SceneSource, clip::Clip, dims::Tuple{Int, Int};
         # The first read at a position clears the film; every read after it adds
         # to it. Without the clear a path tracer would keep averaging the previous
         # frame's picture into this one and the animation would smear.
-        liveframe!(src.live; clear = src.samples == 0,
-                   samples = exact ? nothing : 1, pixel_scale = exact ? 1 : pixel_scale)
+        image = liveframe!(src.live; clear = src.samples == 0,
+                           samples = exact ? nothing : 1, pixel_scale = exact ? 1 : pixel_scale)
+        if rawcapture
+            raw = Base.invokelatest(backend.renderbuffers, src.live.screen)
+            rawcache === nothing || cachewrite!(rawcache, clip.id, src.at, raw; revision = rawrevision)
+            return hdrpicture(raw, clip, src.at)
+        end
+        image
     end; end
     src.samples += 1
     return img
@@ -1015,7 +1029,7 @@ it composites, it keys by source frame.
 """
 function sceneclip(built; build = nothing, start::Integer = 0, frames::Integer = 90,
                    canvas::Tuple{Integer, Integer} = (1920, 1080),
-                   framerate::Real = 30.0, backend::Symbol = :GLMakie)
+                   framerate::Real = 30.0, backend::Symbol = defaultscenebackend())
     src = SceneSource(built.root; joints = built.joints, camera = built.camera,
                       build, backend, width = canvas[1], height = canvas[2],
                       framerate, nframes = frames)
@@ -1069,6 +1083,8 @@ function keyscalar!(fx::Effect, path::Symbol, entries, discrete::Bool, label::Ab
     i === nothing ? push!(fx.params, fresh) : (fx.params[i] = fresh)
     return fresh
 end
+
+defaultscenebackend() = haskey(BACKENDS,:RayMakie) ? :RayMakie : :GLMakie
 
 # ---------------------------------------------------------------- the kind
 

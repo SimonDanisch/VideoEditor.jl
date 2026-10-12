@@ -4349,7 +4349,8 @@ function editedcurve!(player::Player, clip; parameter = nothing)
         fittimelinerow!(player)
     end
     player.edited[] += 1
-    clip isa Clip && bakedirty!(clip)
+    # Parameter notifications record cache dirtiness at the mutation itself:
+    # `bakedirty!` here would drop every frame of the clip for a one-frame edit.
     scene = clip isa Clip ? findslot(clip, :scene) : nothing
     if parameter === nothing || (scene !== nothing && parameter in scene.params)
         invalidatescene!(clip)

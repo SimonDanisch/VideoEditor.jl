@@ -119,6 +119,7 @@ const INSTALLED = Installed(nothing, nothing, nothing, nothing, nothing, nothing
 # host RGB frame as well as a graph plane.
 const AnyRGBFrame = AbstractMatrix{<:Union{RGB{N0f8}, RGBA{N0f8}}}
 
+include("framecache.jl")
 include("source.jl")
 include("proxy.jl")
 include("buffer.jl")
@@ -167,6 +168,9 @@ include(joinpath(@__DIR__, "..", "FarmClient", "src", "wire.jl"))  # the farm's 
 include("farmenv.jl")    # a job's code, as a pinned environment
 include("renderfarm.jl") # job snapshots, persistent timeline renderers and resumable frame jobs
 include("farmnet.jl")    # the farm server: GPUs that farm clients offer, and the renderer they start
+include("hdrcache.jl")
+include("refreshguides.jl")
+include("trackcache.jl")
 include("commands.jl") # everything the editor can do, as data
 include("fxpanel.jl")  # THE effects panel: one card list for the selected clip
 include("trackpreviews.jl") # bounded background scene thumbnails and audio envelopes
@@ -184,6 +188,9 @@ export play!, pause!, step!
 export split!, deleteclip!, moveclip!, copyclip, copyclips!, pasteclips!,
        addsource!, saveproject, loadproject
 export ColorEffect, BlurEffect, SharpenEffect, MatteEffect, seteffect!
+export LinearGradeEffect, HDRDenoiseEffect, ToneMapEffect, sourcecache, cachedsourceframe
+export OIDNDenoiseEffect, registerhdrdenoiser!
+export refreshguides!
 export MatteTrack, analyzematte!, applymatte!, registermatte!, seedmask,
        repairframe!, repairmatteat!, matterepairs
 export sam2seed, sam2ready, defaultsegmenter
@@ -201,6 +208,8 @@ export SceneSource, SceneSpec, sceneclip, textscene, barscene, timecodescene, cu
 export programscene, RenderJob, renderjob, FarmWorker, FarmRenderer, farmrenderer, renderfarm!,
        farmframes!, closefarm!, encodefarm!, farmstatus, pausefarm!, registerfarm!,
        farmenvironment, FarmServer, farmserver, farmworkers, farmchild, registerlanfarm!
+export TrackCache, enabletrackcache!, invalidatetrack!, invalidateclip!, mutateframe!, mutateframes!,
+       setframevalue!, setrenderconfig!, setsceneargs!
 export registertool!, ToolContext, toolplot!, ontool!, tooltime, toolband
 export activatetool!, deactivatetool!
 export repairmattecollect!, brushmatte!, matteframe

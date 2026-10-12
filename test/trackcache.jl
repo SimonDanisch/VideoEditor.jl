@@ -1,0 +1,118 @@
+using Test, VideoEditor, RayMakie, Mantle
+import VideoEditor as VE
+VE.usebackend!(RayMakie)
+
+@testset "track caches record mutations at frame granularity" begin
+    build = VE.scenebuild(:bar, (64, 48))
+    base = VE.sceneclip(VE.buildscene(build); build, frames = 4, canvas = (64, 48), backend = :GLMakie)
+    label = VE.sceneclip(VE.buildscene(build); build, frames = 4, canvas = (64, 48), backend = :GLMakie)
+    label.track = 2
+    seq = VE.Sequence([base, label], 30)
+    seq.canvas = (64, 48)
+    VE.enabletrackcache!(seq, mktempdir())
+    engine = VE.FxEngine(Mantle.defaultbackend())
+    readers = Dict{String, Any}()
+    out = zeros(VE.RGB{VE.N0f8}, 64, 48)
+    draw(ns) = foreach(n -> VE.renderframe!(out, seq, n, readers, engine), ns)
+    try
+        draw(0:3)
+        @test [seq.trackcaches[t].renders for t in 1:2] == [4, 4]
+        draw(0:3)
+        @test [seq.trackcaches[t].renders for t in 1:2] == [4, 4]
+        VE.mutateframe!(seq, 2, 2) do
+            nothing # an external scene mutation declares its exact scope here
+        end
+        draw(0:3)
+        @test [seq.trackcaches[t].renders for t in 1:2] == [4, 5]
+        @test seq.compositecache.renders == 5
+
+        # An ordinary parameter mutation is observed without a UI or history.
+        fx = VE.Effect(VE.OpacityEffect(1.0f0))
+        VE.addslot!(label, fx)
+        draw(0:3)
+        p = VE.param(fx, :opacity)
+        b = seq.trackcaches[1].renders; l = seq.trackcaches[2].renders
+        VE.setframevalue!(p, 2, 0.0f0)
+        draw(0:3)
+        @test seq.trackcaches[1].renders == b
+        @test seq.trackcaches[2].renders == l + 1
+        @test VE.valueat(p, 1) == 1.0f0 && VE.valueat(p, 2) == 0.0f0 && VE.valueat(p, 3) == 1.0f0
+        VE.setkey!(p, 2, 0.5f0)
+        draw(0:3)
+        @test seq.trackcaches[1].renders == b
+        @test seq.trackcaches[2].renders == l + 2
+
+        before = [seq.trackcaches[t].renders for t in 1:2]
+        beforecomposite = seq.compositecache.renders
+        for c in seq.clips
+            c.source.nframes = 6
+            c.src_out = 6
+        end
+        draw(0:5)
+        @test [seq.trackcaches[t].renders for t in 1:2] == before .+ 2
+        @test seq.compositecache.renders == beforecomposite + 2
+
+        # Explicit cache metadata survives a project reopen, including dirty bits.
+        VE.invalidatetrack!(seq, 2, 1:1)
+        project = joinpath(mktempdir(), "test.videoedit")
+        VE.saveproject(project, seq; checkpoint = false)
+        loaded = VE.loadproject(project)
+        @test VE.cachevalid(loaded.trackcaches[1], base.id, 1)
+        @test !VE.cachevalid(loaded.trackcaches[2], label.id, 1)
+        @test VE.cachevalid(loaded.trackcaches[2], label.id, 0)
+
+        # Workers must return the reusable planes, and mutable output must not
+        # alter the immutable job identity or break a farm resume.
+        if isdefined(VE, :renderfarm!)
+            job = VE.renderjob(project, mktempdir())
+            renderer = VE.farmrenderer(job)
+            try
+                worker = VE.FarmWorker("test", ids -> VE.farmframes!(renderer, ids))
+                VE.renderfarm!(job, [worker])
+                receipt = VE.JSON.parsefile(VE.farmreceiptpath(job.directory, 1))
+                @test length(receipt["layers"]) == 2
+                original, _ = VE.farmidentity(VE.jobproject(job), job.canvas, collect(keys(job.inputs)))
+                @test original == job.identity
+                VE.adoptfarmcache!(loaded, job)
+                @test VE.cachevalid(loaded.trackcaches[2], label.id, 1)
+                VE.renderfarm!(job, [worker]) # already completed: no work
+            finally
+                VE.closefarm!(renderer)
+            end
+        end
+
+        # Moving a clip reuses its source frames and only recomposes.
+        before = seq.trackcaches[1].renders
+        base.start = 1
+        draw(1:5)
+        @test seq.trackcaches[1].renders == before
+        revision = get(seq.trackcaches[1].revisions, (base.id, 0), UInt64(0))
+        base.track = 3
+        @test VE.cachevalid(seq.trackcaches[3], base.id, 0)
+        @test get(seq.trackcaches[3].revisions, (base.id, 0), UInt64(0)) == revision
+    finally
+        VE.emptyengine!(engine)
+        foreach(close, values(readers))
+    end
+end
+
+@testset "mutations during an in-flight render stay dirty" begin
+    cache = VE.TrackCache(mktempdir())
+    revision = UInt64(0)
+    VE.dirtyframes!(cache, 1, 2:2)
+    VE.cachewrite!(cache, 1, 2, zeros(VE.PlanePixel, 4, 4); revision)
+    @test !VE.cachevalid(cache, 1, 2)
+    VE.cachewrite!(cache, 1, 2, zeros(VE.PlanePixel, 4, 4))
+    @test VE.cachevalid(cache, 1, 2)
+end
+
+@testset "scene renderer defaults" begin
+    build = VE.scenebuild(:bar, (64, 48))
+    c = VE.sceneclip(VE.buildscene(build); build, canvas = (64, 48))
+    @test c.source.backend === :RayMakie
+    @test VE.renderopts(c.source)[:rasterize]
+    VE.setrenderconfig!(c; raytrace = true, samples = 64)
+    c.source.mode = :bake
+    @test !VE.renderopts(c.source)[:rasterize]
+    @test VE.renderopts(c.source)[:samples] == 64
+end

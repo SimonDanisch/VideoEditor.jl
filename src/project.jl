@@ -47,6 +47,8 @@ function saveproject(path::AbstractString, seq::Sequence; checkpoint::Bool = tru
         "framerate" => seq.framerate,
         "clips" => clips, "sources" => sources, "looks" => looks,
     )
+    caches=saveframecaches!(path,seq)
+    caches === nothing || (dict["framecaches"]=caches)
     # transitions (cross-dissolves) are part of the edit — losing them on reopen
     # would silently drop every dissolve
     isempty(seq.transitions) || (dict["transitions"] =
@@ -377,6 +379,7 @@ function loadproject(path::AbstractString; pathmap::AbstractDict = Dict())
     # …and the bakes: their directory follows the project, and one whose inputs
     # moved on disk is switched off rather than shown as current.
     adoptbakes!(path, seq)
+    loadframecaches!(path,seq,get(dict,"framecaches",nothing))
     reportbackends(seq)
     return seq
 end
