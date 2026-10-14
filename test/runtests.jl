@@ -1242,20 +1242,22 @@ end
     @test VE.needsproxy(src; maxpixels = 100_000)
     @test VE.needsproxy(src; maxbytesperframe = 1)
 
-    # cache pruning: oldest files go first, newest survive, cap respected
-    dir = VE.cachedir("proxies")
-    old = joinpath(dir, "prunetest_old.mp4")
-    new = joinpath(dir, "prunetest_new.mp4")
-    write(old, zeros(UInt8, 1000)); write(new, zeros(UInt8, 1000))
+    # cache pruning: oldest files go first, newest survive, cap respected.
+    # In folders of their own: the real caches hold whatever earlier sessions
+    # left, and a proxy older than `old` went first and ended the prune, so the
+    # test failed once on every machine whose cache had one.
+    dirs = (mktempdir(), mktempdir())
+    old = joinpath(dirs[1], "old.mp4")
+    new = joinpath(dirs[1], "new.mp4")
+    pcm = joinpath(dirs[2], "pcm.s16")
+    foreach(f -> write(f, zeros(UInt8, 1000)), (old, new, pcm))
     # age it: pruning is LRU by mtime. `-t` is the POSIX form; `-d "30 days ago"`
     # is GNU only and macOS's touch refuses it.
     run(`touch -t $(Libc.strftime("%Y%m%d%H%M.%S", time() - 30 * 86400)) $old`)
-    before = sum(filesize, readdir(dir; join = true); init = 0) +
-             sum(filesize, readdir(VE.cachedir("pcm"); join = true); init = 0)
-    VE.prunecache!(maxbytes = before - 500)   # force removal of ≥1 file
-    @test !isfile(old)                        # oldest went first
-    @test isfile(new)
-    rm(new; force = true)
+    @test VE.prunecache!(; maxbytes = 2500, dirs) == 1000   # one file is enough
+    @test !isfile(old)                                      # the oldest one
+    @test isfile(new) && isfile(pcm)
+    @test VE.prunecache!(; maxbytes = 2500, dirs) == 0      # already under the cap
 end
 
 @testset "Object lock" begin

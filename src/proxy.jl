@@ -17,17 +17,19 @@ function proxypath(source::VideoSource, height::Integer)
 end
 
 """
-    prunecache!(; maxbytes = 20 * 2^30) -> bytes_removed
+    prunecache!(; maxbytes = 20 * 2^30, dirs) -> bytes_removed
 
-Keep the regenerable scratch caches (preview proxies + audio PCM) under
-`maxbytes` by deleting least-recently-modified files first. Runs once per
+Keep the regenerable scratch caches (preview proxies, audio PCM, mezzanines)
+under `maxbytes` by deleting least-recently-modified files first. Runs once per
 `Player` construction; entries for edited or moved sources go stale (the
 cache key includes mtime) and would otherwise accumulate forever.
+
+`dirs` are the folders pruned together, the three scratch caches by default.
 """
-function prunecache!(; maxbytes::Integer = 20 * 2^30)
+function prunecache!(; maxbytes::Integer = 20 * 2^30,
+                     dirs = map(cachedir, ("proxies", "pcm", "mezzanine")))
     files = Tuple{Float64, Int, String}[]  # (mtime, size, path)
-    for space in ("proxies", "pcm", "mezzanine")
-        dir = cachedir(space)
+    for dir in dirs
         for name in readdir(dir; join = true)
             endswith(name, ".part") && (rm(name; force = true); continue)  # aborted job
             push!(files, (mtime(name), filesize(name), name))
