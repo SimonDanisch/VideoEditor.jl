@@ -289,6 +289,10 @@ mutable struct Timeline
         hideydecorations!(axis)
         hidespines!(axis, :l, :r)
         deregister_interaction!(axis, :rectanglezoom)  # left-drag is scrubbing
+        # Ctrl is the clip-drag modifier. Makie 0.24.16's LimitReset fires when
+        # Ctrl+left is released and consumes that event: it reset the timeline's
+        # limits and swallowed the end of every Ctrl-drag.
+        deregister_interaction!(axis, :limitreset)
         limits!(axis, 0.0, max(seqduration(sequence), 1.0), 0.0, AXISTOP)
 
         timeline = new(axis, sequence, Dict{VideoSource, ThumbnailCache}(),

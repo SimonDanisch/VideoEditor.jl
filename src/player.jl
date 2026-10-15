@@ -663,6 +663,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     hidedecorations!(ax)
     hidespines!(ax)
     deregister_interaction!(ax, :rectanglezoom)  # left-drag is the crop tool
+    deregister_interaction!(ax, :limitreset)     # Ctrl-presses are the editor's (see timeline.jl)
     previewplot = image!(ax, frame; interpolate = true)
 
     # row 2: the timeline. Keyframe curves overlay the clips directly (one editor,
