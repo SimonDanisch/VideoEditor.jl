@@ -131,6 +131,9 @@ mutable struct FarmRenderer
     engine::FxEngine
     lock::ReentrantLock
     closed::Bool
+    # where the sequence's track caches write the planes of the frame being
+    # rendered, until `farmlayers!` takes them (see `farmcaches!`)
+    planes::String
 end
 function farmthread(renderer::FarmRenderer)
     queue = Mantle.batchqueue(enginedevice(renderer.engine))
@@ -193,12 +196,79 @@ function farmrenderer(job::RenderJob; backend = Mantle.defaultbackend())
     # A recording is a folder: its files map under it, longest first.
     pathmap = Dict(source => joinpath(snapshot, relative) for (source, relative) in job.relocations)
     seq = loadproject(jobproject(job); pathmap)
+    planes = mktempdir(job.directory; prefix = "planes-", cleanup = false)
+    farmcaches!(seq, planes)
     return FarmRenderer(seq, zeros(RGB{N0f8}, job.canvas...), zeros(RGB{N0f8}, job.canvas...),
-                        Dict{String, Any}(), FxEngine(backend), ReentrantLock(), false)
+                        Dict{String, Any}(), FxEngine(backend), ReentrantLock(), false, planes)
+end
+
+"""
+    farmcaches!(seq, directory) -> seq
+
+Give a worker's sequence track caches of its own, empty, in `directory`. The
+project's caches name the coordinator's folder, which a worker does not have;
+and a plane written into the snapshot would change the job's key, so a frame
+rendered would make the job another one. What a worker renders into them it
+hands back with the frame (`farmlayers!`); it composites every frame once, so it
+keeps no composite cache.
+"""
+function farmcaches!(seq::Sequence, directory::AbstractString)
+    isempty(seq.trackcaches) && return seq
+    empty!(seq.trackcaches)
+    enabletrackcache!(seq, directory)
+    seq.compositecache = nothing
+    return seq
+end
+
+"""
+    FarmLayer(track, id, frame, png, hdr)
+
+A plane a farm frame was composited from, as a worker returns it: the clip's
+track and id, its source frame, the track plane as PNG bytes and, for a traced
+clip, its linear HDR source as `.vehdr` bytes (empty for others). The
+coordinator keeps them (`commitlayer!`) for the edit to take into its caches
+(`adoptfarmcache!`), so neither the tracing nor the grading has to be done again.
+"""
+struct FarmLayer
+    track::Int
+    id::UInt64
+    frame::Int
+    png::Vector{UInt8}
+    hdr::Vector{UInt8}
+end
+
+"""
+    farmlayers!(seq, n) -> Vector{FarmLayer}
+
+The planes timeline frame `n` was just composited from, taken out of the
+worker's caches: a worker keeps no frames, and a traced clip's HDR source is
+tens of megabytes a frame.
+"""
+function farmlayers!(seq::Sequence, n::Integer)
+    layers = FarmLayer[]
+    for clip in frameclips(seq, n)
+        cache = trackcache(clip)
+        cache === nothing && continue
+        sf = sourceframe(clip, n)
+        cachevalid(cache, clip.id, sf) || continue
+        raw = cache.source
+        hdr = raw !== nothing && cachevalid(raw, clip.id, sf) ? takeplane!(raw, clip.id, sf) : UInt8[]
+        push!(layers, FarmLayer(clip.track, clip.id, sf, takeplane!(cache, clip.id, sf), hdr))
+    end
+    return layers
+end
+
+"""A cached plane's bytes, its file and its validity taken out of the cache."""
+function takeplane!(c::TrackCache, id::UInt64, sf::Int)
+    file = cachefile(c, id, sf)
+    bytes = read(file)
+    rm(file)
+    delete!(c.valid[id], sf)
+    return bytes
 end
 farmrenderer(directory::AbstractString; kw...) = farmrenderer(RenderJob(directory); kw...)
 
-"Return only PNG bytes and measurements; all GPU state stays in the renderer's process."
+"Return only PNG bytes, the planes they were made of, and measurements; all GPU state stays in the renderer's process."
 function farmframes!(renderer::FarmRenderer, indices)
     return lock(renderer.lock) do
         renderer.closed && error("farm renderer is closed")
@@ -215,7 +285,8 @@ function farmframes!(renderer::FarmRenderer, indices)
                     # The editor's canvas is x×y, PNG is row×column. This is also
                     # writeframe!'s orientation conversion for VideoIO.
                     PNGFiles.save(io, permutedims(renderer.canvas, (2, 1)))
-                    (frame = Int(n), png = take!(io), seconds = (time_ns()-started)/1e9)
+                    (frame = Int(n), png = take!(io), seconds = (time_ns()-started)/1e9,
+                     layers = farmlayers!(renderer.sequence, n))
                 end
             end
         end
@@ -238,6 +309,7 @@ function closefarm!(r::FarmRenderer)
             end
             r.closed = true
         end
+        rm(r.planes; recursive = true, force = true)
     end
     return nothing
 end
@@ -249,6 +321,81 @@ function farmwritejson(path, value)
 end
 farmframepath(dir, n) = joinpath(dir, "frames", string(n; pad = 6) * ".png")
 farmreceiptpath(dir, n) = joinpath(dir, "frames", string(n; pad = 6) * ".json")
+
+"""Where the coordinator keeps the planes workers return for `track`, laid out as a track cache and its HDR sources."""
+farmplanes(dir, track) = TrackCache(joinpath(dir, "trackframes", "track-$track"))
+farmsources(dir, track) = TrackCache(joinpath(dir, "trackframes", "track-$track", "source"); format = :hdr)
+
+"""Write `bytes` to `path` atomically; their SHA-256."""
+function commitbytes!(path::AbstractString, bytes::AbstractVector{UInt8})
+    mkpath(dirname(path))
+    write(path * ".part", bytes)
+    mv(path * ".part", path; force = true)
+    return bytes2hex(SHA.sha256(bytes))
+end
+
+"""Keep a returned plane in the job directory; its entry in the frame's receipt."""
+function commitlayer!(dir, l::FarmLayer)
+    entry = Dict{String, Any}("track" => l.track, "id" => string(l.id), "frame" => l.frame,
+                              "sha256" => commitbytes!(cachefile(farmplanes(dir, l.track), l.id, l.frame), l.png))
+    isempty(l.hdr) ||
+        (entry["hdr_sha256"] = commitbytes!(cachefile(farmsources(dir, l.track), l.id, l.frame), l.hdr))
+    return entry
+end
+
+"""
+    adoptfarmcache!(seq, job) -> seq
+
+Take the planes a farm job's workers returned into the track caches of `seq`,
+the edit the job was made from: a plane is taken where its clip is in `seq` and
+its frame has not been edited since the job was made (its cache revision is the
+one the snapshot saved), and its file is the one the receipt names. A traced
+clip's HDR source is taken by the same rule, so a grade changed after the job
+keeps the traced source and renders only the derived plane. Adopt before
+editing further: an edit made since is never overwritten, but the planes it
+makes stale are not taken either.
+"""
+function adoptfarmcache!(seq::Sequence, job::RenderJob)
+    saved = savedframecaches(jobproject(job))
+    for n in 0:(job.total - 1)
+        farmcomplete(job.directory, n, job.key) || continue
+        for layer in get(JSON.parsefile(farmreceiptpath(job.directory, n)), "layers", ())
+            id, sf, track = parse(UInt64, layer["id"]), Int(layer["frame"]), Int(layer["track"])
+            clip = clipbyid(seq, id)
+            clip === nothing && continue
+            cache, then = trackcache(clip), get(saved, track, nothing)
+            (cache === nothing || then === nothing) && continue
+            if haskey(layer, "hdr_sha256") && cache.source !== nothing && then.source !== nothing &&
+               samerevision(cache.source, then.source, id, sf)
+                adoptplane!(cache.source, id, sf, cachefile(farmsources(job.directory, track), id, sf), layer["hdr_sha256"])
+            end
+            samerevision(cache, then, id, sf) &&
+                adoptplane!(cache, id, sf, cachefile(farmplanes(job.directory, track), id, sf), layer["sha256"])
+        end
+    end
+    return seq
+end
+
+"""The track caches a saved project describes, by track: only their bookkeeping, for the revisions it saved."""
+function savedframecaches(path::AbstractString)
+    d = get(decodeblocks(MsgPack.unpack(read(path))), "framecaches", nothing)
+    d === nothing && return Dict{Int, TrackCache}()
+    return Dict(parse(Int, t) => restorecache(meta, "") for (t, meta) in d["tracks"])
+end
+
+samerevision(a::TrackCache, b::TrackCache, id::UInt64, sf::Int) =
+    get(a.revisions, (id, sf), UInt64(0)) == get(b.revisions, (id, sf), UInt64(0))
+
+"""Copy `file` into `cache` as frame `sf` of clip `id` if it is the file `sha` names; whether it was."""
+function adoptplane!(cache::TrackCache, id::UInt64, sf::Int, file::AbstractString, sha::AbstractString)
+    isfile(file) && filehash(file) == sha || return false
+    target = cachefile(cache, id, sf)
+    mkpath(dirname(target))
+    cp(file, target; force = true)
+    push!(get!(() -> BitSet(), cache.valid, id), sf)
+    delete!(get!(() -> BitSet(), cache.dirty, id), sf)
+    return true
+end
 
 """Whether frame `n` is committed for the job `key`: its PNG, and a receipt (written atomically) naming the job and the PNG's hash."""
 function farmcomplete(dir, n, key)
@@ -345,10 +492,11 @@ function renderfarm!(job::RenderJob, workers; frames = nothing,
                             r.frame == n || error("worker returned frame $(r.frame) for frame $n")
                             img = PNGFiles.load(IOBuffer(r.png))
                             Base.size(img) == reverse(canvas) || error("worker returned the wrong dimensions")
-                            path = farmframepath(dir, n)
-                            write(path * ".part", r.png); mv(path * ".part", path; force = true)
+                            # the planes first: a receipt names only planes that are there
+                            layers = [commitlayer!(dir, l) for l in r.layers]
+                            sha = commitbytes!(farmframepath(dir, n), r.png)
                             farmwritejson(farmreceiptpath(dir, n), Dict("job" => key,
-                                "sha256" => bytes2hex(SHA.sha256(r.png)), "worker" => worker.name,
+                                "sha256" => sha, "worker" => worker.name, "layers" => layers,
                                 "frame" => n, "seconds" => r.seconds, "completed_utc" => string(now(UTC))))
                             committed = true
                         catch e

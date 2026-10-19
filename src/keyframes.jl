@@ -976,8 +976,8 @@ constant, the single key takes the new value and stays where it is. Every call
 site used to spell that fork out, and the two halves wrote to different places.
 """
 function setvalue!(p::Param{T}, value, frame::Integer) where {T}
+    affected=isanimated(p) ? editaffected(p,frame) : nothing
     isfollowing(p) && (p.input = nothing)
-    affected=isanimated(p) ? keyaffected(p,frame) : nothing
     c = p.curve[]
     if isanimated(p)
         setkey!(c, frame, value)
@@ -990,14 +990,14 @@ end
 
 "Insert or replace `p`'s key at `frame` (see [`setkey!`](@ref AnimCurve))."
 function setkey!(p::Param,frame::Integer,value)
+    affected=editaffected(p,frame)
     isfollowing(p) && (p.input = nothing)
-    affected=keyaffected(p,frame)
     setkey!(p.curve[],frame,value); notifyparam!(p,affected)
     return p
 end
 function setkey!(p::Param,frame::Integer,value,ease::Symbol)
+    affected=editaffected(p,frame)
     isfollowing(p) && (p.input = nothing)
-    affected=keyaffected(p,frame)
     setkey!(p.curve[],frame,value,ease); notifyparam!(p,affected)
     return p
 end
@@ -1010,6 +1010,12 @@ function notifyparam!(p::Param,frames=nothing)
     end
     return p
 end
+"""
+    keyaffected(p, frame) -> Union{UnitRange{Int}, Nothing}
+
+The source frames a key edit at `frame` changes: the two segments either side of
+it, a held predecessor's tail included; `nothing` for the whole clip.
+"""
 function keyaffected(p::Param,frame::Integer)
     p.owner === nothing && return nothing
     ks=p.curve[].keys; length(ks)<2 && return nothing
@@ -1020,9 +1026,20 @@ function keyaffected(p::Param,frame::Integer)
     hi=next === nothing ? p.owner.src_out-1 : ks[next].frame-1
     return Int(lo):Int(hi)
 end
+
+"""
+The frames an edit at `frame` changes, asked before the edit detaches a
+following parameter: its input drove every frame, so all of them change
+(`nothing`), not only the segments around the key.
+"""
+editaffected(p::Param,frame::Integer) = isfollowing(p) ? nothing : keyaffected(p,frame)
+
+"Change one frame's value, the curve on either side as it was."
 function setframevalue!(p::Param{T},frame::Integer,value) where {T}
     p.input === nothing || error("detach a driven parameter before making a frame override")
     c=p.curve[]
+    # Guard keys either side are exact for hold and linear segments; a Bézier
+    # segment would need its handles split instead.
     any(k.ease ∉ (:hold, :linear) for k in c.keys) && error("frame overrides require a hold or linear curve")
     before,after=valueat(c,frame-1),valueat(c,frame+1)
     setkey!(c,frame-1,before); setkey!(c,frame,convert(T,value),:hold); setkey!(c,frame+1,after)
@@ -1040,7 +1057,7 @@ last is where animation stops.
 """
 function removekey!(p::Param, frame::Integer)
     length(p.curve[].keys) > 1 || return false
-    affected=keyaffected(p,frame)
+    affected=editaffected(p,frame)
     removekey!(p.curve[], frame) || return false
     isfollowing(p) && (p.input = nothing)
     notifyparam!(p,affected)
@@ -1050,8 +1067,8 @@ end
 function removekeyat!(p::Param, i::Integer)
     ks = p.curve[].keys
     length(ks) > 1 || return false
+    affected=editaffected(p,ks[i].frame)
     isfollowing(p) && (p.input = nothing)
-    affected=keyaffected(p,ks[i].frame)
     deleteat!(ks, i)
     notifyparam!(p,affected)
     return true
@@ -1076,9 +1093,9 @@ end
 
 "Move `p`'s `i`-th key to `(frame, value)` — see [`movekey!`](@ref AnimCurve)."
 function movekey!(p::Param,i::Integer,frame::Integer,value)
-    isfollowing(p) && (p.input = nothing)
-    a=keyaffected(p,p.curve[].keys[i].frame); b=keyaffected(p,frame)
+    a=editaffected(p,p.curve[].keys[i].frame); b=editaffected(p,frame)
     affected=a === nothing || b === nothing ? nothing : (min(first(a),first(b)):max(last(a),last(b)))
+    isfollowing(p) && (p.input = nothing)
     movekey!(p.curve[],i,frame,value); notifyparam!(p,affected)
     return p
 end

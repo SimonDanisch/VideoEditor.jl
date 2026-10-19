@@ -206,6 +206,13 @@ function cachetrackframe!(clip::Clip, sf::Int, readers, engine)
     return nothing
 end
 
+"The clips timeline frame `n` is composited from: those at it, or a transition's two."
+function frameclips(seq::Sequence, n::Integer)
+    tr = transitionat(seq, n)
+    sample = tr === nothing ? nothing : transitionsample(seq, tr, n)
+    return sample === nothing ? clipsat(seq, n) : [sample[1], sample[3]]
+end
+
 "Finished output: render dirty track frames, then composite the cached planes."
 function renderframe!(
         dest::AnyRGBFrame, seq::Sequence, n::Integer, readers::Dict{String, Any}, engine::FxEngine;
@@ -219,10 +226,7 @@ function renderframe!(
         return dest
     end
     if !isempty(seq.trackcaches)
-        tr = transitionat(seq, n)
-        sample = tr === nothing ? nothing : transitionsample(seq, tr, n)
-        clips = sample === nothing ? clipsat(seq, n) : [sample[1], sample[3]]
-        for clip in clips
+        for clip in frameclips(seq, n)
             cachetrackframe!(clip, sourceframe(clip, n), readers, engine)
         end
     end

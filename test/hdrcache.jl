@@ -66,24 +66,22 @@ end
         loaded = VE.loadproject(path)
         @test VE.cachevalid(VE.sourcecache(loaded.clips[1]), clip.id, 0)
         @test VE.cachedsourceframe(loaded.clips[1], 0).color == master.color
-        if isdefined(VE, :renderfarm!)
-            job = VE.renderjob(path, mktempdir())
-            renderer = VE.farmrenderer(job)
-            try
-                worker = VE.FarmWorker("hdr-test", ids -> VE.farmframes!(renderer, ids))
-                VE.renderfarm!(job, [worker]; frames = [0])
-                receipt = VE.JSON.parsefile(VE.farmreceiptpath(job.directory, 0))
-                @test haskey(only(receipt["layers"]), "hdr_sha256")
-                empty!(VE.sourcecache(loaded.clips[1]).valid)
-                # A new grade may invalidate the derived plane while the
-                # source master remains eligible for adoption.
-                VE.setvalue!(VE.param(VE.findslot(loaded.clips[1], VE.LinearGradeEffect), :exposure), -2, 0)
-                VE.adoptfarmcache!(loaded, job)
-                @test VE.cachevalid(VE.sourcecache(loaded.clips[1]), clip.id, 0)
-                @test !VE.cachevalid(VE.trackcache(loaded.clips[1]), clip.id, 0)
-            finally
-                VE.closefarm!(renderer)
-            end
+        job = VE.renderjob(path, mktempdir(); portable = false)
+        renderer = VE.farmrenderer(job)
+        try
+            worker = VE.FarmWorker("hdr-test", ids -> VE.farmframes!(renderer, ids))
+            VE.renderfarm!(job, [worker]; frames = [0])
+            receipt = VE.JSON.parsefile(VE.farmreceiptpath(job.directory, 0))
+            @test haskey(only(receipt["layers"]), "hdr_sha256")
+            empty!(VE.sourcecache(loaded.clips[1]).valid)
+            # A new grade may invalidate the derived plane while the
+            # source master remains eligible for adoption.
+            VE.setvalue!(VE.param(VE.findslot(loaded.clips[1], VE.LinearGradeEffect), :exposure), -2, 0)
+            VE.adoptfarmcache!(loaded, job)
+            @test VE.cachevalid(VE.sourcecache(loaded.clips[1]), clip.id, 0)
+            @test !VE.cachevalid(VE.trackcache(loaded.clips[1]), clip.id, 0)
+        finally
+            VE.closefarm!(renderer)
         end
         draw(1)
         @test cache.renders == 2

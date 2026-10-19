@@ -150,11 +150,38 @@ end
 function (s::FarmSlot)(frames)
     sendmessage(s.socket, Dict{String, Any}("command" => "frames", "frames" => collect(Int, frames)))
     return map(frames) do _
-        header, png = receivemessage(s.socket)
+        header, payload = receivemessage(s.socket)
         e = farmerror(header)
         e === nothing || error("$(s.name): $e")
-        (frame = Int(header["frame"]), png = png, seconds = Float64(header["seconds"]))
+        farmresult(header, payload)
     end
+end
+
+"""
+    farmmessage(result) -> (header, payload)
+
+A frame `farmframes!` rendered as one farm message, so a farm client relays it
+unchanged: the header names the frame, its time and its layers with their
+sizes; the payload is the frame's PNG, then each layer's PNG and HDR bytes.
+"""
+function farmmessage(result)
+    header = Dict{String, Any}("frame" => result.frame, "seconds" => result.seconds, "png" => length(result.png),
+        "layers" => [Dict{String, Any}("track" => l.track, "id" => string(l.id), "frame" => l.frame,
+                                       "png" => length(l.png), "hdr" => length(l.hdr)) for l in result.layers])
+    payload = IOBuffer()
+    write(payload, result.png)
+    foreach(l -> write(payload, l.png, l.hdr), result.layers)
+    return header, take!(payload)
+end
+
+"""The frame a farm message holds, as `farmframes!` returned it (see `farmmessage`)."""
+function farmresult(header::AbstractDict, payload::AbstractVector{UInt8})
+    io = IOBuffer(payload)
+    png = read(io, Int(header["png"]))
+    layers = FarmLayer[FarmLayer(Int(l["track"]), parse(UInt64, l["id"]), Int(l["frame"]),
+                                 read(io, Int(l["png"])), read(io, Int(l["hdr"]))) for l in header["layers"]]
+    eof(io) || error("a farm message holds $(bytesavailable(io)) bytes more than its header names")
+    return (frame = Int(header["frame"]), png, seconds = Float64(header["seconds"]), layers)
 end
 
 function Base.close(s::FarmSlot)
@@ -274,8 +301,9 @@ end
 A farm renderer serving the job in `directory` over a pipe: what a farm client
 runs for each GPU, in the job's environment, on the GPU with index `device`
 (see `farmgpus`; the default GPU without one). Answers each `frames` request
-with one message per frame (the PNG as payload), or an error message for a
-frame that fails, until `close` or the end of input.
+with one message per frame (`farmmessage`: the PNG and the planes it was made
+of), or an error message for a frame that fails, until `close` or the end of
+input.
 """
 function farmchild(directory::AbstractString; device = nothing, input::IO = stdin, output::IO = stdout)
     # what scene code prints goes to the client's log, not into the messages
@@ -297,7 +325,7 @@ function farmchild(directory::AbstractString; device = nothing, input::IO = stdi
                     sendmessage(output, Dict{String, Any}("error" => "frame $n: " * sprint(showerror, e)))
                     continue
                 end
-                sendmessage(output, Dict{String, Any}("frame" => result.frame, "seconds" => result.seconds), result.png)
+                sendmessage(output, farmmessage(result)...)
             end
         end
     finally

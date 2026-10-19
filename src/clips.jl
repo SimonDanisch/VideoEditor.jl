@@ -761,6 +761,8 @@ end
 transhalf(t::Transition) = t.duration ÷ 2
 transstart(t::Transition) = t.at - transhalf(t)
 transstop(t::Transition) = transstart(t) + t.duration   # exclusive
+"The timeline frames a transition blends, whose composites it changes."
+transframes(t::Transition) = transstart(t):(transstop(t) - 1)
 
 """
     Sequence(source) / Sequence(clips, framerate)
@@ -1152,13 +1154,18 @@ function addtransition!(seq::Sequence, at::Integer; duration::Integer, kind::Sym
     if i === nothing
         t = Transition(kind, at, dur)
         push!(seq.transitions, t)
+        invalidatecomposite!(seq, transframes(t))
         drawtransitions!(seq)
         return t
     end
-    seq.transitions[i].kind = kind
-    seq.transitions[i].duration = dur
+    t = seq.transitions[i]
+    # The frames it covered and the frames it covers now.
+    invalidatecomposite!(seq, transframes(t))
+    t.kind = kind
+    t.duration = dur
+    invalidatecomposite!(seq, transframes(t))
     drawtransitions!(seq)
-    return seq.transitions[i]
+    return t
 end
 
 "Remove the transition on the cut at `at` (returns it, or `nothing`)."
@@ -1166,6 +1173,7 @@ function removetransition!(seq::Sequence, at::Integer)
     i = findfirst(t -> t.at == at, seq.transitions)
     i === nothing && return nothing
     t = seq.transitions[i]
+    invalidatecomposite!(seq, transframes(t))
     deleteat!(seq.transitions, i)
     drawtransitions!(seq)
     return t

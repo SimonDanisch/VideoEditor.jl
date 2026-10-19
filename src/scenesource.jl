@@ -187,8 +187,12 @@ function sceneframe!(src::SceneSource, clip::Clip, dims::Tuple{Int, Int};
         # The first read at a position clears the film; every read after it adds
         # to it. Without the clear a path tracer would keep averaging the previous
         # frame's picture into this one and the animation would smear.
-        image = liveframe!(src.live; clear = src.samples == 0,
-                           samples = exact ? nothing : 1, pixel_scale = exact ? 1 : pixel_scale)
+        # In the newest world: a recipe that `livescene!` loaded above can define
+        # methods the frame's GPU code calls (the film's Earth defines its air as
+        # a participating medium), and the frame compiled in this function's
+        # world did not see them.
+        image = Base.invokelatest(liveframe!, src.live; clear = src.samples == 0,
+                                  samples = exact ? nothing : 1, pixel_scale = exact ? 1 : pixel_scale)
         if rawcapture
             raw = Base.invokelatest(backend.renderbuffers, src.live.screen)
             rawcache === nothing || cachewrite!(rawcache, clip.id, src.at, raw; revision = rawrevision)

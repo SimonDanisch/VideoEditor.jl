@@ -109,6 +109,20 @@ end
     close(server)
 end
 
+@testset "a frame and its planes are one farm message" begin
+    traced = VE.FarmLayer(1, typemax(UInt64) - 7, 12, rand(UInt8, 300), rand(UInt8, 5_000))
+    label = VE.FarmLayer(2, UInt64(5), 12, rand(UInt8, 200), UInt8[])
+    result = (frame = 40, png = rand(UInt8, 1_000), seconds = 1.5, layers = [traced, label])
+    header, payload = VE.farmmessage(result)
+    # what a farm client relays: TOML and bytes, an id past Int64 included
+    header = VE.TOML.parse(sprint(VE.TOML.print, header))
+    back = VE.farmresult(header, payload)
+    @test (back.frame, back.png, back.seconds) == (result.frame, result.png, result.seconds)
+    @test [(l.track, l.id, l.frame, l.png, l.hdr) for l in back.layers] ==
+          [(l.track, l.id, l.frame, l.png, l.hdr) for l in result.layers]
+    @test_throws ErrorException VE.farmresult(header, vcat(payload, UInt8[1]))
+end
+
 # FarmClient is a package of its own, standard library only: loaded here from source.
 isdefined(Main, :FarmClient) || include(joinpath(pkgdir(VE), "FarmClient", "src", "FarmClient.jl"))
 
