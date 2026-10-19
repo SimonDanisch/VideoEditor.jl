@@ -163,7 +163,10 @@ function sceneframe!(src::SceneSource, clip::Clip, dims::Tuple{Int, Int};
     # walks Makie's compute graph and can reach the renderer), and reading the
     # film back.
     raw = cachedsourceframe(clip, src.at)
-    raw === nothing || return hdrpicture(raw, clip, src.at)
+    if raw !== nothing
+        work = hdrwork!(src, Mantle.defaultbackend(), size(raw.color))
+        return hdrpicture!(work, uploadmaster!(work, raw), clip, src.at)
+    end
     name = renderwith(src)
     backend = getbackend(name)
     img = onthread(renderthread(backend)) do; lock(SCENELOCK) do
@@ -191,14 +194,15 @@ function sceneframe!(src::SceneSource, clip::Clip, dims::Tuple{Int, Int};
         # methods the frame's GPU code calls (the film's Earth defines its air as
         # a participating medium), and the frame compiled in this function's
         # world did not see them.
-        image = Base.invokelatest(liveframe!, src.live; clear = src.samples == 0,
-                                  samples = exact ? nothing : 1, pixel_scale = exact ? 1 : pixel_scale)
-        if rawcapture
-            raw = Base.invokelatest(backend.renderbuffers, src.live.screen)
-            rawcache === nothing || cachewrite!(rawcache, clip.id, src.at, raw; revision = rawrevision)
-            return hdrpicture(raw, clip, src.at)
-        end
-        image
+        clear = src.samples == 0
+        samples = exact ? nothing : 1
+        px_per_unit = exact ? 1 : pixel_scale
+        rawcapture || return Base.invokelatest(liveframe!, src.live; clear, samples, pixel_scale = px_per_unit)
+        # A traced HDR frame stays on the device: captured there, its master
+        # downloaded once for the cache, and its picture made there.
+        raw = Base.invokelatest(backend.renderbuffers, src.live.screen; clear, samples, px_per_unit)
+        rawcache === nothing || cachewrite!(rawcache, clip.id, src.at, raw; revision = rawrevision)
+        hdrpicture!(hdrwork!(src, KA.get_backend(raw.color), size(raw.color)), raw, clip, src.at)
     end; end
     src.samples += 1
     return img
@@ -957,27 +961,21 @@ end
 
 function chainpass!(g, node::SceneNode, ::Nothing, ::Nothing, ctx::ChainBuild, dims)
     inputdims = node.inputdims
-    cur = Mantle.Transient.Buffer(g, PlanePixel, inputdims...; hostwritten = true)
+    cur = Mantle.Transient.Buffer(g, PlanePixel, inputdims...)
     st = ctx.state
-    # A scene's picture is a host frame and is STORED into the transient for
-    # exactly the reason a decoded one is: a `copyto!` into a device transient
-    # from inside a recorded pass body is a host→device upload mid-batch, which
-    # forces a `vkQueueSubmit` and stalls. A store lands at the update pass
-    # instead, as a command in the run's own submission. This was the video source's bug too —
-    # it is the same bug, and it survived here because the scene pass has its own
-    # body. Measured on the lego project: playback of a timeline with a scene ran
-    # at 10.6 fps against 32.4 without one, and baking the scene (so the body only
-    # reads a PNG) changed nothing, which is what puts the cost on the upload and
-    # not the drawing.
-    st.upload = cur
+    # The picture goes into the chain's own persistent buffer before the run,
+    # the way a decoded frame does (see `rawbuffer!`): a host image (a raster
+    # scene, a bake) is STORED, landing as a command in the run's own submission
+    # rather than as a `copyto!` mid-batch, which forced a `vkQueueSubmit` and
+    # stalled (measured on the lego project: playback with a scene at 10.6 fps
+    # against 32.4 without one). A traced scene's picture is made on the device
+    # and is copied there, device to device (`deliver!`). One pass then copies
+    # it into the chain's transient, which the next node may write in place.
+    pic = scenebuffer!(st, g.dev, inputdims)
+    st.upload = pic
     st.uploaddims = inputdims
     st.blankonmiss = true   # nothing else writes this one
-    # No pass at all. The picture is a host image and `update!` STORES it into
-    # this transient before the run, which is the whole of what the old body did
-    # — it only ever had work left when nobody had filled the update, and that
-    # case is now a store of `blankpixels!` rather than a draw inside a recorded
-    # pass. What reads `cur` is the next node in the chain, which is what gives
-    # the transient its interval.
+    Mantle.dispatch!(g, copypixels_kernel!, (cur, pic), inputdims; name = "scene")
     inputdims == dims && return cur
     # Upscale once on the GPU, before effects. Their pixel units, the clip's
     # placement and editor hit coordinates keep their full-resolution meaning.

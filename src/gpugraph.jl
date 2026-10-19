@@ -569,6 +569,29 @@ function chainpass!(g, ::SourceNode, ::Nothing, ::Nothing, ctx::ChainBuild, dims
 end
 
 """
+    deliver!(dst, picture) -> dst
+
+This frame's picture into the persistent buffer the source pass reads: a host
+image is stored (it lands in the run's own submission), a device image is
+copied where it is, before the run.
+"""
+deliver!(dst, img::Array) = (dst[:] = vec(img); dst)
+deliver!(dst, img::AbstractArray) = (copyto!(Mantle.storage(dst), vec(img)); dst)
+
+"""
+    scenebuffer!(st, dev, dims) -> Mantle.Buffer{PlanePixel}
+
+A scene chain's picture buffer, made once and kept: its address is what the
+recorded copy into the chain packed (see `planebuffers!`).
+"""
+function scenebuffer!(st::FxState, dev, dims::Tuple{Int, Int})
+    b = st.raw
+    b === nothing || return b
+    st.raw = Mantle.Buffer(dev, PlanePixel, dims)
+    return st.raw
+end
+
+"""
     planebuffers!(st, dev, dims) -> (luma, chroma)
 
 The chain's own NV12 planes, made once and kept.
@@ -1284,7 +1307,7 @@ function update!(ch::ClipChain, sf::Integer, phase::Real, source;
     # between runs, so a frame with no picture stores black rather than leaving
     # the chain to read the arena's last tenant.
     if st.upload !== nothing
-        st.uploaded ? (st.upload[:] = vec(hf)) :
+        st.uploaded ? deliver!(st.upload, hf) :
             st.blankonmiss && (st.upload[:] = blankpixels!(st, uploaddims))
     end
     # A decoder that served DEVICE planes: copy them into the chain's own, which

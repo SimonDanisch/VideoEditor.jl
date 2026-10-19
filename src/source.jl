@@ -119,6 +119,9 @@ mutable struct SceneSource <: ClipSource
     pending::Any
     pendingat::Int
     soundtrack::String
+    # The HDR stage's device workspace for a traced scene (`HDRWork`), kept
+    # between frames; `nothing` until the first one.
+    hdr::Any
 end
 SceneSource(root; joints::Dict{Symbol, Any} = Dict{Symbol, Any}(), camera = nothing,
             build = nothing, backend::Symbol = defaultscenebackend(),
@@ -131,7 +134,7 @@ SceneSource(root; joints::Dict{Symbol, Any} = Dict{Symbol, Any}(), camera = noth
     SceneSource(root, joints, camera, build, backend, screenopts, Int(width), Int(height),
                 Float64(framerate),
                 Int(nframes), nothing, -1, bakewith, bakescreenopts, :live, 0, nothing, -1,
-                String(soundtrack))
+                String(soundtrack), nothing)
 
 decodable(::SceneSource) = false
 sourcepath(::SceneSource) = ""

@@ -19,6 +19,77 @@ VE.usebackend!(RayMakie)
     @test minimum(VE.green.(restored.color)) < 0
 end
 
+# The HDR stage runs on the device: each effect a kernel, picked by its type. The
+# reference here is the host formula it replaced, per pixel.
+@testset "the HDR stage is its reference formula, on the device" begin
+    w, h = 24, 16
+    tone(v, mode, gamma) = (v = max(0.0f0, v);
+        t = mode == 1 ? v / (1.0f0 + v) : mode == 2 ? (v * (2.51f0 * v + 0.03f0)) / (v * (2.43f0 * v + 0.59f0) + 0.14f0) : v;
+        clamp(t, 0.0f0, 1.0f0)^(1.0f0 / gamma))
+    lum(c) = 0.2126f0 * c.r + 0.7152f0 * c.g + 0.0722f0 * c.b
+    function atrous(img, frame, iterations)
+        taps = Float32[1, 4, 6, 4, 1] ./ 16
+        result = copy(img)
+        for it in 1:iterations
+            input = result; result = similar(input); step = 1 << (it - 1)
+            for y in 1:h, x in 1:w
+                c = input[x, y]; n = frame.normal[x, y]; d0 = frame.depth[x, y]
+                tr = tg = tb = cnt = 0.0f0
+                for dy in -2:2, dx in -2:2
+                    xx = clamp(x + dx * step, 1, w); yy = clamp(y + dy * step, 1, h)
+                    d = frame.depth[xx, yy]
+                    isfinite(d) == isfinite(d0) || continue
+                    abs(frame.coverage[xx, yy] - frame.coverage[x, y]) < 0.01f0 || continue
+                    nb = frame.normal[xx, yy]
+                    nw = iszero(n) && iszero(nb) ? 1.0f0 : max(0.0f0, n[1] * nb[1] + n[2] * nb[2] + n[3] * nb[3])^64
+                    dw = isfinite(d0) ? exp(-abs(d0 - d) / max(0.1f0, 0.02f0 * abs(d0))) : 1.0f0
+                    s = input[xx, yy]
+                    wt = taps[dx + 3] * taps[dy + 3] * nw * dw * exp(-abs(lum(c) - lum(s)) / max(0.1f0, abs(lum(c))))
+                    tr += s.r * wt; tg += s.g * wt; tb += s.b * wt; cnt += wt
+                end
+                result[x, y] = cnt > 0 ? VE.RGB{Float32}(tr / cnt, tg / cnt, tb / cnt) : c
+            end
+        end
+        return result
+    end
+    frame = (
+        color = [VE.RGB{Float32}(3x / w, 2y / h, (x + y) % 5 / 2) for x in 1:w, y in 1:h],
+        albedo = fill(VE.RGB{Float32}(0.5, 0.5, 0.5), w, h),
+        normal = [VE.Vec3f(0, x > w ÷ 2 ? 1 : 0, x > w ÷ 2 ? 0 : 1) for x in 1:w, y in 1:h],
+        depth = [y > 12 ? Inf32 : Float32(2 + x / w) for x in 1:w, y in 1:h],
+        coverage = [y > 12 ? 0.0f0 : 1.0f0 for x in 1:w, y in 1:h],
+        overlay = [x == 3 ? VE.RGBA{Float32}(0.4, 0.4, 0.4, 0.5) : VE.RGBA{Float32}(0, 0, 0, 0) for x in 1:w, y in 1:h],
+        metadata = Dict{String, Any}(),
+    )
+    build = VE.scenebuild(:bar, (w, h))
+    clip = VE.sceneclip(VE.buildscene(build); build, frames = 1, canvas = (w, h))
+    grade = VE.LinearGradeEffect(exposure = 1, saturation = 0.8, redgain = 1.1, bluegain = 0.9)
+    VE.addslot!(clip, VE.Effect(grade))
+    VE.addslot!(clip, VE.Effect(VE.HDRDenoiseEffect(strength = 0.5, iterations = 2)))
+    VE.addslot!(clip, VE.Effect(VE.ToneMapEffect(mode = 2, gamma = 2.2)))
+    work = VE.hdrwork!(clip.source, Mantle.defaultbackend(), (w, h))
+    out = VE.hdrpicture!(work, VE.uploadmaster!(work, frame), clip, 0)
+    @test !(out isa Array)                    # it stays on the device
+    scale = exp2(grade.exposure)
+    graded = map(frame.color) do c
+        l = lum(c)
+        VE.RGB{Float32}((l + (c.r - l) * grade.saturation) * scale * grade.redgain,
+                        (l + (c.g - l) * grade.saturation) * scale,
+                        (l + (c.b - l) * grade.saturation) * scale * grade.bluegain)
+    end
+    filtered = atrous(graded, frame, 2)
+    mixed = map((a, b) -> VE.RGB{Float32}(a.r * 0.5f0 + b.r * 0.5f0, a.g * 0.5f0 + b.g * 0.5f0, a.b * 0.5f0 + b.b * 0.5f0), graded, filtered)
+    expected = map(mixed, frame.coverage, frame.overlay) do c, a, o
+        VE.RGBA{Float32}(tone(c.r, 2, 2.2f0) * a * (1 - o.alpha) + o.r, tone(c.g, 2, 2.2f0) * a * (1 - o.alpha) + o.g,
+                         tone(c.b, 2, 2.2f0) * a * (1 - o.alpha) + o.b, a * (1 - o.alpha) + o.alpha)
+    end
+    got = Array(out)
+    @test maximum(abs(Float32(getfield(g, k)) - getfield(e, k)) for (g, e) in zip(got, expected) for k in (:r, :g, :b, :alpha)) <= 1.5f0 / 255
+    # an HDR effect after the display transform is refused
+    VE.addslot!(clip, VE.Effect(VE.LinearGradeEffect()))
+    @test_throws ErrorException VE.hdrpicture!(work, VE.uploadmaster!(work, frame), clip, 0)
+end
+
 @testset "HDR effects reuse the traced source master" begin
     build = Dict{String, Any}(
         "kind" => "rig", "rig" => Dict(
