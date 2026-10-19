@@ -45,3 +45,13 @@ VE.usebackend!(RayMakie)
         VE.emptyengine!(engine);foreach(close, values(readers));close(clip.source)
     end
 end
+
+@testset "a farm worker loads what implements the effects" begin
+    build = VE.scenebuild(:bar, (32, 16))
+    clip = VE.sceneclip(VE.buildscene(build); build, frames = 1, canvas = (32, 16))
+    seq = VE.Sequence([clip], 30)
+    @test !("OIDNRunner" in VE.farmpackages(seq))
+    VE.addslot!(clip, VE.Effect(VE.OIDNDenoiseEffect()))
+    @test "OIDNRunner" in VE.loadpackages(seq)
+    @test "OIDNRunner" in VE.farmpackages(seq)
+end

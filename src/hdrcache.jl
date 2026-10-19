@@ -119,6 +119,7 @@ struct OIDNDenoiseEffect <: HDRFxOp
     prefilter::Bool
 end
 OIDNDenoiseEffect(; strength = 1, prefilter = true) = OIDNDenoiseEffect(Float32(strength), Bool(prefilter))
+effectpackages(::OIDNDenoiseEffect) = ["OIDNRunner"]
 const HDR_DENOISERS = Dict{Symbol, Any}()
 """
     registerhdrdenoiser!(name, callback)

@@ -35,7 +35,7 @@ struct RenderJob
     fps::Float64
     julia::String
     backends::Vector{String}
-    packages::Vector{String}          # the scene recipes': a renderer loads them before it renders
+    packages::Vector{String}          # the recipes' and effects' packages: a renderer loads them before it renders (`loadpackages`)
     relocations::Dict{String, String}
 end
 
@@ -111,7 +111,7 @@ function renderjob(project::AbstractString, directory::AbstractString; inputs = 
         open(joinpath(temp, "job.toml"), "w") do io
             TOML.print(io, Dict{String, Any}("size" => collect(canvas), "total" => total, "fps" => seq.framerate,
                                              "julia" => string(VERSION), "backends" => farmbackends(seq),
-                                             "packages" => recipepackages(seq), "relocations" => relocations))
+                                             "packages" => loadpackages(seq), "relocations" => relocations))
         end
         if isdir(snapshot)
             snapshotkey(temp) == snapshotkey(snapshot) ||

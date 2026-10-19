@@ -159,10 +159,29 @@ end
 """
     farmpackages(seq) -> Vector{String}
 
-The packages a farm worker loads to render `seq`: VideoEditor, the backends its
-scenes are finished with, and the packages their recipes come from.
+The packages a farm worker needs to render `seq`: VideoEditor, the backends its
+scenes are finished with, and what it loads before it renders (`loadpackages`).
 """
-farmpackages(seq::Sequence) = unique(["VideoEditor"; farmbackends(seq); recipepackages(seq)])
+farmpackages(seq::Sequence) = unique(["VideoEditor"; farmbackends(seq); loadpackages(seq)])
+
+"""
+    loadpackages(seq) -> Vector{String}
+
+What a farm worker loads before it renders `seq`, beyond VideoEditor and the
+backends: the packages its scene recipes come from, and the packages that
+implement its effects (see `effectpackages`).
+"""
+loadpackages(seq::Sequence) = unique([recipepackages(seq);
+    String[p for c in seq.clips for fx in c.effects if renderable(fx) for p in effectpackages(op(fx, c.src_in))]])
+
+"""
+    effectpackages(op) -> Vector{String}
+
+The packages an effect needs loaded to render, where VideoEditor does not
+implement it itself: the OIDN denoiser is OIDNRunner's extension of the editor,
+so a worker without OIDNRunner cannot denoise.
+"""
+effectpackages(::Any) = String[]
 
 """The packages `seq`'s scene recipes come from (see `packagescene`)."""
 recipepackages(seq::Sequence) =
