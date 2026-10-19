@@ -1997,7 +1997,9 @@ include("renderthread.jl") # renderer handoff, failures and startup deadlines
 include("renderfarm.jl")  # saved procedural scenes, resume, audio and frame transport
 include("farmenv.jl")     # a job's pinned environment, and the farm's messages over TCP
 # track and HDR source caches, and the planes farm workers return; render with RayMakie
-isdefined(Main, :RayMakie) && (include("trackcache.jl"); include("hdrcache.jl"))
+isdefined(Main, :RayMakie) && (include("trackcache.jl"); include("hdrcache.jl"); include("guides.jl"))
+# the OIDN effect is OIDNRunner's extension of the editor
+isdefined(Main, :RayMakie) && isdefined(Main, :OIDNRunner) && include("oidn_effect.jl")
 # farm clients render through their own processes; the first run compiles a job environment
 get(ENV, "VIDEOEDITOR_FARM_TEST", "") == "1" && isdefined(Main, :RayMakie) && include("farmclient.jl")
 include("recordedanimation.jl") # streamed simulation arrays; GPU integration when RayMakie is loaded

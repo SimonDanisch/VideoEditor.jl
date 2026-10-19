@@ -233,6 +233,23 @@ different job. An editor curve change invalidates its entire clip-level bake;
 the scheduler does not calculate which curve segments changed. Supplying a frame
 subset to `renderfarm!` is possible, but is not automatic edit invalidation.
 
+A project with track caches (`enabletrackcache!`) gets its frames' planes back:
+a worker renders into caches of its own, outside the snapshot, and returns each
+frame's track planes and, for a traced clip, its linear HDR source with the
+frame (`farmlayers!`). The coordinator keeps them under
+`<job>/trackframes` and names their hashes in the frame's receipt.
+`adoptfarmcache!(seq, job)` takes them into the edit's caches wherever the
+clip's frame is unchanged since the job was made, so a grade, denoise or label
+edit after the farm render reuses the traced sources and renders only the
+derived planes:
+
+```julia
+renderfarm!(job, farmworkers(job))
+seq = loadproject(project)
+adoptfarmcache!(seq, job)   # before editing it further
+saveproject(project, seq)
+```
+
 `encodefarm!` currently encodes all verified PNGs again, then mixes/muxes audio.
 There is no cached video-stream remux path for an audio-only edit. Independent
 scene-frame, composite/video and speech caches are needed before an edited job
