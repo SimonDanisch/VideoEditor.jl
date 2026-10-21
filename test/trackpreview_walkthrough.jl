@@ -92,7 +92,7 @@ using Main.EditingWalkthroughActions
                     @test VE.targetscene(clip().source.live.target)===scene
                     FI.Wait(0)
                 end);
-                click(()->center(button(p,"Speech")));
+                click(()->center(button(p,"Nar")));
                 reveal(p,()->speechmenu(p,1));click(()->center(speechmenu(p,1)));
                 FI.TypeText("QA preview voice");FI.KeyPress(M.Keyboard.enter);FI.Wait(.3);
                 FI.Lazy(_->begin

@@ -59,7 +59,7 @@ using Main.EditingWalkthroughActions
                 M.Point2f(vp.origin[1]+(frame/24-lim.origin[1])/lim.widths[1]*vp.widths[1],
                     vp.origin[2]+(y-lim.origin[2])/lim.widths[2]*vp.widths[2])
             end
-            actions=[click(()->trackpos(6,1));click(()->center(button(p,"Animation")));
+            actions=[click(()->trackpos(6,1));scenecontrols(p,"acting");
                 FI.Lazy(_->begin
                     @test sections().onlyactive[]
                     @test visible(:sway) && !visible(:height) && !visible(:still)
@@ -91,7 +91,7 @@ using Main.EditingWalkthroughActions
                     @test VE.valueat(prm(:still),6)≈2
                     FI.Wait(0)
                 end);
-                click(()->trackpos(6,2));click(()->center(button(p,"Animation")));
+                click(()->trackpos(6,2));scenecontrols(p,"acting");
                 FI.Lazy(_->begin
                     @test clip().track==2
                     @test sections().onlyactive[] && visible(:still)
@@ -114,7 +114,7 @@ using Main.EditingWalkthroughActions
             trimmed=VE.withfields(first(p.sequence.clips);src_in=24,src_out=48,start=0)
             @test !(Symbol("actor_performance.still") in VE.activeanimationparams(trimmed,VE.findslot(trimmed,:scene),6))
             # Undo restores keys in place and updates the filtered form.
-            actions=[click(()->trackpos(6,1));click(()->center(button(p,"Animation")));
+            actions=[click(()->trackpos(6,1));scenecontrols(p,"acting");
                 chord(M.Keyboard.z);chord(M.Keyboard.z);
                 FI.Lazy(_->begin
                     @test !VE.isanimated(prm(:still))

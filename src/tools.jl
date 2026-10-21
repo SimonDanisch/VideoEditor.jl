@@ -1670,144 +1670,6 @@ function transcriptpanel!(ctx::ToolContext)
     return nothing
 end
 
-"""
-The narration panel: what has been said, and a box to say something new.
-
-Placed at the playhead, because that is where you are when you decide a line
-belongs — the alternative is a time field to type into, which means reading the
-timecode off the screen and copying it by hand.
-
-Each existing line is a card with its own × so one can go without touching the
-others, and re-rendering is per line: a voice or wording change should not cost
-the whole track.
-"""
-function narrationpanel!(ctx::ToolContext)
-    player = ctx.player
-    seq = player.sequence
-    colors = player.fxwidgets[:uicolors]
-    toolcard!(ctx; caption = "Add a spoken line at the playhead") do g, blocks
-        box = Textbox(g[1,1]; placeholder="words to speak…", width=Makie.Relative(1),
-                      tellwidth=false, reset_on_defocus=false, fontsize=11)
-        on(box.stored_string) do str
-            (str === nothing || isempty(strip(str))) && return
-            addnarration!(player,str)
-        end
-        push!(blocks,box)
-    end
-    isempty(seq.narration) && return nothing
-    # One line inspector, rather than building hundreds of widgets for a film.
-    i = clamp(get(player.fxwidgets,:narration_index,1),1,length(seq.narration))
-    player.fxwidgets[:narration_index] = i
-    nar = seq.narration[i]
-    rendering = haskey(get(player.fxwidgets,:speechjobs,IdDict()),nar)
-    toolcard!(ctx; caption="Spoken lines · $(length(seq.narration))") do g, blocks
-        options = [("$(j). $(isempty(n.label) ? n.voice : n.label) · $(round(something(narrationtime(seq,n),n.at);digits=2))s · $(first(n.text,24))",j)
-                   for (j,n) in enumerate(seq.narration)]
-        menu = Menu(g[1,1]; options, default=options[i][1], fontsize=11, searchable=true,
-                    search_placeholder="find a line…",
-                    width=Makie.Relative(1),tellwidth=false)
-        on(menu.selection) do j
-            j === nothing && return
-            selectnarration!(player,j; seek=false)
-        end
-        push!(blocks,menu)
-        nav = GridLayout(g[2,1]); colgap!(nav,4)
-        for (k,label,delta) in ((1,"◀ line",-1),(2,"line ▶",1))
-            btn = Button(nav[1,k];label,fontsize=11,tellwidth=false,width=Makie.Relative(1))
-            on(btn.clicks) do _
-                selectnarration!(player,clamp(i+delta,1,length(seq.narration)); seek=false)
-            end
-        end
-        goto = Button(nav[1,3];label="Go to line",fontsize=11,tellwidth=false,width=Makie.Relative(1))
-        on(_ -> seek!(player,round(Int,something(narrationtime(seq,nar),nar.at)*seq.framerate)),goto.clicks)
-        push!(blocks,nav)
-    end
-    toolcard!(ctx; caption="$(isempty(nar.label) ? nar.voice : nar.label) · at $(round(something(narrationtime(seq,nar),nar.at);digits=2))s",
-              onremove=_ -> dropnarration!(player,i)) do g, blocks
-        function field(row,label,value,commit; placeholder="")
-            push!(blocks,Label(g[row,1],label;fontsize=10,halign=:left,tellwidth=false,color=colors.text_muted))
-            box = Textbox(g[row+1,1];stored_string=value,placeholder,fontsize=11,
-                          width=Makie.Relative(1),tellwidth=false,reset_on_defocus=false)
-            on(v -> v === nothing || commit(v),box.stored_string)
-            push!(blocks,box)
-            return box
-        end
-        field(1,"Words",nar.text,v -> setnarrationtext!(player,i,v))
-        options = [("Session default",:default); [(m.label,k) for (k,m) in speechmodels()]]
-        any(o -> o[2] === nar.speech.model,options) || push!(options,("$(nar.speech.model) · unavailable",nar.speech.model))
-        modelrow = GridLayout(g[3,1])
-        modellabel = Label(modelrow[1,1], "Voice model"; fontsize=10,halign=:left,tellwidth=false)
-        push!(blocks,modellabel)
-        modelmenu = Menu(modelrow[2,1];options,default=first(only(filter(o->o[2]===nar.speech.model,options))),
-                         fontsize=11,width=Makie.Relative(1),tellwidth=false,searchable=true,
-                         search_placeholder="find a voice model…")
-        on(k -> k === nothing || setnarrationspeech!(player,i;model=k),modelmenu.selection)
-        push!(blocks,modelmenu)
-        model = speechmodel(nar)
-        refs = Pair{String,Tuple{String,String,String}}["No reference" => ("","",nar.voice)]
-        for n in seq.narration
-            isempty(n.speech.reference) && continue
-            value = (n.speech.reference,n.speech.reference_text,n.voice)
-            any(r -> r.second[1] == value[1],refs) || push!(refs,
-                "$(n.voice) · $(basename(value[1]))" => value)
-        end
-        current = findfirst(r->r.second[1]==nar.speech.reference,refs)
-        refmenu = Menu(g[4,1]; options=[(r.first,j) for (j,r) in enumerate(refs)],
-                       default=refs[something(current,1)].first,fontsize=11,searchable=true,
-                       search_placeholder="find a reference voice…",
-                       width=Makie.Relative(1),tellwidth=false)
-        on(refmenu.selection) do j
-            j === nothing && return
-            reference,reference_text,voice = refs[j].second
-            setnarrationspeech!(player,i;reference,reference_text,voice)
-        end
-        push!(blocks,refmenu)
-        if model !== nothing && model.reference
-            push!(blocks,Label(g[5,1],"Voice identity comes from the reference clip above.";
-                              fontsize=10,tellwidth=false,halign=:left,color=colors.text_muted))
-        else
-            field(5,"Voice ID",nar.voice,v -> setnarrationvoice!(player,i,v))
-        end
-        field(7,"Regie · delivery instructions",nar.speech.direction,
-              v -> setnarrationspeech!(player,i;direction=v);placeholder="quiet, hesitant, then increasingly angry…")
-        field(9,"Reference transcript (Fish uses this)",nar.speech.reference_text,
-              v -> setnarrationspeech!(player,i;reference_text=v))
-        footer = GridLayout(g[0,1]);colgap!(footer,4)
-        for (k,label,action) in ((1,rendering ? "Rendering…" : isempty(nar.samples) ? "Render take" : "Re-render take",()->rendernarration!(player,i)),
-                                 (2,"Listen",()->listennarration!(player,i)),
-                                 (3,"Move here",()->movenarration!(player,i)),
-                                 (4,"Reference…",()->choosenarrationreference!(player,i)))
-            btn = Button(footer[div(k-1,2)+1,mod(k-1,2)+1];label,fontsize=11,tellwidth=false,width=Makie.Relative(1))
-            on(_->action(),btn.clicks)
-        end
-        push!(blocks,footer)
-        note = rendering ? "Generating this take · you can continue editing." : isempty(nar.samples) ? "Not rendered · render to hear these settings." :
-               "Take ready · $(round(length(nar.samples)/nar.rate;digits=2))s · included in preview and export."
-        push!(blocks,Label(g[12,1],note;fontsize=10,tellwidth=false,halign=:left,color=colors.text_muted))
-        if model === nothing || !model.direction
-            push!(blocks,Label(g[13,1],"This model cannot use Regie; choose VoxCPM2 or Fish for directed delivery.";
-                  fontsize=10,tellwidth=false,halign=:left,color=colors.text_muted))
-        end
-    end
-    return nothing
-end
-
-function listennarration!(player::Player,i::Integer)
-    1 <= i <= length(player.sequence.narration) || return nothing
-    n = player.sequence.narration[i]
-    isempty(n.samples) && return setstatus!(player,"render this take before listening")
-    Sys.which("pw-cat") === nothing && return setstatus!(player,"audio preview needs pw-cat")
-    setstatus!(player,"playing this take…")
-    Threads.@spawn try
-        run(pipeline(audiocommand(`pw-cat --playback --raw --rate $(n.rate) --channels 1 --format f32 -`);
-                     stdin=IOBuffer(reinterpret(UInt8,n.samples)),stdout=devnull,stderr=devnull))
-        setstatus!(player,"played this take")
-    catch e
-        setstatus!(player,"could not play this take: $(briefly(e))")
-    end
-    return nothing
-end
-
 function setnarrationspeech!(player::Player,i::Integer;voice=nothing,kw...)
     1 <= i <= length(player.sequence.narration) || return nothing
     old = player.sequence.narration[i]
@@ -1824,38 +1686,7 @@ end
 "Audio edits do not invalidate the raytraced picture; rebuild after the input callback completes."
 function speechchanged!(player::Player)
     player.edited[] += 1
-    put!(player.uiqueue,()->rebuildtoolcard!(player,:narration))
-    return nothing
-end
-
-"Select the existing take from either its timeline block or the speech picker."
-function selectnarration!(player::Player, i::Integer; seek=true)
-    1 <= i <= length(player.sequence.narration) || return nothing
-    player.fxwidgets[:narration_index] = Int(i)
-    selected = get(player.fxwidgets,:dialogue_selected,nothing)
-    selected === nothing || (selected[] = Int(i))
-    opendock!(player,:effects)
-    if haskey(player.fxpanel.toolcards,:narration)
-        rebuildtoolcard!(player,:narration)
-    else
-        opentool!(player,:narration)
-    end
-    Makie.set!(player.fxwidgets[:fxfilterbox],"narration")
-    player.fxpanel.toolcards[:narration].open = true
-    if seek
-        n = player.sequence.narration[i]
-        seek!(player,round(Int,something(narrationtime(player.sequence,n),n.at)*player.sequence.framerate))
-    end
-    showspeechline!(player)
-    put!(player.uiqueue,()->showspeechline!(player))
-    return nothing
-end
-
-"Bring the selected line's words and model into view above add/picker controls."
-function showspeechline!(player::Player)
-    cards = filter(c->c.tool===:narration,player.fxwidgets[:toolcards][3])
-    length(cards) >= 3 || return nothing
-    scrollinspectorto!(player,last(cards).frame)
+    put!(player.uiqueue,()->refreshnarrationdock!(player))
     return nothing
 end
 
@@ -2195,12 +2026,6 @@ registertool!(:timeinterp, "Time interpolation",
     "nearest (frame sampling) or synthesize it with RIFE (optical flow).";
     activate = ctx -> smoothslowmo!(ctx.player),
     panel = timeinterppanel!)
-
-registertool!(:narration, "Narration",
-    "Edit spoken lines, reference voices, speech models and delivery instructions. Mixed over " *
-    "the timeline in the preview and in the export.";
-    activate = ctx -> setstatus!(ctx.player, "narration: type a line in the card and press Enter"),
-    panel = narrationpanel!)
 
 registertool!(:transcript, "Transcript",
     "Speech to captions with Whisper. The line under the playhead is editable — " *

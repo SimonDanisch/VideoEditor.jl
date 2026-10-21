@@ -15,7 +15,7 @@ module EditingWalkthroughActions
     const FI = Main.FakeInteraction
     const K = M.Keyboard
 
-    export center, header, button, speechblocks, speechfield, speechmenu, menurow, timelinepos, click, chord, reveal, typefield, recordactions
+    export center, header, button, scenecontrols, layoutblocks, speechblocks, speechfield, speechmenu, menurow, timelinepos, click, chord, reveal, typefield, recordactions
 
     "Compare displayed scene pixels with the rendered image, including orientation."
     function previewmatches(p, axis, picture)
@@ -56,9 +56,17 @@ module EditingWalkthroughActions
         visit(p.fig.layout)
         return only(b for b in blocks if b isa M.Button && b.label[] == label)
     end
-    function speechblocks(p)
-        return last(filter(c -> c.tool === :narration, p.fxwidgets[:toolcards][3])).blocks
+    "Open the clip's scene card on a section (`camera`, `acting`, `lighting`, or all of it)."
+    scenecontrols(p, query = "") = [FI.Lazy(_ -> (VE.openscenecontrols!(p, query); FI.Wait(0.25)))]
+    "Every block in `layout`, nested layouts included, in the order they were made."
+    function layoutblocks(layout, out = Any[])
+        for c in layout.content
+            c.content isa M.GridLayout ? layoutblocks(c.content, out) : push!(out, c.content)
+        end
+        return out
     end
+    "The narration dock's editor of the line in hand."
+    speechblocks(p) = layoutblocks(p.fxwidgets[:narrationline])
     function speechfield(p, label)
         blocks = speechblocks(p)
         i = findfirst(b -> b isa M.Label && b.text[] == label, blocks)
@@ -84,8 +92,10 @@ module EditingWalkthroughActions
     end
     click(f) = [FI.Lazy(_ -> FI.MouseTo(f(), 0.05)), FI.LeftClick(), FI.Wait(0.25)]
     chord(key) = [FI.KeyDown(K.left_control), FI.KeyPress(key), FI.KeyUp(K.left_control), FI.Wait(0.25)]
+    "What scrolls in the open dock: the effects panel's card list, or the dock itself."
+    dockscroll(p) = p.dockopen[] === :effects ? p.fxpanel.scroll : p.dockpanels[p.dockopen[]].sf
     function reveal(p, f)
-        actions = Any[FI.Lazy(_ -> FI.MouseTo(center(p.fxpanel.scroll), 0.05))]
+        actions = Any[FI.Lazy(_ -> FI.MouseTo(center(dockscroll(p)), 0.05))]
         # Wheel delivery and layout settle over several recorded frames. Re-check
         # the target after each gesture instead of assuming one wheel event got it
         # into view. Long, filtered performance sections exercise both directions.
@@ -93,9 +103,10 @@ module EditingWalkthroughActions
             push!(
                 actions, FI.Lazy(
                     _ -> begin
-                        bb = p.fxpanel.scroll.layoutobservables.computedbbox[]
+                        scroll = dockscroll(p)
+                        bb = scroll.layoutobservables.computedbbox[]
                         y = center(f())[2]
-                        step = p.fxpanel.scroll.scroll_speed[]
+                        step = scroll.scroll_speed[]
                         dy = y < bb.origin[2] + 60 ? -(bb.origin[2] + 60 - y) / step :
                             y > bb.origin[2] + bb.widths[2] - 60 ? (y - bb.origin[2] - bb.widths[2] + 60) / step : 0
                         FI.Scroll((0, dy); duration = 0.5)

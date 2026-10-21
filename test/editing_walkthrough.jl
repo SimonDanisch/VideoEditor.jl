@@ -73,7 +73,7 @@ using Main.EditingWalkthroughActions
                      click(() -> center(previewmenu()));click(() -> menurow(previewmenu(),1.0));
                      FI.Lazy(_ -> begin @test p.previewscale[] == 1;FI.Wait(0) end)]
             recordactions(p,out,"preview_quality",actions)
-            actions=[click(() -> center(button(p,"Scene")));
+            actions=[scenecontrols(p,"");
                      reveal(p,()->p.fxwidgets[Symbol(:fxsections_,fx().id)].activecheck);
                      click(()->center(p.fxwidgets[Symbol(:fxsections_,fx().id)].activecheck));
                      FI.Lazy(_ -> begin @test fx().card.open[]; FI.Wait(0) end);
@@ -121,7 +121,7 @@ using Main.EditingWalkthroughActions
             lightposition()=VE.param(fx(),Symbol("lights[1].position[1]"))
             lights()=M.get_lights(VE.targetscene(clip().source.live.target))
             beforelight=copy(p.frame[])
-            actions=[click(() -> center(button(p,"Light")));
+            actions=[scenecontrols(p,"lighting");
                      typefield(p,()->ambient().view.control,"0.8");
                      FI.Lazy(_ -> begin
                          @test VE.valueat(ambient(),p.playhead[])≈.8
@@ -150,7 +150,7 @@ using Main.EditingWalkthroughActions
             recordactions(p,out,"light_keys_undo",actions)
             grade()=VE.param(VE.findslot(clip(),:color),:brightness)
             beforegrade = copy(p.frame[])
-            actions=[click(() -> center(button(p,"Colour")));
+            actions=[typefield(p,()->p.fxwidgets[:fxfilterbox],"color");
                      reveal(p,()->grade().view.control);
                      FI.Lazy(_ -> FI.MouseTo(FI.relative_pos(grade().view.control,(0.5,0.5)),0.05));
                      FI.LeftDown();FI.Lazy(_ -> FI.MouseTo(FI.relative_pos(grade().view.control,(0.7,0.5)),0.2));FI.LeftUp();
@@ -177,7 +177,7 @@ using Main.EditingWalkthroughActions
                          FI.Wait(0)
                      end)]
             recordactions(p,out,"cuts_grade_undo",actions)
-            actions=[click(() -> center(button(p,"Speech")));
+            actions=[click(() -> center(button(p,"Nar")));
                      typefield(p,()->speechfield(p,"Words"),"Hallo, Chef!";guard=true);
                      typefield(p,()->speechfield(p,"Regie · delivery instructions"),"quiet, hesitant");
                      reveal(p,()->speechmenu(p,1));click(() -> center(speechmenu(p,1)));
