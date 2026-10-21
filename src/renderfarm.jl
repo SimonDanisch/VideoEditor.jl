@@ -410,15 +410,17 @@ function adoptplane!(cache::TrackCache, id::UInt64, sf::Int, file::AbstractStrin
     # plane. A hard link therefore preserves both job receipts and later edits,
     # without doubling hundreds of GB of HDR masters. Stage the replacement so
     # an interrupted copy cannot destroy a previously valid cached frame.
-    mktempdir(dirname(target)) do dir
-        staged = joinpath(dir, basename(target))
-        try
-            hardlink(file, staged)
-        catch err
-            err isa Base.IOError || err isa SystemError || rethrow()
-            cp(file, staged)
+    if !isfile(target) || !samefile(file, target)
+        mktempdir(dirname(target)) do dir
+            staged = joinpath(dir, basename(target))
+            try
+                hardlink(file, staged)
+            catch err
+                err isa Base.IOError || err isa SystemError || rethrow()
+                cp(file, staged)
+            end
+            mv(staged, target; force = true)
         end
-        mv(staged, target; force = true)
     end
     push!(get!(() -> BitSet(), cache.valid, id), sf)
     delete!(get!(() -> BitSet(), cache.dirty, id), sf)

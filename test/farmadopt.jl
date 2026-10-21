@@ -12,6 +12,7 @@ import VideoEditor as VE
         target = VE.cachefile(cache,id,0)
         @test read(target)==read(source)
         @test VE.cachevalid(cache,id,0)
+        @test VE.adoptplane!(cache,id,0,source,sha) # repeat an already linked adoption
         if Sys.isunix()
             @test stat(target).inode==stat(source).inode
         end
