@@ -44,9 +44,17 @@ function test_fileinputs(video,directory)
         @test VE.valueat(loadeddata,0).weight==0.5f0
         relocated=VE.farmrebase(packed,Dict(paths[1]=>joinpath(directory,"elsewhere.png")))
         @test relocated["paths"][1]==joinpath(directory,"elsewhere.png")
-        package=VE.FileSeriesRef(paths,[0,2,5];package="GRMHDSnapshots",loader=:radiative_volume,
-                                options=Dict("resolution"=>8))
-        @test VE.inputpackages(package)==["GRMHDSnapshots"]
+        package=VE.FileSeriesRef(paths,[0,2,5];package="Hikari",loader=:radiative_volume,
+                                options=Dict("resolution"=>8),requires=["GRMHDSnapshots"])
+        @test VE.inputpackages(package)==["Hikari","GRMHDSnapshots"]
         @test VE.inputreffromdict(VE.inputrefdict(package)).loader==:radiative_volume
+        @test VE.inputreffromdict(VE.inputrefdict(package)).requires==["GRMHDSnapshots"]
+        legacy=VE.inputrefdict(ref)
+        delete!(legacy,"requires")
+        @test isempty(VE.inputreffromdict(legacy).requires)
+        prereq=VE.FileSeriesRef(paths,[0,2,5];requires=["LinearAlgebra","LinearAlgebra"])
+        @test prereq.requires==["LinearAlgebra"]
+        @test VE.sampleinput(VE.FileSeries(prereq),1).weight==0.5f0
+        @test VE.farmrebase(VE.inputrefdict(package),Dict(paths[1]=>"relocated"))["requires"]==["GRMHDSnapshots"]
     end
 end

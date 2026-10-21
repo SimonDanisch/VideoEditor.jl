@@ -180,7 +180,7 @@ inputrefdict(r::SceneRef) = Dict{String, Any}("kind" => "scene", "path" => Strin
 inputrefdict(r::RecordedRef) = Dict{String, Any}("kind" => "recorded", "path" => r.path)
 inputrefdict(r::FileSeriesRef)=Dict{String,Any}("kind"=>"file_series",
     "paths"=>r.paths,"times"=>r.times,"package"=>r.package,
-    "loader"=>String(r.loader),"options"=>r.options)
+    "loader"=>String(r.loader),"options"=>r.options,"requires"=>r.requires)
 
 function inputreffromdict(d::AbstractDict)
     k = String(get(d, "kind", "param"))
@@ -190,7 +190,7 @@ function inputreffromdict(d::AbstractDict)
     k == "recorded" && return RecordedRef(String(d["path"]))
     k == "file_series" && return FileSeriesRef(String.(d["paths"]),Float64.(d["times"]);
         package=String(get(d,"package","")),loader=Symbol(get(d,"loader","load")),
-        options=get(d,"options",Dict()))
+        options=get(d,"options",Dict()),requires=String.(get(d,"requires",String[])))
     k == "param" || error("project names an unknown input kind: $(repr(k))")
     return ParamRef(Symbol(d["param"]); clip = UInt64(get(d, "clip", 0)),
                     effect = UInt64(get(d, "effect", 0)))

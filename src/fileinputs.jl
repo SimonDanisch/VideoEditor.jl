@@ -1,8 +1,9 @@
 """
-    FileSeriesRef(paths, times; package="", loader=:load, options=Dict())
+    FileSeriesRef(paths, times; package="", loader=:load, options=Dict(), requires=[])
 
 An immutable file-backed time sequence. Its `:sample` input takes this reference
-and a numeric time parameter. Only the two bracketing files are loaded. `package`
+and a numeric time parameter. Only the two bracketing files are loaded. `requires`
+lists optional integration packages to load before calling the loader. `package`
 and `loader` optionally name an installed package's public file loader; empty
 `package` uses FileIO. The project saves addresses/options, never volume arrays.
 """
@@ -12,11 +13,12 @@ struct FileSeriesRef <: InputRef
     package::String
     loader::Symbol
     options::Dict{String,Any}
-    function FileSeriesRef(paths,times;package="",loader=:load,options=Dict())
+    requires::Vector{String}
+    function FileSeriesRef(paths,times;package="",loader=:load,options=Dict(),requires=String[])
         length(paths)==length(times)>=2 || throw(ArgumentError("file series needs at least two matching paths/times"))
         ts=Float64.(times)
         all(isfinite,ts) && all(>(0),diff(ts)) || throw(ArgumentError("file series times must increase strictly"))
-        new(abspath.(String.(paths)),ts,String(package),Symbol(loader),Dict{String,Any}(options))
+        new(abspath.(String.(paths)),ts,String(package),Symbol(loader),Dict{String,Any}(options),unique(String.(requires)))
     end
 end
 
@@ -43,6 +45,9 @@ function sampleinput(series::FileSeries,time::Real)
         k in (i,i+1) || delete!(series.loaded,k)
     end
     if series.loader===nothing
+        for name in ref.requires
+            Base.require(Main,Symbol(name))
+        end
         mod=isempty(ref.package) ? Makie.FileIO : Base.require(Main,Symbol(ref.package))
         series.loader=getproperty(mod,ref.loader)
     end
@@ -69,4 +74,4 @@ inputfiles(ref::FileRef)=[ref.path]
 inputfiles(ref::RecordedRef)=[ref.path]
 inputfiles(ref::FileSeriesRef)=ref.paths
 inputpackages(::InputRef)=String[]
-inputpackages(ref::FileSeriesRef)=isempty(ref.package) ? String[] : [ref.package]
+inputpackages(ref::FileSeriesRef)=unique([isempty(ref.package) ? String[] : [ref.package]; ref.requires])
