@@ -359,7 +359,7 @@ function postrestore!(player::Player; viewrange = nothing)
     # object; an ordinary edit does not replace objects and does not come here.
     player.shownclip = nothing
     showclip!(player)
-    rebuildtoolcard!(player, :narration)
+    refreshnarrationdock!(player)
     redraw!(player)
     viewrange === nothing || Makie.xlims!(player.timeline.axis, viewrange...)
     return nothing
@@ -874,7 +874,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     buildmediabin!(player, mediadock[1, 1], uicolors)
     exportdock = dockpanel!(player, :export)
     buildexportpanel!(player, exportdock[1, 1], uicolors)
-    # toolbar in three groups: the docks (FX · Bin · Out · Prj), the edit tools
+    # toolbar in three groups: the docks (FX · Bin · Out · Prj · Nar), the edit tools
     # (✂ ▢), the one-shots (✕ ↶ ↷).
     #
     # There is no separate Tools dock: stabilize, the matte, the flicker fix,
@@ -886,9 +886,12 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     projectdock = dockpanel!(player, :project; width = 300)
     buildprojectpanel!(player, projectdock[1, 1], uicolors)
     prjbtn = toolbarbutton!(player, toolbar[4, 1], "Prj", :project, uicolors)
+    narrationdock = dockpanel!(player, :narration; width = 392)
+    buildnarrationdock!(player, narrationdock[1, 1], uicolors)
+    narbtn = toolbarbutton!(player, toolbar[5, 1], "Nar", :narration, uicolors)
     buildkeyframeeditor!(player)   # the keyframe gestures on the timeline
-    splitbtn = Button(toolbar[5, 1]; label = "✂", width = 40, height = 40)
-    cropbtn = Button(toolbar[6, 1]; label = "▢", width = 40, height = 40)
+    splitbtn = Button(toolbar[6, 1]; label = "✂", width = 40, height = 40)
+    cropbtn = Button(toolbar[7, 1]; label = "▢", width = 40, height = 40)
     on(_ -> usetool!(player, :split), splitbtn.clicks)
     on(_ -> usetool!(player, :crop), cropbtn.clicks)
     oneshots = [("✕", "Delete  (X)", () -> deleteat!(player)),
@@ -898,7 +901,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
                             (redo!(player); setstatus!(player, "redone")))]
     onebtns = Makie.Button[]
     for (row, (lbl, _tip, action)) in enumerate(oneshots)
-        b = Button(toolbar[7 + row, 1]; label = lbl, width = 40, height = 40)
+        b = Button(toolbar[8 + row, 1]; label = lbl, width = 40, height = 40)
         on(_ -> action(), b.clicks)
         push!(onebtns, b)
     end
@@ -906,6 +909,7 @@ function buildui(sequence, pools, capacity, proxyheight, proxythreshold,
     # right of it (detected by mouse-vs-bbox; Makie Buttons have no hover attr).
     tiptargets = vcat([(fxbtn, "Effects — everything applied to the clip"),
                        (binbtn, "Media bin — import & drag clips"),
+                       (narbtn, "Narration — add, step through and edit spoken lines"),
                        (outbtn, "Export"),
                        (previewmenu, "Raytraced scene preview resolution · final export stays full size"),
                        (splitbtn, "Blade  (S)"), (cropbtn, "Crop  (C)")],
@@ -3328,6 +3332,9 @@ function opendock!(player::Player, key::Symbol)
         # hidden — but the clip under the playhead may have changed, and which
         # cards are shown follows that.
         showclip!(player)
+    elseif key === :narration
+        # the dock edits the line in hand, which makes it the selection
+        marknarration!(player)
     elseif key === :project
         # same rule as the effects panel: a panel that does not update while it is
         # hidden has to catch up when it comes back

@@ -22,7 +22,7 @@ function run(project,out)
         sections()=p.fxwidgets[Symbol(:fxsections_,fx().id)]
         data()=VE.param(fx(),Symbol("subject.color"))
         position()=VE.param(fx(),Symbol("subject.translation[1]"))
-        actions=[click(()->timelinepos(p,9));click(()->center(button(p,"Scene")));
+        actions=[click(()->timelinepos(p,9));scenecontrols(p,"");
             reveal(p,()->sections().picker);click(()->center(sections().picker));click(()->menurow(sections().picker,"subject"));
             FI.Lazy(_->begin
                 M.save(joinpath(out,"selected.png"),M.colorbuffer(p.screen))
@@ -67,7 +67,7 @@ function run(project,out)
             end);
             click(()->timelinepos(p,9;scrub=false));
             click(()->timelinepos(p,9));
-            click(()->center(button(p,"Scene")));
+            scenecontrols(p,"");
             FI.Lazy(_->begin
                 @test clip()===last(p.sequence.clips)
                 @test p.playhead[]==9

@@ -135,26 +135,6 @@ function buildfxpanel!(player::Player, gridpos, uicolors)
     countlabel = Label(filterrow[2, 1], ""; halign = :left, fontsize = 10,
                        color = uicolors.text_muted, tellwidth = false)
     player.fxwidgets[:fxfilterbox] = filterbox
-    modes = GridLayout(head[2,1:3]); colgap!(modes,4)
-    for (i,label,q) in ((1,"Scene","scene"),(2,"Colour","color"),(3,"Speech","narration"),(4,"All",""))
-        btn = Button(modes[1,i];label,fontsize=11,height=22,
-                     width=Makie.Relative(1),tellwidth=false,buttoncolor=uicolors.surface)
-        on(btn.clicks) do _
-            if q == "narration" && !isempty(player.sequence.narration)
-                selectnarration!(player,get(player.fxwidgets,:narration_index,1);seek=false)
-                return
-            end
-            q == "narration" && !haskey(player.fxpanel.toolcards,:narration) && opentool!(player,:narration)
-            Makie.set!(filterbox,q)
-            q == "scene" && openscenecontrols!(player, "")
-        end
-    end
-    for (i, label, query) in ((1, "Camera", "camera"), (2, "Animation", "acting"),
-                              (3, "Light", "lighting"))
-        btn = Button(modes[2,i]; label, fontsize=11, height=24,
-            width=Makie.Relative(1), tellwidth=false, buttoncolor=uicolors.surface)
-        on(_ -> openscenecontrols!(player, query), btn.clicks)
-    end
 
     # …and which clip this all applies to labels the stack, right above it. Its
     # text names the clip's SPAN, so it follows three different facts: which clip
@@ -945,15 +925,14 @@ end
 
 Whether a tool-only card starts unfolded.
 
-Open when the tool has something to show — narration lines, a transcript, a
-retimed clip — and folded otherwise, which still shows the header. All four
-expanded on every clip fills the panel with cards that are mostly empty.
+Open when the tool has something to show — a transcript, a retimed clip — and
+folded otherwise, which still shows the header. All of them expanded on every
+clip fills the panel with cards that are mostly empty.
 
 Crop is never open by default: it is reached for, not read.
 """
 function toolcardopen(kind, player::Player)
     seq = player.sequence
-    kind.name === :narration  && return !isempty(seq.narration)
     kind.name === :transcript && return !isempty(seq.captions)
     if kind.name === :timeinterp
         loc = editclip(player)
@@ -974,7 +953,7 @@ panels that could not appear. It went unused after the Tools dock was removed,
 which is why nothing noticed until four of them were written against it.
 
 These are the project- and sequence-level tools (the crop scope, the transcript,
-the narration, the retime mode). They belong under the clip's effects, not inside
+the retime mode); narration has a dock of its own. They belong under the clip's effects, not inside
 them, and they have no slot, no bypass eye and no keyframes — which is why this is
 its own builder rather than another branch through `fxcard!`.
 """

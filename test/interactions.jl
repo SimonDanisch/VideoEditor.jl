@@ -1437,33 +1437,58 @@ end
             @test waitfor(() -> length(p.sequence.clips) == 1)
         end
 
-        @testset "a sequence-level edit reaches the card that shows it" begin
-            # The panel used to notice this through a signature over the clip AND
-            # the document, compared on every playhead move: Narration, Transcript,
-            # Crop and Time interpolation read the SEQUENCE, the clip-only
-            # signature was blind to them, and a narration line you had just typed
-            # did not appear on the card that added it. A screenshot found that; no
-            # assertion did.
-            #
-            # A tool card is a singleton the panel owns, so the edit says what it
-            # changed: `rebuildtoolcard!`. What has to hold is that the card shows
-            # the line — and that a card which is not open is not conjured up.
+        @testset "narration: its own dock, one selection, one take at a time" begin
+            # Narration was a card glued into the effects panel, opened by forcing
+            # the panel's filter to "narration". It is a dock of its own now, and
+            # the dock is the selected line's inspector: a line and a clip are never
+            # selected together, and a narration edit rebuilds the dock.
             seq = p.sequence
             empty!(seq.captions); empty!(seq.narration)
-            VE.closetool!(p, :narration)
-            @test !("Narration" in cardtitles(p))
+            function dockblocks(layout = p.fxwidgets[:narrationdock].layout, out = Any[])
+                for c in layout.content
+                    c.content isa Makie.GridLayout ? dockblocks(c.content, out) : push!(out, c.content)
+                end
+                return out
+            end
+            linecards() = filter(b -> b isa Makie.Label && startswith(b.text[], "Line "), dockblocks())
+            VE.refreshnarrationdock!(p)
+            @test isempty(linecards())
             VE.dropnarration!(p, 1)                     # nothing there: a no-op
-            @test !("Narration" in cardtitles(p))       # …and it opens nothing
-
-            VE.opentool!(p, :narration); sleep(0.2)
-            @test "Narration" in cardtitles(p)
-            card0 = p.fxpanel.toolcards[:narration]
-            push!(seq.narration, VE.Narration("hi", 0.0))
-            VE.dropnarration!(p, 1); sleep(0.2)         # …which rebuilds the card
-            @test p.fxpanel.toolcards[:narration] !== card0
             @test isempty(seq.narration)
-            VE.closetool!(p, :narration)
-            @test !("Narration" in cardtitles(p))
+
+            push!(seq.narration, VE.Narration("hi", 0.0), VE.Narration("there", 1.0))
+            VE.speechchanged!(p); sleep(0.3)
+            p.timeline.selected[] = first(seq.clips).id
+            VE.selectnarration!(p, 2; seek = false); sleep(0.3)
+            @test p.dockopen[] === :narration
+            @test p.timeline.selected[] == 0             # the line took the selection
+            @test p.fxwidgets[:dialogue_selected][] == 2
+            @test only(linecards()).text[] |> startswith("Line 2")
+            p.timeline.selected[] = first(seq.clips).id  # …and a clip takes it back
+            @test p.fxwidgets[:dialogue_selected][] == 0
+            @test p.dockopen[] === :effects
+
+            # Listening is play/stop: clicking again stops, another take replaces
+            # the first, and two never play over each other.
+            if Sys.which("pw-cat") !== nothing
+                silent(text) = VE.Narration(text, 0.0, "af_heart", zeros(Float32, 48_000 * 5), 48_000)
+                a, b = silent("a"), silent("b")
+                listening = p.fxwidgets[:listening]
+                VE.togglelisten!(p, a); first_process = listening[].process
+                VE.togglelisten!(p, a)
+                @test listening[] === nothing
+                @test timedwait(() -> !process_running(first_process), 5) === :ok
+                VE.togglelisten!(p, a); replaced = listening[].process
+                VE.togglelisten!(p, b)
+                @test listening[].line === b
+                @test timedwait(() -> !process_running(replaced), 5) === :ok
+                VE.togglelisten!(p, b)
+                @test listening[] === nothing
+            end
+
+            VE.dropnarration!(p, 2); VE.dropnarration!(p, 1); sleep(0.3)  # …which rebuilds the dock
+            @test isempty(seq.narration)
+            @test isempty(linecards())
         end
 
         @testset "a hidden panel is never stale" begin
@@ -1535,7 +1560,7 @@ end
             # `toolonlykinds` selects on — if one grows a `make` it becomes a
             # normal effect card and belongs on the stack above instead.
             names = [k.name for k in VE.toolonlykinds()]
-            @test Set(names) == Set([:crop, :transcript, :narration, :timeinterp])
+            @test Set(names) == Set([:crop, :transcript, :timeinterp])   # narration has its own dock
         end
 
         @testset "an outward crop survives all the way to the exported file" begin
@@ -1916,7 +1941,8 @@ end
             # The gap these close: `narrate!` and the focus parameter existed with
             # NO way for a user to reach them — plumbing with no door.
             names = [k.name for k in VE.toolkinds()]
-            @test :narration in names
+            # narration is a dock of its own, behind its own toolbar button
+            @test haskey(p.dockpanels, :narration)
             @test :transcript in names
             @test :timeinterp in names        # flow was command-only and invisible
 

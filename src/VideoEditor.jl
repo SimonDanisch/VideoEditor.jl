@@ -178,6 +178,7 @@ include("fxpanel.jl")  # THE effects panel: one card list for the selected clip
 include("trackpreviews.jl") # bounded background scene thumbnails and audio envelopes
 include("palette.jl")  # Ctrl+P over the commands
 include("farmui.jl")   # render-farm connections are ordinary export commands
+include("narrationdock.jl") # the narration workflow: its own dock, the selected line's inspector
 include("transform.jl")  # the preview gizmo for TransformEffect
 include("sceneediting.jl") # object selection and independent raster scene tools
 include("agentview.jl")  # what an AGENT sees: contact sheets, zoom, change search

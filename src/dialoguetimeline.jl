@@ -63,7 +63,7 @@ function dialoguetimeline!(player::Player, gridpos)
     positions = Observable(Point2f[])
     labels = Observable(String[])
     colors = Observable(RGBAf[])
-    selected = Observable(get(player.fxwidgets,:narration_index,1))
+    selected = Observable(0)         # the selected line, 0 while a clip (or nothing) is
     player.fxwidgets[:dialogue_selected] = selected
     boxes = poly!(axis,rects;color=colors,strokecolor=tl.colors.border,strokewidth=1)
     words = text!(axis,positions;text=labels,fontsize=11,color=tl.colors.text,
