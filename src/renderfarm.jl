@@ -197,9 +197,23 @@ function farmrenderer(job::RenderJob; backend = Mantle.defaultbackend())
     # A recording is a folder: its files map under it, longest first.
     pathmap = Dict(source => joinpath(snapshot, relative) for (source, relative) in job.relocations)
     seq = loadproject(jobproject(job); pathmap)
-    planes = mktempdir(job.directory; prefix = "planes-", cleanup = false)
+    return farmrenderer(seq;backend,directory=job.directory,canvas=job.canvas)
+end
+
+"""
+    farmrenderer(sequence; backend=Mantle.defaultbackend(), directory)
+
+Open the same persistent timeline renderer directly on an existing sequence.
+File inputs keep their saved addresses; this does not copy large volume files.
+Use `renderjob` when a self-contained immutable farm snapshot is needed.
+The caller owns the sequence and its input files for the renderer's lifetime.
+"""
+function farmrenderer(seq::Sequence; backend = Mantle.defaultbackend(),
+                      directory::AbstractString = mktempdir(;cleanup=false),canvas=canvassize(seq))
+    mkpath(directory)
+    planes = mktempdir(directory; prefix = "planes-", cleanup = false)
     farmcaches!(seq, planes)
-    return FarmRenderer(seq, zeros(RGB{N0f8}, job.canvas...), zeros(RGB{N0f8}, job.canvas...),
+    return FarmRenderer(seq, zeros(RGB{N0f8}, canvas...), zeros(RGB{N0f8}, canvas...),
                         Dict{String, Any}(), FxEngine(backend), ReentrantLock(), false, planes)
 end
 
