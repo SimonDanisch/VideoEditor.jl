@@ -65,6 +65,8 @@ function editproject!(f, path)
 end
 
 include("refactor.jl")   # registry, analyses-as-slots, links, commands
+include("fileinputs.jl")
+test_fileinputs(testvideo,joinpath(dirname(testvideo),"file-inputs"))
 
 "The curve of `clip`'s `T` effect parameter `name`. A parameter always has one."
 paramcurve!(clip, ::Type{T}, name::Symbol) where {T} =

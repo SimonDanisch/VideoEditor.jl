@@ -51,6 +51,12 @@ function externalinputs(clip::Clip)
                                  isfile(f) && (out[f] = (mtime(f), filesize(f))))
     stamp!(::Any) = nothing
     stamp!(sourcepath(clip.source))
+    for fx in clip.effects,p in fx.params
+        p.input===nothing && continue
+        for ref in p.input.inputs,file in inputfiles(ref)
+            stamp!(file)
+        end
+    end
     # A scene's meshes are named in its BUILD RECIPE, not in the realized spec —
     # by the time the spec exists the strings have become geometry. Walking the
     # recipe for anything that names a file finds them without knowing which key

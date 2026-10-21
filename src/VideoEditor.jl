@@ -126,6 +126,7 @@ include("buffer.jl")
 include("decoder.jl")
 include("keyframes.jl")
 include("recordedtracks.jl") # disk-backed simulation values use ordinary parameter inputs
+include("fileinputs.jl")    # lazy file series and device-side blend descriptors
 include("clips.jl")      # Effect, Clip, Sequence — in that order, because each
                          # of them is a field of the next
 include("pack.jl")   # how our own types go into a project file
@@ -166,6 +167,7 @@ include("overlays.jl")   # the stock non-footage clips, each as a SceneSpec pres
 include("bake.jl")       # pre-rendering a clip's chain to disk
 include(joinpath(@__DIR__, "..", "FarmClient", "src", "wire.jl"))  # the farm's messages, shared with FarmClient
 include("farmenv.jl")    # a job's code, as a pinned environment
+include("farmroot.jl")   # optional validation in one existing application root
 include("renderfarm.jl") # job snapshots, persistent timeline renderers and resumable frame jobs
 include("farmnet.jl")    # the farm server: GPUs that farm clients offer, and the renderer they start
 include("hdrcache.jl")
@@ -221,6 +223,7 @@ export generateproxy, startproxy!
 export mcpserve!
 export Command, registercommand!, runcommand!, commands
 export ParamInput, ParamRef, FileRef, ClipRef, bindinput!, unbindinput!, bindinputs!
+export FileSeriesRef, BlendedInput
 export RecordedTrack, RecordedRef, recordanimation, openrecording, recordsceneanimation!, valueat
 
 end

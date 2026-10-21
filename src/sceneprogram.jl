@@ -558,6 +558,9 @@ leafvalue(old::Bool, x) = x >= 0.5
 leafvalue(old::Integer, x) = round(typeof(old), x)
 leafvalue(old::Enum, x) = typeof(old)(round(Int, x))
 leafvalue(old::AbstractString, x::AbstractString) = String(x)
+# `Observable{Any}(nothing)` declares an initially unbound data input. Its
+# file-backed value need not have a type known before the provider is loaded.
+leafvalue(::Nothing, x) = x
 leafvalue(old, x) = convert(typeof(old), x)
 
 argfieldpath(key::Symbol) = key === Symbol("") ? () : Tuple(Symbol.(split(String(key), '.')))

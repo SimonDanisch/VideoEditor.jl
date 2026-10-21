@@ -983,6 +983,14 @@ function resolveinput(seq::Sequence, clip::Clip, fx::Effect, p::Param, r::ParamR
 end
 resolveinput(::Sequence, ::Clip, ::Effect, ::Param, r::FileRef) =
     isfile(r.path) ? loadinputfile(r.path) : nothing
+function resolveinput(::Sequence, ::Clip, ::Effect, p::Param, r::FileSeriesRef)
+    if p.input!==nothing
+        for resolved in p.input.resolved
+            resolved isa FileSeries && resolved.ref===r && return resolved
+        end
+    end
+    FileSeries(r)
+end
 function resolveinput(::Sequence, ::Clip, ::Effect, p::Param, r::RecordedRef)
     # Recordings are immutable. Structural edits/cuts can retain their existing
     # reader rather than reread the index and map the same file again.
@@ -1011,6 +1019,7 @@ readinput(::Clip, ::Integer) =
 inputclip(seq::Sequence, clip::Clip, r::ParamRef) = r.clip == 0 ? clip : clipbyid(seq, r.clip)
 inputclip(seq::Sequence, ::Clip, r::ClipRef) = clipbyid(seq, r.clip)
 inputclip(::Sequence, ::Clip, ::FileRef) = nothing
+inputclip(::Sequence, ::Clip, ::FileSeriesRef) = nothing
 inputclip(::Sequence, clip::Clip, ::SceneRef) = clip
 inputclip(::Sequence, clip::Clip, ::RecordedRef) = clip
 

@@ -172,6 +172,8 @@ backends: the packages its scene recipes come from, and the packages that
 implement its effects (see `effectpackages`).
 """
 loadpackages(seq::Sequence) = unique([recipepackages(seq);
+    String[name for c in seq.clips for fx in c.effects for p in fx.params if p.input!==nothing
+        for ref in p.input.inputs for name in inputpackages(ref)];
     String[p for c in seq.clips for fx in c.effects if renderable(fx) for p in effectpackages(op(fx, c.src_in))]])
 
 """

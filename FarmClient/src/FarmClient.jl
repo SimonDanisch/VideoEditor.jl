@@ -35,16 +35,20 @@ struct Client
     port::Int
     gpus::String
     root::String
+    project::String
     locks::Dict{String, ReentrantLock}   # per job and per environment: one task unpacks or installs it
     juliacmds::Dict{String, Cmd}         # Julia version => the command starting it
     guard::ReentrantLock
 end
 
 function Client(gpus::AbstractString, address::AbstractString;
-                root::AbstractString = joinpath(homedir(), ".videoeditor", "farm"))
+                root::AbstractString = joinpath(homedir(), ".videoeditor", "farm"),
+                project::AbstractString = get(ENV,"VIDEOEDITOR_FARM_PROJECT",""))
     host, port = splitaddress(address)
     foreach(d -> mkpath(joinpath(root, d)), ("jobs", "envs", "logs", "locks"))
-    return Client(host, port, String(gpus), root, Dict{String, ReentrantLock}(), Dict{String, Cmd}(),
+    project=isempty(project) ? "" : abspath(project)
+    isempty(project) || isfile(joinpath(project,"Project.toml")) || error("Missing application root: $project")
+    return Client(host, port, String(gpus), root, project, Dict{String, ReentrantLock}(), Dict{String, Cmd}(),
                   ReentrantLock())
 end
 
@@ -170,6 +174,14 @@ precompilation is off; what is loaded compiles when it is loaded.
 """
 function environment!(c::Client, job, julia::Cmd, log, logpath)
     project = joinpath(job, "job", "environment", "Project.toml")
+    if !isempty(c.project)
+        # No Pkg operation, project overwrite, or hidden second environment.
+        code="using VideoEditor; VideoEditor.checkfarmroot(ARGS[1])"
+        cmd=`$julia --startup-file=no --project=$(c.project) -e $code $project`
+        success(pipeline(cmd;stdout=log,stderr=log)) || error("Root-project validation failed:\n"*logtail(logpath))
+        println(log,"using existing application root ",c.project);flush(log)
+        return c.project
+    end
     env = joinpath(c.root, "envs", first(bytes2hex(open(sha256, project)), 16))
     lock(namedlock(c, "env:" * env)) do
         isfile(joinpath(env, "instantiated")) && return
@@ -215,7 +227,8 @@ integrated ones, or those the comma-separated selectors name, each an index or
 part of a name. Each comes with a `name` unique on this machine.
 """
 function selectgpus(c::Client, julia::Cmd, env, log, logpath)
-    listing = joinpath(env, "gpus.toml")
+    listing = isempty(c.project) ? joinpath(env,"gpus.toml") :
+        joinpath(c.root,"gpus-"*first(bytes2hex(sha256(env)),16)*".toml")
     lock(namedlock(c, "env:" * env)) do
         isfile(listing) && return
         println(log, "listing the GPUs")

@@ -119,6 +119,28 @@ finally
 end
 ```
 
+### File-backed volume sequences
+
+`FileSeriesRef(paths, times; package, loader, options)` declares immutable
+snapshot files as ordinary project inputs. A `ParamInput(:sample, series,
+ParamRef(:time))` reads the keyed time, retains only the two bracketing files,
+and returns `BlendedInput(a, b, weight)`. The scene receives this via an ordinary
+data argument (`Observable{Any}(nothing)` is a suitable unbound default).
+The volume/material consumer interpolates on the GPU; the input graph does not
+allocate a blended host volume. Outside the sequence range the endpoints hold.
+
+An empty `package` uses FileIO; otherwise `loader` names an installed package's
+function accepting `path; options...`. Use a shared normalization across outputs
+when deriving emission coefficients, not a new display exposure per snapshot.
+This is snapshot interpolation (fast-light), not time-dependent transport along
+each individual ray.
+
+The files and loader package are discovered automatically by `renderjob`, paths
+are rebased on workers, and the addresses, loader options and keyed time survive
+save/load. File data and GPU resources are never embedded in the project file.
+Replace inputs through the editor's mutation/binding API when changing an edit;
+do not mutate referenced snapshot data behind a valid frame cache.
+
 `renderjob` writes `renders/job-001/job/`: the project and its sidecars, the
 files it reads (soundtracks, recordings, scene scripts, and declared `inputs`;
 files under `root`, the project's folder by default, keep their relative paths
@@ -172,6 +194,15 @@ encodefarm!(job.directory, "movie.mp4")
 ```
 
 `farmworkers` sends every connected client the job's snapshot. The client
+can be restricted to one existing application environment by setting
+`VIDEOEDITOR_FARM_PROJECT` to that root directory (or passing `project` to
+`FarmClient.Client`). In this mode it validates the root's package pins and
+preferences against the job, then launches all GPU children with that root.
+It never installs, activates, or overwrites a job-specific Pkg environment;
+a mismatch is reported instead. Synchronize that root's packages before
+offering the client. GPU inventories and job data stay in the client cache.
+
+Without this setting, the client
 unpacks it, instantiates `environment/Project.toml` with the job's Julia
 version (`julia +<version>` through juliaup, or its own Julia if it is that
 version; automatic precompilation off), asks the job's VideoEditor which GPUs

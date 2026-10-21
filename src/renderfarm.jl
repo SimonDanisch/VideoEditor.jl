@@ -157,6 +157,7 @@ function farmrebase(x::AbstractDict, pathmap)
     return Dict(k => farmrebase(v, pathmap) for (k, v) in x)
 end
 farmrebase(x::Vector{Any}, pathmap) = [farmrebase(v, pathmap) for v in x]
+farmrebase(x::AbstractVector{<:AbstractString}, pathmap) = [farmpath(v,pathmap) for v in x]
 farmrebase(x::AbstractString, pathmap) = farmpath(x, pathmap)
 farmrebase(x, pathmap) = x
 
@@ -170,7 +171,7 @@ function farminputs(seq::Sequence, extra)
         for fx in c.effects, p in fx.params
             p.input === nothing && continue
             for ref in p.input.inputs
-                ref isa RecordedRef && push!(files,ref.path)
+                append!(files,inputfiles(ref))
             end
         end
         for p in (sourcepath(c.source), audiopath(c.source))
