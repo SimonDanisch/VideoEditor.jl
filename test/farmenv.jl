@@ -41,7 +41,7 @@ gitin(dir, args...) = run(pipeline(`git -C $dir -c user.email=farm@test -c user.
         julia_version = "$VERSION"
         manifest_format = "2.0"
         [[deps.Probe]]
-        deps = ["Rexported", "Dates", "libpng_jll"]
+        deps = ["Rexported", "Dates", "libpng_jll", "pocl_standalone_jll"]
         path = "../monorepo/Probe"
         uuid = "$uuid"
         version = "0.1.0"
@@ -56,6 +56,10 @@ gitin(dir, args...) = run(pipeline(`git -C $dir -c user.email=farm@test -c user.
         git-tree-sha1 = "32781be40fe86735af02eae0dd22754e4b5f779d"
         uuid = "b53b4c65-9356-5827-b1ea-8c7a1a84506f"
         version = "1.6.59+0"
+        [[deps.pocl_standalone_jll]]
+        git-tree-sha1 = "08415d7a450af8e59727af27bec9e9e61aa75944"
+        uuid = "54f56a70-6062-5590-a942-1226658f6c83"
+        version = "7.2.2+11"
         """)
         project = joinpath(env, "Project.toml")
         pinned = VE.farmenvironment(["Probe"]; project)
@@ -66,6 +70,9 @@ gitin(dir, args...) = run(pipeline(`git -C $dir -c user.email=farm@test -c user.
         @test pinned["compat"]["libpng_jll"] == "=1.6.59"
         @test pinned["sources"]["libpng_jll"] ==
               Dict("url" => "https://github.com/JuliaBinaryWrappers/libpng_jll.jl.git", "rev" => "libpng-v1.6.59+0")
+        # Always pin the build, including when this registry has no newer one.
+        @test pinned["sources"]["pocl_standalone_jll"] ==
+              Dict("url" => "https://github.com/JuliaBinaryWrappers/pocl_standalone_jll.jl.git", "rev" => "pocl_standalone-v7.2.2+11")
         @test pinned["compat"]["julia"] == "=$(VERSION.major).$(VERSION.minor).$(VERSION.patch)"
         @test !haskey(pinned["deps"], "Dates")                   # standard libraries come with Julia
         @test pinned["preferences"]["Probe"]["quality"] == "high"

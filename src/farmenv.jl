@@ -18,8 +18,8 @@ and weak dependencies as the active manifest resolved them, each pinned.
   - A package added from a repository is pinned to its commit the same way;
     one that follows a branch is refused (the branch moves).
   - A registered package gets an exact `[compat]` version, and so does Julia.
-    Compat cannot name a build (a JLL's `+2`); a JLL whose build is not the
-    newest of its version is pinned by `[sources]` at its release tag.
+    Compat cannot name a build (a JLL's `+2`); JLLs are always pinned by
+    `[sources]` at their release tags, independently of registry freshness.
   - The environment's package preferences come along, as `[preferences]`.
 
 With `portable = false`, developed packages are `path` sources instead: an
@@ -50,10 +50,11 @@ function farmenvironment(roots; project::AbstractString = Base.active_project(),
         else
             version = VersionNumber(entry["version"])
             compat[name] = "=" * string(VersionNumber(version.major, version.minor, version.patch))
-            # Compat names a version, not its build (a JLL's `+2`): it admits every
-            # build of it, and a worker would install the newest. Not ours when the
-            # registry has a newer one, so then the build is pinned at its release tag.
-            repo = newerbuild(entry["uuid"], version)
+            # Registry freshness must not change a job's identity: even the
+            # currently newest JLL build gets an explicit immutable release tag.
+            repo = endswith(name, "_jll") ? registeredrepository(entry["uuid"]) : newerbuild(entry["uuid"], version)
+            endswith(name, "_jll") && repo === nothing &&
+                push!(problems, "$name: no registered repository for its exact build")
             if repo !== nothing
                 endswith(name, "_jll") ||
                     push!(problems, "$name $version is not the newest build of its version, and only a JLL's tag can be named")
@@ -69,6 +70,15 @@ function farmenvironment(roots; project::AbstractString = Base.active_project(),
     filter!(p -> haskey(deps, first(p)), preferences)
     isempty(preferences) || (env["preferences"] = preferences)
     return env
+end
+
+"The repository of a registered package, without depending on available build versions."
+function registeredrepository(uuid::AbstractString)
+    for registry in Pkg.Registry.reachable_registries()
+        entry = get(registry, Base.UUID(uuid), nothing)
+        entry === nothing || return Pkg.Registry.registry_info(entry).repo
+    end
+    return nothing
 end
 
 """The package preferences an environment sets: its Project.toml's `[preferences]` and its `LocalPreferences.toml`."""
