@@ -229,13 +229,18 @@ end
 The command running Julia `version`: `julia +version` where juliaup is
 installed, or this client's own Julia if it is that version. Asked once per version.
 """
+function versioncommand(julia::Cmd, project::AbstractString)
+    projectflag = isempty(project) ? `` : `--project=$project`
+    return `$julia --startup-file=no $projectflag -e "print(VERSION)"`
+end
+
 function juliacmd!(c::Client, version)
     lock(c.guard) do
         haskey(c.juliacmds, version) && return c.juliacmds[version]
         for cmd in (`julia +$version`, `$(joinpath(Sys.BINDIR, Base.julia_exename()))`)
             out = IOBuffer()
             ran = try
-                success(pipeline(`$cmd --startup-file=no -e "print(VERSION)"`; stdout = out, stderr = devnull))
+                success(pipeline(versioncommand(cmd,c.project); stdout = out, stderr = devnull))
             catch e
                 e isa Base.IOError || rethrow()     # no `julia` launcher on the PATH: no juliaup
                 false
