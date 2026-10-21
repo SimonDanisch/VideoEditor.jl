@@ -113,9 +113,23 @@ function session(c::Client, sock)
     writes = ReentrantLock()
     report(header) = lock(() -> sendmessage(sock, header), writes)
     while !eof(sock)
-        header, archive = receivemessage(sock)
-        header["command"] == "open" || error("unknown farm request $(header["command"])")
-        errormonitor(@async openjob(c, report, id, header, archive))
+        archive, stream = mktemp(c.root)
+        try
+            header, _ = receivemessage(sock; sink=stream)
+            close(stream)
+            header["command"] == "open" || error("unknown farm request $(header["command"])")
+            let header=header, archive=archive
+                errormonitor(@async try
+                    openjob(c, report, id, header, archive)
+                finally
+                    rm(archive; force=true)
+                end)
+            end
+        catch
+            close(stream)
+            rm(archive; force=true)
+            rethrow()
+        end
     end
 end
 
@@ -172,7 +186,7 @@ function unpack!(c::Client, key, archive)
         isfile(joinpath(job, "job", "job.toml")) && return
         mkpath(job)
         mktempdir(job) do temp
-            Tar.extract(IOBuffer(archive), joinpath(temp, "job"))
+            Tar.extract(archive isa AbstractString ? archive : IOBuffer(archive), joinpath(temp, "job"))
             mv(joinpath(temp, "job"), joinpath(job, "job"); force = true)
         end
     end

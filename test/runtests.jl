@@ -1998,6 +1998,7 @@ include("preview_mode.jl") # refinement follows the backend's runtime mode
 include("renderthread.jl") # renderer handoff, failures and startup deadlines
 include("renderfarm.jl")  # saved procedural scenes, resume, audio and frame transport
 include("farmenv.jl")     # a job's pinned environment, and the farm's messages over TCP
+include("farmwire.jl")    # large snapshots stream without whole-archive RAM buffers
 # track and HDR source caches, and the planes farm workers return; render with RayMakie
 isdefined(Main, :RayMakie) && (include("trackcache.jl"); include("hdrcache.jl"); include("guides.jl"))
 # the OIDN effect is OIDNRunner's extension of the editor

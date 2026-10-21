@@ -25,17 +25,43 @@ function sendmessage(io::IO, header::AbstractDict, payload::AbstractVector{UInt8
     return nothing
 end
 
+"Write an existing stream without materializing a multi-gigabyte archive."
+function sendmessage(io::IO, header::AbstractDict, payload::IO, count::Integer)
+    text = sprint(TOML.print, header)
+    write(io, hton(UInt32(sizeof(text))), text, hton(UInt64(count)))
+    copypayload!(io, payload, count)
+    flush(io)
+    return nothing
+end
+
+"Copy exactly one payload, using at most one MiB of working memory."
+function copypayload!(destination::IO, source::IO, count::Integer)
+    count >= 0 || error("invalid farm payload length $count")
+    buffer = Vector{UInt8}(undef, min(count, 1024 * 1024))
+    remaining = count
+    while remaining > 0
+        wanted = min(remaining, length(buffer))
+        wanted < length(buffer) && resize!(buffer, wanted)
+        got = readbytes!(source, buffer, wanted)
+        got == wanted || error("farm connection closed inside a message ($got of $wanted bytes)")
+        write(destination, buffer)
+        remaining -= got
+    end
+    return destination
+end
+
 """
     receivemessage(io) -> (header, payload)
 
 Read one message. A connection that closes inside a message is an error; one
 that closes between messages is `eof(io)`, for the caller to check first.
 """
-function receivemessage(io::IO)
+function receivemessage(io::IO; sink::Union{IO,Nothing}=nothing)
     count=Int(ntoh(read(io,UInt32)))
     0<count<=1024*1024 || error("invalid farm header length $count; the peer may have printed to the protocol stream")
     header = TOML.parse(String(readexactly(io,count)))
-    payload = readexactly(io, Int(ntoh(read(io, UInt64))))
+    size = Int(ntoh(read(io, UInt64)))
+    payload = sink === nothing ? readexactly(io, size) : copypayload!(sink, io, size)
     return header, payload
 end
 

@@ -204,18 +204,33 @@ function farmworkers(job::RenderJob, server::FarmServer = farmserver())
     machines = farmmachines(server)
     isempty(machines) &&
         error("no farm client is connected: on each machine that renders, run\n    $(clientcommand(server))")
-    archive = take!(Tar.create(jobsnapshot(job), IOBuffer()))
+    archive, stream = mktemp()
+    close(stream)
+    try
+        Tar.create(jobsnapshot(job), archive)
+    catch
+        rm(archive; force=true)
+        rethrow()
+    end
     events = Channel{Any}(Inf)
     lock(() -> server.jobs[job.key] = events, server.guard)
     header = Dict{String, Any}("command" => "open", "job" => job.key, "julia" => job.julia,
                                "backends" => job.backends, "packages" => job.packages)
-    for m in machines
-        errormonitor(@async try
-            lock(() -> sendmessage(m.socket, header, archive), m.writes)
-        catch e
-            put!(events, (m.id, Dict{String, Any}("error" => sprint(showerror, e))))
-        end)
-    end
+    errormonitor(@async try
+        @sync for m in machines
+            @async try
+                lock(m.writes) do
+                    open(archive) do input
+                        sendmessage(m.socket, header, input, filesize(archive))
+                    end
+                end
+            catch e
+                put!(events, (m.id, Dict{String, Any}("error" => sprint(showerror, e))))
+            end
+        end
+    finally
+        rm(archive; force=true)
+    end)
     workers = Channel{FarmWorker}(Inf)
     errormonitor(@async collectslots!(workers, server, job.key, events, machines))
     return workers
