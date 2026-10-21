@@ -401,12 +401,25 @@ end
 samerevision(a::TrackCache, b::TrackCache, id::UInt64, sf::Int) =
     get(a.revisions, (id, sf), UInt64(0)) == get(b.revisions, (id, sf), UInt64(0))
 
-"""Copy `file` into `cache` as frame `sf` of clip `id` if it is the file `sha` names; whether it was."""
+"""Adopt a verified immutable plane, sharing its storage when the filesystem permits."""
 function adoptplane!(cache::TrackCache, id::UInt64, sf::Int, file::AbstractString, sha::AbstractString)
     isfile(file) && filehash(file) == sha || return false
     target = cachefile(cache, id, sf)
     mkpath(dirname(target))
-    cp(file, target; force = true)
+    # Cache writers publish new files by rename, never by modifying an existing
+    # plane. A hard link therefore preserves both job receipts and later edits,
+    # without doubling hundreds of GB of HDR masters. Stage the replacement so
+    # an interrupted copy cannot destroy a previously valid cached frame.
+    mktempdir(dirname(target)) do dir
+        staged = joinpath(dir, basename(target))
+        try
+            hardlink(file, staged)
+        catch err
+            err isa Base.IOError || err isa SystemError || rethrow()
+            cp(file, staged)
+        end
+        mv(staged, target; force = true)
+    end
     push!(get!(() -> BitSet(), cache.valid, id), sf)
     delete!(get!(() -> BitSet(), cache.dirty, id), sf)
     return true

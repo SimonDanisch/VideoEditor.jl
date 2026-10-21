@@ -1999,6 +1999,7 @@ include("renderthread.jl") # renderer handoff, failures and startup deadlines
 include("renderfarm.jl")  # saved procedural scenes, resume, audio and frame transport
 include("farmenv.jl")     # a job's pinned environment, and the farm's messages over TCP
 include("farmwire.jl")    # large snapshots stream without whole-archive RAM buffers
+include("farmadopt.jl")   # immutable planes share storage without corrupting job receipts
 include("farmrootprobe.jl") # even runtime version checks keep the sole application environment
 # track and HDR source caches, and the planes farm workers return; render with RayMakie
 isdefined(Main, :RayMakie) && (include("trackcache.jl"); include("hdrcache.jl"); include("guides.jl"))
