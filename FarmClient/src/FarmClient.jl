@@ -125,6 +125,18 @@ and a connection to the server. What fails before a GPU's connection exists is
 reported on the client's connection, so the editor knows not to wait for it.
 """
 function openjob(c::Client, report, id, header, archive)
+    gate=namedlock(c,"running:"*header["job"])
+    # A coordinator may resume while this same job is still warming up.
+    # Reuse its pending GPU startup, never launch a competing renderer.
+    trylock(gate) || return nothing
+    try
+        openjob_locked(c,report,id,header,archive)
+    finally
+        unlock(gate)
+    end
+end
+
+function openjob_locked(c::Client, report, id, header, archive)
     key = header["job"]
     @info "farm job $(first(key, 12)) arrived"
     try
@@ -314,12 +326,20 @@ loading VideoEditor, the job's backends and the packages its scenes come from
 talking over its stdin and stdout, logging to `log`.
 """
 function startrenderer(julia::Cmd, env, job, gpu, backends, packages, log)
-    code = join(["using VideoEditor"; ["using $b; VideoEditor.usebackend!($b)" for b in backends];
-                 ["using $p" for p in packages]; "VideoEditor.farmchild(ARGS[1]; device = $(gpu.index))"], "; ")
+    code = renderercode(gpu.index,backends,packages)
     println(log, "starting the renderer on ", gpu.name)
     flush(log)
     cmd = `$julia --startup-file=no --project=$env --threads=auto -e $code $job`
     return open(pipeline(cmd; stderr = log), "r+")
+end
+
+function renderercode(device,backends,packages)
+    # Library initialization/precompilation may print before farmchild runs.
+    # Protect the wire from the very first import, not only inside farmchild.
+    join(["farm_protocol_output=stdout; redirect_stdout(stderr)";
+          "using VideoEditor";["using $b; VideoEditor.usebackend!($b)" for b in backends];
+          ["using $p" for p in packages];
+          "VideoEditor.farmchild(ARGS[1];device=$device,output=farm_protocol_output)"],"; ")
 end
 
 """Frames requested on `sock` go to the renderer, its answers back, until close or a dropped connection."""

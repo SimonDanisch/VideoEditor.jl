@@ -32,7 +32,9 @@ Read one message. A connection that closes inside a message is an error; one
 that closes between messages is `eof(io)`, for the caller to check first.
 """
 function receivemessage(io::IO)
-    header = TOML.parse(String(readexactly(io, Int(ntoh(read(io, UInt32))))))
+    count=Int(ntoh(read(io,UInt32)))
+    0<count<=1024*1024 || error("invalid farm header length $count; the peer may have printed to the protocol stream")
+    header = TOML.parse(String(readexactly(io,count)))
     payload = readexactly(io, Int(ntoh(read(io, UInt64))))
     return header, payload
 end
