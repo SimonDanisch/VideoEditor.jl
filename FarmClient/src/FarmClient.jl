@@ -345,11 +345,17 @@ loading VideoEditor, the job's backends and the packages its scenes come from
 talking over its stdin and stdout, logging to `log`.
 """
 function startrenderer(julia::Cmd, env, job, gpu, backends, packages, log)
-    code = renderercode(gpu.index,backends,packages)
     println(log, "starting the renderer on ", gpu.name)
     flush(log)
-    cmd = `$julia --startup-file=no --project=$env --threads=auto -e $code $job`
+    cmd = renderercommand(julia, env, job, gpu, backends, packages)
     return open(pipeline(cmd; stderr = log), "r+")
+end
+
+"The actual child command, retaining an explicitly configured thread budget."
+function renderercommand(julia::Cmd, env, job, gpu, backends, packages;
+                         threads=get(ENV,"JULIA_NUM_THREADS","auto"))
+    code = renderercode(gpu.index,backends,packages)
+    return `$julia --startup-file=no --project=$env --threads=$threads -e $code $job`
 end
 
 function renderercode(device,backends,packages)

@@ -1,6 +1,22 @@
 # Stdlib-only checks; run in the application's existing root environment.
 using Test, Sockets
 function test_farmstartup(FC)
+    @testset "renderer honors the configured CPU thread budget" begin
+        root=dirname(Base.active_project())
+        gpu=(index=1,name="fixture")
+        withenv("JULIA_NUM_THREADS"=>"2,1") do
+            args=collect(FC.renderercommand(Base.julia_cmd(),root,"fixture",gpu,String[],String[]))
+            @test "--threads=2,1" in args
+            @test "--project=$root" in args
+            code=findfirst(==("-e"),args)+1
+            stub="module FarmThreadStub; farmchild(args...;device,output)=print(output,Threads.nthreads(:default),\",\",Threads.nthreads(:interactive),\"|\",Base.active_project()); end"
+            args[code]=replace(args[code],"using VideoEditor"=>stub,
+                "VideoEditor.farmchild"=>"FarmThreadStub.farmchild")
+            @test read(Cmd(args),String)=="2,1|$(Base.active_project())"
+        end
+        @test "--threads=auto" in collect(FC.renderercommand(Base.julia_cmd(),root,
+            "fixture",gpu,String[],String[];threads="auto"))
+    end
     @testset "farm startup wire is protected" begin
         bad=IOBuffer();write(bad,hton(UInt32(2_000_000)));seekstart(bad)
         @test_throws ErrorException FC.receivemessage(bad)
