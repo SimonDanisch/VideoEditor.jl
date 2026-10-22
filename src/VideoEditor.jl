@@ -169,6 +169,7 @@ include(joinpath(@__DIR__, "..", "FarmClient", "src", "wire.jl"))  # the farm's 
 include("farmenv.jl")    # a job's code, as a pinned environment
 include("farmroot.jl")   # optional validation in one existing application root
 include("renderfarm.jl") # job snapshots, persistent timeline renderers and resumable frame jobs
+include("farmreuse.jl")  # coordinator-side reuse of native HDR/plane caches across job snapshots
 include("farmnet.jl")    # the farm server: GPUs that farm clients offer, and the renderer they start
 include("hdrcache.jl")
 include("refreshguides.jl")

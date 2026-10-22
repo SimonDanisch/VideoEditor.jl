@@ -454,8 +454,13 @@ PNG commits and receipts are atomic. Resume the same call and directory to keep
 completed frames. `pausefarm!` stops dispatch after in-flight requests finish;
 remove `pause.requested` to resume. This renders frames only; `encodefarm!`
 performs the final encode and audio mix.
+
+With `reuse=seq`, native cached pictures/HDR masters are left in that project's
+caches instead of being retraced in a new snapshot. `status["reused"]` counts
+these frames. Adopt the returned planes and finish with `exportvideo(output, seq)`;
+`encodefarm!` alone cannot encode frames intentionally kept only in `seq`.
 """
-function renderfarm!(job::RenderJob, workers; frames = nothing,
+function renderfarm!(job::RenderJob, workers; frames = nothing, reuse = nothing,
                      retries::Integer = 3, progress = nothing)
     workers isa Channel || isempty(workers) && error("no farm workers supplied")
     retries > 0 || error("retries must be positive")
@@ -463,6 +468,8 @@ function renderfarm!(job::RenderJob, workers; frames = nothing,
     dir, total, canvas, key = job.directory, job.total, job.canvas, job.key
     wanted = frames === nothing ? collect(0:total-1) : sort!(unique(Int.(collect(frames))))
     all(n -> 0 <= n < total, wanted) || error("invalid farm frame range")
+    requested=length(wanted)
+    reuse===nothing || filter!(n->farmneedsframe(reuse,n),wanted)
     # An atomic mkdir is a process-wide coordinator lock, including other editors.
     lockdir = joinpath(dir, "coordinator.lock")
     ispath(lockdir) && error("farm directory already has a coordinator: $lockdir")
@@ -480,6 +487,7 @@ function renderfarm!(job::RenderJob, workers; frames = nothing,
         function report()
             data = Dict("job" => key, "completed" => completed, "total" => length(wanted),
                         "timeline_frames" => total, "workers" => counts, "active" => collect(active),
+                        "reused" => requested-length(wanted),
                         "errors" => copy(errors), "elapsed_seconds" => (time_ns()-started)/1e9,
                         "paused" => isfile(joinpath(dir, "pause.requested")))
             farmwritejson(joinpath(dir, "status.json"), data)
