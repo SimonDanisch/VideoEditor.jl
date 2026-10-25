@@ -2014,6 +2014,7 @@ include("sceneediting.jl") # inspector, original animation, overrides and saved 
 include("speechediting.jl") # model capabilities, approved takes and speech following cuts
 include("creative_controls.jl") # native lights and dialogue timing through edits
 include("sceneargs.jl") # native plot properties, held steps, multiple cameras and seeded keys
+include("performance.jl") # narrated recipes bound to native property tracks
 include("trackpreviews.jl") # exact audio envelopes and bounded asynchronous preview work
 
 # LAST, and that is the whole point. `interactions.jl` throws at the end of the

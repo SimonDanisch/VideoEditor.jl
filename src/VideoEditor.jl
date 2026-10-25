@@ -160,6 +160,7 @@ include("campath.jl")  # GrayReader wraps export's SequentialReader; grayinto! n
 include("tools.jl")    # GUI tools: timeline-overlay hints + premade operations
 include("scenespec.jl") # a Makie scene AS DATA: plots, backend, theme, paths
 include("sceneprogram.jl") # saved recipes for procedural Makie animation
+include("performance.jl") # narrated recipes: construction values bound to native property tracks
 include("scenerender.jl") # …and rendering it, with the backend as a parameter
 include("scenesource.jl") # a scene AS A CLIP: the source pass, and making one
 include("recordedscene.jl") # record and replay the real scene's animation inputs
