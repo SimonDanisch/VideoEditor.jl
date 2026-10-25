@@ -43,11 +43,6 @@ end
 function sceneobjectsections(src::SceneSource, object)
     object === nothing && return Set{Symbol}()
     names = Set([Symbol(object)])
-    if src isa SceneSource && src.live !== nothing && src.live.target isa ProgramInstance
-        for group in src.live.target.controls
-            group.object === object && push!(names, group.name)
-        end
-    end
     return names
 end
 
@@ -98,12 +93,9 @@ function samplesceneparams!(player, clip, params)
     samples = Dict(p.name => Keyframe{Float64}[] for p in pending)
     recordings = scenerecordings!(src.live.target,src)
     for f in clip.src_in:(clip.src_out - 1)
-        values = programsampleparams(src.live.target, f, src.framerate)
         for p in pending
             v = if recordings !== nothing
                 recordedproperty(recordings,p.name,f)
-            elseif values !== nothing && haskey(values, p.name)
-                values[p.name]
             elseif startswith(String(p.name), "camera.")
                 _, field, component = scenepath(p.name)
                 cameracomponent(getfield(scenecamerasample(clip, f), field), component)
@@ -229,12 +221,6 @@ function scenecamerasample(clip::Clip, frame::Int)
     src = clip.source
     baseline = src.camera
     target = src.live.target
-    if target isa ProgramInstance
-        updater = target.update! isa SceneUpdater ? target.update!.callback : target.update!
-        if updater isa ProgramAnimation && updater.camera !== nothing
-            baseline = Base.invokelatest(updater.camera, frame, src.framerate)
-        end
-    end
     baseline === nothing && return nothing
     fx = findslot(clip, :scene)
     function sampled(name, original)
@@ -359,18 +345,6 @@ function startscenehandledrag!(view, point)
     field = name === :camera ? :eye : view.mode
     path = Symbol(name, ".", field, "[", selected, "]")
     fx = findslot(view.clip, :scene);p = param(fx, path)
-    # Actor position belongs to its performance when the recipe exposes it.
-    # Moving the rendered plot alone would freeze its world-space animation.
-    if name !== :camera && field === :translation && view.clip.source.live.target isa ProgramInstance
-        group = findfirst(g -> g.object === name, view.clip.source.live.target.controls)
-        if group !== nothing
-            localpath = Symbol(view.clip.source.live.target.controls[group].name, ".local_position[", selected, "]")
-            localparam = param(fx, localpath)
-            if localparam !== nothing
-                p, path = localparam, localpath
-            end
-        end
-    end
     p === nothing && return false
     selectsceneobject!(view.player, name; clip = view.clip)
     p.visible[] = true

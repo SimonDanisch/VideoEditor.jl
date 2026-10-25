@@ -78,33 +78,29 @@ pans and the mouse wheel zooms; these gestures do not change the film camera.
 **Camera path** shows the selected shot's authored camera motion. **Add camera key**
 captures that motion as ordinary editable parameter curves while retaining the
 current frame as a key. Drag the gold key points to change camera positions in 3D.
-Recipes provide a pure `camera(frame, fps)` sampler so path inspection requires
-no intermediate scene renders. Each transform or path drag makes one Undo step;
+The path samples the camera's parameter tracks without intermediate scene
+renders. Each transform or path drag makes one Undo step;
 **Ctrl+Z** and **Ctrl+Shift+Z** work in the Scene view too. Save normally to retain
 the same edits for export and the render farm.
 
-**Animated at playhead only** is checked by default. It shows editor curves whose
-key span includes the playhead and original recipe properties active around that
+**Animated at playhead only** is checked by default. It shows editor curves and
+recorded properties whose values change around that
 frame, within the selected clip's source range. Cuts, retiming and track selection
-use the selected clip's source clock. Key spans remain editable even when two
-keys currently have equal values. Uncheck it to reveal static/unkeyed parameters
+use the selected clip's source clock. Uncheck it to reveal static/unkeyed parameters
 and start a new animation. The choice is shared across scene cards for this
 editor session; it does not change the project or its keyframes.
 
 The object picker excludes groups with no active parameters. An empty filter
 explains how to show all controls. Seeking and Undo update the row masks while
-retaining the existing widgets and renderer. Odyssee declares original activity
-with a pure CPU `activeparams(firstframe,lastframe,fps)` recipe callback, covering
-its actor performances, ship motion and camera. Recipes without that callback
-still expose editor-keyed/driven parameters by default; uncheck the filter for
-their other controls. Activity queries must not render, seek or mutate the scene.
+retaining the existing widgets and renderer. Activity comes from the parameter
+tracks and recorded inputs themselves; recipes do not supply activity callbacks.
 
 Press **Camera** or **Animation**, then choose an object in the menu. Type positions,
 targets, rotations in degrees, and scales directly into the numeric fields. The
 object filter finds actors and their properties. The movie's actor groups move
 their body, face and attached parts together.
 
-An untouched property follows the original procedural animation. Editing a
+An untouched property follows its scene's default value or recorded input. Editing a
 property replaces that component with a constant for the selected shot. Press
 **◇** to animate it, scrub, and change its value to add keys. **◀ / ▶** walk the
 keys; **∿** shows the curve on the timeline. **↺** removes the override and restores
@@ -181,26 +177,24 @@ values are ordinary project data; the live scene remains the source of truth.
 Plot names must be stable and group members should not also belong to another
 editing group. Camera controls are offered automatically for a 3D camera.
 
-A recipe can expose creative controls that aren't Makie plot attributes by
-returning `controls` alongside `scene` and `update!`:
+A recipe names its actual plots; animate their native properties:
 
 ```julia
-clock = Ref(0.0)
-controls = [(name=:performance, label="Performance",
-    sample=(frame, fps)->(time=frame/fps,),
-    apply! = (edits, frame, fps)->(clock[]=get(edits, :time, frame/fps)))]
-return (scene=scene, update! = (frame,fps)->animate!(scene, clock[]), controls)
+mesh!(scene, geometry; name=:actor)
+return (scene=scene,)
+# In the project builder:
+keyframes!(clip, "actor.rotation[3]", [0=>0.0, 48=>180.0]; ease=:smooth)
 ```
 
-`sample` reports the original values without mutating the scene. `apply!` gets
-only edited fields, once per frame, before the updater. It also gets an empty
-dictionary when the scene effect is bypassed or a property is reset. Values can
-be numbers, vectors or colours. These controls reuse ordinary scene parameters;
-callbacks stay in the Julia recipe and are never serialized into the project.
+Numbers, vectors and colours on Makie plots become editable tracks. Custom
+geometric or medium parameters belong to their owning plot's attribute graph.
+Booleans use held steps. Related attribute components are applied together to
+each plot. Every animation is stored in the clip's tracks; scene
+recipes do not return frame updaters, sampled controls or camera samplers.
 
 A builder may also return `preview! = pixel_scale -> ...` to adjust procedural
 detail for the preview. The editor calls it once per quality change, before
-`update!`, including when the playhead stays still. A scale of `1.0` must restore
+applying parameters, including when the playhead stays still. A scale of `1.0` must restore
 the original scene detail; exact output always requests it. Keep this callback
 separate from saved artistic parameters and do not change recipe arguments.
 

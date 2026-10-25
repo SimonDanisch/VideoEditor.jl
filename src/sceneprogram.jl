@@ -52,20 +52,10 @@ transforms, the camera (eye, target, up, field of view) and the native lights
 are keyframable without further declarations. A scene with a 3D camera inside a
 figure layout (an `LScene` beside axes) exposes the first 3D camera it holds.
 
-`args` declares the recipe's own animated inputs: a NamedTuple (or dictionary)
-of `Observable`s the scene derives its plots from. Each becomes an editable
-group with timeline lanes, addressed as `"args.name"`. Numbers, `Vec`/`Point`
-values and colours key per component; integers, `Bool`s and enums key as held
-steps; plain structs key per numeric field (`"args.pose.eye[1]"`). Arrays,
-meshes and other data are shown as data inputs. The editor writes each
-argument once per frame, only when its value changes, so expensive derived
-plots (a wave simulation, a ray trace) recompute only on an actual change.
-Keyed arguments belong to the editor: an `update!` must not also set them.
-
-`update! = (frame, fps) -> ...` is optional, for procedural animation. It
-receives absolute source frames, so scrubbing, cuts, and farm frames all evaluate
-the same animation. It must support seeking in arbitrary order. It runs before
-the clip's ordinary scene keyframes, which can override values.
+The builder's `args` dictionary contains construction settings. Animation belongs
+to native plot, camera and light property tracks. Custom geometric and medium
+parameters are inputs on the owning Makie plot's attribute graph. Frames with
+equal parameter values share the same traced source master.
 
 Optional `objects` describes inspector groups as dictionaries with `label`,
 `plots` (stable names; first is the pivot), and optional `attributes` to expose.
@@ -74,45 +64,13 @@ The builder may return the same `objects` (NamedTuples or dictionaries) beside
 its scene instead, where the code that names the plots also groups them; groups
 saved with the recipe take precedence.
 
-The builder may also return `controls`: groups with `name`, `label`,
-`sample(frame, fps)` returning a NamedTuple of numeric/vector/colour values, and
-`apply!(overrides, frame, fps)`. Each frame samples the original performance,
-then applies the clip's keyed overrides before calling the scene updater.
-`overrides` contains only edited fields; an empty dictionary restores following
-the recipe. These controls use the same inspector, curves and saved parameters
-as plot attributes, without serializing live callbacks or GPU objects.
-Set a control group's optional `object` to the stable name of its object's pivot
-plot to show those controls when that object is picked in a preview. Optional
-`sections = [(label = "Face", fields = [:smile, :eyeopen])]` separates related
-controls in the inspector without changing their saved parameter paths.
-Optional `detail` says what the group is (`"Material"`); the default,
-`"Performance"`, is what the inspector's Animation view lists.
-
 An optional `preview!(pixel_scale)` callback can adjust expensive procedural
 detail when preview quality changes. It runs before the next animation update,
 once per quality change. Full preview and finished output always pass `1.0`;
 the callback must restore original detail at that scale. It does not edit the
 saved recipe arguments or the clip's parameters.
 
-An optional pure `activeparams(firstframe, lastframe, fps)` callback returns
-editable property paths varying over that source-frame interval. The inspector
-uses a small interval around the playhead, clamped inside the selected clip.
-It must not seek/render the scene or mutate animation state. Without this query,
-the active-parameter filter can list editor keyframes and driven values; the
-checkbox still exposes every unkeyed recipe control.
-
 The file runs in its own module and may include other files relative to itself.
-An optional pure `sampleparams(frame, fps)` returns a dictionary from property
-paths to original scalar values. Picking an object fits just its curves over
-the selected shot to sparse Bézier anchors using the existing curve fitter
-(relative tolerance `1e-4`), retaining their `SceneRef` inputs. Sampling here
-supplies the fit, not timeline keys. A gesture edits those same curves and
-detaches only the touched property. This query must
-not render, seek, or mutate the live performance. Camera curves can use `camera`
-without this callback. Recipes without either query remain editable in the
-inspector; the editor does not invent their original animation.
-An optional pure `camera(frame, fps)` callback returns `(eye, lookat, up)` for
-camera-path previews. It must sample without seeking or rendering the scene.
 Only open recipes whose Julia code you trust, just as with a Julia project.
 """
 function programscene(file::AbstractString; entry::Symbol = :buildscene,
@@ -125,29 +83,18 @@ function programscene(file::AbstractString; entry::Symbol = :buildscene,
     return d
 end
 
-mutable struct ProgramControlGroup
-    name::Symbol
-    label::String
-    sample::Any
-    apply!::Any
-    values::Dict{Symbol, Any}
-    object::Union{Nothing, Symbol}
-    sections::Vector{NamedTuple}
-    detail::String
+struct SceneOverrides
+    defaults::Dict{Tuple{Symbol, Symbol}, Any}
+    touched::Set{Tuple{Symbol, Symbol}}
 end
 
 mutable struct ProgramInstance
     scene::Makie.Scene
-    update!::Any
+    overrides::SceneOverrides
     frame::Int
-    controls::Vector{ProgramControlGroup}
     preview!::Any
     previewscale::Float64
     recordings::Dict{Symbol,RecordedTrack}
-    # The recipe's animated inputs, in declaration order, and the values they were
-    # built with: what an argument returns to when its keys are removed.
-    args::Vector{Pair{Symbol, Observable}}
-    argdefaults::Dict{Symbol, Any}
     # Inspector groups the builder returned (see `programscene`), in the saved
     # form: `label`, `plots` and optional `attributes`, as strings.
     objects::Vector{Dict{String, Any}}
@@ -173,44 +120,6 @@ function camerascene(scene::Makie.Scene)
 end
 
 """
-    recipeargs(built) -> Vector{Pair{Symbol, Observable}}
-
-A recipe's declared arguments in declaration order. A NamedTuple keeps its
-order; a dictionary is sorted by name, so paths and lanes are stable.
-"""
-recipeargs(::Nothing) = Pair{Symbol, Observable}[]
-recipeargs(args::NamedTuple) = Pair{Symbol, Observable}[k => args[k] for k in keys(args)]
-recipeargs(args::AbstractDict) =
-    Pair{Symbol, Observable}[Symbol(k) => args[k] for k in sort!(collect(keys(args)); by = string)]
-
-function recipeargument(p::ProgramInstance, name::Symbol)
-    for (k, obs) in p.args
-        k === name && return obs
-    end
-    return nothing
-end
-
-function programcontrols(built, scene)
-    names = Set(first.(sceneplots(scene)))
-    push!(names, :camera)
-    groups = ProgramControlGroup[]
-    for c in get(built, :controls, ())
-        name = Symbol(c.name)
-        occursin(r"^[A-Za-z_][A-Za-z_0-9]*$", String(name)) ||
-            error("invalid scene control name: $name")
-        name in names && error("duplicate scene control name: $name")
-        push!(names, name)
-        owner = get(c, :object, nothing)
-        push!(groups, ProgramControlGroup(name, String(c.label), c.sample, c.apply!, Dict(),
-                                          owner === nothing ? nothing : Symbol(owner),
-                                          NamedTuple[(label = String(s.label), fields = Symbol.(collect(s.fields)))
-                                              for s in get(c, :sections, ())],
-                                          String(get(c, :detail, "Performance"))))
-    end
-    return groups
-end
-
-"""
     programobjects(objects) -> Vector{Dict{String, Any}}
 
 Inspector groups a builder returned, in the form a saved recipe holds them.
@@ -224,85 +133,13 @@ function programobject(o)
 end
 programobject(o::AbstractDict) = programobject((; (Symbol(k) => v for (k, v) in o)...))
 
-programcontrol(::Any, name) = nothing
-function programcontrol(p::ProgramInstance, name)
-    i = findfirst(g -> g.name === name, p.controls)
-    return i === nothing ? nothing : p.controls[i]
-end
-
-function updatescenecontrols!(target::ProgramInstance, clip, frame, fps)
-    fx = findslot(clip, :scene)
-    lookup = Dict(g.name => g for g in target.controls)
-    changes = Dict(g.name => Dict{Symbol, Any}() for g in target.controls)
-    for group in target.controls
-        values = Base.invokelatest(group.sample, frame, fps)
-        empty!(group.values)
-        for (key, value) in pairs(values)
-            rowkind(value) in (:number, :vector, :colour) ||
-                error("scene control $(group.name).$key must be numeric, vector or colour")
-            group.values[Symbol(key)] = value
-        end
-    end
-    # Walk the clip's parameters once, rather than once per actor/control group.
-    if fx !== nothing && fx.enabled[]
-        for p in fx.params
-            isfollowing(p) && continue
-            address = scenepath(p.name)
-            address === nothing && continue
-            name, key, component = address
-            group = get(lookup, name, nothing)
-            group !== nothing && haskey(group.values, key) || continue
-            overrides = changes[name]
-            original = get(overrides, key, group.values[key])
-            v = valueat(p, frame)
-            overrides[key] = component === nothing ? convert(typeof(original), v) :
-                                                    withcomponent(original, component, v)
-        end
-    end
-    for group in target.controls
-        Base.invokelatest(group.apply!, changes[group.name], frame, fps)
-    end
-    return nothing
-end
-
-"A scene updater with an optional pure animation-activity query."
-struct ProgramAnimation
-    update!::Any
-    activeparams::Any
-    camera::Any
-    sampleparams::Any
-end
-ProgramAnimation(update!,activeparams,camera=nothing) = ProgramAnimation(update!,activeparams,camera,nothing)
-(a::ProgramAnimation)(frame, fps) = Base.invokelatest(a.update!, frame, fps)
-
-"Optional pure recipe query for property paths animated in a source-frame interval."
-programactiveparams(::Any, firstframe, lastframe, fps) = Symbol[]
-function programactiveparams(p::ProgramInstance, firstframe, lastframe, fps)
-    u = p.update!
-    a = u isa SceneUpdater ? u.callback : u
-    a isa ProgramAnimation || return Symbol[]
-    a.activeparams === nothing && return Symbol[]
-    return Base.invokelatest(a.activeparams, firstframe, lastframe, fps)
-end
-
-"Pure original values for timeline curves, without seeking the live scene."
-function programsampleparams(p::ProgramInstance, frame, fps)
-    u = p.update! isa SceneUpdater ? p.update!.callback : p.update!
-    u isa ProgramAnimation && u.sampleparams !== nothing || return nothing
-    return Base.invokelatest(u.sampleparams, frame, fps)
-end
-
-"Original values for properties touched by editor overrides, held with the live scene."
-struct SceneUpdater
-    callback::Any
-    defaults::Dict{Tuple{Symbol, Symbol}, Any}
-    touched::Set{Tuple{Symbol, Symbol}}
-end
-
-function SceneUpdater(callback, scene)
+function SceneOverrides(scene)
     defaults = Dict{Tuple{Symbol, Symbol}, Any}()
     camscene = camerascene(scene)
     camscene === nothing || (defaults[(:camera, :camera)] = cameravalues(camscene))
+    for (i,camera) in enumerate(nativecameras(scene))
+        i==1 || (defaults[(Symbol("camera[",i,"]"),:camera)]=cameravalues(camera))
+    end
     for (i, light) in [(0, Makie.AmbientLight(scene.compute[:ambient_color][]));
                        collect(enumerate(Makie.get_lights(scene)))]
         for key in fieldnames(typeof(light))
@@ -315,13 +152,12 @@ function SceneUpdater(callback, scene)
         end
         for key in sceneinputkeys(plot)
             v = Makie.to_value(plot.attributes[key])
-            (key === :visible || rowkind(v) in (:number, :vector, :colour)) || continue
+            (v===nothing || v isa Bool || rowkind(v) in (:number, :vector, :colour,:data)) || continue
             defaults[(name, key)] = v
         end
     end
-    return SceneUpdater(callback, defaults, Set{Tuple{Symbol, Symbol}}())
+    return SceneOverrides(defaults, Set{Tuple{Symbol, Symbol}}())
 end
-(u::SceneUpdater)(frame, fps) = Base.invokelatest(u.callback, frame, fps)
 
 """
     restoresceneprogram!(target, keep = Set()) -> nothing
@@ -333,8 +169,7 @@ recompute twice per frame. Transforms are always restored, because grouped
 objects move by the difference to their current placement.
 """
 function restoresceneprogram!(target::ProgramInstance, keep = Set{Tuple{Symbol, Symbol}}())
-    u = target.update!
-    u isa SceneUpdater || return nothing
+    u = target.overrides
     for address in u.touched
         # Kept addresses are re-applied this frame, which touches them again.
         (haskey(u.defaults, address) && address ∉ keep) || continue
@@ -345,6 +180,11 @@ function restoresceneprogram!(target::ProgramInstance, keep = Set{Tuple{Symbol, 
         end
         if name === :camera && key === :camera
             setcameravalues!(target.camerascene, u.defaults[address])
+            continue
+        end
+        camera=nativecamera(target.scene,name)
+        if camera !== nothing && key===:camera
+            setcameravalues!(camera,u.defaults[address])
             continue
         end
         plot = Makie.findplot(target.scene, name)
@@ -369,7 +209,7 @@ end
 
 The plot attributes this clip's scene effect writes every frame: the ones
 [`restoresceneprogram!`](@ref) need not restore first. Transforms, the camera,
-lights and arguments are not included.
+lights are not included.
 """
 function keyedattributes(clip)
     keep = Set{Tuple{Symbol, Symbol}}()
@@ -380,7 +220,7 @@ function keyedattributes(clip)
         address = scenepath(p.name)
         address === nothing && continue
         name, key, _ = address
-        (name === :camera || name === :args || key in (:translation, :rotation, :scale) ||
+        (name === :camera || key in (:translation, :rotation, :scale) ||
          startswith(String(name), "lights[")) && continue
         push!(keep, (name, key))
     end
@@ -389,8 +229,7 @@ end
 
 function remembersceneoverride!(src, path)
     src.live.target isa ProgramInstance || return nothing
-    u = src.live.target.update!
-    u isa SceneUpdater || return nothing
+    u = src.live.target.overrides
     address = scenepath(path)
     address === nothing && return nothing
     name, key, _ = address
@@ -399,6 +238,8 @@ function remembersceneoverride!(src, path)
         return nothing
     end
     name === :camera && (push!(u.touched, (:camera, :camera)); return nothing)
+    nativecamera(targetscene(src.live.target),name)===nothing ||
+        (push!(u.touched,(name,:camera));return nothing)
     plots = key in (:translation, :rotation, :scale) ? sceneobjectplots(src, name) :
             filter(!isnothing, [Makie.findplot(targetscene(src.live.target), name)])
     for plot in plots
@@ -441,26 +282,15 @@ function programbuilder!(root::SceneProgram)
     return root.builder
 end
 
-"No procedural animation: the scene is moved by its keyframes alone."
-staticscene(frame, fps) = nothing
-
 function realize(root::SceneProgram, canvas::NTuple{2, Int})
     built = Base.invokelatest(programbuilder!(root), canvas, deepcopy(root.args))
     built.scene isa Makie.Scene || error("scene program must return a Makie.Scene")
-    activity = get(built, :activeparams, nothing)
-    camera = get(built, :camera, nothing)
-    samples = get(built, :sampleparams, nothing)
-    update = get(built, :update!, staticscene)
-    updater = activity === nothing && camera === nothing && samples === nothing ? update :
-        ProgramAnimation(update, activity, camera, samples)
-    args = recipeargs(get(built, :args, nothing))
-    for (name, obs) in args
-        occursin(r"^[A-Za-z_][A-Za-z_0-9]*$", String(name)) || error("invalid scene argument name: $name")
+    for name in (:update!, :controls, :activeparams, :sampleparams, :camera, :args)
+        haskey(built, name) && error("$(root.entry) returned obsolete procedural hook `$name`; key native Makie plot, camera and light properties instead")
     end
-    defaults = Dict{Symbol, Any}(name => deepcopy(obs[]) for (name, obs) in args)
-    instance = ProgramInstance(built.scene, SceneUpdater(updater, built.scene), -1,
-                               programcontrols(built, built.scene), get(built, :preview!, nothing), NaN,
-                               Dict{Symbol,RecordedTrack}(), args, defaults,
+    instance = ProgramInstance(built.scene, SceneOverrides(built.scene), -1,
+                               get(built, :preview!, nothing), NaN,
+                               Dict{Symbol,RecordedTrack}(),
                                programobjects(get(built, :objects, ())), camerascene(built.scene))
     return built.scene, instance
 end
@@ -480,77 +310,11 @@ function updatesceneprogram!(target::ProgramInstance, src, clip, frame, fps; res
     changed = reset || target.frame != frame
     if changed
         restoresceneprogram!(target, keyedattributes(clip))
-        if !replayrecordedscene!(target,src,frame)
-            updatescenecontrols!(target, clip, frame, fps)
-            Base.invokelatest(target.update!, frame, fps)
-        end
+        replayrecordedscene!(target, src, frame)
         target.frame = frame
     end
     target.camerascene === nothing || (src.camera = cameravalues(target.camerascene))
     return changed
-end
-
-# ------------------------------------------------------------ recipe arguments
-
-"""
-    argleaves(value) -> Vector{Tuple{Symbol, Union{Nothing, Int}, Real, Bool}}
-
-The keyframable numbers in an argument's value: `(field, component, number,
-discrete)`. `field` is the dotted field path inside a struct (`Symbol("")` for
-the value itself), `component` indexes a vector or colour. Integers, `Bool`s and
-enums are `discrete`: they key as held steps, never as blends.
-
-Arrays and other data have no leaves; they are inputs, not numbers.
-"""
-argleaves(v) = argleaves!(Tuple{Symbol, Union{Nothing, Int}, Real, Bool}[], Symbol(""), v)
-
-argleaves!(out, field, v::Bool) = push!(out, (field, nothing, Float64(v), true))
-argleaves!(out, field, v::Integer) = push!(out, (field, nothing, Float64(v), true))
-argleaves!(out, field, v::Enum) = push!(out, (field, nothing, Float64(Int(v)), true))
-argleaves!(out, field, v::Real) = push!(out, (field, nothing, Float64(v), false))
-function argleaves!(out, field, v::Union{GeometryBasics.Vec, GeometryBasics.Point})
-    for i in eachindex(v)
-        push!(out, (field, i, Float64(v[i]), false))
-    end
-    return out
-end
-function argleaves!(out, field, v::Colorant)
-    c = RGBAf(v)
-    for (i, x) in enumerate((c.r, c.g, c.b, c.alpha))
-        push!(out, (field, i, Float64(x), false))
-    end
-    return out
-end
-argleaves!(out, field, ::Union{AbstractArray, AbstractString, Symbol, Function, Nothing}) = out
-function argleaves!(out, field, v)
-    isstructtype(typeof(v)) || return out
-    for name in fieldnames(typeof(v))
-        argleaves!(out, field === Symbol("") ? name : Symbol(field, ".", name), getfield(v, name))
-    end
-    return out
-end
-
-"""
-    withleaf(value, fields, component, x) -> value
-
-`value` with one keyframable number replaced: the field reached by the dotted
-`fields` path, and its `component` if it is a vector or colour. Structs are
-rebuilt through their default constructor, field by field.
-"""
-withleaf(old, fields::Tuple{}, component::Nothing, x) = leafvalue(old, x)
-withleaf(old, fields::Tuple{}, component::Integer, x) = withcomponent(old, component, x)
-function withleaf(old::NamedTuple, fields::Tuple{Symbol, Vararg{Symbol}}, component, x)
-    name = first(fields)
-    return merge(old, NamedTuple{(name,)}((withleaf(getfield(old, name), Base.tail(fields), component, x),)))
-end
-function withleaf(old, fields::Tuple{Symbol, Vararg{Symbol}}, component, x)
-    name = first(fields)
-    T = typeof(old)
-    values = ntuple(fieldcount(T)) do i
-        f = fieldname(T, i)
-        f === name ? withleaf(getfield(old, f), Base.tail(fields), component, x) : getfield(old, f)
-    end
-    return T(values...)
 end
 
 "A keyed number as the type it lands in: held steps for discrete values."
@@ -563,79 +327,6 @@ leafvalue(old::AbstractString, x::AbstractString) = String(x)
 leafvalue(::Nothing, x) = x
 leafvalue(old, x) = convert(typeof(old), x)
 
-argfieldpath(key::Symbol) = key === Symbol("") ? () : Tuple(Symbol.(split(String(key), '.')))
-
-"""
-    argpath(name, field, component) -> Symbol
-
-The parameter path of one argument number: `args.speed`, `args.pose.eye[2]`.
-"""
-argpath(name::Symbol, field::Symbol, component) =
-    Symbol("args.", name, field === Symbol("") ? "" : ".", field,
-           component === nothing ? "" : "[$component]")
-
-"The argument a path addresses, and the rest of the path inside it."
-function argaddress(key::Symbol)
-    parts = split(String(key), '.'; limit = 2)
-    return Symbol(parts[1]), length(parts) == 1 ? () : Tuple(Symbol.(split(parts[2], '.')))
-end
-
-"""
-    applyargs!(target, fx, frame) -> nothing
-
-Write every keyed recipe argument for this frame: its default value with each
-keyed number replaced. One assignment per argument and only when the value
-changed, so a plot derived from it recomputes once, and not at all on a frame
-that does not move it.
-"""
-function applyargs!(target::ProgramInstance, fx, frame::Integer)
-    isempty(target.args) && return nothing
-    # The recipe's types (a struct, an enum) were defined when its file loaded:
-    # building and comparing their values happens in the latest world.
-    Base.invokelatest(writeargs!, target, fx, frame)
-    return nothing
-end
-
-function writeargs!(target::ProgramInstance, fx, frame::Integer)
-    values = Dict{Symbol, Any}()
-    if fx !== nothing && fx.enabled[]
-        for p in fx.params
-            isfollowing(p) && continue
-            address = scenepath(p.name)
-            address === nothing && continue
-            name, key, component = address
-            name === :args || continue
-            arg, fields = argaddress(key)
-            haskey(target.argdefaults, arg) || continue
-            current = get(values, arg, target.argdefaults[arg])
-            values[arg] = withleaf(current, fields, component, valueat(p, frame))
-        end
-    end
-    for (name, obs) in target.args
-        new = get(values, name, target.argdefaults[name])
-        isequal(obs[], new) || (obs[] = new)
-    end
-    return nothing
-end
-
-"""
-The recipe's own value of one argument number, before this clip's keys: what a
-parameter that follows the recipe reads.
-"""
-function argnumber(target::ProgramInstance, key::Symbol, component)
-    arg, fields = argaddress(key)
-    haskey(target.argdefaults, arg) || return nothing
-    v = target.argdefaults[arg]
-    for f in fields
-        hasfield(typeof(v), f) || return nothing
-        v = getfield(v, f)
-    end
-    component === nothing || (v = v isa Colorant ? (red(v), green(v), blue(v), alpha(v))[component] : v[component])
-    return leafnumber(v)
-end
-leafnumber(v::Real) = Float64(v)
-leafnumber(v::Enum) = Float64(Int(v))
-leafnumber(::Any) = nothing
 
 "Set finished-output scene settings for a scoped operation, restoring preview settings on exit."
 function withfinalscenes(f::Function, seq::Sequence)

@@ -76,33 +76,29 @@ function readsceneproperty(scene,path)
 end
 
 """
-    recordsceneanimation!(clip, directory; progress=nothing)
+    recordsceneanimation!(clip, directory; producer, progress=nothing)
 
-Construct a fresh instance of the clip's saved scene recipe, advance it once
-through all source frames, and stream its native numeric/array inputs to disk.
-Discover writable scene properties. Playback constructs the scene but bypasses its simulation
-updater, restoring recorded samples before normal editor overrides. Recordings
+Run an offline `producer(canvas, args)` returning `(scene, advance!)` once
+through all source frames and stream its native numeric/array inputs to disk.
+Playback uses only the saved scene and recorded inputs; the producer is never
+saved or called by preview/export/farm. Recordings
 belong to the source, so existing cuts share the same source clock and samples.
 Use a new directory for a new recording. The recipe factory must create fresh
 simulation state rather than reuse mutable global state.
 """
 function recordsceneanimation!(clip::Clip,directory::AbstractString;
-                               progress=nothing)
+                               producer, progress=nothing)
     src = clip.source
     src isa SceneSource && src.root isa SceneProgram ||
-        throw(ArgumentError("recording requires a saved procedural scene"))
+        throw(ArgumentError("recording requires a saved scene"))
     get(src.build,"recordings",nothing) === nothing || error("source already uses a recording")
-    # Reuse the loaded Julia factory, not its live scene or mutable simulation.
-    root = SceneProgram(src.root.file,src.root.entry,deepcopy(src.root.args))
-    root.builder = programbuilder!(src.root)
     backend = getbackend(src.backend)
     tracks = onthread(renderthread(backend)) do
         lock(SCENELOCK) do
-            scene,target = realize(root,(src.width,src.height))
+            scene, advance! = Base.invokelatest(producer, (src.width, src.height), deepcopy(src.root.args))
             try
                 # Only record the source performance; clip overrides remain
                 # separately editable and apply after these recorded values.
-                unkeyed = Clip(src)
                 candidates = Symbol[]
                 if camerascene(scene) !== nothing
                     for (field,n) in pairs(CAMERAFIELDS)
@@ -130,8 +126,7 @@ function recordsceneanimation!(clip::Clip,directory::AbstractString;
                 end
                 chosen = unique(candidates)
                 capture = (frame,fps) -> begin
-                    updatescenecontrols!(target,unkeyed,frame,fps)
-                    Base.invokelatest(target.update!,frame,fps)
+                    Base.invokelatest(advance!,frame,fps)
                     Dict(path=>readsceneproperty(scene,path) for path in chosen)
                 end
                 recordanimation(capture,directory,0:src.nframes-1;framerate=src.framerate,progress)

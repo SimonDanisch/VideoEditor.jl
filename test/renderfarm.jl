@@ -16,14 +16,14 @@ Base.close(r::OwnedTestFrames) = (r.closed[] = true; nothing)
         function buildscene(canvas, args)
             scene = Scene(; size=canvas, camera=campixel!)
             dot = scatter!(scene, [Point2f(8, 12)]; color=:red, markersize=10, name=:dot)
-            update! = (frame, fps) -> (dot[1] = [Point2f(8 + 4frame, 12)])
-            return (scene=scene, update! = update!)
+            return (scene=scene,)
         end
         """)
         wav = joinpath(dir, "tone.wav")
         run(`$(VE.FFMPEG_jll.ffmpeg()) -v error -y -f lavfi -i sine=frequency=440:sample_rate=48000 -t 1 $wav`)
         build = VE.programscene(script)
         clip = VE.sceneclip(VE.buildscene(build); build, frames=6, canvas=(64, 40), framerate=24)
+        VE.keyframes!(clip,"dot.translation[1]",[0=>0.,5=>20.];ease=:linear)
         clip.source.soundtrack = wav
         clip.source.bakewith = :GLMakie
         clip.look = ones(Float32, 2, 2, 2, 3)
@@ -132,7 +132,7 @@ Base.close(r::OwnedTestFrames) = (r.closed[] = true; nothing)
                 VE.pausefarm!(pausejob.directory)
                 VE.farmframes!(renderer, ids)
             end)
-            status = VE.renderfarm!(pausejob, [pauseworker])
+            status = VE.renderfarm!(pausejob, [pauseworker];batchsize=1)
             @test status["paused"] && status["completed"] == 1
             rm(joinpath(pausejob.directory, "pause.requested"))
             @test VE.renderfarm!(pausejob, [worker])["completed"] == 6

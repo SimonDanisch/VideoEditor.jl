@@ -18,13 +18,14 @@ using Main.EditingWalkthroughActions
             sc=Scene(;size=canvas,camera=cam3d!,backgroundcolor=:black,lights=[
                 AmbientLight(RGBf(.2,.3,.4)),PointLight(RGBf(1,1,1),Point3f(1,2,3))])
             mesh!(sc,Rect3f(Vec3f(-0.4),Vec3f(0.8));color=:orange,name=:actor)
-            update! = (frame,fps)->update_cam!(sc,Vec3f(4+frame/100,-6,4),Vec3f(0),Vec3f(0,0,1))
-            return (scene=sc,update! = update!)
+            update_cam!(sc,Vec3f(4,-6,4),Vec3f(0),Vec3f(0,0,1))
+            return (scene=sc,)
         end
         """)
         build=VE.programscene(script;objects=[Dict("label"=>"Actor","plots"=>["actor"],
                                                      "attributes"=>["color","alpha"])])
         c=VE.sceneclip(VE.buildscene(build);build,frames=120,canvas=(96,64),framerate=24)
+        VE.keyframes!(c,"camera.eye[1]",[0=>4.,119=>5.19];ease=:linear)
         VE.seteffect!(c,VE.ColorEffect())
         # An identity grade keeps the fixture's colour visible in the recording.
         c.look = [Float32((i,j,k)[channel]-1)
@@ -79,7 +80,7 @@ using Main.EditingWalkthroughActions
                      FI.Lazy(_ -> begin @test fx().card.open[]; FI.Wait(0) end);
                      click(() -> timelinepos(p,12));
                      FI.Lazy(_ -> begin
-                         @test VE.isfollowing(camera())
+                         @test VE.isanimated(camera())
                          @test camera().view.control.stored_string[] == "4.12"
                          @test clip().source.camera.eye[1] ≈ 4.12
                          FI.Wait(0)

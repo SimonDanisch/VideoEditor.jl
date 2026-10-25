@@ -18,16 +18,14 @@ using Main.EditingWalkthroughActions
         function buildscene(canvas,args)
             s=Scene(;size=canvas,camera=cam3d!,backgroundcolor=:navy)
             box=mesh!(s,Rect3f(Vec3f(-.4),Vec3f(.8));name=:actor,color=:orange)
-            update! = (frame,fps)->begin
-                translate!(box,Vec3f(frame/100,0,0))
-                update_cam!(s,Vec3f(4,-6,4),Vec3f(0),Vec3f(0,0,1))
-            end
-            return (scene=s,update! = update!)
+            update_cam!(s,Vec3f(4,-6,4),Vec3f(0),Vec3f(0,0,1))
+            return (scene=s,)
         end
         """)
         build=VE.programscene(script)
         backend=haskey(VE.BACKENDS,:RayMakie) ? :RayMakie : :GLMakie
         c=VE.sceneclip(VE.buildscene(build);build,frames=48,canvas=(160,120),framerate=24,backend)
+        VE.keyframes!(c,"actor.translation[1]",[0=>0.,47=>0.47];ease=:linear)
         backend===:RayMakie && (c.source.screenopts[:rasterize]=true)
         c.source.soundtrack=wav
         seq=VE.Sequence([c],24)

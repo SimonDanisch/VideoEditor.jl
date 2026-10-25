@@ -15,6 +15,26 @@ end
 FarmWorker(name::AbstractString, render) = FarmWorker{typeof(render)}(String(name), render)
 closeworker!(worker::FarmWorker) = applicable(close, worker.render) ? close(worker.render) : nothing
 
+"Whether this worker can render a timeline frame; specialize on its callable resource."
+acceptsfarmframe(resource, job, frame::Integer) = true
+function nextfarmframes!(pending::Vector{Int}, worker::FarmWorker, job, batchsize::Integer = 16)
+    i=findlast(n->acceptsfarmframe(worker.render,job,n),pending)
+    i===nothing && return Int[]
+    frames = [splice!(pending,i)]
+    # Adjacent work preserves scene locality. Never lease a cached, already
+    # leased or incompatible frame just to fill a batch.
+    while length(frames) < batchsize && i > 1
+        i -= 1
+        pending[i] == last(frames)+1 || break
+        acceptsfarmframe(worker.render,job,pending[i]) || break
+        push!(frames,splice!(pending,i))
+    end
+    return frames
+end
+
+"""Consume a leased batch incrementally. Transports may stream instead of retaining a batch in RAM."""
+foreachfarmresult(accept, resource, frames) = foreach(accept, resource(frames))
+
 """The folder of a job directory that workers render: the snapshot."""
 const FARM_SNAPSHOT = "job"
 
@@ -404,6 +424,12 @@ samerevision(a::TrackCache, b::TrackCache, id::UInt64, sf::Int) =
 """Adopt a verified immutable plane, sharing its storage when the filesystem permits."""
 function adoptplane!(cache::TrackCache, id::UInt64, sf::Int, file::AbstractString, sha::AbstractString)
     isfile(file) && filehash(file) == sha || return false
+    linkplane!(cache, id, sf, file)
+    return true
+end
+
+"""Publish `file` as `cache`'s valid frame `sf`, sharing its storage when the filesystem permits."""
+function linkplane!(cache::TrackCache, id::UInt64, sf::Int, file::AbstractString)
     target = cachefile(cache, id, sf)
     mkpath(dirname(target))
     # Cache writers publish new files by rename, never by modifying an existing
@@ -424,7 +450,7 @@ function adoptplane!(cache::TrackCache, id::UInt64, sf::Int, file::AbstractStrin
     end
     push!(get!(() -> BitSet(), cache.valid, id), sf)
     delete!(get!(() -> BitSet(), cache.dirty, id), sf)
-    return true
+    return target
 end
 
 """Whether frame `n` is committed for the job `key`: its PNG, and a receipt (written atomically) naming the job and the PNG's hash."""
@@ -457,19 +483,22 @@ performs the final encode and audio mix.
 
 With `reuse=seq`, native cached pictures/HDR masters are left in that project's
 caches instead of being retraced in a new snapshot. `status["reused"]` counts
-these frames. Adopt the returned planes and finish with `exportvideo(output, seq)`;
+these frames, and the frames left out because another frame traces the same
+pictures (see [`distinctframes`](@ref)). Adopt the returned planes and finish
+with `exportvideo(output, seq)`;
 `encodefarm!` alone cannot encode frames intentionally kept only in `seq`.
 """
 function renderfarm!(job::RenderJob, workers; frames = nothing, reuse = nothing,
-                     retries::Integer = 3, progress = nothing)
+                     retries::Integer = 3, batchsize::Integer = 16, progress = nothing)
     workers isa Channel || isempty(workers) && error("no farm workers supplied")
     retries > 0 || error("retries must be positive")
+    batchsize > 0 || throw(ArgumentError("batchsize must be positive"))
     pool = workerchannel(workers)
     dir, total, canvas, key = job.directory, job.total, job.canvas, job.key
     wanted = frames === nothing ? collect(0:total-1) : sort!(unique(Int.(collect(frames))))
     all(n -> 0 <= n < total, wanted) || error("invalid farm frame range")
     requested=length(wanted)
-    reuse===nothing || filter!(n->farmneedsframe(reuse,n),wanted)
+    reuse===nothing || (wanted = distinctframes(reuse, filter!(n->farmneedsframe(reuse,n),wanted)))
     # An atomic mkdir is a process-wide coordinator lock, including other editors.
     lockdir = joinpath(dir, "coordinator.lock")
     ispath(lockdir) && error("farm directory already has a coordinator: $lockdir")
@@ -480,7 +509,9 @@ function renderfarm!(job::RenderJob, workers; frames = nothing, reuse = nothing,
         pending = reverse([n for n in wanted if !farmcomplete(dir, n, key)])
         completed = length(wanted) - length(pending)
         counts = Dict{String, Int}()
+        batches = Dict{String, Any}()
         errors = Dict{String, String}()
+        incidents = Dict{String,Any}[]
         active = Set{String}()
         guard = ReentrantLock()
         started = time_ns()
@@ -488,8 +519,10 @@ function renderfarm!(job::RenderJob, workers; frames = nothing, reuse = nothing,
             data = Dict("job" => key, "completed" => completed, "total" => length(wanted),
                         "timeline_frames" => total, "workers" => counts, "active" => collect(active),
                         "reused" => requested-length(wanted),
-                        "errors" => copy(errors), "elapsed_seconds" => (time_ns()-started)/1e9,
-                        "paused" => isfile(joinpath(dir, "pause.requested")))
+                        "errors" => copy(errors), "incidents" => copy(incidents),
+                        "elapsed_seconds" => (time_ns()-started)/1e9,
+                        "batches" => copy(batches),
+                        "paused" => isfile(joinpath(dir, "pause.requested")), "batchsize" => batchsize)
             farmwritejson(joinpath(dir, "status.json"), data)
             progress === nothing || progress(completed, length(wanted))
         end
@@ -518,16 +551,20 @@ function renderfarm!(job::RenderJob, workers; frames = nothing, reuse = nothing,
                         ids = lock(guard) do
                             isempty(pending) && return Int[]
                             paused() && return Int[]
-                            [pop!(pending)]
+                            nextfarmframes!(pending,worker,job,batchsize)
                         end
                         isempty(ids) && break
-                        n = only(ids)
-                        committed = false
+                        remaining = Set(ids)
+                        reporting = false
+                        batch_started = time_ns()
+                        render_seconds = 0.0
+                        first_result_seconds = nothing
                         try
-                            result = worker.render(ids)
-                            length(result) == 1 || error("worker returned an incomplete request")
-                            r = only(result)
-                            r.frame == n || error("worker returned frame $(r.frame) for frame $n")
+                          foreachfarmresult(worker.render,ids) do r
+                            n = r.frame
+                            n in remaining || error("worker returned duplicate or unleased frame $n")
+                            first_result_seconds === nothing && (first_result_seconds=(time_ns()-batch_started)/1e9)
+                            render_seconds += r.seconds
                             img = PNGFiles.load(IOBuffer(r.png))
                             Base.size(img) == reverse(canvas) || error("worker returned the wrong dimensions")
                             # the planes first: a receipt names only planes that are there
@@ -536,23 +573,40 @@ function renderfarm!(job::RenderJob, workers; frames = nothing, reuse = nothing,
                             farmwritejson(farmreceiptpath(dir, n), Dict("job" => key,
                                 "sha256" => sha, "worker" => worker.name, "layers" => layers,
                                 "frame" => n, "seconds" => r.seconds, "completed_utc" => string(now(UTC))))
-                            committed = true
-                        catch e
+                            # Keep successful prefixes even if a connection fails
+                            # halfway through the batch or a progress observer throws.
+                            delete!(remaining,n)
+                            reporting = true
                             lock(guard) do
-                                push!(pending, n); failures += 1
-                                errors[worker.name] = sprint(showerror, e); report()
+                                counts[worker.name] += 1; completed += 1; failures = 0
+                                delete!(errors, worker.name)
+                                completed==length(wanted) && empty!(errors)
+                                report()
+                            end
+                            reporting = false
+                          end
+                          isempty(remaining) || error("worker returned an incomplete batch: $(sort!(collect(remaining)))")
+                        catch e
+                            reporting && rethrow()
+                            isempty(remaining) && rethrow() # observer failed after a durable commit
+                            lock(guard) do
+                                append!(pending,remaining); sort!(pending;rev=true); failures += 1
+                                errors[worker.name] = sprint(showerror, e)
+                                push!(incidents,Dict("worker"=>worker.name,"frames"=>sort!(collect(remaining)),
+                                    "error"=>errors[worker.name],"utc"=>string(now(UTC))))
+                                report()
                             end
                             failures >= retries && break
                         end
-                        # Reporting failures must never retry a frame that has
-                        # already been committed and counted.
-                        if committed
-                            lock(guard) do
-                                counts[worker.name] += 1; completed += 1; failures = 0
-                                delete!(errors, worker.name); report()
-                            end
+                        lock(guard) do
+                            batches[worker.name] = Dict("frames"=>ids,"committed"=>length(ids)-length(remaining),
+                                "elapsed_seconds"=>(time_ns()-batch_started)/1e9,
+                                "render_seconds"=>render_seconds,"first_result_seconds"=>first_result_seconds)
+                            report()
                         end
-                        yield()
+                        # yield() alone can keep a CPU-bound ready queue running
+                        # indefinitely without polling network I/O.
+                        sleep(0.001)
                     end
                 finally
                     lock(guard) do; delete!(active, worker.name); report(); finished(); end

@@ -9,14 +9,17 @@ import VideoEditor as VE
         function buildscene(canvas,args)
             sc=Scene(;size=canvas,camera=campixel!)
             point=scatter!(sc,[Point2f(10,10)];name=:point,color=:red)
-            scale=Ref(1.0);calls=Float64[]
+            offset=Observable(0.0);scale=Observable(1.0);calls=Float64[]
+            on(v -> (point[1]=[Point2f(10+v[1],10*v[2])]),lift((x,s)->(x,s),offset,scale);update=true)
             preview! = value -> (scale[]=value;push!(calls,value))
-            update! = (frame,fps) -> (point[1]=[Point2f(10+frame,10*scale[])])
-            return (scene=sc,update! = update!,preview! = preview!)
+            Makie.add_input!(point.attributes,:x_shift,offset[])
+            connect!(offset,point.x_shift)
+            return (scene=sc,preview! = preview!)
         end
         """)
         build=VE.programscene(script)
         c=VE.sceneclip(VE.buildscene(build);build,frames=12,canvas=(48,32),framerate=24)
+        VE.keyframes!(c,"point.x_shift",[0=>0.,11=>11.];ease=:linear)
         src=c.source;src.bakewith=:GLMakie
         try
             VE.updatesource!(src,c,4)
@@ -41,7 +44,7 @@ import VideoEditor as VE
     end
 end
 
-@testset "procedural scene editing" begin
+@testset "keyframed scene editing" begin
     mktempdir() do dir
         script = joinpath(dir, "scene.jl")
         write(script, """
@@ -50,15 +53,9 @@ end
             sc = Scene(; size=canvas, camera=cam3d!, backgroundcolor=:black)
             body = mesh!(sc, Rect3f(Vec3f(-0.4), Vec3f(0.8)); color=:orange, name=:body)
             face = mesh!(sc, Rect3f(Vec3f(-0.15), Vec3f(0.3)); color=:white, name=:face)
-            update! = (frame, fps) -> begin
-                translate!(body, frame / 10, 0, 0)
-                translate!(face, frame / 10, 0, 1)
-                rotate!(body, qrotation(Vec3f(0,0,1), 0))
-                rotate!(face, qrotation(Vec3f(0,0,1), 0))
-                scale!(body, 1,1,1); scale!(face, 1,1,1)
-                update_cam!(sc, Vec3f(4 + frame / 10, -6, 4), Vec3f(0), Vec3f(0,0,1))
-            end
-            return (scene=sc, update! = update!)
+            translate!(face,0,0,1)
+            update_cam!(sc, Vec3f(4,-6,4), Vec3f(0), Vec3f(0,0,1))
+            return (scene=sc,)
         end
         """)
         objects = [Dict("label" => "Actor", "plots" => ["body", "face"],
@@ -70,10 +67,12 @@ end
         builder = recipe.builder
         _, resized = VE.realize(recipe, (48, 32))
         @test recipe.builder === builder
-        @test typeof(initial.update!.callback) === typeof(resized.update!.callback)
+        @test typeof(initial.overrides) === typeof(resized.overrides)
         @test initial.scene !== resized.scene
         clip = VE.sceneclip(VE.buildscene(build); build, frames=8,
                              canvas=(96,64), framerate=24)
+        VE.keyframes!(clip,"camera.eye[1]",[0=>4.,7=>4.7];ease=:linear)
+        VE.keyframes!(clip,"body.translation[1]",[0=>0.,7=>0.7];ease=:linear)
         VE.seteffect!(clip, VE.ColorEffect())
         clip.look = ones(Float32, 2,2,2,3)
         VE.seteffect!(clip, VE.LookEffect())
@@ -88,7 +87,7 @@ end
             secs = VE.sceneparamsections(c, fx)
             @test getproperty.(secs, :label) == ["Camera", "Actor", "Light · Ambient", "Light · Directional 1"]
             @test all(s -> s.detail == "Lighting", secs[3:4])
-            @test all(VE.isfollowing, fx.params)
+            @test count(VE.isanimated, fx.params) == 2
             @test only(VE.farmframes!(renderer, [4])).png == original
             @test src.camera.eye[1] ≈ 4.4
             VE.farmframes!(renderer, [7])
@@ -178,8 +177,8 @@ end
             @test !VE.isanimated(camera)
             @test c.source.camera.eye[1] ≈ 4
             VE.seek!(player, 3)
-            @test c.source.camera.eye[1] ≈ 4.3
-            @test VE.valueat(camera, 3) ≈ 4.3 atol=1e-6
+            @test c.source.camera.eye[1] ≈ 4
+            @test VE.valueat(camera, 3) ≈ 4 atol=1e-6
             VE.togglekey!(player, c, camera)
             @test !VE.isfollowing(camera)
             @test VE.isanimated(camera)
@@ -285,7 +284,7 @@ end
     end
 end
 
-@testset "recipe performance controls" begin
+@testset "recipe argument tracks" begin
     mktempdir() do dir
         script = joinpath(dir, "performance.jl")
         write(script, """
@@ -293,20 +292,19 @@ end
         function buildscene(canvas, args)
             sc = Scene(; size=canvas, camera=cam3d!, backgroundcolor=:black)
             body = mesh!(sc, Rect3f(Vec3f(-0.4), Vec3f(0.8)); color=:orange, name=:body)
-            position = Ref(0.0)
-            control = (name=:acting, label="Acting",
-                sample=(frame,fps)->(phase=frame/10, amplitude=1.0, offset=Vec3f(0)),
-                apply! = (edits,frame,fps)->(position[] = get(edits,:phase,frame/10) *
-                    get(edits,:amplitude,1.0) + get(edits,:offset,Vec3f(0))[1]))
-            update! = (frame,fps)->begin
-                translate!(body, position[], 0, 0)
-                update_cam!(sc, Vec3f(4,-6,4), Vec3f(0), Vec3f(0,0,1))
+            phase=Observable(0.0);amplitude=Observable(1.0);offset=Observable(Vec3f(0))
+            on(v->translate!(body,v,0,0),lift((p,a,o)->p*a+o[1],phase,amplitude,offset);update=true)
+            update_cam!(sc, Vec3f(4,-6,4), Vec3f(0), Vec3f(0,0,1))
+            for (key,obs) in pairs((;phase,amplitude,offset))
+                Makie.add_input!(body.attributes,key,obs[])
+                connect!(obs,body.attributes[key])
             end
-            return (scene=sc, update! = update!, controls=[control])
+            return (scene=sc,)
         end
         """)
         build = VE.programscene(script)
         c = VE.sceneclip(VE.buildscene(build); build, frames=8,canvas=(96,64),framerate=24)
+        VE.keyframes!(c,"body.phase",[0=>0.,7=>0.7];ease=:linear)
         seq = VE.Sequence([c],24);seq.canvas=(96,64)
         path=joinpath(dir,"performance.videoedit");VE.saveproject(path,seq)
         renderer=VE.farmrenderer(VE.renderjob(path,joinpath(dir,"original")))
@@ -314,13 +312,13 @@ end
             VE.farmframes!(renderer,[4])
             c=only(renderer.sequence.clips);src=c.source;fx=VE.findslot(c,:scene)
             VE.sceneparamsections(c,fx)
-            phase=VE.param(fx,Symbol("acting.phase"))
-            @test VE.isfollowing(phase)
+            phase=VE.param(fx,Symbol("body.phase"))
+            @test VE.isanimated(phase)
             @test VE.scenevalue(src,phase.name) ≈ 0.4
             @test VE.Makie.findplot(VE.targetscene(src.live.target),:body).transformation.translation[][1] ≈ 0.4
             VE.setvalue!(phase,2,4);VE.farmframes!(renderer,[6])
             @test VE.Makie.findplot(VE.targetscene(src.live.target),:body).transformation.translation[][1] ≈ 2
-            offset=VE.param(fx,Symbol("acting.offset[1]"));VE.setvalue!(offset,1,6)
+            offset=VE.param(fx,Symbol("body.offset[1]"));VE.setvalue!(offset,1,6)
             VE.farmframes!(renderer,[6])
             @test VE.Makie.findplot(VE.targetscene(src.live.target),:body).transformation.translation[][1] ≈ 3
             # World-space actor transforms run after recipe performance edits.
@@ -339,12 +337,12 @@ end
                 VE.closefarm!(saved)
             end
             fx.enabled[]=false;VE.farmframes!(renderer,[6])
-            @test VE.Makie.findplot(VE.targetscene(src.live.target),:body).transformation.translation[][1] ≈ 0.6
+            @test VE.Makie.findplot(VE.targetscene(src.live.target),:body).transformation.translation[][1] ≈ 0
             fx.enabled[]=true
             phase.input=VE.ParamInput(:copy,VE.SceneRef(phase.name))
             offset.input=VE.ParamInput(:copy,VE.SceneRef(offset.name));VE.bindinputs!(renderer.sequence)
             VE.farmframes!(renderer,[3])
-            @test VE.Makie.findplot(VE.targetscene(src.live.target),:body).transformation.translation[][1] ≈ 0.3
+            @test VE.Makie.findplot(VE.targetscene(src.live.target),:body).transformation.translation[][1] ≈ 0
         finally
             VE.closefarm!(renderer)
         end

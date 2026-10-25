@@ -30,13 +30,13 @@ end
         function buildscene(canvas, args)
             scene = Scene(; size=canvas, camera=campixel!)
             dot = scatter!(scene, [Point2f(8, 12)]; color=:red, markersize=10, name=:dot)
-            update! = (frame, fps) -> (dot[1] = [Point2f(8 + 4frame, 12)])
-            return (scene=scene, update! = update!)
+            return (scene=scene,)
         end
         """)
         VE.usebackend!(RayMakie)
         build = VE.programscene(script)
         clip = VE.sceneclip(VE.buildscene(build); build, frames=8, canvas=(64, 40), framerate=24, backend = :RayMakie)
+        VE.keyframes!(clip,"dot.translation[1]",[0=>0.,7=>28.];ease=:linear)
         clip.source.screenopts = Dict{Symbol, Any}(:rasterize => true, :samples => 1, :device => "Mantle.defaultbackend()")
         clip.source.bakewith = :RayMakie
         clip.source.bakescreenopts = Dict{Symbol, Any}(:rasterize => true, :samples => 1)

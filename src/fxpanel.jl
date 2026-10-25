@@ -1792,8 +1792,7 @@ function activeanimationparams(clip::Clip, fx::Effect, frame::Integer)
     clip.start <= frame < clipend(clip) || return Set{Symbol}()
     sf = sourceframe(clip, frame)
     a, b = max(clip.src_in, sf - 1), min(clip.src_out - 1, sf + 1)
-    original = clip.source.live === nothing ? Set{Symbol}() :
-        Set{Symbol}(programactiveparams(clip.source.live.target, a, b, clip.source.framerate))
+    original = Set{Symbol}()
     target = clip.source.live === nothing ? nothing : clip.source.live.target
     if target isa ProgramInstance
         tracks = scenerecordings!(target,clip.source)
@@ -1805,7 +1804,7 @@ function activeanimationparams(clip::Clip, fx::Effect, frame::Integer)
     end
     return Set(p.name for p in fx.params if isfollowing(p) || followsrecording(clip.source,p) ? p.name in original :
         recordedinput(p) !== nothing ? recordedchanged(recordedinput(p),a,b) :
-        isanimated(p) ? first(p.curve[].keys).frame <= sf <= last(p.curve[].keys).frame :
+        isanimated(p) ? !isequal(valueat(p, a), valueat(p, b)) :
         isdriven(p) && !isequal(valueat(p, a), valueat(p, b)))
 end
 
@@ -1850,12 +1849,6 @@ function sectionform!(player::Player, gridpos, target, fx::Effect, uicolors;
         if target isa Clip && target.source isa SceneSource && fx.kind === :scene
             i = findfirst(sec -> lowercase(sec.label) == q, secs)
             object = i === nothing ? nothing : secs[i].name
-            if object !== nothing && target.source.live !== nothing &&
-               target.source.live.target isa ProgramInstance
-                groups = target.source.live.target.controls
-                group = findfirst(g -> g.name === object, groups)
-                group === nothing || (object = groups[group].object)
-            end
             selectingfrompicker[] = true
             try
                 selectsceneobject!(player, object; clip=target)
@@ -2071,7 +2064,7 @@ end
     animationsection(section) -> Bool
 
 Whether the inspector's Animation view lists a scene section: an actor's
-performance, the recipe's own arguments, or an object with keys of its own. The
+recorded input or native object properties with keys of their own. The
 camera and the lights have views of their own.
 """
 animationsection(sec) = sec.detail == "Performance" || sec.detail == "Scene inputs" ||

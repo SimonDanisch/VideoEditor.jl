@@ -5,29 +5,40 @@ cuts, transitions and audio all go through `renderframe!`, the editor's existing
 finished-output compositor. The farm distributes timeline frames; it does not
 implement another movie renderer.
 
+Dispatch uses bounded adjacent batches (16 frames by default), not one network
+round trip per frame. `renderfarm!(job, workers; batchsize=16)` leases only
+missing, compatible frames; faster slots request more batches. GPU renderers
+must live in separate processes from the coordinator. Native `FarmSlot` results
+stream through `foreachfarmresult` and are validated/committed individually.
+After a partial batch failure only its uncommitted frames are retried. Pause
+drains already leased batches, and resume retains every valid committed frame.
+`status.json` includes the batch size and each worker's latest batch elapsed,
+render and first-result times. Custom transports can specialize
+`foreachfarmresult(accept, resource, frames)` to stream bounded results without
+retaining a full batch of HDR masters in memory.
+
 Preview quality is an editor-session preference. Farm frames always use the
 project canvas, final sample budget and full procedural detail. Recipes with an
 optional `preview!(pixel_scale)` detail callback receive `1.0` before final
 animation evaluation. Reduced previews do not change saved artistic controls.
 
-## A procedural scene clip
+## A keyframed scene clip
 
-The animation file defines a factory with an absolute source-frame updater:
+The scene file builds the named Makie plots once:
 
 ```julia
 using Makie
 function buildscene(canvas, args)
     scene = Scene(; size=canvas, camera=cam3d!)
     subject = mesh!(scene, Sphere(Point3f(0), 1f0); name=:subject, color=:orange)
-    update! = (frame, fps) -> translate!(subject, sin(frame / fps), 0, 0)
-    return (scene=scene, update! = update!)
+    return (scene=scene,)
 end
 ```
 
-The updater must support seeking backwards and frames arriving in any order.
-Procedural animation runs before the clip's editor keyframes. Named plots expose
-translation, rotation, scale and editable attributes; camera and effect curves can override
-the script. The scene is built lazily and retained across cuts. Saved sources and
+Animation is saved as ordinary property tracks. Named plots expose translation,
+rotation, scale and editable attributes; cameras and lights use the same tracks.
+Seeking backwards and farm frames arriving in any order evaluate those saved
+values. The scene is built lazily and retained across cuts. Saved sources and
 colour grades are shared resources rather than copies in every shot.
 
 The [scene editing guide](scene-editing.md) describes grading, numeric camera
@@ -39,6 +50,7 @@ VideoEditor.usebackend!(RayMakie)
 build = programscene("scene.jl")
 clip = sceneclip(VideoEditor.buildscene(build); build, frames=240,
                  canvas=(1920,1080), framerate=24)
+keyframes!(clip,"subject.translation[1]",[0=>0.,120=>1.,239=>0.];ease=:smooth)
 clip.source.bakewith = :RayMakie
 clip.source.bakescreenopts = Dict{Symbol,Any}(:rasterize=>false, :samples=>100,
     :denoise=>false, :device=>"Mantle.defaultbackend()")

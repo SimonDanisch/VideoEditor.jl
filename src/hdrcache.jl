@@ -17,6 +17,21 @@ function cachedsourceframe(clip::Clip, sf::Integer)
     return readrenderframe(cachefile(c, clip.id, sf))
 end
 
+"""
+    twinsourceframe!(clip, sf) -> master or nothing
+
+The master of a traced frame of `clip` that is the same picture as `sf` (see
+[`framekey`](@ref)), linked in as `sf`'s: a still held for seconds traces once.
+"""
+function twinsourceframe!(clip::Clip, sf::Integer)
+    c = sourcecache(clip)
+    c === nothing && return nothing
+    twin = twinframe(c, clip, sf)
+    twin === nothing && return nothing
+    linkplane!(c, clip.id, Int(sf), cachefile(c, clip.id, twin))
+    return cachedsourceframe(clip, sf)
+end
+
 const HDR_PLANES = (:color, :albedo, :normal, :depth, :coverage, :overlay)
 function writerenderframe(path, frame)
     ENDIAN_BOM == 0x04030201 || error("VEHDR requires a little-endian host")

@@ -148,13 +148,25 @@ mutable struct FarmSlot
 end
 
 function (s::FarmSlot)(frames)
+    results = []
+    foreachfarmresult(r -> push!(results,r),s,frames)
+    return results
+end
+
+function foreachfarmresult(accept, s::FarmSlot, frames)
     sendmessage(s.socket, Dict{String, Any}("command" => "frames", "frames" => collect(Int, frames)))
-    return map(frames) do _
+    for _ in frames
         header, payload = receivemessage(s.socket)
         e = farmerror(header)
-        e === nothing || error("$(s.name): $e")
-        farmresult(header, payload)
+        # An error ends this connection/batch. Do not leave unread messages
+        # from an abandoned lease to be mistaken for the next request.
+        if e !== nothing
+            close(s.socket)
+            error("$(s.name): $e")
+        end
+        accept(farmresult(header, payload))
     end
+    return nothing
 end
 
 """
@@ -200,8 +212,14 @@ the first one while slower machines still install or compile. The channel
 closes once every client has opened or failed all its GPUs; what failed is
 reported, and is the channel's error if no GPU opened at all.
 """
-function farmworkers(job::RenderJob, server::FarmServer = farmserver())
-    machines = farmmachines(server)
+function farmworkers(job::RenderJob, server::FarmServer = farmserver(); exclude=String[])
+    machines = filter(farmmachines(server)) do machine
+        name=lowercase(machine.name)
+        all(exclude) do blocked
+            b=lowercase(blocked)
+            name!=b && !startswith(name,b*" (")
+        end
+    end
     isempty(machines) &&
         error("no farm client is connected: on each machine that renders, run\n    $(clientcommand(server))")
     archive, stream = mktemp()

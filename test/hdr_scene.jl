@@ -11,5 +11,5 @@ function buildscene(canvas, args)
         material = Hikari.Emissive(Le = (20, 5, 2), two_sided = true)
     )
     update_cam!(scene, Vec3f(0, -4, 1.5), Vec3f(0, 0, 0))
-    return (scene = scene, update! = (t, fps) -> nothing)
+    return (scene = scene,)
 end

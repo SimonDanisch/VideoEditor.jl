@@ -10,12 +10,12 @@ import VideoEditor as VE
             scene=Scene(;size=canvas,camera=cam3d!,lights=[
                 AmbientLight(RGBf(.2,.3,.4)),PointLight(RGBf(1,1,1),Point3f(1,2,3))])
             mesh!(scene,Rect3f(Vec3f(-.5),Vec3f(1));name=:actor)
-            update! = (frame,fps)->set_light!(scene,1;position=Point3f(frame,2,3))
-            return (scene,update! = update!)
+            return (;scene)
         end
         """)
         build=VE.programscene(file)
         c=VE.sceneclip(VE.buildscene(build);build,frames=48,canvas=(96,64),framerate=24)
+        VE.keyframes!(c,"lights[1].position[1]",[0=>0.,47=>47.];ease=:linear)
         seq=VE.Sequence([c],24)
         scene,target=VE.realize(c.source.root,(96,64))
         c.source.live=VE.LiveScene(scene,nothing,target,(96,64),:GLMakie,c.source.root,Dict{Symbol,Any}(),Any[])
@@ -24,12 +24,12 @@ import VideoEditor as VE
         @test any(s->s.label=="Light · Ambient",secs)
         p=VE.param(fx,Symbol("lights[1].position[1]"))
         ambient=VE.param(fx,Symbol("lights[0].color[1]"))
-        @test VE.isfollowing(p)
-        VE.updatesceneprogram!(target,c.source,c,12,24)
+        @test VE.isanimated(p)
+        VE.applysceneparams!(c.source,c,12)
         VE.syncsceneinputs!(c.source,c)
-        @test VE.valueat(p,12)==12
+        @test VE.valueat(p,12)≈12
         p.input=nothing
-        VE.movekey!(p.curve[],1,0,20)
+        p.curve[] = VE.AnimCurve([VE.Keyframe(0,20.0)], :linear)
         ambient.input=nothing
         VE.movekey!(ambient.curve[],1,0,.8)
         VE.applysceneparams!(c.source,c,12)
@@ -43,14 +43,14 @@ import VideoEditor as VE
         @test VE.Makie.Colors.red(scene.compute[:ambient_color][])≈.2f0
         fx.enabled[]=false
         VE.updatesceneprogram!(target,c.source,c,5,24)
-        @test VE.Makie.get_lights(scene)[1].position[1]==5
+        @test VE.Makie.get_lights(scene)[1].position[1]==1
     end
 end
 
 @testset "dialogue spans follow cuts, gaps, speed and pending takes" begin
     mktempdir() do dir
         file=joinpath(dir,"scene.jl")
-        write(file,"using Makie; buildscene(canvas,args)=(scene=Scene(;size=canvas),update! = (frame,fps)->nothing)")
+        write(file,"using Makie; buildscene(canvas,args)=(scene=Scene(;size=canvas),)")
         build=VE.programscene(file)
         c=VE.sceneclip(VE.buildscene(build);build,frames=48,canvas=(16,16),framerate=24)
         left=VE.Clip(c.source;src_in=0,src_out=24,start=0)

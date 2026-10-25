@@ -23,5 +23,5 @@ function buildscene(canvas, args)
     )
     mesh!(sc, Sphere(Point3f(0.8, 0, -0.1), 0.65f0); material = mixed)
     update_cam!(sc, Vec3f(0, -4, 1.5), Vec3f(0))
-    return (scene = sc, update! = (t, fps) -> nothing)
+    return (scene = sc,)
 end

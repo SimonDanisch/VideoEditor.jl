@@ -1999,6 +1999,7 @@ include("renderthread.jl") # renderer handoff, failures and startup deadlines
 include("renderfarm.jl")  # saved procedural scenes, resume, audio and frame transport
 include("farmenv.jl")     # a job's pinned environment, and the farm's messages over TCP
 include("farmwire.jl")    # large snapshots stream without whole-archive RAM buffers
+include("farmbatch.jl")   # bounded leases, partial retry and incremental wire commits
 include("farmadopt.jl")   # immutable planes share storage without corrupting job receipts
 include("farmreuse.jl")   # new snapshots/label edits retain native traced masters
 include("farmrootprobe.jl") # even runtime version checks keep the sole application environment
@@ -2012,7 +2013,7 @@ include("recordedanimation.jl") # streamed simulation arrays; GPU integration wh
 include("sceneediting.jl") # inspector, original animation, overrides and saved edits
 include("speechediting.jl") # model capabilities, approved takes and speech following cuts
 include("creative_controls.jl") # native lights and dialogue timing through edits
-include("sceneargs.jl") # recipe arguments, held steps, nested cameras and seeded keys
+include("sceneargs.jl") # native plot properties, held steps, multiple cameras and seeded keys
 include("trackpreviews.jl") # exact audio envelopes and bounded asynchronous preview work
 
 # LAST, and that is the whole point. `interactions.jl` throws at the end of the

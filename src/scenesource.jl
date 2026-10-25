@@ -163,6 +163,7 @@ function sceneframe!(src::SceneSource, clip::Clip, dims::Tuple{Int, Int};
     # walks Makie's compute graph and can reach the renderer), and reading the
     # film back.
     raw = cachedsourceframe(clip, src.at)
+    exact && raw === nothing && (raw = twinsourceframe!(clip, src.at))
     if raw !== nothing
         work = hdrwork!(src, Mantle.defaultbackend(), size(raw.color))
         return hdrpicture!(work, uploadmaster!(work, raw), clip, src.at)
@@ -178,7 +179,12 @@ function sceneframe!(src::SceneSource, clip::Clip, dims::Tuple{Int, Int};
         rawcapture && (opts[:denoise] = false)
         rawcache = rawcapture && exact ? ensuresourcecache!(clip) : nothing
         rawrevision = rawcache === nothing ? UInt64(0) : get(rawcache.revisions, (clip.id, src.at), UInt64(0))
-        src.live = livescene!(src.live, src.root, dims, name, backend; opts)
+        # Source dimensions are output pixels. Explicit pixel density preserves
+        # the recipe's logical layout while rendering text/geometry natively.
+        density = Float64(get(opts, :px_per_unit, 1))
+        isfinite(density) && density > 0 || throw(ArgumentError("px_per_unit must be positive and finite"))
+        canvas = Tuple(round.(Int, dims ./ density))
+        src.live = livescene!(src.live, src.root, canvas, name, backend; opts)
         quality_changed = preparepreview!(src.live.target, exact ? 1.0 : detail_scale)
         changed = updatesceneprogram!(src.live.target, src, clip, src.at, src.framerate;
                                       reset = src.samples == 0 || exact || src.mode === :bake || quality_changed)
@@ -196,7 +202,7 @@ function sceneframe!(src::SceneSource, clip::Clip, dims::Tuple{Int, Int};
         # world did not see them.
         clear = src.samples == 0
         samples = exact ? nothing : 1
-        px_per_unit = exact ? 1 : pixel_scale
+        px_per_unit = density * (exact ? 1 : pixel_scale)
         rawcapture || return Base.invokelatest(liveframe!, src.live; clear, samples, pixel_scale = px_per_unit)
         # A traced HDR frame stays on the device: captured there, its master
         # downloaded once for the cache, and its picture made there.
@@ -294,44 +300,69 @@ function applysceneparams!(src::SceneSource, clip::Clip, sf::Integer)
     src.live === nothing && return nothing
     fx = findslot(clip, :scene)
     if fx === nothing || !fx.enabled[]
-        # A bypassed scene effect shows the recipe's own arguments.
-        src.live.target isa ProgramInstance && applyargs!(src.live.target, nothing, sf)
         return nothing
     end
     applyscenecamera!(src)          # the eye first: a path may then move it
+    plotchanges=IdDict{Any,Dict{Symbol,Any}}()
+    plotpaths=IdDict{Any,Vector{Symbol}}()
+    camerachanges=IdDict{Makie.Scene,Any}()
+    camerapaths=Symbol[]
+    placements=Tuple{Symbol,Any}[]
     for p in fx.params
-        (isfollowing(p) || followsrecording(src,p) || isargpath(p.name)) && continue
-        setscenevalue!(src, p.name, valueat(p, sf)) && remembersceneoverride!(src, p.name)
+        (isfollowing(p) || followsrecording(src,p)) && continue
+        address=scenepath(p.name)
+        if address !== nothing
+            name,key,component=address
+            camera=name===:camera ? camerascene(src.live.target) : nativecamera(targetscene(src.live.target),name)
+            if camera !== nothing && haskey(CAMERAFIELDS,key)
+                values=get(camerachanges,camera,cameravalues(camera))
+                old=getfield(values,key);value=valueat(p,sf)
+                new=component===nothing ? leafvalue(old,value) : withcomponent(old,component,value)
+                camerachanges[camera]=merge(values,NamedTuple{(key,)}((new,)))
+                push!(camerapaths,p.name)
+                continue
+            end
+            plot=Makie.findplot(targetscene(src.live.target),name)
+            if plot !== nothing && haskey(plot.attributes.inputs,key) && key ∉ (:translation,:rotation,:scale)
+                changes=get!(() -> Dict{Symbol,Any}(),plotchanges,plot)
+                old=get(changes,key,Makie.to_value(plot.attributes[key]))
+                value=valueat(p,sf)
+                changes[key]=component===nothing ? leafvalue(old,value) : withcomponent(old,component,value)
+                push!(get!(() -> Symbol[],plotpaths,plot),p.name)
+                continue
+            end
+        end
+        push!(placements,(p.name,valueat(p,sf)))
+    end
+    for (camera,values) in camerachanges
+        isequal(cameravalues(camera),values) || setcameravalues!(camera,values)
+        camera===camerascene(src.live.target) && (src.camera=values)
+    end
+    foreach(path->remembersceneoverride!(src,path),camerapaths)
+    for (plot,changes) in plotchanges
+        filter!(pair->!isequal(Makie.to_value(plot.attributes[first(pair)]),last(pair)),changes)
+        isempty(changes) || Makie.update!(plot;changes...)
+        foreach(path->remembersceneoverride!(src,path),plotpaths[plot])
+    end
+    for (path,value) in placements
+        setscenevalue!(src,path,value) && remembersceneoverride!(src,path)
     end
     applyjoints!(src, fx, sf)       # …and the rig, once every number is known
-    # Arguments last and whole: one write per argument, after every number of it
-    # is known, so a plot derived from it recomputes once.
-    src.live.target isa ProgramInstance && applyargs!(src.live.target, fx, sf)
     return nothing
 end
-
-isargpath(path::Symbol) = startswith(String(path), "args.")
 
 "Read an editable scalar without changing the scene or advancing its animation."
 function scenevalue(src::SceneSource, path::Symbol)
     a = scenepath(path)
     a === nothing && return nothing
     name, key, comp = a
-    if name === :camera && src.camera !== nothing && haskey(CAMERAFIELDS, key)
+    if name !== :camera && src.live !== nothing && nativecamera(targetscene(src.live.target),name) !== nothing
+        cam=nativecamera(targetscene(src.live.target),name)
+        v=getfield(cameravalues(cam),key)
+    elseif name === :camera && src.camera !== nothing && haskey(CAMERAFIELDS, key)
         v = getfield(src.camera, key)
-    elseif name === :args
-        target = src.live === nothing ? nothing : src.live.target
-        return target isa ProgramInstance ? argnumber(target, key, comp) : nothing
     else
         src.live === nothing && return nothing
-        group = programcontrol(src.live.target, name)
-        if group !== nothing
-            haskey(group.values, key) || return nothing
-            v = group.values[key]
-            comp === nothing || (v = v isa Colorant ?
-                (red(v), green(v), blue(v), alpha(v))[comp] : v[comp])
-            return v isa Real ? Float64(v) : nothing
-        end
         light = scenelight(targetscene(src.live.target), name)
         plot = light === nothing ? Makie.findplot(targetscene(src.live.target), name) : nothing
         if light !== nothing
@@ -471,7 +502,7 @@ rowlabel(name::AbstractString, suffix::Symbol, v) =
     suffix === Symbol("") ? String(name) :
     string(name, " ", componentname(v, parse(Int, strip(String(suffix), ['[', ']']))))
 componentname(::Colorant, i::Integer) = ("R", "G", "B", "A")[i]
-componentname(::Any, i::Integer) = ("X", "Y", "Z", "W")[i]
+componentname(::Any, i::Integer) = i <= 4 ? ("X", "Y", "Z", "W")[i] : string(i)
 
 """
     sceneattributes(src) -> Vector{NamedTuple}
@@ -495,11 +526,14 @@ function sceneattributes(src::SceneSource)
         push!(out, (name = :camera, label = "Camera", detail = "eye · look-at · up · fov",
                     rows = rows))
     end
-    target = src.live.target
-    if target isa ProgramInstance && !isempty(target.args)
-        push!(out, (name = :args, label = "Arguments", detail = "Scene inputs",
-                    rows = argrows(target)))
+    for (i,scene) in enumerate(nativecameras(targetscene(src.live.target)))
+        i==1 && continue
+        camera=cameravalues(scene);name=Symbol("camera[",i,"]")
+        rows=vcat([comprows(name,f,n,getfield(camera,f)) for (f,n) in pairs(CAMERAFIELDS) if n==3]...)
+        push!(rows,(path=Symbol(name,".fov"),label="Field of view °",kind=:number,value=Float64(camera.fov)))
+        push!(out,(name,label="Camera $i",detail="eye · look-at · up · fov",rows))
     end
+    target = src.live.target
     objects = sceneobjects(src)
     for object in objects
         name, plot = object.name, object.plot
@@ -526,9 +560,9 @@ function sceneattributes(src::SceneSource)
         for key in sort!(sceneinputkeys(plot))
             object.attributes === nothing || String(key) in object.attributes || continue
             v = Makie.to_value(plot.attributes[key])
-            if key === :visible && v isa Bool
+            if v isa Bool
                 # Shown/hidden is keyed as a held step, never blended.
-                push!(rows, (path = Symbol(name, ".visible"), label = "Visible", kind = :number,
+                push!(rows, (path = Symbol(name, ".",key), label = titlecase(String(key)), kind = :number,
                              value = Float64(v), discrete = true))
                 continue
             end
@@ -554,34 +588,6 @@ function sceneattributes(src::SceneSource)
             push!(out, (name = name, label = object.label,
                         detail = string(nameof(typeof(plot))), rows = rows))
     end
-    if src.live.target isa ProgramInstance
-        for group in src.live.target.controls
-            motion = (:animation_time,:time,:local_position,:position,:translation,
-                      :yaw_degrees,:lean_degrees,:roll_degrees,:rotation,:scale,:grow,:squash)
-            order = key -> (something(findfirst(==(key),motion),length(motion)+1),String(key))
-            fields = sort!(collect(keys(group.values)); by = order)
-            assigned = Set{Symbol}()
-            for section in group.sections, field in section.fields
-                field in assigned && error("duplicate inspector field $(group.name).$field")
-                push!(assigned, field)
-            end
-            sections = [(label = group.label, fields = filter(k -> k ∉ assigned, fields)); group.sections]
-            for section in sections
-                rows = NamedTuple[]
-                for key in section.fields
-                    haskey(group.values, key) || continue
-                    v = group.values[key]
-                    for (suffix, num) in rowcomponents(Val(rowkind(v)), v)
-                        push!(rows, (path = Symbol(group.name, ".", key, suffix),
-                            label = rowlabel(titlecase(replace(String(key), '_' => ' ')), suffix, v),
-                            kind = :number, value = num))
-                    end
-                end
-                isempty(rows) || push!(out, (name = group.name, label = section.label,
-                    detail = group.detail, rows = rows))
-            end
-        end
-    end
     scene = targetscene(src.live.target)
     for (i, light) in [(0, Makie.AmbientLight(scene.compute[:ambient_color][]));
                        collect(enumerate(Makie.get_lights(scene)))]
@@ -604,37 +610,6 @@ function sceneattributes(src::SceneSource)
     end
     return out
 end
-
-"""
-    argrows(target) -> Vector{NamedTuple}
-
-Inspector rows for a recipe's arguments: one per keyframable number (see
-[`argleaves`](@ref)), `discrete` for those that key as held steps, and one data
-row for an argument without numbers (an array, a mesh).
-"""
-function argrows(target::ProgramInstance)
-    rows = NamedTuple[]
-    for (name, obs) in target.args
-        v = obs[]
-        leaves = argleaves(v)
-        if isempty(leaves)
-            push!(rows, (path = Symbol("args.", name), label = argtitle(name), kind = :data, value = v))
-            continue
-        end
-        for (field, component, number, discrete) in leaves
-            label = join(argtitle.(filter(!=(Symbol("")), [name; Symbol.(split(String(field), '.'))])), " · ")
-            component === nothing ||
-                (label *= " " * (getfieldpath(v, field) isa Colorant ?
-                                 ("R", "G", "B", "A") : ("X", "Y", "Z", "W"))[component])
-            push!(rows, (path = argpath(name, field, component), label = label, kind = :number,
-                         value = number, discrete = discrete))
-        end
-    end
-    return rows
-end
-argtitle(s) = titlecase(replace(String(s), '_' => ' '))
-getfieldpath(v, field::Symbol) =
-    field === Symbol("") ? v : foldl(getfield, Symbol.(split(String(field), '.')); init = v)
 
 """
     objectdescriptions(src) -> descriptions or `nothing`
@@ -787,6 +762,15 @@ function setscenevalue!(src::SceneSource, path, v)
     a = scenepath(path)
     a === nothing && return false
     name, key, comp = a
+    if name !== :camera && src.live !== nothing
+        camera=nativecamera(targetscene(src.live.target),name)
+        if camera !== nothing && haskey(CAMERAFIELDS,key)
+            current=cameravalues(camera);old=getfield(current,key)
+            new=comp===nothing ? leafvalue(old,v) : withcomponent(old,comp,v)
+            setcameravalues!(camera,merge(current,NamedTuple{(key,)}((new,))))
+            return true
+        end
+    end
     # A joint's numbers are applied together, by `applyjoints!`, once every
     # parameter has been read — an angle and an offset are one placement.
     haskey(src.joints, name) && haskey(JOINTFIELDS, key) && return true
@@ -799,16 +783,6 @@ function setscenevalue!(src::SceneSource, path, v)
         return true
     end
     src.live === nothing && return false
-    if name === :args
-        target = src.live.target
-        target isa ProgramInstance || return false
-        arg, fields = argaddress(key)
-        obs = recipeargument(target, arg)
-        obs === nothing && return false
-        new = Base.invokelatest(withleaf, obs[], fields, comp, v)
-        Base.invokelatest(isequal, obs[], new) || (obs[] = new)
-        return true
-    end
     scene = targetscene(src.live.target)
     light = scenelight(scene, name)
     if light !== nothing
@@ -887,6 +861,23 @@ and its vertical field of view in degrees. The number is how many components
 each has.
 """
 const CAMERAFIELDS = (eye = 3, lookat = 3, up = 3, fov = 1)
+
+"All native Camera3D scenes in stable scene-tree order."
+function nativecameras(scene::Makie.Scene)
+    cameras=Makie.Scene[]
+    visit(sc)=begin
+        Makie.cameracontrols(sc) isa Makie.Camera3D && push!(cameras,sc)
+        foreach(visit,sc.children)
+    end
+    visit(scene)
+    return cameras
+end
+function nativecamera(scene::Makie.Scene,name::Symbol)
+    m=match(r"^camera\[(\d+)\]$",String(name))
+    m===nothing && return nothing
+    i=parse(Int,m[1]);cameras=nativecameras(scene)
+    return 1<=i<=length(cameras) ? cameras[i] : nothing
+end
 
 "The camera of a scene with a `Camera3D`, as the editor keys it."
 function cameravalues(scene::Makie.Scene)
@@ -1049,7 +1040,7 @@ end
 
 Key scene numbers from code, exactly as the inspector would: `path` names them
 as the inspector does (`"camera.eye[1]"`, `"camera.fov"`, `"callout.alpha"`,
-`"args.time"`, `"args.pose.eye[2]"`), `keys` are `frame => value` pairs in the
+`"image.focus"`, `"plasma_volume.gas_scale"`), `keys` are `frame => value` pairs in the
 clip's source frames, or `(frame, value, ease)` triples. A `Vec`, `Point` or
 colour value keys every component (`path[1]`, `path[2]`, …). Existing keys on
 those paths are replaced.

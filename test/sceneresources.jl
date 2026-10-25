@@ -12,8 +12,7 @@ VE.usebackend!(RayMakie)
             function buildscene(canvas, args)
                 scene = Scene(; size=canvas, camera=campixel!, backgroundcolor=:black)
                 scatter!(scene, [Point2f(32, 24)]; color=:orange, markersize=12)
-                update! = (frame, fps) -> nothing
-                return (; scene, update!)
+                return (; scene)
             end
             """
         )

@@ -67,8 +67,8 @@ one it has to count out (`"plots[4].rotation"`).
 
 Native lights use `lights[i]` in the scene's light order; `lights[0]` addresses
 Makie's separate ambient colour. `component` is `nothing` unless the path indexes
-one, as `offset[1]` does. A recipe argument's struct fields extend the field
-with dots: `"args.pose.eye[1]"` is `(:args, Symbol("pose.eye"), 1)`.
+one, as `offset[1]` does. Native sub-cameras use `camera[i]`, for example
+`"camera[2].eye[1]"` is `(:camera[2], :eye, 1)`.
 Returns `nothing` for anything unaddressable rather than throwing: a project
 from a newer editor may name parts this one has not got, and a curve pointing
 nowhere is one to ignore, not a crash on open.

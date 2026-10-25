@@ -56,14 +56,12 @@ The animation filter shows the selected object's original animated parameters;
 turn it off to access static parameters as well. A field edited with a 3D handle
 is also shown while the filter is on.
 
-Recipes can associate numeric control groups with objects using
-`object=:pivot_plot_name`, and provide a pure `camera(frame,fps)` sampler for
-camera-path previews without rendering intermediate frames. A pure
-`sampleparams(frame,fps)` callback exposes original recipe animations in the same
-inspector and timeline without seeking or editing the scene. The existing curve
-fitter reduces procedural samples to sparse Bézier anchors before showing them.
-Untouched parameters keep following the recipe; editing a curve takes control of
-only that parameter.
+Recipes return a scene. Animate its named plots with property tracks such as
+`keyframes!(clip, "actor.rotation[3]", keys)`, and key native camera,
+plot and light properties directly. All animation lives in these tracks;
+recipes do not supply frame callbacks or samplers. Equal parameter values reuse
+the same traced source master. Offline simulations can be recorded once with
+`recordsceneanimation!(clip, directory; producer)` and replayed as data inputs.
 
 | Key | Action |
 |---|---|

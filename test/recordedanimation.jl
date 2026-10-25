@@ -49,7 +49,7 @@ if haskey(VE.BACKENDS,:RayMakie)
         write(script,"""
         using Makie
         const steps=Ref(0)
-        function buildscene(canvas,args)
+        function fixture(canvas,args; recording=false)
             scene=Scene(;size=canvas,camera=cam3d!,backgroundcolor=:black,
                 lights=[AmbientLight(RGBf(.7,.7,.7))])
             texture=Observable(fill(RGBf(.1,.2,.3),4,4))
@@ -57,13 +57,15 @@ if haskey(VE.BACKENDS,:RayMakie)
             mesh!(scene,Rect3f(Vec3f(20),Vec3f(1));name=:default_subject,visible=false)
             update_cam!(scene,Vec3f(3,-5,2),Vec3f(0),Vec3f(0,0,1))
             state=Ref(0)
-            update! = (frame,fps)->begin
+            advance! = (frame,fps)->begin
                 steps[]+=1;state[]+=1
                 texture[] .= RGBf(state[]/12,.2,.3);notify(texture)
                 translate!(subject,state[]/8,0,0)
             end
-            (;scene,update!)
+            recording ? (scene,advance!) : (;scene)
         end
+        buildscene(canvas,args)=fixture(canvas,args)
+        recordingproducer(canvas,args)=fixture(canvas,args;recording=true)
         """)
         build=VE.programscene(script)
         clip=VE.sceneclip(VE.buildscene(build);build,frames=12,canvas=(96,64),framerate=24,backend=:RayMakie)
@@ -74,7 +76,9 @@ if haskey(VE.BACKENDS,:RayMakie)
         seq=VE.Sequence([clip],24);seq.canvas=(96,64)
         back=nothing;renderer=nothing
         try
-        tracks=VE.recordsceneanimation!(clip,joinpath(tmp,"recording"))
+        builder=VE.programbuilder!(clip.source.root)
+        producer=getproperty(parentmodule(builder),:recordingproducer)
+        tracks=VE.recordsceneanimation!(clip,joinpath(tmp,"recording");producer)
         @test !haskey(tracks,Symbol("subject.model"))
         @test !haskey(tracks,Symbol("default_subject.color"))
         @test Base.invokelatest(getproperty,parentmodule(clip.source.root.builder),:steps)[] == 12

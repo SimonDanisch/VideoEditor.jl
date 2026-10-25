@@ -40,14 +40,9 @@ module SceneEditingWalkthroughTests
                     part=mesh!(sc,Rect3f(Vec3f(.5,-.2,-.2),Vec3f(.4));name=:arm,color=:orange)
                     other=mesh!(sc,Rect3f(Vec3f(-.5),Vec3f(1));name=:other,color=:dodgerblue)
                     translate!(other,2.5,0,0)
-                    camera=(frame,fps)->(;eye=Vec3f(5+sin(frame/20),-8,5),lookat=Vec3f(1,0,0),up=Vec3f(0,0,1))
-                    update! = (frame,fps)->begin
-                        c=camera(frame,fps);update_cam!(sc,c.eye,c.lookat,c.up)
-                    end
-                    controls=[(;name=:acting,object=:actor,label="Actor · acting",
-                        sections=[(label="Actor · face",fields=[:smile])],
-                        sample=(frame,fps)->(;smile=.5),apply! = (changes,frame,fps)->nothing)]
-                    return (;scene=sc,update!,controls,camera,activeparams=(lo,hi,fps)->Symbol[])
+                    update_cam!(sc,Vec3f(5,-8,5),Vec3f(1,0,0),Vec3f(0,0,1))
+                    Makie.add_input!(body.attributes,:smile,.5)
+                    return (;scene=sc)
                 end
                 """
             )
@@ -55,11 +50,12 @@ module SceneEditingWalkthroughTests
                 file; objects = [
                     Dict(
                         "label" => "Actor", "plots" => ["actor", "arm"],
-                        "attributes" => ["color"]
+                        "attributes" => ["color", "smile"]
                     ),
                 ]
             )
             fixture = VE.sceneclip(VE.buildscene(root); build = root, frames = 96, canvas = (320, 240), framerate = 24)
+            VE.keyframes!(fixture,"camera.eye[1]",[f=>5+sin(f/20) for f in 0:95];ease=:linear)
             fixture.source.backend = :RayMakie
             fixture.source.screenopts = Dict(:rasterize => true, :shadows => false, :device => "Mantle.defaultbackend()")
             sequence = VE.Sequence([fixture], 24);sequence.canvas = (320, 240)
@@ -98,8 +94,8 @@ module SceneEditingWalkthroughTests
                     FI.Lazy(
                         _ -> begin
                             @test VE.sceneselection(p)[].object === :actor
-                            @test VE.selectedscenesections(p, clip()) == Set([:actor, :acting])
-                            @test Set(sec.name for (sec, card) in zip(sections().sections, sections().cards) if card.visible[]) == Set([:actor, :acting])
+                            @test VE.selectedscenesections(p, clip()) == Set([:actor])
+                            @test Set(sec.name for (sec, card) in zip(sections().sections, sections().cards) if card.visible[]) == Set([:actor])
                             @test any(sec -> sec.label == "Actor · face", sections().sections)
                             @test sections().onlyactive[]
                             @test all(card.open[] for (sec, card) in zip(sections().sections, sections().cards) if card.visible[])
@@ -146,7 +142,7 @@ module SceneEditingWalkthroughTests
                     FI.Lazy(_ -> begin
                         @test VE.sceneselection(p)[].object === :actor
                         @test [sec.label for (sec,card) in zip(sections().sections,sections().cards) if card.visible[]] == ["Actor · face"]
-                        @test VE.param(fx(), Symbol("acting.smile")).view !== nothing
+                        @test VE.param(fx(), Symbol("actor.smile")).view !== nothing
                         FI.Wait(0)
                     end)
                 ])

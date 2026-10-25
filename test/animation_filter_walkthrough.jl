@@ -15,27 +15,25 @@ using Main.EditingWalkthroughActions
         function buildscene(canvas,args)
             scene=Scene(;size=canvas,camera=cam3d!,backgroundcolor=:navy)
             actor=mesh!(scene,Rect3f(Vec3f(-.3),Vec3f(.6));name=:actor,color=:orange)
-            values=Ref((sway=0.,height=0.,still=1.))
-            original(f,fps)=(sway=min(f,24)/fps,height=max(0,f-24)/fps,still=1.)
-            controls=[(name=:actor_performance,label="Actor · acting",sample=original,
-                apply! = (edits,f,fps)->(values[]=merge(original(f,fps),NamedTuple(edits))))]
-            update! = (f,fps)->begin
-                translate!(actor,Vec3f(values[].sway,0,values[].height))
-                update_cam!(scene,Vec3f(4,-6,4),Vec3f(0),Vec3f(0,0,1))
+            sway=Observable(0.);height=Observable(0.);still=Observable(1.)
+            on(v->translate!(actor,Vec3f(v[1],0,v[2])),lift((x,z)->(x,z),sway,height);update=true)
+            update_cam!(scene,Vec3f(4,-6,4),Vec3f(0),Vec3f(0,0,1))
+            for (key,obs) in pairs((;sway,height,still))
+                Makie.add_input!(actor.attributes,key,obs[])
+                connect!(obs,actor.attributes[key])
             end
-            activeparams=(a,b,fps)->Symbol[
-                original(a,fps)[k]!=original(b,fps)[k] ? Symbol("actor_performance.",k) : :unused
-                for k in (:sway,:height)]
-            return (;scene,update!,controls,activeparams)
+            return (;scene)
         end
         """)
         build = VE.programscene(script)
         backend = haskey(VE.BACKENDS,:RayMakie) ? :RayMakie : :GLMakie
         c = VE.sceneclip(VE.buildscene(build);build,frames=48,canvas=(160,120),framerate=24,backend)
+        VE.keyframes!(c,"actor.sway",[0=>0.,24=>1.];ease=:linear)
+        VE.keyframes!(c,"actor.height",[0=>0.,24=>0.,47=>23/24];ease=:linear)
         backend === :RayMakie && (c.source.screenopts[:rasterize]=true)
         second = VE.withfields(c;id=VE.freshid(),track=2,
             effects=[copy(fx;id=VE.freshid()) for fx in c.effects])
-        keyed = VE.Param(Symbol("actor_performance.still"),"Still",1.;range=(0.,5.))
+        keyed = VE.Param(Symbol("actor.still"),"Still",1.;range=(0.,5.))
         VE.setkey!(keyed,0,1.);VE.setkey!(keyed,47,3.)
         push!(VE.findslot(second,:scene).params,keyed)
         seq=VE.Sequence([c,second],24)
@@ -51,7 +49,7 @@ using Main.EditingWalkthroughActions
             clip()=VE.selectedclip(p)
             fx()=VE.findslot(clip(),:scene)
             sections()=p.fxwidgets[Symbol(:fxsections_,fx().id)]
-            prm(name)=VE.param(fx(),Symbol("actor_performance.",name))
+            prm(name)=VE.param(fx(),Symbol("actor.",name))
             visible(name)=prm(name).view!==nothing && prm(name).view.control.blockscene.visible[]
             function trackpos(frame,track)
                 axis=p.timeline.axis;lim=axis.finallimits[];vp=axis.scene.viewport[]
@@ -112,7 +110,7 @@ using Main.EditingWalkthroughActions
             @test VE.activeanimationparams(first(p.sequence.clips),VE.findslot(first(p.sequence.clips),:scene),60)==Set{Symbol}()
             # A trimmed clip must not advertise keys that ended before its source in-point.
             trimmed=VE.withfields(first(p.sequence.clips);src_in=24,src_out=48,start=0)
-            @test !(Symbol("actor_performance.still") in VE.activeanimationparams(trimmed,VE.findslot(trimmed,:scene),6))
+            @test !(Symbol("actor.still") in VE.activeanimationparams(trimmed,VE.findslot(trimmed,:scene),6))
             # Undo restores keys in place and updates the filtered form.
             actions=[click(()->trackpos(6,1));scenecontrols(p,"acting");
                 chord(M.Keyboard.z);chord(M.Keyboard.z);
@@ -125,8 +123,8 @@ using Main.EditingWalkthroughActions
             recordactions(p,out,"filter_undo",actions)
             VE.saveproject(path,p.sequence)
             restored=VE.loadproject(path)
-            @test !VE.isanimated(VE.param(VE.findslot(first(restored.clips),:scene),Symbol("actor_performance.still")))
-            @test VE.isanimated(VE.param(VE.findslot(last(restored.clips),:scene),Symbol("actor_performance.still")))
+            @test !VE.isanimated(VE.param(VE.findslot(first(restored.clips),:scene),Symbol("actor.still")))
+            @test VE.isanimated(VE.param(VE.findslot(last(restored.clips),:scene),Symbol("actor.still")))
         finally
             close(p)
         end
