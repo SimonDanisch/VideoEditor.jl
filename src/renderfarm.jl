@@ -46,6 +46,8 @@ the snapshot every worker renders: the project and its sidecars, the files it
 reads (`data/`, `inputs/`), `environment/Project.toml` (the code) and
 `job.toml`. `key` names the snapshot's content: frames committed for another
 snapshot are not this job's, so a changed edit can never mix with old frames.
+`planes`: whether workers return each frame's planes beside it (see
+[`renderjob`](@ref)).
 """
 struct RenderJob
     directory::String
@@ -57,6 +59,7 @@ struct RenderJob
     backends::Vector{String}
     packages::Vector{String}          # the recipes' and effects' packages: a renderer loads them before it renders (`loadpackages`)
     relocations::Dict{String, String}
+    planes::Bool
 end
 
 function RenderJob(directory::AbstractString)
@@ -64,7 +67,8 @@ function RenderJob(directory::AbstractString)
     meta = TOML.parsefile(joinpath(snapshot, "job.toml"))
     return RenderJob(abspath(directory), snapshotkey(snapshot), Tuple(Int.(meta["size"])), Int(meta["total"]),
                      Float64(meta["fps"]), String(meta["julia"]), String.(meta["backends"]),
-                     String.(meta["packages"]), Dict{String, String}(meta["relocations"]))
+                     String.(meta["packages"]), Dict{String, String}(meta["relocations"]),
+                     Bool(get(meta, "planes", true)))
 end
 
 jobsnapshot(job::RenderJob) = joinpath(job.directory, FARM_SNAPSHOT)
@@ -83,7 +87,8 @@ end
 filehash(path) = open(SHA.sha256, path) |> bytes2hex
 
 """
-    renderjob(project, directory; inputs = [], root = dirname(project), size = nothing, portable = true) -> RenderJob
+    renderjob(project, directory; inputs = [], root = dirname(project), size = nothing, portable = true,
+              planes = true) -> RenderJob
 
 Snapshot the saved `project` into `directory/job`: the project and its
 sidecars, the files it reads (soundtracks, recordings, scene scripts, and the
@@ -92,12 +97,18 @@ includes and assets declared in `inputs`), and the environment of its code
 clients on this machine only). Files under `root` keep their relative paths,
 so a script's `include`s still work; others are kept by content.
 
+With `planes`, workers return each frame's track planes and a traced clip's
+linear HDR source beside it, for the edit to adopt (`adoptfarmcache!`): a
+traced 1080p frame's source is over 100 MB. `planes = false` returns finished
+frames only, for a film rendered to be encoded (`encodefarm!`).
+
 Narration must be rendered first, so workers need no speech model. Asked again
 for the same directory, the same snapshot resumes the job; anything changed
 (the edit, a file, a package) is refused: make a new job for it.
 """
 function renderjob(project::AbstractString, directory::AbstractString; inputs = String[],
-                   root::AbstractString = dirname(abspath(project)), size = nothing, portable::Bool = true)
+                   root::AbstractString = dirname(abspath(project)), size = nothing, portable::Bool = true,
+                   planes::Bool = true)
     seq = loadproject(project)
     any(n -> !isempty(strip(n.text)) && isempty(n.samples), seq.narration) &&
         error("render narration before preparing the farm job")
@@ -131,7 +142,8 @@ function renderjob(project::AbstractString, directory::AbstractString; inputs = 
         open(joinpath(temp, "job.toml"), "w") do io
             TOML.print(io, Dict{String, Any}("size" => collect(canvas), "total" => total, "fps" => seq.framerate,
                                              "julia" => string(VERSION), "backends" => farmbackends(seq),
-                                             "packages" => loadpackages(seq), "relocations" => relocations))
+                                             "packages" => loadpackages(seq), "relocations" => relocations,
+                                             "planes" => planes))
         end
         if isdir(snapshot)
             snapshotkey(temp) == snapshotkey(snapshot) ||
@@ -154,6 +166,8 @@ mutable struct FarmRenderer
     # where the sequence's track caches write the planes of the frame being
     # rendered, until `farmlayers!` takes them (see `farmcaches!`)
     planes::String
+    # whether they are returned with the frame or only cleared (`renderjob`'s `planes`)
+    keepplanes::Bool
 end
 function farmthread(renderer::FarmRenderer)
     queue = Mantle.batchqueue(enginedevice(renderer.engine))
@@ -217,7 +231,7 @@ function farmrenderer(job::RenderJob; backend = Mantle.defaultbackend())
     # A recording is a folder: its files map under it, longest first.
     pathmap = Dict(source => joinpath(snapshot, relative) for (source, relative) in job.relocations)
     seq = loadproject(jobproject(job); pathmap)
-    return farmrenderer(seq;backend,directory=job.directory,canvas=job.canvas)
+    return farmrenderer(seq;backend,directory=job.directory,canvas=job.canvas,keepplanes=job.planes)
 end
 
 """
@@ -229,12 +243,13 @@ Use `renderjob` when a self-contained immutable farm snapshot is needed.
 The caller owns the sequence and its input files for the renderer's lifetime.
 """
 function farmrenderer(seq::Sequence; backend = Mantle.defaultbackend(),
-                      directory::AbstractString = mktempdir(;cleanup=false),canvas=canvassize(seq))
+                      directory::AbstractString = mktempdir(;cleanup=false),canvas=canvassize(seq),
+                      keepplanes::Bool = true)
     mkpath(directory)
     planes = mktempdir(directory; prefix = "planes-", cleanup = false)
     farmcaches!(seq, planes)
     return FarmRenderer(seq, zeros(RGB{N0f8}, canvas...), zeros(RGB{N0f8}, canvas...),
-                        Dict{String, Any}(), FxEngine(backend), ReentrantLock(), false, planes)
+                        Dict{String, Any}(), FxEngine(backend), ReentrantLock(), false, planes, keepplanes)
 end
 
 """
@@ -295,11 +310,34 @@ end
 
 """A cached plane's bytes, its file and its validity taken out of the cache."""
 function takeplane!(c::TrackCache, id::UInt64, sf::Int)
-    file = cachefile(c, id, sf)
-    bytes = read(file)
-    rm(file)
-    delete!(c.valid[id], sf)
+    bytes = read(cachefile(c, id, sf))
+    dropplane!(c, id, sf)
     return bytes
+end
+
+"""A cached plane's file and validity removed from the cache."""
+function dropplane!(c::TrackCache, id::UInt64, sf::Int)
+    rm(cachefile(c, id, sf))
+    delete!(c.valid[id], sf)
+    return c
+end
+
+"""
+    dropplanes!(seq, n) -> FarmLayer[]
+
+The planes timeline frame `n` was composited from, cleared from the worker's
+caches and not returned: a job without planes keeps only its frames.
+"""
+function dropplanes!(seq::Sequence, n::Integer)
+    for clip in frameclips(seq, n)
+        cache = trackcache(clip)
+        cache === nothing && continue
+        sf = sourceframe(clip, n)
+        cachevalid(cache, clip.id, sf) && dropplane!(cache, clip.id, sf)
+        raw = cache.source
+        raw !== nothing && cachevalid(raw, clip.id, sf) && dropplane!(raw, clip.id, sf)
+    end
+    return FarmLayer[]
 end
 farmrenderer(directory::AbstractString; kw...) = farmrenderer(RenderJob(directory); kw...)
 
@@ -321,7 +359,8 @@ function farmframes!(renderer::FarmRenderer, indices)
                     # writeframe!'s orientation conversion for VideoIO.
                     PNGFiles.save(io, permutedims(renderer.canvas, (2, 1)))
                     (frame = Int(n), png = take!(io), seconds = (time_ns()-started)/1e9,
-                     layers = farmlayers!(renderer.sequence, n))
+                     layers = renderer.keepplanes ? farmlayers!(renderer.sequence, n) :
+                                                   dropplanes!(renderer.sequence, n))
                 end
             end
         end

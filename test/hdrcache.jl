@@ -154,6 +154,18 @@ end
         finally
             VE.closefarm!(renderer)
         end
+        # A job without planes commits the frame alone, and its worker keeps none.
+        bare = VE.renderjob(path, mktempdir(); portable = false, planes = false)
+        @test !bare.planes
+        framesonly = VE.farmrenderer(bare)
+        try
+            VE.renderfarm!(bare, [VE.FarmWorker("hdr-test", ids -> VE.farmframes!(framesonly, ids))]; frames = [0])
+            @test isfile(VE.farmreceiptpath(bare.directory, 0))
+            @test isempty(get(VE.JSON.parsefile(VE.farmreceiptpath(bare.directory, 0)), "layers", []))
+            @test isempty([f for (_, _, fs) in walkdir(framesonly.planes) for f in fs])
+        finally
+            VE.closefarm!(framesonly)
+        end
         draw(1)
         @test cache.renders == 2
         derived = VE.trackcache(clip).renders
