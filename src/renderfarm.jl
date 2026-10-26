@@ -74,14 +74,43 @@ end
 jobsnapshot(job::RenderJob) = joinpath(job.directory, FARM_SNAPSHOT)
 jobproject(job::RenderJob) = joinpath(jobsnapshot(job), "project.videoedit")
 
-"""What a snapshot holds: every file by relative path and content, hashed."""
-function snapshotkey(snapshot::AbstractString)
+"""What a snapshot holds: every file by relative path and content (but those named in `except`), hashed."""
+function snapshotkey(snapshot::AbstractString; except = ())
     entries = Tuple{String, String}[]
     for (parent, _, names) in walkdir(snapshot), name in names
         file = joinpath(parent, name)
-        push!(entries, (replace(relpath(file, snapshot), '\\' => '/'), filehash(file)))
+        relative = replace(relpath(file, snapshot), '\\' => '/')
+        relative in except || push!(entries, (relative, filehash(file)))
     end
     return bytes2hex(SHA.sha256(MsgPack.pack(sort!(entries))))
+end
+
+"""What a snapshot renders: its edit and files, without the environment of its code."""
+editkey(snapshot::AbstractString) = snapshotkey(snapshot; except = ("environment/Project.toml",))
+
+"""
+    carryframes!(job, from) -> Int
+
+Take into `job` the frames `from` committed: the same edit made a job again for
+changed code (a fix in the renderer), so what was rendered stays rendered.
+Refused unless both snapshots hold the same edit, files and settings; only the
+environment of the code may differ. A frame comes with its receipt, which names
+the job it came from; planes are not carried. Returns how many frames came.
+"""
+function carryframes!(job::RenderJob, from::RenderJob)
+    editkey(jobsnapshot(job)) == editkey(jobsnapshot(from)) ||
+        error("$(from.directory) renders another edit than $(job.directory): its frames are not this job's")
+    carried = 0
+    for n in 0:job.total-1
+        farmcomplete(job.directory, n, job.key) && continue
+        farmcomplete(from.directory, n, from.key) || continue
+        receipt = JSON.parsefile(farmreceiptpath(from.directory, n))
+        commitbytes!(farmframepath(job.directory, n), read(farmframepath(from.directory, n)))
+        farmwritejson(farmreceiptpath(job.directory, n),
+                      merge(receipt, Dict("job" => job.key, "carried_from" => from.key, "layers" => Any[])))
+        carried += 1
+    end
+    return carried
 end
 
 filehash(path) = open(SHA.sha256, path) |> bytes2hex
@@ -351,6 +380,7 @@ function farmframes!(renderer::FarmRenderer, indices)
             withfinalscenes(renderer.sequence) do
                 map(indices) do n
                     0 <= n < seqlength(renderer.sequence) || error("invalid farm frame $n")
+                    closeoffscreen!(renderer, n)
                     started = time_ns()
                     renderframe!(renderer.canvas, renderer.sequence, n, renderer.readers,
                                  renderer.engine; black = renderer.black)
@@ -367,20 +397,33 @@ function farmframes!(renderer::FarmRenderer, indices)
     end
 end
 
+"""
+    closeoffscreen!(renderer, n) -> renderer
+
+End what timeline frame `n` does not show: the compiled plans of the clips
+off screen (`retainclips!`), their scenes and their HDR work. A farm renderer
+draws a film in order and kept every scene and plan it ever drew, a few GB
+each for a traced 1080p clip, until an 8 GB GPU ran out two parts in. A clip
+shown again is built again.
+"""
+function closeoffscreen!(renderer::FarmRenderer, n::Integer)
+    shown = frameclips(renderer.sequence, n)
+    retainclips!(renderer.engine, shown)
+    foreach(endrender!, setdiff(unique(c.source for c in renderer.sequence.clips), Set(c.source for c in shown)))
+    return renderer
+end
+
+"End what a source holds to render, once the farm no longer draws it: a scene's screen and HDR work."
+endrender!(src::SceneSource) = close(src)
+endrender!(::ClipSource) = nothing
+
 function closefarm!(r::FarmRenderer)
     lock(r.lock) do
         r.closed && return nothing
         onthread(farmthread(r)) do
             foreach(close, values(r.readers))
             emptyengine!(r.engine)
-            for s in unique(c.source for c in r.sequence.clips if c.source isa SceneSource)
-                s.live === nothing && continue
-                closeretired!(s.live)
-                onthread(renderthread(getbackend(s.live.backend))) do
-                    applicable(close, s.live.screen) && close(s.live.screen)
-                end
-                s.live = nothing
-            end
+            foreach(endrender!, unique(c.source for c in r.sequence.clips))
             r.closed = true
         end
         rm(r.planes; recursive = true, force = true)

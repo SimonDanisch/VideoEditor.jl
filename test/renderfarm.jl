@@ -143,6 +143,22 @@ Base.close(r::OwnedTestFrames) = (r.closed[] = true; nothing)
             @test_throws ErrorException VE.renderfarm!(wrongjob, [wrong]; retries=1)
             @test !isfile(VE.farmreceiptpath(wrongjob.directory, 0))
 
+            # The same edit made a job again for other code keeps the frames rendered.
+            regen = joinpath(dir, "regenerated")
+            cp(job.directory, regen)
+            rm(joinpath(regen, "frames"); recursive = true)
+            open(io -> println(io, "# other code"), joinpath(regen, "job", "environment", "Project.toml"), "a")
+            again = VE.RenderJob(regen)
+            @test again.key != job.key
+            @test VE.carryframes!(again, job) == 6
+            @test all(n -> VE.farmcomplete(regen, n, again.key), 0:5)
+            @test VE.carryframes!(again, job) == 0
+            other = joinpath(dir, "otheredit")
+            cp(regen, other)
+            rm(joinpath(other, "frames"); recursive = true)
+            open(io -> write(io, UInt8[0]), joinpath(other, "job", "project.videoedit"), "a")
+            @test_throws r"another edit" VE.carryframes!(VE.RenderJob(other), job)
+
             # A GPU whose device was lost leaves the render; its renderer, started
             # again, joins under the same name and finishes it.
             rejoinjob = newjob("rejoinjob")
