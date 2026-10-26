@@ -3,16 +3,21 @@ function checkfarmroot(project::AbstractString)
     wanted=TOML.parsefile(project)
     names=String.(collect(keys(wanted["deps"])))
     # A job of path sources (`portable = false`) pins developed packages by their code.
-    portable=!any(s -> haskey(s,"path"), values(get(wanted,"sources",Dict())))
-    actual=farmenvironment(names; portable)
+    pinned=get(wanted,"content",Dict{String,Any}())
+    actual=farmenvironment(names; portable=isempty(pinned))
     problems=String[]
     for name in names
         get(actual["deps"],name,nothing)==wanted["deps"][name] || push!(problems,"$name: UUID differs")
-        for section in ("sources","compat")
-            expected=get(get(wanted,section,Dict()),name,nothing)
-            found=get(get(actual,section,Dict()),name,nothing)
-            samesource(expected,found) || push!(problems,"$name: $section differs (synchronize the root project)")
+        if haskey(pinned,name)
+            # a path is each machine's own; the code is what has to agree
+            get(get(actual,"content",Dict()),name,nothing)==pinned[name] ||
+                push!(problems,"$name: code differs (synchronize the root project)")
+        else
+            isequal(get(get(wanted,"sources",Dict()),name,nothing),get(get(actual,"sources",Dict()),name,nothing)) ||
+                push!(problems,"$name: sources differs (synchronize the root project)")
         end
+        isequal(get(get(wanted,"compat",Dict()),name,nothing),get(get(actual,"compat",Dict()),name,nothing)) ||
+            push!(problems,"$name: compat differs (synchronize the root project)")
         isequal(get(get(actual,"preferences",Dict()),name,nothing),
                 get(get(wanted,"preferences",Dict()),name,nothing)) || push!(problems,"$name: preferences differ")
     end
@@ -20,8 +25,3 @@ function checkfarmroot(project::AbstractString)
     isempty(problems) || error("Farm job does not match the application root:\n"*join(problems,"\n"))
     dirname(Base.active_project())
 end
-
-"The same code: a developed package by its content (its path is each machine's own), anything else exactly."
-samesource(expected::AbstractDict, found::AbstractDict) =
-    haskey(expected,"content") ? get(found,"content",nothing)==expected["content"] : isequal(expected,found)
-samesource(expected, found) = isequal(expected, found)

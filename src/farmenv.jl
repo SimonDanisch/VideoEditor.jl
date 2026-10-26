@@ -22,12 +22,13 @@ and weak dependencies as the active manifest resolved them, each pinned.
     `[sources]` at their release tags, independently of registry freshness.
   - The environment's package preferences come along, as `[preferences]`.
 
-With `portable = false`, developed packages are `path` sources instead, each
-with the hash of its code (`sourcecontent`): an environment for farm clients
-on this machine, or for clients that run an application root of their own
-(`VIDEOEDITOR_FARM_PROJECT`) holding the same code in other folders, such as
-copies synchronized to each machine. It can render what is not committed yet;
-[`checkfarmroot`](@ref) compares such a package by its code, not its path.
+With `portable = false`, developed packages are `path` sources instead, and a
+`[content]` table holds the hash of each one's code (`sourcecontent`): an
+environment for farm clients on this machine, or for clients that run an
+application root of their own (`VIDEOEDITOR_FARM_PROJECT`) holding the same
+code in other folders, such as copies synchronized to each machine. It can
+render what is not committed yet; [`checkfarmroot`](@ref) compares such a
+package by its code, not its path.
 """
 function farmenvironment(roots; project::AbstractString = Base.active_project(), portable::Bool = true)
     manifestpath = Base.project_file_manifest_path(project)
@@ -36,7 +37,7 @@ function farmenvironment(roots; project::AbstractString = Base.active_project(),
     for root in roots
         haskey(entries, root) || error("$root is not in the environment $project")
     end
-    deps, sources, compat = Dict{String, Any}(), Dict{String, Any}(), Dict{String, Any}()
+    deps, sources, compat, content = Dict{String, Any}(), Dict{String, Any}(), Dict{String, Any}(), Dict{String, Any}()
     problems = String[]
     for name in sort!(collect(dependencyclosure(entries, roots)))
         entry = entries[name]
@@ -44,8 +45,12 @@ function farmenvironment(roots; project::AbstractString = Base.active_project(),
         deps[name] = entry["uuid"]
         if haskey(entry, "path")
             path = abspath(dirname(manifestpath), entry["path"])
-            sources[name] = portable ? pinnedsource!(problems, name, path) :
-                            Dict{String, Any}("path" => path, "content" => sourcecontent(path))
+            if portable
+                sources[name] = pinnedsource!(problems, name, path)
+            else
+                sources[name] = Dict{String, Any}("path" => path)
+                content[name] = sourcecontent(path)
+            end
         elseif haskey(entry, "repo-url")
             rev = get(entry, "repo-rev", "")
             occursin(r"^[0-9a-f]{40}$", rev) ||
@@ -69,6 +74,8 @@ function farmenvironment(roots; project::AbstractString = Base.active_project(),
     isempty(problems) || error("the farm can only render code a worker can fetch:\n  " * join(problems, "\n  "))
     compat["julia"] = "=$(VERSION.major).$(VERSION.minor).$(VERSION.patch)"
     env = Dict{String, Any}("deps" => deps, "sources" => sources, "compat" => compat)
+    # Pkg reads `[sources]` and leaves a table of its own alone
+    isempty(content) || (env["content"] = content)
     # preferences change what a package does: they travel with its code
     preferences = environmentpreferences(project)
     filter!(p -> haskey(deps, first(p)), preferences)

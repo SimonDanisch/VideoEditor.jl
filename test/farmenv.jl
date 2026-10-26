@@ -76,18 +76,18 @@ gitin(dir, args...) = run(pipeline(`git -C $dir -c user.email=farm@test -c user.
         @test pinned["compat"]["julia"] == "=$(VERSION.major).$(VERSION.minor).$(VERSION.patch)"
         @test !haskey(pinned["deps"], "Dates")                   # standard libraries come with Julia
         @test pinned["preferences"]["Probe"]["quality"] == "high"
-        # a path source carries its code's hash: a copy elsewhere is the same code,
-        # whatever else lies beside it, and an edit is not
-        bypath = VE.farmenvironment(["Probe"]; project, portable = false)["sources"]["Probe"]
-        @test bypath == Dict("path" => pkg, "content" => VE.sourcecontent(pkg))
+        # a path source comes with its code's hash: a copy elsewhere is the same
+        # code, whatever else lies beside it, and an edit is not
+        local_env = VE.farmenvironment(["Probe"]; project, portable = false)
+        @test local_env["sources"]["Probe"] == Dict("path" => pkg)
+        @test local_env["content"]["Probe"] == VE.sourcecontent(pkg)
         elsewhere = mktempdir()
         cp(joinpath(pkg, "src"), joinpath(elsewhere, "src"))
         cp(joinpath(pkg, "Project.toml"), joinpath(elsewhere, "Project.toml"))
         write(joinpath(elsewhere, "notes.md"), "not code\n")
-        @test VE.sourcecontent(elsewhere) == bypath["content"]
-        @test VE.samesource(bypath, Dict("path" => elsewhere, "content" => VE.sourcecontent(elsewhere)))
+        @test VE.sourcecontent(elsewhere) == local_env["content"]["Probe"]
         write(joinpath(elsewhere, "src", "more.jl"), "# more code\n")
-        @test !VE.samesource(bypath, Dict("path" => elsewhere, "content" => VE.sourcecontent(elsewhere)))
+        @test VE.sourcecontent(elsewhere) != local_env["content"]["Probe"]
         # what a worker could not fetch is refused, by name
         write(joinpath(pkg, "src", "draft.jl"), "# not committed\n")
         @test_throws r"Probe has uncommitted changes" VE.farmenvironment(["Probe"]; project)

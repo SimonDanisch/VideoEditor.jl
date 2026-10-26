@@ -572,11 +572,12 @@ function renderfarm!(job::RenderJob, workers; frames = nothing, reuse = nothing,
         finished()
         @sync for worker in pool
             fresh = lock(guard) do
-                if haskey(counts, worker.name)
+                # the same GPU may join again once its earlier worker has ended (its renderer restarted)
+                if worker.name in active
                     errors[worker.name] = "a second worker of this name joined and was left out"
                     return false
                 end
-                counts[worker.name] = 0
+                get!(counts, worker.name, 0)
                 push!(joined, worker)
                 push!(active, worker.name)
                 report()

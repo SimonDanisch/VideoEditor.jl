@@ -142,6 +142,19 @@ Base.close(r::OwnedTestFrames) = (r.closed[] = true; nothing)
                                                    for _ in 1:2])
             @test_throws ErrorException VE.renderfarm!(wrongjob, [wrong]; retries=1)
             @test !isfile(VE.farmreceiptpath(wrongjob.directory, 0))
+
+            # A GPU whose device was lost leaves the render; its renderer, started
+            # again, joins under the same name and finishes it.
+            rejoinjob = newjob("rejoinjob")
+            pool = Channel{VE.FarmWorker}(Inf)
+            put!(pool, VE.FarmWorker("gpu", ids -> error("device lost")))
+            left() = isfile(joinpath(rejoinjob.directory, "status.json")) &&
+                     (s = VE.farmstatus(rejoinjob.directory); haskey(s["errors"], "gpu") && !("gpu" in s["active"]))
+            rejoin = @async (timedwait(left, 60); put!(pool, VE.FarmWorker("gpu", ids -> VE.farmframes!(renderer, ids))))
+            status = VE.renderfarm!(rejoinjob, pool)
+            wait(rejoin)
+            @test status["completed"] == 6 && status["workers"]["gpu"] == 6
+            @test !isopen(pool)
             # The same edit resumes its job; a changed one is refused, not mixed in.
             @test VE.renderjob(path, job.directory; portable = false).key == job.key
             mkpath(path * ".mattes")

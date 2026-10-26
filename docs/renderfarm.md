@@ -229,7 +229,10 @@ under `~/.videoeditor/farm` and reused; packages and compiled code live in the
 ordinary Julia depot. The first job on a machine installs and compiles, which
 takes minutes. A GPU that cannot be opened is reported and left out. Closing a
 GPU's worker, or a dropped connection, ends its renderer and frees the GPU; a
-lock file per GPU keeps two jobs from sharing one.
+lock file per GPU keeps two jobs from sharing one. A renderer whose device is
+lost (a GPU reset) reports the failed frame and ends; its client starts it
+again and the GPU joins the running render anew, its frames retried elsewhere
+meanwhile.
 
 Messages are TOML headers with byte payloads, not Julia serialization, so the
 editor, client and renderer may run different Julia or VideoEditor versions.
