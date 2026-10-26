@@ -202,7 +202,7 @@ export sam2seed, sam2ready, defaultsegmenter
 export RestoreEffect, registerrestore!, restorewindow!, applyrestore!
 export DepthBlurEffect, DepthTrack, registerdepth!, installdepth!, analyzedepth!, depthframe
 export LookEffect, registerlook!, installlook!, analyzelook!, lookdim
-export Caption, transcribe!, registertranscribe!, installtranscribe!, captionat
+export Caption, transcribe!, registertranscribe!, installtranscribe!, captionat, checknarration
 export captionindexat, editcaption!
 export registerinterpolate!, installinterpolate!, settimeinterp!, smoothslowmo!
 export addnarration!, dropnarration!, rendernarration!, pickfocus!, setinterp!

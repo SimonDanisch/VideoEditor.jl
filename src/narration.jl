@@ -157,14 +157,27 @@ end
 
 "Timeline time of a source-anchored line after cuts, or `nothing` when cut away."
 function narrationtime(seq::Sequence,n::Narration)
-    n.anchor === nothing && return n.at
+    span = narrationspan(seq,n)
+    return span === nothing ? nothing : first(span)
+end
+
+"""
+    narrationspan(seq, n) -> (start, stop) or nothing
+
+The timeline seconds in which narration `n` is heard: its rendered length, or
+for a line anchored to a source the part its first clip of that source plays
+(at that clip's speed); `nothing` when cut away.
+"""
+function narrationspan(seq::Sequence,n::Narration)
     stop = n.rate > 0 ? n.at + min(length(n.samples)/n.rate,n.mix.stop) : n.at
+    n.anchor === nothing && return (n.at, stop)
     for c in sort(seq.clips;by=c->c.start)
         c.source === n.anchor || continue
         a,b = c.src_in/c.source.framerate,c.src_out/c.source.framerate
         (a <= n.at < b || n.at < a < stop) || continue
         speed = c.rate*seq.framerate/c.source.framerate
-        return c.start/seq.framerate + (max(n.at,a)-a)/speed
+        start = c.start/seq.framerate + (max(n.at,a)-a)/speed
+        return (start, start + (min(stop,b)-max(n.at,a))/speed)
     end
     return nothing
 end

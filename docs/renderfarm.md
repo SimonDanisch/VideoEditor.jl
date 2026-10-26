@@ -212,7 +212,10 @@ can be restricted to one existing application environment by setting
 preferences against the job, then launches all GPU children with that root.
 It never installs, activates, or overwrites a job-specific Pkg environment;
 a mismatch is reported instead. Synchronize that root's packages before
-offering the client. GPU inventories and job data stay in the client cache.
+offering the client. A job made with `portable = false` pins each developed
+package by the hash of its code (`Project.toml`, `Artifacts.toml`, `src`,
+`ext`, `assets`), so a root whose packages are copies synchronized into other
+folders, uncommitted work included, passes; a portable job pins them by commit. GPU inventories and job data stay in the client cache.
 
 Without this setting, the client
 unpacks it, instantiates `environment/Project.toml` with the job's Julia

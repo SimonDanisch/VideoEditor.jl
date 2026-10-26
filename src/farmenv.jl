@@ -22,9 +22,12 @@ and weak dependencies as the active manifest resolved them, each pinned.
     `[sources]` at their release tags, independently of registry freshness.
   - The environment's package preferences come along, as `[preferences]`.
 
-With `portable = false`, developed packages are `path` sources instead: an
-environment for farm clients on this machine only (its own GPUs), which can
-render what is not committed yet.
+With `portable = false`, developed packages are `path` sources instead, each
+with the hash of its code (`sourcecontent`): an environment for farm clients
+on this machine, or for clients that run an application root of their own
+(`VIDEOEDITOR_FARM_PROJECT`) holding the same code in other folders, such as
+copies synchronized to each machine. It can render what is not committed yet;
+[`checkfarmroot`](@ref) compares such a package by its code, not its path.
 """
 function farmenvironment(roots; project::AbstractString = Base.active_project(), portable::Bool = true)
     manifestpath = Base.project_file_manifest_path(project)
@@ -41,7 +44,8 @@ function farmenvironment(roots; project::AbstractString = Base.active_project(),
         deps[name] = entry["uuid"]
         if haskey(entry, "path")
             path = abspath(dirname(manifestpath), entry["path"])
-            sources[name] = portable ? pinnedsource!(problems, name, path) : Dict{String, Any}("path" => path)
+            sources[name] = portable ? pinnedsource!(problems, name, path) :
+                            Dict{String, Any}("path" => path, "content" => sourcecontent(path))
         elseif haskey(entry, "repo-url")
             rev = get(entry, "repo-rev", "")
             occursin(r"^[0-9a-f]{40}$", rev) ||
@@ -157,6 +161,30 @@ function pinnedsource!(problems, name, path)
     subdir = relpath(realpath(path), top)
     subdir == "." || (source["subdir"] = replace(subdir, '\\' => '/'))
     return source
+end
+
+"""
+    sourcecontent(path) -> String
+
+The hash of a developed package's code at `path`: its `Project.toml`,
+`Artifacts.toml` and every file under `src`, `ext` and `assets`, by relative
+path. A checkout and a synchronized copy of the same code hash the same; what
+else lies in the folder (tests, docs, generated output, `.git`) does not count.
+"""
+function sourcecontent(path::AbstractString)
+    files = [f for f in ("Project.toml", "Artifacts.toml") if isfile(joinpath(path, f))]
+    for dir in ("src", "ext", "assets")
+        isdir(joinpath(path, dir)) || continue
+        for (root, _, names) in walkdir(joinpath(path, dir)), name in names
+            startswith(name, '.') || push!(files, replace(relpath(joinpath(root, name), path), '\\' => '/'))
+        end
+    end
+    ctx = SHA.SHA256_CTX()
+    for file in sort!(files)
+        SHA.update!(ctx, codeunits(file))
+        SHA.update!(ctx, read(joinpath(path, file)))
+    end
+    return bytes2hex(SHA.digest!(ctx))
 end
 
 """Git's answer in `dir`, or `nothing` where git fails (not a checkout)."""
