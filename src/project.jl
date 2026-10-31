@@ -23,9 +23,29 @@ Writing is atomic (write a temp, rename) and keeps the previous version as a
 checkpoint, so an interrupted save cannot destroy the last good one.
 """
 function saveproject(path::AbstractString, seq::Sequence; checkpoint::Bool = true)
+    # A cut shares its source and analysis data. Preserve that ownership in the
+    # document: one scene/screen and one LUT, regardless of how many shots use it.
+    sourceids = IdDict{ClipSource, Int}()
+    lookids = IdDict{Any, Int}()
+    sources, looks = Any[], Any[]
+    clips = map(seq.clips) do clip
+        sid = get!(sourceids, clip.source) do
+            push!(sources, sourcedict(clip.source)); length(sources)
+        end
+        cd = clipdict(clip)
+        delete!(cd, "source"); delete!(cd, "scene")
+        cd["source_index"] = sid
+        if clip.look !== nothing
+            lid = get!(lookids, clip.look) do
+                push!(looks, cd["look"]); length(looks)
+            end
+            delete!(cd, "look"); cd["look_index"] = lid
+        end
+        return cd
+    end
     dict = Dict{String, Any}(
         "framerate" => seq.framerate,
-        "clips" => [clipdict(clip) for clip in seq.clips],
+        "clips" => clips, "sources" => sources, "looks" => looks,
     )
     # transitions (cross-dissolves) are part of the edit — losing them on reopen
     # would silently drop every dissolve
@@ -35,8 +55,8 @@ function saveproject(path::AbstractString, seq::Sequence; checkpoint::Bool = tru
     # overlays are edits like any other — a lost title is a lost edit
     # …and the transcript, for the same reason: a corrected caption is an edit,
     # and re-running Whisper to get it back costs minutes.
-    # …and the narration's WORDS. The samples are a cache of them and would be
-    # megabytes of JSON; `render!` puts them back.
+    # Rendered narration is kept as a binary block. A farm worker must use the
+    # approved performance, without loading a speech model to synthesize it again.
     # The canvas, when it has been set — the crop tool's output size.
     seq.canvas === nothing ||
         (dict["canvas"] = [seq.canvas[1], seq.canvas[2]])
@@ -44,8 +64,14 @@ function saveproject(path::AbstractString, seq::Sequence; checkpoint::Bool = tru
     # one, so a project nobody laid out by hand reads and writes exactly as before.
     isempty(seq.trackheights) || (dict["trackheights"] = copy(seq.trackheights))
     isempty(seq.narration) ||
-        (dict["narration"] = [Dict{String, Any}("text" => n.text, "at" => n.at,
-                                                "voice" => n.voice) for n in seq.narration])
+        (dict["narration"] = [merge(Dict{String, Any}("text" => n.text, "at" => n.at,
+                                                     "voice" => n.voice, "label" => n.label,
+                                                     "anchor" => n.anchor === nothing ? nothing : get(sourceids,n.anchor,nothing),
+                                                     "speech" => Dict(String(k) => (getfield(n.speech,k) isa Symbol ? String(getfield(n.speech,k)) : getfield(n.speech,k)) for k in fieldnames(SpeechSettings)),
+                                                     "mix" => Dict(String(k) => getfield(n.mix,k) for k in fieldnames(VoiceMix))),
+                                    isempty(n.samples) ? Dict{String, Any}() :
+                                    Dict{String, Any}("samples" => Block(n.samples), "rate" => n.rate))
+                              for n in seq.narration])
     isempty(seq.captions) ||
         (dict["captions"] = [Dict{String, Any}("start" => c.start, "stop" => c.stop,
                                                "text" => c.text) for c in seq.captions])
@@ -125,7 +151,7 @@ sourcedict(s::SceneSource) = Dict{String, Any}(
         "backend" => String(s.backend), "bakewith" => String(s.bakewith),
         "screenopts" => optsdict(s.screenopts),
         "bakescreenopts" => optsdict(s.bakescreenopts),
-        "build" => s.build))
+        "build" => s.build, "soundtrack" => s.soundtrack))
 
 optsdict(d::Dict{Symbol, Any}) = Dict{String, Any}(
     string(k) => (v isa Symbol ? String(v) : v === nothing ? "nothing" : v) for (k, v) in d)
@@ -148,7 +174,8 @@ function sourcefromdict(cd::AbstractDict, sources::Dict{String, VideoSource})
                            width = Int(get(sd, "width", 1920)),
                            height = Int(get(sd, "height", 1080)),
                            framerate = Float64(get(sd, "framerate", 30.0)),
-                           nframes = Int(get(sd, "nframes", 90)))
+                           nframes = Int(get(sd, "nframes", 90)),
+                           soundtrack = String(get(sd, "soundtrack", "")))
     end
     path = String(cd["source"])
     return get!(() -> VideoSource(path), sources, path)
@@ -219,24 +246,30 @@ function clipdict(clip::Clip)
     return cd
 end
 
-function loadproject(path::AbstractString)
+function loadproject(path::AbstractString; pathmap::AbstractDict = Dict())
     # `decodeblocks` first, so nothing below this line has to know that a numeric
     # array may have been written as raw bytes — see pack.jl.
     dict = decodeblocks(MsgPack.unpack(read(path)))
+    isempty(pathmap) || (dict = farmrebase(dict, pathmap))
     # A scene clip has no file to be missing (its `"source"` is empty).
-    missing_sources = unique(String[cd["source"] for cd in dict["clips"]
+    descriptors = get(dict, "sources", dict["clips"])
+    missing_sources = unique(String[cd["source"] for cd in descriptors
                                     if !isempty(get(cd, "source", "")) && !isfile(cd["source"])])
     isempty(missing_sources) ||
         error("project references missing video file(s):\n  " * join(missing_sources, "\n  ") *
               "\nMove them back (or edit the paths in $path) and reload.")
     sources = Dict{String, VideoSource}()
+    sourcepool = [sourcefromdict(sd, sources) for sd in get(dict, "sources", [])]
+    lookpool = [reshape(collect(Float32, lk["table"]), ntuple(_ -> Int(lk["dim"]), 3)..., 3)
+                for lk in get(dict, "looks", [])]
     # `saveproject` writes every field below, but the reader takes a default for
     # each one it can. A project file is meant to be writable by a script — an
     # agent placing clips does not want to spell out `timeinterp` to say nothing
     # — so the minimum is a source and a range, and everything else means what
     # a freshly dropped clip means.
     clips = map(dict["clips"]) do cd
-        source = sourcefromdict(cd, sources)
+        source = haskey(cd, "source_index") ? sourcepool[Int(cd["source_index"])] :
+                                             sourcefromdict(cd, sources)
         clip = Clip(source, cd["src_in"], cd["src_out"], cd["start"],
                     NTuple{4, Float64}(get(cd, "crop", (0.0, 0.0, 1.0, 1.0))),
                     Float64(get(cd, "rate", 1.0)))
@@ -288,7 +321,9 @@ function loadproject(path::AbstractString)
         end
         haskey(cd, "bake") &&
             (clip.bake = bakefromdict(cd["bake"], bakeclipdir(path, clip.id)))
-        if haskey(cd, "look")
+        if haskey(cd, "look_index")
+            clip.look = lookpool[Int(cd["look_index"])]
+        elseif haskey(cd, "look")
             lk = cd["look"]
             d = Int(lk["dim"])
             clip.look = reshape(collect(Float32, lk["table"]), d, d, d, 3)
@@ -314,8 +349,21 @@ function loadproject(path::AbstractString)
         seq.canvas = (Int(cv[1]), Int(cv[2]))
     end
     for nd in get(dict, "narration", [])
-        push!(seq.narration, Narration(String(nd["text"]), Float64(get(nd, "at", 0.0)),
-                                       String(get(nd, "voice", "af_heart"))))
+        s = get(nd,"speech",Dict())
+        speech = SpeechSettings(; model=Symbol(get(s,"model","default")),
+            direction=String(get(s,"direction","")), reference=farmpath(String(get(s,"reference","")),pathmap),
+            reference_text=String(get(s,"reference_text","")), seed=Int(get(s,"seed",1)))
+        m = get(nd,"mix",Dict())
+        mix = VoiceMix(; gain=Float32(get(m,"gain",1)), pan=Float32(get(m,"pan",0)),
+            ramp=Float32(get(m,"ramp",1)), stop=Float64(get(m,"stop",Inf)), filter=String(get(m,"filter","")))
+        n = Narration(String(nd["text"]), Float64(get(nd, "at", 0.0)), String(get(nd, "voice", "af_heart"));
+                      speech,mix,label=String(get(nd,"label","")),
+                      anchor=get(nd,"anchor",nothing) === nothing ? nothing : sourcepool[Int(nd["anchor"])])
+        if haskey(nd, "samples")
+            append!(n.samples, Float32.(nd["samples"]))
+            n.rate = Int(nd["rate"])
+        end
+        push!(seq.narration, n)
     end
     for cd in get(dict, "captions", [])
         push!(seq.captions, Caption(Float64(cd["start"]), Float64(cd["stop"]),
@@ -482,4 +530,3 @@ function loadmatte(path::AbstractString, id::Integer, sz::NTuple{3, Int})
     isfile(f) && @warn "matte sidecar for clip $id is $(filesize(f)) bytes, expected $n — ignoring"
     return zeros(UInt8, sz)
 end
-

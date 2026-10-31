@@ -339,11 +339,11 @@ registereffect!(EffectKind(:depthblur, "Depth blur";
     # reachable from the card and could only fire via `activatetool!`.
     body = ctx -> depthbody!(ctx)))
 
-registereffect!(EffectKind(:look, "Look";
-    description = "A colour grade learned from one frame of this shot. " *
-                  "Strength dials it back — the look is the same, the amount is " *
-                  "what changes, so a fade-in is a curve on it and never a re-run.",
-    params = [FxParam(:look, "Look"; min = 0.0, max = 1.0, default = 1.0)],
+registereffect!(EffectKind(:look, "Color grade";
+    description = "A saved colour curve applied throughout this clip. " *
+                  "Strength blends it with the original. AI grading is optional " *
+                  "and replaces this curve using the frame under the playhead.",
+    params = [FxParam(:look, "Strength"; min = 0.0, max = 1.0, default = 1.0)],
     make = nt -> LookEffect(Float32(nt.look)),
     matches = e -> e isa LookEffect,
     read = e -> (look = Float64(e.strength),),

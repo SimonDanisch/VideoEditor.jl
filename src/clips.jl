@@ -296,6 +296,24 @@ function Effect(id::Integer, payload, enabled::Bool)
     return Effect(UInt64(id), k.name, enabled, paramsfor(k, k.read(payload)))
 end
 
+"Saved synthesis settings. Models are registered by the application, not bundled with a project."
+Base.@kwdef struct SpeechSettings
+    model::Symbol = :default
+    direction::String = ""
+    reference::String = ""
+    reference_text::String = ""
+    seed::Int = 1
+end
+
+"How a spoken take sits in the mix, independently of the synthesizer."
+Base.@kwdef struct VoiceMix
+    gain::Float32 = 1f0
+    pan::Float32 = 0f0
+    ramp::Float32 = 1f0
+    stop::Float64 = Inf
+    filter::String = ""
+end
+
 """
 A line of synthesized narration: what to say, when to say it (seconds from the
 sequence's start), and which voice.
@@ -314,9 +332,26 @@ mutable struct Narration
     voice::String
     const samples::Vector{Float32}
     rate::Int
+    speech::SpeechSettings
+    mix::VoiceMix
+    label::String
+    anchor::Union{Nothing,ClipSource}
 end
-Narration(text::AbstractString, at::Real = 0.0, voice::AbstractString = "af_heart") =
-    Narration(String(text), Float64(at), String(voice), Float32[], 0)
+Narration(text::AbstractString, at::Real = 0.0, voice::AbstractString = "af_heart";
+          speech=SpeechSettings(), mix=VoiceMix(), label="", anchor=nothing) =
+    Narration(String(text), Float64(at), String(voice), Float32[], 0, speech, mix, String(label),anchor)
+Narration(text::String, at::Float64, voice::String, samples::Vector{Float32}, rate::Int) =
+    Narration(text, at, voice, samples, rate, SpeechSettings(), VoiceMix(), "",nothing)
+
+function narrationcopy(n::Narration; text=n.text, at=n.at, voice=n.voice,
+                       speech=n.speech, mix=n.mix, label=n.label, anchor=n.anchor, audio=false)
+    fresh = Narration(text, at, voice; speech, mix, label,anchor)
+    if audio
+        append!(fresh.samples, n.samples)
+        fresh.rate = n.rate
+    end
+    return fresh
+end
 
 """
 One spoken line: `start` and `stop` in seconds from the sequence's beginning, and
@@ -917,6 +952,8 @@ end
 resolveinput(::Sequence, ::Clip, ::Effect, ::Param, r::FileRef) =
     isfile(r.path) ? loadinputfile(r.path) : nothing
 resolveinput(seq::Sequence, ::Clip, ::Effect, ::Param, r::ClipRef) = clipbyid(seq, r.clip)
+resolveinput(::Sequence, clip::Clip, ::Effect, p::Param, ::SceneRef) =
+    clip.source isa SceneSource ? SceneValue(Float64(valueat(p.curve[], 0))) : nothing
 
 """
 A clip's picture is not a value but a transient that exists while a composition
@@ -932,6 +969,7 @@ readinput(::Clip, ::Integer) =
 inputclip(seq::Sequence, clip::Clip, r::ParamRef) = r.clip == 0 ? clip : clipbyid(seq, r.clip)
 inputclip(seq::Sequence, ::Clip, r::ClipRef) = clipbyid(seq, r.clip)
 inputclip(::Sequence, ::Clip, ::FileRef) = nothing
+inputclip(::Sequence, clip::Clip, ::SceneRef) = clip
 
 """
     loadinputfile(path) -> data
@@ -1345,10 +1383,9 @@ function rippledoc!(seq::Sequence, from::Real, by::Real)
         c.start >= from && (seq.captions[i] = Caption(c.start - by, c.stop - by, c.text))
     end
     for (i, nar) in enumerate(seq.narration)
+        nar.anchor === nothing || continue  # source-clock speech follows the cut list
         nar.at >= from || continue
-        fresh = Narration(nar.text, nar.at - by, nar.voice)
-        append!(fresh.samples, nar.samples)
-        fresh.rate = nar.rate
+        fresh = narrationcopy(nar; at=nar.at - by, audio=true)
         seq.narration[i] = fresh
     end
     return seq
@@ -1457,6 +1494,13 @@ function restoreinto!(into::Clip, from::Clip)
     # `cardlayout`, `sequence` or `view` — the clip keeps the ones it is open with.
     into.graph = nothing
     old = Dict{UInt64, Effect}(fx.id => fx for fx in into.effects)
+    # Curve observers can request previews during restoration. Keep the old
+    # complete stack available until every restored entry is ready.
+    restored = Effect[]
+    for fx in from.effects
+        cur = pop!(old, fx.id, nothing)
+        push!(restored, cur === nothing ? copy(fx) : restoreinto!(cur, fx))
+    end
     empty!(into.effects)
     # One door, here as everywhere: an effect gets onto a clip through
     # `addslot!`, which is what makes sure it has a card. This was a bare `push!`,
@@ -1465,9 +1509,8 @@ function restoreinto!(into::Clip, from::Clip)
     # selecting another clip and coming back drew it. An effect that kept its card
     # keeps it (`addslot!` builds only for one that has none), so a restore does
     # not churn the rows of everything it did not touch.
-    for fx in from.effects
-        cur = pop!(old, fx.id, nothing)
-        addslot!(into, cur === nothing ? copy(fx) : restoreinto!(cur, fx))
+    for fx in restored
+        addslot!(into, fx)
     end
     # What the snapshot does not list is gone from the document, and its card goes
     # with it. Nothing else would ever delete it: the panel builds cards for the
@@ -1479,7 +1522,7 @@ end
 function restoreinto!(into::Effect, from::Effect)
     into.enabled[] = from.enabled[]
     old = Dict{Symbol, Param}(p.name => p for p in into.params)
-    empty!(into.params)
+    restored = Param[]
     newrows = false
     for p in from.params
         cur = pop!(old, p.name, nothing)
@@ -1487,8 +1530,12 @@ function restoreinto!(into::Effect, from::Effect)
         # being of the old type — copied rather than converted
         fresh = cur === nothing || typeof(cur) !== typeof(p)
         newrows |= fresh
-        push!(into.params, fresh ? copyparam(p) : restoreinto!(cur, p))
+        push!(restored, fresh ? copyparam(p) : restoreinto!(cur, p))
     end
+    # Updating a curve notifies its observers synchronously. Publish the list
+    # only after those updates, so no observer freezes an incomplete effect.
+    empty!(into.params)
+    append!(into.params, restored)
     # A parameter that came or went makes this a different card — the rows are
     # built with it, and a copied parameter has no view at all. Dropping it here
     # is what makes `addslot!` build a fresh one; the card is the effect's, so the
@@ -1543,6 +1590,13 @@ function restore!(seq::Sequence, snap::Vector{Clip})
     empty!(seq)
     for c in snap
         cur = pop!(old, c.id, nothing)
+        # Opening a project can retain clip ids while replacing source objects.
+        # A source is immutable membership: keeping the old clip here would
+        # disconnect narration anchors and restore the wrong scene runtime.
+        if cur !== nothing && cur.source !== c.source
+            dropcards!(cur)
+            cur = nothing
+        end
         addclip!(seq, cur === nothing ?
                  withfields(c; effects = [copy(fx) for fx in c.effects]) :
                  restoreinto!(cur, c))

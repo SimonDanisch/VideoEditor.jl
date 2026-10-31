@@ -466,8 +466,13 @@ Asked of the screen rather than branched on a backend name — and asked with
 `hasmethod`, not a dependency, because the renderer is registered at runtime
 (`usebackend!`) and this file must not know which ones exist.
 """
-function readfilm(screen, clear::Bool; samples::Union{Nothing, Integer} = nothing)
+function readfilm(screen, clear::Bool; samples::Union{Nothing, Integer} = nothing,
+                  pixel_scale::Real = 1)
     T = Tuple{typeof(screen), typeof(Makie.GLNative)}
+    if hasmethod(Makie.colorbuffer, T, (:clear, :samples, :px_per_unit))
+        return upright(Makie.colorbuffer(screen, Makie.GLNative;
+                         clear, samples, px_per_unit = pixel_scale))
+    end
     if samples !== nothing && hasmethod(Makie.colorbuffer, T, (:clear, :samples))
         return upright(Makie.colorbuffer(screen, Makie.GLNative;
                                          clear = clear, samples = Int(samples)))
@@ -479,10 +484,25 @@ function readfilm(screen, clear::Bool; samples::Union{Nothing, Integer} = nothin
 end
 
 
-"Whether this screen accumulates samples across reads — see [`readfilm`](@ref)."
-progressive(screen) =
-    hasmethod(Makie.colorbuffer, Tuple{typeof(screen), typeof(Makie.GLNative)}, (:clear,))
+"Whether this screen's current mode refines repeated reads — see [`readfilm`](@ref)."
+function progressive(screen)
+    backend = parentmodule(typeof(screen))
+    # A backend can offer both raster and traced modes on the same Screen type.
+    # Its runtime answer takes precedence over accepting a `clear` keyword.
+    if isdefined(backend, :isprogressive)
+        capability = getfield(backend, :isprogressive)
+        applicable(capability, screen) && return capability(screen)
+    end
+    return hasmethod(Makie.colorbuffer,
+                     Tuple{typeof(screen), typeof(Makie.GLNative)}, (:clear,))
+end
 
+
+"The renderer owner could not start this request before its startup deadline."
+struct RenderThreadTimeout <: Exception
+    message::String
+end
+Base.showerror(io::IO, e::RenderThreadTimeout) = print(io, e.message)
 
 """
     onthread(f, tid; startwithin = 10.0) -> f()
@@ -508,9 +528,11 @@ long it may then run — see the comment on the wait.
 function onthread(f::Function, tid::Int; startwithin::Real = 10.0)
     Threads.threadid() == tid + 1 && return f()
     done = Channel{Any}(1)
-    started = Threads.Atomic{Bool}(false)
+    state = Threads.Atomic{Int}(0) # pending, started, or expired
     t = Task() do
-        started[] = true               # …which is what the deadline below watches
+        # An expired request must not apply its edits later, after the caller
+        # has reported failure. Only the task or the deadline can claim it.
+        Threads.atomic_cas!(state, 0, 1) == 0 || return
         try
             put!(done, (true, f()))
         catch e
@@ -519,7 +541,6 @@ function onthread(f::Function, tid::Int; startwithin::Real = 10.0)
     end
     t.sticky = true
     ccall(:jl_set_task_tid, Cint, (Any, Cint), t, tid)
-    schedule(t)
     # The deadline covers STARTING, not running. The failure it exists for is the
     # owning thread never yielding — it can be holding a renderloop's
     # `with_context` across its own `sleep`, and then a pinned task scheduled onto
@@ -532,19 +553,27 @@ function onthread(f::Function, tid::Int; startwithin::Real = 10.0)
     # well over ten seconds on RayMakie's first frame. Timing that out aborted a
     # render that was working, and the retry after it succeeded — which is what
     # made the error look both alarming and harmless.
-    t0 = time()
-    while !isready(done)
-        (started[] || time() - t0 <= startwithin) ||
-            error("a scene render never started on thread $(tid + 1), which owns " *
-                  "the renderer's resources; that thread has not yielded in " *
-                  "$(startwithin)s. Called from thread $(Threads.threadid()). Renders " *
-                  "belong before the graph runs (`prerender!`), where the caller is " *
-                  "not waiting on the composite that waits for this.")
-        sleep(0.001)
+    caller = Threads.threadid()
+    deadline = Timer(startwithin) do _
+        if Threads.atomic_cas!(state, 0, 2) == 0
+            put!(done, (false, RenderThreadTimeout(
+                "a scene render never started on thread $(tid + 1), which owns " *
+                "the renderer's resources; that thread has not yielded in " *
+                "$(startwithin)s. Called from thread $(caller). Renders " *
+                "belong before the graph runs (`prerender!`), where the caller is " *
+                "not waiting on the composite that waits for this.")))
+        end
     end
-    ok, val = take!(done)
-    ok || throw(val)
-    return val
+    schedule(t)
+    try
+        # Channel notification wakes the caller immediately. Millisecond sleep
+        # polling added a scheduler/timer tick to every pick and render hop.
+        ok, val = take!(done)
+        ok || throw(val)
+        return val
+    finally
+        close(deadline)
+    end
 end
 
 "Run `f` on thread 1, where GLMakie's screen and the editor's renderloop live."
@@ -596,7 +625,12 @@ A `SubmitChannel` records the thread it belongs to, so the honest answer is to
 read it — which is also right in the old arrangement, where it answers with the
 worker's thread exactly as before.
 """
-mantlethread(M::Module) = M.batchqueue(M.Device()).thread - 1
+function mantlethread(M::Module)
+    queue = M.batchqueue(M.Device())
+    # Vulkan records a single writer; Metal's batch has no thread owner and
+    # uses the main thread, which also owns Makie's window resources.
+    return hasproperty(queue, :thread) ? queue.thread - 1 : 0
+end
 
 """
     sharesdevice(clip) -> Bool
@@ -639,8 +673,8 @@ needs to go over the whole plot tree"), and between frames a scene only ever
 changes values.
 """
 function liveframe!(live::LiveScene; clear::Bool = true,
-                    samples::Union{Nothing, Integer} = nothing)
-    img = readfilm(live.screen, clear; samples)
+                    samples::Union{Nothing, Integer} = nothing, pixel_scale::Real = 1)
+    img = readfilm(live.screen, clear; samples, pixel_scale)
     return withalpha(img, coverage(live.screen))
 end
 

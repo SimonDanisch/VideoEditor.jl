@@ -88,6 +88,10 @@ step with the drawing.
     markgap = 9.0
     "Index of this curve's selected anchor, or 0 — only it shows handles."
     selectedkey = 0
+    "Selected object's lanes share the inspector's highlight."
+    highlighted = false
+    "Parameter label shown alongside the curve."
+    name = ""
     color = RGBAf(1, 0.47, 0.22, 1)
     handlecolor = :white
     # `visible` among them, which is what a parameter's lane is switched off with
@@ -97,6 +101,12 @@ step with the drawing.
 end
 
 function Makie.plot!(p::LaneCurve)
+    map!(p, [:highlighted], :curvelinewidth) do selected
+        selected ? 3.0 : 2.0
+    end
+    map!(p, [:clipspan, :viewrange, :band], :labelposition) do span, range, band
+        Point2f(max(span[1], range[1]) + 0.02, band[2])
+    end
     map!(p, [:curve, :clipspan, :viewrange, :band, :valuerange, :framemap,
              :pixelspersecond], :points) do c, span, vrange, band, vals, fm, pps
         return lanepoints(c, span, vrange, band, vals, fm, pps)
@@ -119,7 +129,9 @@ function Makie.plot!(p::LaneCurve)
     # `Param.visible` never actually took a curve off the timeline.
     vis = p.visible
     lines!(p, p.points; color = (:black, 0.55), linewidth = 4, visible = vis)
-    lines!(p, p.points; color = p.color, linewidth = 2, visible = vis)
+    lines!(p, p.points; color = p.color, linewidth = p.curvelinewidth, visible = vis)
+    text!(p, p.labelposition; text = p.name, fontsize = 10, align = (:left, :top),
+        color = p.color, strokecolor = :black, strokewidth = 2, visible = vis)
     scatter!(p, p.markpoints; marker = :diamond, markersize = 10, color = p.color,
              strokecolor = :white, strokewidth = 1, visible = vis)
     lines!(p, p.handlebars; color = p.handlecolor, linewidth = 1.2, visible = vis)

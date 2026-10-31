@@ -176,11 +176,13 @@ inputrefdict(r::ParamRef) = Dict{String, Any}("kind" => "param", "clip" => r.cli
                                               "param" => String(r.param))
 inputrefdict(r::FileRef) = Dict{String, Any}("kind" => "file", "path" => r.path)
 inputrefdict(r::ClipRef) = Dict{String, Any}("kind" => "clip", "clip" => r.clip)
+inputrefdict(r::SceneRef) = Dict{String, Any}("kind" => "scene", "path" => String(r.path))
 
 function inputreffromdict(d::AbstractDict)
     k = String(get(d, "kind", "param"))
     k == "file" && return FileRef(String(d["path"]))
     k == "clip" && return ClipRef(UInt64(d["clip"]))
+    k == "scene" && return SceneRef(Symbol(d["path"]))
     k == "param" || error("project names an unknown input kind: $(repr(k))")
     return ParamRef(Symbol(d["param"]); clip = UInt64(get(d, "clip", 0)),
                     effect = UInt64(get(d, "effect", 0)))

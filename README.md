@@ -9,7 +9,7 @@ using VideoEditor
 p = Player("footage.mp4")           # opens the editor window
 addsource!(p, "more.mp4")           # append another video (or drop the file onto the window)
 
-saveproject("edit.toml", p.sequence)
+saveproject("edit.videoedit", p.sequence)
 exportvideo("out.mp4", p.sequence)  # bakes crop/effects/stabilization + muxes
                                     # the sources' audio along the cut list
 
@@ -18,6 +18,12 @@ srv = mcpserve!(p)                  # expose the live editor to AI agents (see b
 
 Sequences can mix any number of sources (each decodes through its own
 background worker); resolutions may differ, framerates must match.
+
+For procedural movies, see [scene editing](docs/scene-editing.md) for colour
+controls, camera and object transforms, actor timing and expressions, keyframes,
+speech editing and restoring original motion.
+The [walkthrough regression guide](docs/testing.md) describes reproducible mouse
+and keyboard tests using Makie's existing interaction helpers.
 
 Heavy sources — above full HD, or heavyweight codecs like DNxHR/ProRes —
 automatically get a background **preview proxy** (720p h264, cached across
@@ -34,6 +40,20 @@ Renders identically to the CPU path (WYSIWYG-verified) and falls back to
 it automatically on any error.
 
 ## Keys
+
+Live RayMakie raster scenes support click selection in the preview. The inspector
+shows the picked object and its linked performance controls, including static
+transforms. **All objects** returns to the full scene and its animation filter.
+**Scene view** opens an independent orbit camera over the same GPU geometry:
+drag the coloured XYZ handles to move, rotate or scale; right-drag orbits,
+middle-drag pans, and the wheel zooms. These view controls do not edit the film
+camera. **Camera path** shows the current shot's camera curve; **Add camera key**
+creates ordinary scene parameter keys, and the gold points can be dragged in 3D.
+Each gesture is one Undo step and uses the same saved parameters as the inspector.
+
+Recipes can associate numeric control groups with objects using
+`object=:pivot_plot_name`, and provide a pure `camera(frame,fps)` sampler for
+camera-path previews without rendering intermediate frames.
 
 | Key | Action |
 |---|---|
@@ -169,3 +189,10 @@ isn't available (`Player(...; audiopreview = false)` disables it).
 - preview audio has ~0.1–0.2 s of pipe latency (export stays sample-exact);
   no audio effects/crossfades
 - sources must share the sequence framerate (frame-exact model, no resampling)
+
+## Live scenes and render farms
+
+Procedural Makie scenes can be saved as timeline sources and exported through
+a resumable GPU farm. See [the scene and farm guide](docs/renderfarm.md) and
+[the BonitoAgents connection example](examples/bonito_farm.jl). Workers use ordinary
+Julia Pkg environments and compilation caches.
