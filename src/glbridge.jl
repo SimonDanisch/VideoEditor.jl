@@ -614,7 +614,7 @@ end
 
 """
 Enable GPU playback if the device supports hardware video decode. The capability is
-probed with `vk_context().video_decode_available` ON THE GPU WORKER, so the worker
+probed with `Mantle.videodecodes` ON THE GPU WORKER, so the worker
 creates and owns the (process-global, single-writer) Vulkan context — keeping async
 analysis on the same thread. On success it attaches a [`GPUPreview`] and opens a
 streaming decoder per source; otherwise it is a silent no-op and playback stays on
@@ -624,7 +624,7 @@ function autodetectgpu!(player::Player)
     player.gpupreview isa GPUPreview && return nothing   # already enabled (explicit gpupreview)
     capable = try
         rungpusync(player) do
-            Mantle.vk_context().video_decode_available
+            Mantle.videodecodes(Mantle.defaultbackend())
         end
     catch e
         # a silent false here is how GPU decode gets demoted to the CPU unnoticed
