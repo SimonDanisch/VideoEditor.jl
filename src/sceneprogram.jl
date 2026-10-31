@@ -64,8 +64,10 @@ Keyed arguments belong to the editor: an `update!` must not also set them.
 
 `update! = (frame, fps) -> ...` is optional, for procedural animation. It
 receives absolute source frames, so scrubbing, cuts, and farm frames all evaluate
-the same animation. It must support seeking in arbitrary order. It runs before
-the clip's ordinary scene keyframes, which can override values.
+the same animation. It must support seeking in arbitrary order. The keyed `args`
+are written before it, so it reads this frame's inputs (a file series sampled at
+this frame's time). It runs before the clip's ordinary scene keyframes, which can
+override values.
 
 Optional `objects` describes inspector groups as dictionaries with `label`,
 `plots` (stable names; first is the pivot), and optional `attributes` to expose.
@@ -482,6 +484,9 @@ function updatesceneprogram!(target::ProgramInstance, src, clip, frame, fps; res
         restoresceneprogram!(target, keyedattributes(clip))
         if !replayrecordedscene!(target,src,frame)
             updatescenecontrols!(target, clip, frame, fps)
+            # The recipe's own inputs first: `update!` derives this frame from them,
+            # so a file input it reads is this frame's, not the last one's.
+            applyargs!(target, findslot(clip, :scene), frame)
             Base.invokelatest(target.update!, frame, fps)
         end
         target.frame = frame

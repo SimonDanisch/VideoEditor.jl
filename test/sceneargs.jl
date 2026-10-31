@@ -120,6 +120,42 @@ end
     end
 end
 
+# A recipe whose procedural update derives the frame from its own keyed input.
+const READINGRECIPE = """
+using Makie
+const SEEN = Float32[]
+function buildscene(canvas, args)
+    scene = Scene(; size = canvas)
+    cam3d!(scene)
+    time = Observable(0f0)
+    mesh!(scene, Rect3f(Vec3f(-0.5), Vec3f(1)); name = :box)
+    return (scene = scene, args = (; time), update! = (frame, fps) -> push!(SEEN, time[]))
+end
+"""
+
+@testset "a recipe's update! reads this frame's arguments" begin
+    mktempdir() do dir
+        file = joinpath(dir, "reading.jl")
+        write(file, READINGRECIPE)
+        build = VE.programscene(file)
+        c = VE.sceneclip(VE.buildscene(build); build, frames = 48, canvas = (32, 32), framerate = 24)
+        scene, target = VE.realize(c.source.root, (32, 32))
+        c.source.live = VE.LiveScene(scene, nothing, target, (32, 32), :GLMakie, c.source.root,
+                                     Dict{Symbol, Any}(), Any[])
+        VE.keyframes!(c, "args.time", [0 => 0.0, 24 => 2.0]; ease = :linear)
+        seen = Base.invokelatest(getproperty, parentmodule(c.source.root.builder), :SEEN)
+        empty!(seen)
+        for frame in (12, 3, 24)            # seeking in any order
+            VE.updatesceneprogram!(target, c.source, c, frame, 24)
+        end
+        @test seen ≈ Float32[1, 0.25, 2]
+        # A bypassed scene effect gives the recipe its own values.
+        VE.findslot(c, :scene).enabled[] = false
+        VE.updatesceneprogram!(target, c.source, c, 12, 24)
+        @test last(seen) == 0f0
+    end
+end
+
 @testset "package recipes resolve through the environment" begin
     build = VE.packagescene(VE.Makie, :Scene; args = Dict("x" => 1))
     @test build["package"] == "Makie" && !haskey(build, "file")
