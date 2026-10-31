@@ -559,6 +559,20 @@ Ids, not objects: position and `objectid` both die on the first sort or reload.
 """
 abstract type InputRef end
 
+"The original value of a procedural scene property, before this clip's overrides."
+struct SceneRef <: InputRef
+    path::Symbol
+end
+
+"A scene input sampled by the renderer before it applies editor curves."
+mutable struct SceneValue
+    value::Float64
+end
+readinput(v::SceneValue, ::Integer) = v.value
+
+isfollowing(p) = p.input !== nothing && p.input.op === :copy &&
+                 length(p.input.inputs) == 1 && only(p.input.inputs) isa SceneRef
+
 """
 Something a value's frames can be counted in: a [`Clip`](@ref), and only that.
 
@@ -788,7 +802,9 @@ Whether `p` is animated: more than one key, so its value depends on the frame.
 One key is a constant — the shape every parameter starts as — which is why this
 is a count and not "does it have a curve".
 """
-isanimated(p::Param) = length(p.curve[].keys) > 1
+inputanimated(::Any) = false
+isanimated(p::Param) = length(p.curve[].keys) > 1 ||
+    (p.input !== nothing && any(inputanimated,p.input.resolved))
 
 """
     isconstant(p::Param) -> Bool
@@ -943,6 +959,7 @@ constant, the single key takes the new value and stays where it is. Every call
 site used to spell that fork out, and the two halves wrote to different places.
 """
 function setvalue!(p::Param{T}, value, frame::Integer) where {T}
+    isfollowing(p) && (p.input = nothing)
     c = p.curve[]
     if isanimated(p)
         setkey!(c, frame, value)
@@ -955,9 +972,9 @@ end
 
 "Insert or replace `p`'s key at `frame` (see [`setkey!`](@ref AnimCurve))."
 setkey!(p::Param, frame::Integer, value) =
-    (setkey!(p.curve[], frame, value); notify(p.curve); p)
+    (isfollowing(p) && (p.input = nothing); setkey!(p.curve[], frame, value); notify(p.curve); p)
 setkey!(p::Param, frame::Integer, value, ease::Symbol) =
-    (setkey!(p.curve[], frame, value, ease); notify(p.curve); p)
+    (isfollowing(p) && (p.input = nothing); setkey!(p.curve[], frame, value, ease); notify(p.curve); p)
 
 """
     removekey!(p, frame) -> Bool
@@ -970,6 +987,7 @@ last is where animation stops.
 function removekey!(p::Param, frame::Integer)
     length(p.curve[].keys) > 1 || return false
     removekey!(p.curve[], frame) || return false
+    isfollowing(p) && (p.input = nothing)
     notify(p.curve)
     return true
 end
@@ -977,6 +995,7 @@ end
 function removekeyat!(p::Param, i::Integer)
     ks = p.curve[].keys
     length(ks) > 1 || return false
+    isfollowing(p) && (p.input = nothing)
     deleteat!(ks, i)
     notify(p.curve)
     return true
@@ -992,6 +1011,7 @@ always a curve.
 function clearkeys!(p::Param{T}, frame::Integer) where {T}
     c = p.curve[]
     v = convert(T, valueat(p, frame))
+    isfollowing(p) && (p.input = nothing)
     empty!(c.keys)
     push!(c.keys, Keyframe{T}(Int(frame), v, :linear))
     notify(p.curve)
@@ -1000,19 +1020,19 @@ end
 
 "Move `p`'s `i`-th key to `(frame, value)` — see [`movekey!`](@ref AnimCurve)."
 movekey!(p::Param, i::Integer, frame::Integer, value) =
-    (movekey!(p.curve[], i, frame, value); notify(p.curve); p)
+    (isfollowing(p) && (p.input = nothing); movekey!(p.curve[], i, frame, value); notify(p.curve); p)
 
 "Set the ease mode of `p`'s `i`-th key."
 setease!(p::Param, i::Integer, mode::Symbol) =
-    (setease!(p.curve[], i, mode); notify(p.curve); p)
+    (isfollowing(p) && (p.input = nothing); setease!(p.curve[], i, mode); notify(p.curve); p)
 
 "Move one handle of `p`'s `i`-th key — see [`sethandle!`](@ref AnimCurve)."
 sethandle!(p::Param, i::Integer, side::Symbol, h::Handle; couple::Bool = true) =
-    (sethandle!(p.curve[], i, side, h; couple); notify(p.curve); p)
+    (isfollowing(p) && (p.input = nothing); sethandle!(p.curve[], i, side, h; couple); notify(p.curve); p)
 
 "Make `p`'s `i`-th key a smooth anchor / a corner anchor."
-smoothkey!(p::Param, i::Integer) = (smoothkey!(p.curve[], i); notify(p.curve); p)
-cornerkey!(p::Param, i::Integer) = (cornerkey!(p.curve[], i); notify(p.curve); p)
+smoothkey!(p::Param, i::Integer) = (isfollowing(p) && (p.input = nothing); smoothkey!(p.curve[], i); notify(p.curve); p)
+cornerkey!(p::Param, i::Integer) = (isfollowing(p) && (p.input = nothing); cornerkey!(p.curve[], i); notify(p.curve); p)
 
 "Bake `p`'s legacy curve-wide ease into its keys — see [`materializeease!`](@ref)."
 materializeease!(p::Param) = (materializeease!(p.curve[]); notify(p.curve); p)
@@ -1025,4 +1045,4 @@ Refit `p`'s curve to the few Bézier anchors that reproduce it — see
 which is what makes one tolerance mean the same thing for an angle and an offset.
 """
 simplify!(p::Param; tol::Real = 0.005) =
-    (simplify!(p.curve[]; tol); notify(p.curve); p)
+    (isfollowing(p) && (p.input = nothing); simplify!(p.curve[]; tol); notify(p.curve); p)

@@ -178,6 +178,7 @@ plainscene(root) = (root = root, joints = Dict{Symbol, Any}(), camera = nothing)
 
 function buildscene(d::AbstractDict)
     kind = Symbol(get(d, "kind", "rig"))
+    kind === :program && return plainscene(SceneProgram(d))
     a = fromspecvalue(get(d, "args", Dict{String, Any}()))
     canvas = Tuple(Int.(get(a, :canvas, (1920, 1080))))
     kind === :text && return plainscene(textscene(String(get(a, :text, "")); canvas,

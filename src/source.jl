@@ -27,6 +27,9 @@ decodable(::ClipSource) = true
 "Where this source's media lives, or `\"\"` for one that has no file."
 sourcepath(s::ClipSource) = s.path
 
+"The source's soundtrack; a rendered scene can attach an independent audio file."
+audiopath(s::ClipSource) = sourcepath(s)
+
 """
 A clip whose frames are rendered rather than decoded.
 
@@ -115,6 +118,7 @@ mutable struct SceneSource <: ClipSource
     # thread 1; the pass body takes what is here. See [`takepending!`](@ref).
     pending::Any
     pendingat::Int
+    soundtrack::String
 end
 SceneSource(root; joints::Dict{Symbol, Any} = Dict{Symbol, Any}(), camera = nothing,
             build = nothing, backend::Symbol = :GLMakie,
@@ -122,13 +126,16 @@ SceneSource(root; joints::Dict{Symbol, Any} = Dict{Symbol, Any}(), camera = noth
             width::Integer = 1920, height::Integer = 1080,
             framerate::Real = 30.0, nframes::Integer = 90,
             bakewith::Symbol = :auto,
-            bakescreenopts::Dict{Symbol, Any} = Dict{Symbol, Any}()) =
+            bakescreenopts::Dict{Symbol, Any} = Dict{Symbol, Any}(),
+            soundtrack::AbstractString = "") =
     SceneSource(root, joints, camera, build, backend, screenopts, Int(width), Int(height),
                 Float64(framerate),
-                Int(nframes), nothing, -1, bakewith, bakescreenopts, :live, 0, nothing, -1)
+                Int(nframes), nothing, -1, bakewith, bakescreenopts, :live, 0, nothing, -1,
+                String(soundtrack))
 
 decodable(::SceneSource) = false
 sourcepath(::SceneSource) = ""
+audiopath(s::SceneSource) = s.soundtrack
 
 function Base.resize!(s::SceneSource, wh::Tuple{Integer, Integer})
     w, h = max(Int(wh[1]), 2), max(Int(wh[2]), 2)

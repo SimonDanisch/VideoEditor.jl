@@ -429,12 +429,14 @@ mutable struct Timeline
 
         # re-pull thumbnails as the background decoders fill the caches
         timeline.refreshtask = @async while timeline.running[]
+            dirty=previewtick!(timeline)
             for cache in collect(values(timeline.caches))
                 if cache.dirty[]
                     cache.dirty[] = false
-                    timeline.refresh[] += 1
+                    dirty=true
                 end
             end
+            dirty && (timeline.refresh[] += 1)
             sleep(0.1)
         end
         # initialize the shared view inputs directly — notify(finallimits) on
@@ -465,6 +467,9 @@ end
 
 function stop!(timeline::Timeline)
     timeline.running[] = false
+    player = editorof(timeline.sequence)
+    previews = player === nothing ? nothing : get(player.fxwidgets,:trackpreviews,nothing)
+    previews === nothing || stop!(previews)
     foreach(stop!, values(timeline.caches))
     return nothing
 end
@@ -566,13 +571,16 @@ function buildclipview!(clip::Clip)
                     viewrange = timeline.viewrange, pixelspersecond = timeline.pps,
                     bandheight = timeline.bandheight,
                     sourcestart = srcstart, state = state,
-                    thumbs = thumbsfor(timeline, clip.source),
+                    thumbs = clip.source isa SceneSource ? scenethumbsfor(timeline,clip) : thumbsfor(timeline, clip.source),
+                    waveform = clipwaveform(timeline,clip),
+                    thumbinterval = clip.source isa SceneSource ? 0.25 : 1.0,
+                    frameinterval = 1 / clip.source.framerate,
                     refresh = timeline.refresh,
                     color = timeline.colors.surface,
                     strokecolor_idle = timeline.colors.border,
                     strokecolor_hovered = timeline.colors.accent_subtle,
                     strokecolor_selected = timeline.colors.accent,
-                    thumbsize = thumbdims(cache))
+                    thumbsize = clip.source isa SceneSource ? scenethumbdims(clip.source) : thumbdims(cache))
     clip.view = ClipPlot(plt, rng, srcstart, state)
     # …and placed, in the same breath. Creating the plot and giving it its extent
     # used to be one pass of `relayout!`; split in two, a clip built here and not
@@ -600,6 +608,8 @@ function placeclip!(clip::Clip)
     g = min(0.02, trackspan(ntr) * 0.15)   # gutter, sized from an equal lane
     v.range[] = (clip.start / fps, clipend(clip) / fps)
     v.srcstart[] = clip.src_in / clip.source.framerate
+    v.plot.sourcespeed = clip.rate * fps / clip.source.framerate
+    v.plot.sourcebounds = (clip.src_in/clip.source.framerate,(clip.src_out-1)/clip.source.framerate)
     lo, hi = trackband(seq, clip.track, ntr)   # higher track sits higher up the axis
     v.plot.bandlo = lo + g
     v.plot.bandhi = hi - g
@@ -697,12 +707,17 @@ function placelanes!(timeline::Timeline, clip::Clip, lo::Real, hi::Real)
     fm = FrameMap(clip, fps)
     inset = 0.12 * (hi - lo)
     band = (Float64(lo + inset), Float64(hi - inset))
+    shown = [p for fx in clip.effects for p in fx.params if p.visible[] && p.view !== nothing]
     for fx in clip.effects, p in fx.params
         v = p.view
         v === nothing && continue
         v.lane.clipspan = span
         v.lane.framemap = fm
-        v.lane.band = band
+        i = findfirst(q -> q === p, shown)
+        n = length(shown)
+        v.lane.band = i === nothing || n <= 1 ? band :
+            (band[1] + (n - i) * (band[2] - band[1]) / n,
+             band[1] + (n - i + 0.85) * (band[2] - band[1]) / n)
     end
     return nothing
 end

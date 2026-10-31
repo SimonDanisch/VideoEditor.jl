@@ -88,6 +88,8 @@ step with the drawing.
     markgap = 9.0
     "Index of this curve's selected anchor, or 0 — only it shows handles."
     selectedkey = 0
+    "Selected object's lanes share the inspector's highlight."
+    highlighted = false
     color = RGBAf(1, 0.47, 0.22, 1)
     handlecolor = :white
     # `visible` among them, which is what a parameter's lane is switched off with
@@ -97,6 +99,15 @@ step with the drawing.
 end
 
 function Makie.plot!(p::LaneCurve)
+    map!(p, [:highlighted], :curvelinewidth) do selected
+        selected ? 3.0 : 2.0
+    end
+    map!(p, [:visible, :highlighted], :backdropvisible) do on, selected
+        on && selected
+    end
+    map!(p, [:clipspan, :band], :lanerect) do span, band
+        Rect2f(span[1], band[1], span[2] - span[1], band[2] - band[1])
+    end
     map!(p, [:curve, :clipspan, :viewrange, :band, :valuerange, :framemap,
              :pixelspersecond], :points) do c, span, vrange, band, vals, fm, pps
         return lanepoints(c, span, vrange, band, vals, fm, pps)
@@ -118,8 +129,10 @@ function Makie.plot!(p::LaneCurve)
     # keep drawing, so a lane switched off went on being drawn — which meant
     # `Param.visible` never actually took a curve off the timeline.
     vis = p.visible
+    poly!(p, p.lanerect; color = RGBAf(.10,.11,.13,.92), strokewidth = 0,
+        visible = p.backdropvisible)
     lines!(p, p.points; color = (:black, 0.55), linewidth = 4, visible = vis)
-    lines!(p, p.points; color = p.color, linewidth = 2, visible = vis)
+    lines!(p, p.points; color = p.color, linewidth = p.curvelinewidth, visible = vis)
     scatter!(p, p.markpoints; marker = :diamond, markersize = 10, color = p.color,
              strokecolor = :white, strokewidth = 1, visible = vis)
     lines!(p, p.handlebars; color = p.handlecolor, linewidth = 1.2, visible = vis)
@@ -130,6 +143,30 @@ end
 
 "A curve is its own argument — `lanecurve!(ax, p.curve)` takes the parameter's."
 Makie.convert_arguments(::Type{<:LaneCurve}, c::AnimCurve) = (c,)
+Makie.convert_arguments(::Type{<:LaneCurve}, c::RecordedTrack) = (c,)
+
+"Recorded arrays have a time span, not a fictitious scalar amplitude."
+function lanepoints(track::RecordedTrack,clipspan,viewrange,band,valuerange,fm::FrameMap,pps)
+    lo,hi = max(clipspan[1],viewrange[1]),min(clipspan[2],viewrange[2])
+    lo < hi || return Point2f[]
+    if !track.scalar || !(track.element <: Real)
+        y = Float32((band[1]+band[2])/2)
+        return [Point2f(lo,y),Point2f(hi,y)]
+    end
+    points = Point2f[]
+    for f in track.frames
+        t = seconds(fm,f)
+        lo <= t <= hi || continue
+        y = laney(band,valuerange,valueat(track,f))
+        isempty(points) || push!(points,Point2f(t,points[end][2]))
+        push!(points,Point2f(t,y))
+    end
+    return points
+end
+# Recorded samples are not editable scalar anchors. Editing a scalar control
+# detaches its input into the existing curve; an array lane selects its row.
+lanemarks(::RecordedTrack,args...) = (Point2f[],Int[])
+handlegeometry(::RecordedTrack,args...) = (Point2f[],Point2f[],Symbol[])
 
 """
     lanepoints(curve, clipspan, viewrange, band, valuerange, framemap, pps)

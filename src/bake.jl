@@ -92,12 +92,15 @@ bakeframefile(b::Bake, sf::Integer) = joinpath(b.dir, string(lpad(sf, 6, '0'), "
 The baked picture for source frame `sf`, or `nothing` when the bake is off, does
 not cover it, or its file is gone.
 """
-function bakedframe(clip::Clip, sf::Integer)
+function hasbakedframe(clip::Clip, sf::Integer)
     b = clip.bake
-    (b === nothing || !b.enabled) && return nothing
-    Int(sf) in b.frames || return nothing
+    return b !== nothing && b.enabled && Int(sf) in b.frames && isfile(bakeframefile(b, sf))
+end
+
+function bakedframe(clip::Clip, sf::Integer)
+    hasbakedframe(clip, sf) || return nothing
+    b = clip.bake
     f = bakeframefile(b, sf)
-    isfile(f) || return nothing
     # In the plane's format whatever the file turned out to be, because the source
     # pass copies this straight into a device buffer and an element type that only
     # usually matches is one that fails on somebody else's PNG.

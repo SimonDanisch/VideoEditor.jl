@@ -8,8 +8,8 @@ using GPUFiltering
 using Mantle
 using Makie
 using Observables
+using LinearAlgebra: I, norm, dot
 using SAM2Runner
-import Mmap
 import DepthAnythingRunner
 import NeuralLUTRunner
 import WhisperRunner
@@ -33,6 +33,7 @@ import PNGFiles
 import MsgPack
 import Scratch
 import Statistics: median, mean
+import SHA
 
 const RGBFrame = Matrix{RGB{N0f8}}
 
@@ -120,6 +121,7 @@ include("proxy.jl")
 include("buffer.jl")
 include("decoder.jl")
 include("keyframes.jl")
+include("recordedtracks.jl") # disk-backed simulation values use ordinary parameter inputs
 include("clips.jl")      # Effect, Clip, Sequence — in that order, because each
                          # of them is a field of the next
 include("pack.jl")   # how our own types go into a project file
@@ -144,6 +146,7 @@ include("look.jl")      # …and LookNode likewise
 include("captions.jl")  # needs overlays.jl AND audiopreview.jl, both above
 include("flow.jl")      # SmoothSourceNode is in gpugraph.jl; the model is here
 include("narration.jl") # after audio.jl/audiopreview.jl: mixes into both paths
+include("dialoguetimeline.jl") # views of existing narration, not duplicate audio clips
 include("colorstab.jl")
 include("motionstab.jl")
 include("bundlestab.jl")
@@ -151,14 +154,21 @@ include("export.jl")   # sourceinto! dispatches on GpuVideoStream — needs the 
 include("campath.jl")  # GrayReader wraps export's SequentialReader; grayinto! needs GpuVideoStream
 include("tools.jl")    # GUI tools: timeline-overlay hints + premade operations
 include("scenespec.jl") # a Makie scene AS DATA: plots, backend, theme, paths
+include("sceneprogram.jl") # saved recipes for procedural Makie animation
 include("scenerender.jl") # …and rendering it, with the backend as a parameter
 include("scenesource.jl") # a scene AS A CLIP: the source pass, and making one
+include("recordedscene.jl") # record and replay the real scene's animation inputs
 include("overlays.jl")   # the stock non-footage clips, each as a SceneSpec preset
 include("bake.jl")       # pre-rendering a clip's chain to disk
+include("renderfarm.jl") # persistent timeline renderers and resumable frame jobs
+include("farmbundle.jl") # relocate jobs and their declared animation inputs
 include("commands.jl") # everything the editor can do, as data
 include("fxpanel.jl")  # THE effects panel: one card list for the selected clip
+include("trackpreviews.jl") # bounded background scene thumbnails and audio envelopes
 include("palette.jl")  # Ctrl+P over the commands
+include("farmui.jl")   # render-farm connections are ordinary export commands
 include("transform.jl")  # the preview gizmo for TransformEffect
+include("sceneediting.jl") # object selection and independent raster scene tools
 include("agentview.jl")  # what an AGENT sees: contact sheets, zoom, change search
 include("mcp.jl")
 include("precompile.jl")  # LAST: the workload runs the render + matte paths, so
@@ -180,8 +190,12 @@ export captionindexat, editcaption!
 export registerinterpolate!, installinterpolate!, settimeinterp!, smoothslowmo!
 export addnarration!, dropnarration!, rendernarration!, pickfocus!, setinterp!
 export Narration, narrate!, registerspeak!, installspeak!
+export SpeechSettings, VoiceMix, registerspeechmodel!
 export registerplugin!, registereffect!, EffectKind, FxParam, Pointwise, Stencil
 export SceneSource, SceneSpec, sceneclip, textscene, barscene, timecodescene, curvescene
+export programscene, RenderJob, renderjob, FarmWorker, FarmRenderer, farmrenderer, renderfarm!,
+       farmframes!, closefarm!, encodefarm!, farmstatus, pausefarm!, registerfarm!,
+       bundlefarm, openfarmbundle
 export registertool!, ToolContext, toolplot!, ontool!, tooltime, toolband
 export activatetool!, deactivatetool!
 export repairmattecollect!, brushmatte!, matteframe
@@ -193,5 +207,6 @@ export generateproxy, startproxy!
 export mcpserve!
 export Command, registercommand!, runcommand!, commands
 export ParamInput, ParamRef, FileRef, ClipRef, bindinput!, unbindinput!, bindinputs!
+export RecordedTrack, RecordedRef, recordanimation, openrecording, recordsceneanimation!, valueat
 
 end

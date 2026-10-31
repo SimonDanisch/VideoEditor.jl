@@ -109,6 +109,7 @@ mutable struct FxState
     # available. `nothing` for a source pass that has no update (the retime
     # path), and unfired for a decoder that serves device planes.
     upload::Any
+    uploaddims::Union{Nothing, Tuple{Int, Int}}
     uploaded::Bool
     # What gets stored when there is no picture. A transient keeps nothing
     # between runs, so a frame the source could not produce must still write
@@ -141,10 +142,10 @@ end
 # does, and that typechecked as far as the constructor.
 FxState(; source = nothing, decoded = nothing, decoded2 = nothing, baked = nothing,
         phase = 0.0, clip = nothing, frame = 0, served = Ref(0), upload = nothing,
-        uploaded = false, blank = nothing, blankonmiss = false, planes = nothing,
+        uploaddims = nothing, uploaded = false, blank = nothing, blankonmiss = false, planes = nothing,
         raw = nothing, synth = nothing, exact = false) =
     FxState(source, decoded, decoded2, baked, phase, clip, frame, served, upload,
-            uploaded, blank, blankonmiss, planes, raw, synth, exact)
+            uploaddims, uploaded, blank, blankonmiss, planes, raw, synth, exact)
 
 """
     blankpixels!(st, dims) -> Vector{PlanePixel}
@@ -1124,10 +1125,10 @@ Built ONCE per structural change, because that is the only thing it depends on.
 different `dims` (a proxy swapped in, a source replaced) is the other way, since
 the buffers a recorded chain reserves are sized by it.
 """
-function graphof!(clip::Clip, dims::Tuple{Int, Int})
+function graphof!(clip::Clip, dims::Tuple{Int, Int}; source = sourcenode(clip))
     g = clip.graph
-    g === nothing || (g.dims == dims && return g)
-    nodes = FxNode[sourcenode(clip)]
+    g === nothing || (g.dims == dims && first(g.nodes) == source && return g)
+    nodes = FxNode[source]
     slots = Effect[]
     for fx in clip.effects
         renderable(fx) || continue       # data, not a pass — see `renderable`
@@ -1277,13 +1278,14 @@ function update!(ch::ClipChain, sf::Integer, phase::Real, source;
     # or read off a bake.
     st.exact = exact
     hf = st.upload === nothing ? nothing : sourcepicture!(st, ch.dims; exact)
-    st.uploaded = hf !== nothing && size(hf) == ch.dims
+    uploaddims = something(st.uploaddims, ch.dims)
+    st.uploaded = hf !== nothing && size(hf) == uploaddims
     # UNCONDITIONAL where there is a destination: a transient holds nothing
     # between runs, so a frame with no picture stores black rather than leaving
     # the chain to read the arena's last tenant.
     if st.upload !== nothing
         st.uploaded ? (st.upload[:] = vec(hf)) :
-            st.blankonmiss && (st.upload[:] = blankpixels!(st, ch.dims))
+            st.blankonmiss && (st.upload[:] = blankpixels!(st, uploaddims))
     end
     # A decoder that served DEVICE planes: copy them into the chain's own, which
     # is what the conversion pass reads. Device to device, ~3 MB at 1080p, and it
@@ -1658,7 +1660,8 @@ function composite(f, engine::FxEngine, clips, n::Integer, sourcefor;
         s = decodable(clip.source) ? sourcefor(clip, sourceframe(clip, n)) : clip.source
         s === nothing && return false
         push!(sources, s)
-        push!(graphs, graphof!(clip, framesize(s)))
+        push!(graphs, graphof!(clip, framesize(s);
+            source = previewnode(clip, sourceframe(clip, n); exact)))
     end
     comp = composition!(engine, clips, graphs, can)
     for (ch, source) in zip(comp.chains, sources)

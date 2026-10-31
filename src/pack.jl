@@ -176,11 +176,15 @@ inputrefdict(r::ParamRef) = Dict{String, Any}("kind" => "param", "clip" => r.cli
                                               "param" => String(r.param))
 inputrefdict(r::FileRef) = Dict{String, Any}("kind" => "file", "path" => r.path)
 inputrefdict(r::ClipRef) = Dict{String, Any}("kind" => "clip", "clip" => r.clip)
+inputrefdict(r::SceneRef) = Dict{String, Any}("kind" => "scene", "path" => String(r.path))
+inputrefdict(r::RecordedRef) = Dict{String, Any}("kind" => "recorded", "path" => r.path)
 
 function inputreffromdict(d::AbstractDict)
     k = String(get(d, "kind", "param"))
     k == "file" && return FileRef(String(d["path"]))
     k == "clip" && return ClipRef(UInt64(d["clip"]))
+    k == "scene" && return SceneRef(Symbol(d["path"]))
+    k == "recorded" && return RecordedRef(String(d["path"]))
     k == "param" || error("project names an unknown input kind: $(repr(k))")
     return ParamRef(Symbol(d["param"]); clip = UInt64(get(d, "clip", 0)),
                     effect = UInt64(get(d, "effect", 0)))
@@ -268,6 +272,7 @@ end
 # `Vec3f` — two entries, one key, and whichever lost would read back as the
 # other's element type.
 const PARAMTYPES = Dict{String, Type}(
+    "Any" => Any,
     "Float64" => Float64, "Float32" => Float32, "Int64" => Int64, "Bool" => Bool,
     "Vec2f" => Vec2f, "Vec3f" => Vec3f, "RGBf" => RGBf, "RGBAf" => RGBAf)
 
@@ -297,7 +302,7 @@ function MsgPack.to_msgpack(::MsgPack.MapType, p::Param{T}) where {T}
     # A constant is a curve of one key, and writing that key twice — once as
     # `"value"`, once as a one-key curve — would double the size of a project
     # whose parameters are mostly untouched.
-    isanimated(p) && (d["curve"] = c)
+    length(c.keys) > 1 && (d["curve"] = c)
     p.input === nothing || (d["input"] = p.input)
     return d
 end
@@ -306,13 +311,19 @@ function MsgPack.from_msgpack(::Type{<:Param}, d::AbstractDict)
     T = get(PARAMTYPES, d["T"]) do
         error("project names an unknown parameter type: $(repr(d["T"]))")
     end
-    value = MsgPack.from_msgpack(T, d["value"])
+    value = T === Any ? d["value"] : MsgPack.from_msgpack(T, d["value"])
     # the curve arrives as a plain map, and `T` — which the file just told us —
     # is what says how to read a key's value. That is the whole reason this
     # method is written out: every other field could be inferred from the type.
     curve = haskey(d, "curve") ? MsgPack.from_msgpack(AnimCurve{T}, d["curve"]) : nothing
     range = haskey(d, "lo") ? (Float64(d["lo"]), Float64(d["hi"])) : nothing
     input = haskey(d, "input") ? MsgPack.from_msgpack(ParamInput, d["input"]) : nothing
+    if T === Any
+        c = curve === nothing ? AnimCurve{Any}() : curve
+        isempty(c.keys) && push!(c.keys,Keyframe{Any}(0,value,:hold))
+        return Param{Any}(Symbol(d["name"]),String(get(d,"label",d["name"])),
+            Observable(c),Observable(Bool(get(d,"visible",false))),range,input,nothing)
+    end
     # `value` seeds the curve when the file carries none — see [`Param`](@ref).
     return Param(Symbol(d["name"]), String(get(d, "label", d["name"])), value;
                  curve, visible = Bool(get(d, "visible", false)), range, input)
