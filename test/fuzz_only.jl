@@ -6,7 +6,9 @@
 # is how it gets run.
 using VideoEditor, Test, GLMakie
 import VideoEditor as VE
-import FFMPEG_jll
+# Through VideoEditor: the environment that runs this need not list FFMPEG_jll
+# itself, and none of the workers' environments do.
+import VideoEditor.FFMPEG_jll as FFMPEG_jll
 
 testvideo = joinpath(mktempdir(), "test.mp4")
 run(pipeline(`$(FFMPEG_jll.ffmpeg()) -y -f lavfi -i testsrc2=size=320x180:rate=30 -t 4 -c:v libx264 -g 30 -pix_fmt yuv420p $testvideo`,

@@ -82,6 +82,9 @@ caller falls back to CPU decode) rather than thrash.
 """
 function openstream(backend::KA.GPU, path::AbstractString, width::Integer, height::Integer;
                     capacity::Integer = 120, vrambudget::Integer = 3 * 2^30)
+    Mantle.videodecodes(backend) || throw(ArgumentError(
+        "openstream: $(nameof(typeof(backend))) has no hardware video decode " *
+        "session. Ask `Mantle.videodecodes(backend)` first and read on the CPU."))
     codec = videocodec(path)
     codec in (:h264, :hevc) ||
         error("GPU stream: codec $codec has no hardware decode session yet — transcode first")
@@ -517,7 +520,15 @@ function Base.close(s::GpuVideoStream)
     s.feedgop = 0
     for f in values(s.ring); Mantle.unsafe_free!(f.y); Mantle.unsafe_free!(f.uv); end
     empty!(s.ring); empty!(s.resident)
-    finalize(s.bitstream)                       # unmap
+    # Unmap NOW, through the array's `Memory`: that is where `Mmap.mmap` attaches
+    # the unmapping finalizer, so `finalize(s.bitstream)` on the `Vector` ran
+    # nothing and the mapping lived until the GC found the Memory. Windows cannot
+    # delete a mapped file, so the `rm` below failed with EACCES and took every
+    # GPU-decode export and analysis down on LapWin (2026-10-07); elsewhere the
+    # file was unlinked while still mapped. The emptied field keeps the stream from
+    # pointing at unmapped bytes.
+    finalize(s.bitstream.ref.mem)
+    s.bitstream = UInt8[]
     isfile(s.tmpfile) && rm(s.tmpfile; force = true)
     return nothing
 end

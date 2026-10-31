@@ -105,6 +105,9 @@ VideoIO. Feed frames with [`grayinto!`](@ref)/[`hostgray!`](@ref)/[`rgbinto!`](@
 """
 graysource(backend::KA.CPU, source::VideoSource) = GrayReader(source)
 function graysource(backend, source::VideoSource)
+    # A GPU with no hardware decoder reads on the CPU by design, not as a fallback
+    # worth a warning: see `opendecoder`.
+    Mantle.videodecodes(backend) || return GrayReader(source)
     mezz = mezzaninepath(source)
     # Keep the ORIGINAL's failure: without a mezzanine the warning below is the
     # only thing said, and it used to say the GPU stream was declined without
