@@ -71,63 +71,96 @@ end
 
     # the render graph takes them from the STACK now, in stack order
     VE.setmotiontrack!(clip, track)
-    g = VE.graphof(clip)
+    dims = (clip.source.width, clip.source.height)
+    g = VE.graphof!(clip, dims)
     kinds = [nameof(typeof(n)) for n in g.nodes]
     @test :MotionNode in kinds && :ColorTrackNode in kinds
-    # a slot switched off renders nothing
+    # …and it is the STRUCTURE: switching a slot off does not change it. Whether a
+    # pass does its work is a per-frame flag (`active`), because "is this blur
+    # switched on right now" is a value and a value must not decide which graph is
+    # compiled — a σ reaching zero mid-drag would otherwise recompile.
     for s in clip.effects
         s.enabled = false
     end
-    g2 = VE.graphof(clip)
-    @test !(:MotionNode in [nameof(typeof(n)) for n in g2.nodes])
+    @test VE.graphof!(clip, dims) === g
 end
 
-@testset "effect links" begin
+@testset "a parameter can be driven by another" begin
     src = VideoSource(testvideo)
     seq = Sequence([Clip(src; src_in = 0, src_out = 30, start = 0),
                     Clip(src; src_in = 30, src_out = 60, start = 30)], 30.0)
     a, b = seq.clips
     seteffect!(a, VE.OpacityEffect(1.0f0))
-    seteffect!(b, VE.OpacityEffect(0.0f0))
-    sa, sb = a.effects[1], b.effects[1]
+    seteffect!(b, VE.OpacityEffect(0.25f0))
+    pa = VE.param(a.effects[1], :opacity)
+    pb = VE.param(b.effects[1], :opacity)
 
-    VE.linkeffects!(seq, a, sa, b, sb; role = :fadesinto, backrole = :fadesfrom)
-    @test length(sa.links) == 1 && length(sb.links) == 1
+    # `a`'s opacity is one minus `b`'s: two nodes with an edge between them, which
+    # is what a cross-dissolve IS. Ids, not objects — they survive a round trip.
+    pa.input = VE.ParamInput(:invert, VE.ParamRef(:opacity; clip = b.id))
+    VE.bindinputs!(seq)
+    @test VE.isdriven(pa)
+    @test VE.valueat(pa, 0) ≈ 0.75f0
+    pb.value = 0.5f0
+    @test VE.valueat(pa, 0) ≈ 0.5f0          # …and it FOLLOWS, there is no copy
 
-    # a link resolves to the OTHER clip's slot, by id — not by index or identity,
-    # so it survives sorting, undo and a project round trip
-    got = VE.resolvelink(seq, a, sa.links[1])
-    @test got !== nothing && got[1] === b && got[2] === sb
+    # a `:mix` takes three inputs: two sources and the number between them
+    @test VE.inputarity(:mix) == 3
+    @test VE.lerp(0.0, 10.0, 0.25) ≈ 2.5
 
-    # the walk visits each slot once: a paired link's first step is the way back
-    chain = VE.linkchain(seq, a, sa)
-    @test length(chain) == 1 && chain[1][2] === sb
+    # nothing drives itself, and nothing drives in a circle
+    pa.input = VE.ParamInput(:copy, VE.ParamRef(:opacity))
+    VE.bindinputs!(seq)
+    @test !VE.isdriven(pa)
+    pa.input = VE.ParamInput(:copy, VE.ParamRef(:opacity; clip = b.id))
+    pb.input = VE.ParamInput(:copy, VE.ParamRef(:opacity; clip = a.id))
+    VE.bindinputs!(seq)
+    # ONE edge of the loop is cut, not both: what has to be true is that reading a
+    # value terminates, and refusing more than the offending edge would throw away
+    # a binding the user made for no reason.
+    @test !(VE.isdriven(pa) && VE.isdriven(pb))
+    @test VE.valueat(pa, 0) isa Real && VE.valueat(pb, 0) isa Real
 
-    # what a card inlines is DIRECT links only — the target's own card shows its
-    # links, so following the chain here would draw the same sliders twice
-    inl = VE.linkedparams(seq, a, sa)
-    @test length(inl) == 1 && inl[1][2] === sb && inl[1][4] === :fadesinto
+    # a target that is deleted leaves the edge DANGLING, not broken: the ids are
+    # what the user wrote, and undo has to be able to bring the target back
+    pb.input = nothing
+    pa.input = VE.ParamInput(:invert, VE.ParamRef(:opacity; clip = b.id))
+    VE.bindinputs!(seq)
+    @test VE.isdriven(pa)
+    VE.removeslot!(b, b.effects[1].id)
+    VE.bindinputs!(seq)
+    @test !VE.isdriven(pa)
+    @test VE.valueat(pa, 0) ≈ pa.value       # …and it reads as its own value
 
-    # deleting one half leaves the other dangling, and pruning says how many
-    VE.removeslot!(b, sb.id)
-    @test VE.resolvelink(seq, a, sa.links[1]) === nothing
-    @test VE.prunelinks!(seq) == 1
-    @test isempty(sa.links)
-
-    # links survive a project round trip
-    seteffect!(b, VE.OpacityEffect(0.0f0))
-    sb2 = b.effects[1]
-    VE.linkeffects!(seq, a, sa, b, sb2; role = :fadesinto, backrole = :fadesfrom)
-    path = tempname() * ".videoedit.toml"
+    # …and an edge survives a project round trip, because the file holds its ids
+    seteffect!(b, VE.OpacityEffect(0.25f0))
+    VE.bindinputs!(seq)
+    path = tempname() * ".videoedit"
     saveproject(path, seq)
     seq2 = loadproject(path)
     rm(path; force = true)
-    a2 = seq2.clips[1]
-    s2 = a2.effects[1]
-    @test length(s2.links) == 1
-    r = VE.resolvelink(seq2, a2, s2.links[1])
-    @test r !== nothing && r[1] === seq2.clips[2]
-    @test s2.links[1].role === :fadesinto
+    p2 = VE.opacityparam(seq2.clips[1])
+    @test p2.input !== nothing && p2.input.op === :invert
+    @test VE.isdriven(p2)
+end
+
+@testset "a blend pairing is an edge that carries no value" begin
+    src = VideoSource(testvideo)
+    seq = Sequence([Clip(src; src_in = 0, src_out = 30, start = 0),
+                    Clip(src; src_in = 30, src_out = 60, start = 30)], 30.0)
+    a, b = seq.clips
+    VE.keyfade!(b, 6, :in)
+    VE.pairblend!(seq, b, a)
+    p = VE.opacityparam(b)
+    # it POINTS, it does not drive: `b`'s fade is its own curve, because fading
+    # both sides darkens the middle of a dissolve
+    @test p.input !== nothing && p.input.op === :pairedwith
+    @test !VE.isdriven(p)
+    @test VE.isanimated(p)
+    @test VE.blendpartner(seq, b) == 1
+    @test first(VE.blends(seq)) == (1, 2, 6)
+    VE.pairblend!(seq, b, nothing)
+    @test VE.blendpartner(seq, b) === nothing
 end
 
 @testset "commands" begin

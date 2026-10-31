@@ -79,26 +79,6 @@ wrong one.
 lookdim(clip::Clip) = (l = clip.look; l === nothing ? nothing : size(l, 1))
 
 """
-    loadlut!(store, key, lut) -> device array
-
-The look on the device, uploaded on first sight and then left alone.
-
-Guarded by IDENTITY, not by frame: a look is constant across the shot, so
-re-uploading it per frame would move 431 KB sixty times a second to say the same
-thing. This is [`loadplane!`](@ref)'s bargain without the frame — the slot
-remembers which table it holds, and re-grading (which replaces the array under an
-unchanged clip) writes it again because the identity changed.
-"""
-function loadlut!(s::BufferStore, key, lut::Array{Float32, 4})
-    sl = slot!(s, key, Float32, length(lut))
-    if sl.source !== lut
-        copyto!(Mantle.storage(sl.buf), vec(lut))
-        sl.source = lut
-    end
-    return reshape(Mantle.storage(sl.buf), size(lut))
-end
-
-"""
     applylook!(out, img, lut, strength)
 
 Grade `img` into `out`, mixed back toward the original by `strength`.
@@ -131,12 +111,14 @@ end
         a = out[I]
         b = img[I]
         q = 1.0f0 - s
-        # `unitn0f8`, not the validating `RGB{N0f8}(::Float32, …)` — see its note in
-        # `matte.jl`. The validating form compiles on the CPU and is rejected by
-        # Lava for the string building on its error path, so this kernel worked in
-        # every CPU test and could never have run on the GPU it was written for.
-        out[I] = RGB{N0f8}(unitn0f8(q * Float32(red(b))   + s * Float32(red(a))),
-                           unitn0f8(q * Float32(green(b)) + s * Float32(green(a))),
-                           unitn0f8(q * Float32(blue(b))  + s * Float32(blue(a))))
+        # `topixel`, not the validating `RGB{N0f8}(::Float32, …)` — the latter's
+        # error path builds a message with `repr`, and Lava rejects the whole
+        # kernel for the string allocation, so this compiled on the CPU and could
+        # never have run on the GPU it was written for.
+        out[I] = topixel(eltype(out),
+                         q * Float32(red(b))   + s * Float32(red(a)),
+                         q * Float32(green(b)) + s * Float32(green(a)),
+                         q * Float32(blue(b))  + s * Float32(blue(a)),
+                         alphaof(b))
     end
 end

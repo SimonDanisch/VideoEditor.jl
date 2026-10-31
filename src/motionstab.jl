@@ -31,6 +31,13 @@ function analyzemotion!(clip::Clip; mode::Symbol = :similarity, analysis_width::
                         backend = KA.CPU(), progress = nothing)
     mode in (:similarity, :tripod, :perspective, :smooth) ||
         error("mode must be :similarity, :tripod, :perspective or :smooth")
+    # NOTHING TO TRACK in a clip that renders its own frames: there is no file to
+    # read grayscale out of. `nothing` like every other "this clip cannot be
+    # analysed" answer here (too short, no model), so the caller reports it the
+    # way it already reports those. Without this, pressing Stabilize on a scene
+    # clip — and the card is offered on every clip — died with
+    # `MethodError: graysource(::CPU, ::SceneSource)`.
+    decodable(clip.source) || return nothing
     mode === :similarity && return similaritypath!(clip; backend, progress)
     mode === :bundle && return bundlelock!(clip; analysis_width, backend, progress)
     n = srclength(clip)
@@ -212,6 +219,7 @@ function cameralock!(clip::Clip; point = nothing, window::Integer = 96,
                      backend = KA.CPU(), progress = nothing, debug = nothing)
     n = srclength(clip)
     n >= 2 || return nothing
+    decodable(clip.source) || return nothing   # see `analyzemotion!`
     source = clip.source
     # small sources get proportionally smaller patches and searches
     window = clamp(min(Int(window), source.width ÷ 3, source.height ÷ 3), 24, Int(window))

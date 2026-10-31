@@ -8,3 +8,13 @@ bird = "/windows/Users/sdani/Cloudi/giffers/20260708_160827.mp4"
 # analysis on the pinned worker asserts "BatchQueue is single-writer".
 # `autodetectgpu!` establishes worker ownership in the right order.
 player = Player(bird; gpupreview=true);
+
+1+1
+begin
+    using VideoEditor, Lava, RayMakie, GLMakie
+    import VideoEditor as VE
+    GLMakie.activate!()
+    project = "/sim/Programmieren/VideoEdit/media/lego.videoedit"
+    player = Player(project)
+end
+isfile("/sim/Programmieren/VideoEdit/media/lego.videoedit")

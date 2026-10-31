@@ -307,14 +307,15 @@ function viewsummary(seq::Sequence)
         (index = i, track = c.track,
          start_time = round(c.start / fps, digits = 3),
          end_time = round(clipend(c) / fps, digits = 3),
-         source = basename(c.source.path),
+         source = basename(sourcepath(c.source)),
          # in the SOURCE's own seconds: `src_in` counts source frames, and on a
          # conformed clip those don't tick at the sequence rate
          source_in = round(c.src_in / c.source.framerate, digits = 3),
          source_fps = c.source.framerate,
          conformed = conformed(c),
          crop = round.(c.crop, digits = 3),
-         effects = [string(nameof(typeof(op(s)))) for s in c.effects if s.enabled],
+         effects = [renderable(s) ? string(nameof(typeof(op(s)))) : String(s.kind)
+                    for s in c.effects if s.enabled],
          stabilized = c.motiontrack !== nothing,
          flicker_fixed = c.colortrack !== nothing,
          animated = sort!([string(fx.kind, ".", prm.name) for fx in c.effects

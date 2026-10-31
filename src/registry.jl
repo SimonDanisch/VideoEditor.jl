@@ -77,7 +77,7 @@ exists, and an untyped single-argument method there would be ambiguous with
 `Effect(payload)`.
 """
 Effect(k::EffectKind; enabled::Bool = true) =
-    Effect(freshid(), k.name, enabled, FxLink[], paramsfor(k))
+    Effect(freshid(), k.name, enabled, paramsfor(k))
 
 """
     setparams!(fx, values)
@@ -96,6 +96,18 @@ end
 
 "Default parameter values of `k`, as the NamedTuple `make` takes."
 defaults(k::EffectKind) = NamedTuple(p.name => p.default for p in k.params)
+
+"""
+    anykind(name) -> EffectKind | nothing
+
+The registered kind called `name`.
+
+There used to be two registries to look in — effects, and the overlay kinds that
+drew over the finished canvas — and this asked both, so a project file could name
+either. There is one now: everything that draws is a clip, and everything a clip
+carries is an effect.
+"""
+anykind(name::Symbol) = kindbyname(name)
 
 """
 Whether `k` can be added by name. Anything that can BUILD an effect can: adding
@@ -173,7 +185,7 @@ end
 function findeffect(clip::Clip, kind::EffectKind)
     kind.matches === nothing && return nothing
     for s in clip.effects
-        kind.matches(op(s)) && return op(s)
+        renderable(s) && kind.matches(op(s)) && return op(s)
     end
     return nothing
 end
@@ -212,11 +224,11 @@ end
 fxkind(e::PluginEffect) = KINDCALLBACKS[e.name](e.params)
 isneutral(::PluginEffect) = false                    # a registered op applies whenever present
 effectkey(e::PluginEffect) = (PluginEffect, e.name)  # upsert per kind, not per (shared) type
-# No serialization of its own: a plugin is a kind like any other, so `effectdict`
-# writes its parameters and `effectfromdict` reads them back through its kind.
-# The pair that used to live here — a `"type" => "plugin"` writer and a
-# `plugineffectfromdict` reader — existed only because the format stored typed
-# payloads instead of parameters.
+# No serialization of its own: a plugin is a kind like any other, so pack.jl
+# writes its parameters and reads them back through its kind. The pair that used
+# to live here — a `"type" => "plugin"` writer and a `plugineffectfromdict`
+# reader — existed only because the format stored typed payloads instead of
+# parameters.
 
 """
 Render callback per registered kind, keyed by name.

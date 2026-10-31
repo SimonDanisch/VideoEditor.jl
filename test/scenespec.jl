@@ -1,255 +1,200 @@
-# A Makie scene as data (src/scenespec.jl): the tree, the paths, the round trip.
+# A scene as a clip's source (src/scenesource.jl): the spec, the live scene, and
+# what the panel reads off it.
 #
-# The properties that make the approach work, each easy to lose: a path addresses
-# a part BY NAME (so reordering does not re-aim it), animating writes a COPY (so
-# it cannot accumulate across frames), and what goes into the project file comes
-# back out the same.
+# The properties that make the approach work, each easy to lose: what is
+# animatable comes from the SCENE and not from a description beside it, a path
+# addresses a plot BY NAME (so nothing re-aims when the scene is rebuilt), a
+# joint's axis is authored data while its angle is a parameter, and what goes into
+# the project file comes back out the same.
 
-# `Makie` is not in `Main` when the suite runs it — reach it through the package,
-# the way the other test files reach `VE`.
 using VideoEditor.Makie
+import VideoEditor.Makie.SpecApi as S
 
-meshpart(name, parent = nothing; kw...) =
-    VE.ScenePart(name, Makie.PlotSpec(:Mesh; color = :red); parent = parent, kw...)
+@testset "a scene clip draws a spec" begin
+    spec = S.Scene(; camera = Makie.campixel!,
+                   plots = [Makie.PlotSpec(:Scatter, [Makie.Point2f(10, 10)];
+                                           markersize = 8.0, name = :dot)])
+    clip = VE.sceneclip((root = spec, joints = Dict{Symbol, Any}(), camera = nothing);
+                        frames = 30, canvas = (64, 48), framerate = 30.0)
+    @test clip.source isa VE.SceneSource
+    @test !VE.decodable(clip.source)          # nothing to decode, nothing to proxy
+    @test VE.sourcepath(clip.source) == ""
+    @test (clip.source.width, clip.source.height) == (64, 48)
+    @test VE.cliplength(clip) == 30
+    # the `:scene` entry is DATA — it holds the curves, it is not a pixel pass
+    fx = VE.findslot(clip, :scene)
+    @test fx !== nothing && !VE.renderable(fx)
+    @test isempty(VE.graphof!(clip, (64, 48)).slots)   # …so the chain has no effect pass
 
-@testset "scenespec: a path addresses a part by name" begin
-    spec = VE.SceneSpec([meshpart(:torso),
-                         meshpart(:arm_left, :torso; origin = (0.1, 6.2, 5.7),
-                                  axis = (0.0, 0.98, 0.18))])
-
-    @test VE.scenepath("arm_left.angle") == (:arm_left, :angle, nothing)
-    @test VE.scenepath("torso.offset[2]") == (:torso, :offset, 2)
-    # unaddressable is `nothing`, NOT an error: a project from a newer editor may
-    # name parts this one has not got, and such a curve is one to ignore
-    @test VE.scenepath("nonsense") === nothing
-    @test VE.scenepathvalue(spec, "nosuchpart.angle") === nothing
-    @test VE.scenepathvalue(spec, "torso.nosuchfield") === nothing
-
-    @test VE.scenepathvalue(spec, "arm_left.angle") == 0.0
-    @test VE.scenepathvalue(spec, "arm_left.origin") == (0.1, 6.2, 5.7)
-    @test VE.scenepathvalue(spec, "arm_left.origin[2]") == 6.2
-    @test VE.setscenepath!(spec, "arm_left.angle", 0.5)
-    @test VE.scenepathvalue(spec, "arm_left.angle") == 0.5
-    # one component at a time — an offset is three curves, not a new value type
-    @test VE.setscenepath!(spec, "torso.offset[3]", 20.0)
-    @test VE.scenepathvalue(spec, "torso.offset") == (0.0, 0.0, 20.0)
-    @test !VE.setscenepath!(spec, "nosuchpart.angle", 1.0)
-
-    # …and a plot ATTRIBUTE goes through the same path syntax, which is why no
-    # part declares in advance what is animatable
-    @test VE.setscenepath!(spec, "torso.transparency", true)
-    @test VE.scenepathvalue(spec, "torso.transparency") === true
+    engine = VE.FxEngine(VE.KA.CPU())
+    img = Ref{Any}(nothing)
+    VE.render(engine, clip.source, clip, 0) do o; img[] = copy(o); end
+    @test size(img[]) == (64, 48)
+    # it DREW, and it did not cover the frame: a scene is transparent where it
+    # drew nothing, which is what lets it sit over a clip
+    drawn = count(!=(VE.RGB{VE.N0f8}(0, 0, 0)), img[])
+    @test 0 < drawn < length(img[])
+    VE.emptyengine!(engine)
 end
 
-@testset "scenespec: reordering parts does not re-aim a curve" begin
-    # THE reason paths are by name. With `plots[2].angle` this test is the bug:
-    # inserting anything ahead of a part silently points its curve at a neighbour.
-    spec = VE.SceneSpec([meshpart(:torso), meshpart(:arm_left, :torso)])
-    VE.setscenepath!(spec, "arm_left.angle", 0.5)
+@testset "what is animatable comes from the scene" begin
+    spec = S.Scene(; camera = Makie.campixel!,
+                   plots = [Makie.PlotSpec(:Scatter, [Makie.Point2f(10, 10)];
+                                           markersize = 8.0, name = :dot)])
+    clip = VE.sceneclip((root = spec, joints = Dict{Symbol, Any}(), camera = nothing);
+                        frames = 30, canvas = (64, 48))
+    src = clip.source
+    # BEFORE anything is rendered there is no scene, so there is nothing to offer —
+    # and that is why the card is lazy rather than eager
+    @test isempty(VE.sceneattributes(src))
 
-    reordered = VE.SceneSpec(reverse(spec.parts); backend = spec.backend)
-    @test reordered.parts[1].name === :arm_left          # it really did move
-    @test VE.scenepathvalue(reordered, "arm_left.angle") == 0.5
-    # …and inserting a part in front changes nothing either
-    grown = VE.SceneSpec(vcat([meshpart(:head, :torso)], spec.parts))
-    @test VE.scenepathvalue(grown, "arm_left.angle") == 0.5
-    @test VE.scenepathvalue(grown, "torso.angle") == 0.0
+    engine = VE.FxEngine(VE.KA.CPU())
+    VE.render(engine, src, clip, 0) do _; nothing end
+    objs = VE.sceneattributes(src)
+    @test !isempty(objs)
+    dot = objs[findfirst(o -> o.name === :dot, objs)]
+    paths = [String(r.path) for r in dot.rows]
+    # a scatter's `markersize` is a `Vec2f`, so it is two rows — the row kind
+    # comes from the VALUE, not from a list of attribute names
+    @test "dot.markersize[1]" in paths && "dot.markersize[2]" in paths
+    @test "dot.strokewidth" in paths                    # …and a scalar is one row
+    # a DERIVED attribute is not a row: `eyeposition` and friends are answers
+    # Makie computed from the scene, and a slider on an answer gets overwritten
+    @test !any(startswith("dot.eyeposition"), paths)
+    @test !any(startswith("dot.N_"), paths)
+
+    # writing a path lands on the plot itself
+    @test VE.setscenevalue!(src, Symbol("dot.markersize[1]"), 20.0)
+    plot = Makie.findplot(VE.targetscene(src.live.target), :dot)
+    @test Makie.to_value(plot.attributes[:markersize])[1] ≈ 20.0
+    # …and a path that addresses nothing says so instead of throwing
+    @test !VE.setscenevalue!(src, Symbol("nosuch.thing"), 1.0)
+    VE.emptyengine!(engine)
 end
 
-@testset "scenespec: names must be unique" begin
-    # A duplicate makes the second part unreachable — `findfirst` takes the first
-    # — so it is refused at construction rather than animating the wrong arm.
-    @test_throws ErrorException VE.SceneSpec([meshpart(:arm), meshpart(:arm)])
-    # `camera` is reserved: "camera.eye[1]" is how a camera move is keyframed
-    @test_throws ErrorException VE.SceneSpec([meshpart(:camera)])
-end
-
-@testset "scenespec: the camera is keyframed like anything else" begin
-    spec = VE.SceneSpec([meshpart(:torso)];
-                        camera = VE.CameraSpec(; eye = (100.0, 30.0, 80.0),
-                                               lookat = (0.0, 0.0, -10.0)))
-    @test VE.scenepathvalue(spec, "camera.eye") == (100.0, 30.0, 80.0)
-    @test VE.scenepathvalue(spec, "camera.eye[1]") == 100.0
-    @test VE.setscenepath!(spec, "camera.eye[1]", 60.0)
-    @test VE.scenepathvalue(spec, "camera.eye") == (60.0, 30.0, 80.0)
-    @test VE.scenepathvalue(spec, "camera.nosuchfield") === nothing
-end
-
-@testset "scenespec: animating writes a copy" begin
-    spec = VE.SceneSpec([meshpart(:torso), meshpart(:arm_left, :torso)])
-    a = VE.animatedspec(spec, (; Symbol("arm_left.angle") => 0.9))
-    @test VE.scenepathvalue(a, "arm_left.angle") == 0.9
-    # the ORIGINAL is untouched: mutating in place would make the animation
-    # cumulative — a curve that ended at frame 10 would still be showing its last
-    # value at frame 11 instead of the spec's own
-    @test VE.scenepathvalue(spec, "arm_left.angle") == 0.0
-    # a key that addresses nothing is skipped, not fatal — `overlaystate` merges
-    # reserved keys like `frame`/`framerate` into the same namedtuple
-    b = VE.animatedspec(spec, (; :frame => 7, Symbol("arm_left.angle") => 0.2))
-    @test VE.scenepathvalue(b, "arm_left.angle") == 0.2
-end
-
-@testset "scenespec: a point light falls off with distance" begin
-    # ONE intensity number, TWO renderers. A raytracer is physical by
-    # construction, but Makie's `PointLight` defaults to `attenuation = Vec2f(0)`
-    # — no falloff at all — so a lamp written for RayMakie reached GLMakie
-    # undimmed. Measured on the lego figure: intensity 15000 at 269 units came
-    # back a flat (1.0, 1.0, 1.0) on every lit pixel, and the diagnosis that
-    # invites is "the legs are missing" when they are blue legs blown to white.
-    lights = VE.makielights([VE.LightSpec(:ambient; color = (0.1, 0.1, 0.1)),
-                             VE.LightSpec(:point; color = (15000.0, 15000.0, 15000.0),
-                                          position = (150.0, 100.0, 200.0))])
-    pt = lights[2]
-    @test pt isa Makie.PointLight
-    @test pt.attenuation == Makie.Vec2f(0, 1)   # 1/(1 + 0*d + 1*d^2)
-    # ambient has no position and so nothing to fall off
-    @test lights[1] isa Makie.AmbientLight
-end
-
-@testset "scenespec: a scene overlay survives save/load" begin
-    # THE GAP THIS CLOSES. `tomlvalue`'s fallback is `string(v)`, so a SceneSpec
-    # in an overlay's settings was saved as its `show` form — unreadable — and
-    # the project reopened with `spec` a String. `:scene`'s draw opens with
-    # `spec isa SceneSpec || return`, so the scene came back SILENTLY ABSENT.
-    # The round trip through `scenedict` alone (below) never caught it, because
-    # nothing tested the SETTINGS carrying one.
-    src = VE.VideoSource(testvideo)
-    seq = VE.Sequence(src)
-    spec = VE.SceneSpec(
-        [VE.ScenePart(:torso, Makie.PlotSpec(:Mesh, "lego_figure_torso.stl")),
-         VE.ScenePart(:arm_left, Makie.PlotSpec(:Mesh, "lego_figure_arm_left.stl");
-                      parent = :torso, origin = (0.1427, 6.2127, 5.7342),
-                      axis = (0.0, 0.9828, 0.1848))];
-        backend = :GLMakie)
-    # `bakewith` is GLMakie here, not RayMakie: the suite does not load a
-    # raytracer, and what is under test is that a SETTING survives as a name the
-    # registry accepts — not which renderer it names.
-    ov = VE.addoverlay!(seq, :scene; start = 0, stop = 60,
-                        spec = spec, bakewith = :GLMakie)
-    VE.setoverlaykey!(ov, Symbol("arm_left.angle"), 0, 0.0)
-    VE.setoverlaykey!(ov, Symbol("arm_left.angle"), 30, 0.8)
-
-    path = joinpath(mktempdir(), "scene.videoedit.json")
-    VE.saveproject(path, seq)
-    back = VE.loadproject(path)
-    bov = back.overlays[1]
-    got = get(bov.settings, :spec, nothing)
-
-    @test got isa VE.SceneSpec                     # NOT a String
-    @test length(got.parts) == 2
-    @test VE.partbyname(got, :arm_left).parent === :torso
-    @test VE.scenepathvalue(got, "arm_left.origin[2]") ≈ 6.2127
-    # a setting comes back as a STRING, and `bake!` feeds it straight to
-    # `getbackend` — without a String method that was a MethodError on the first
-    # bake after reopening
-    @test get(bov.settings, :bakewith, nothing) == "GLMakie"
-    @test VE.getbackend(get(bov.settings, :bakewith, :GLMakie)) === VE.getbackend(:GLMakie)
-    # …and a name nobody registered still says so, rather than rendering nothing
-    @test_throws ErrorException VE.getbackend("NoSuchBackend")
-    # the curves are the animation — they must survive with their values
-    @test length(bov.animations[Symbol("arm_left.angle")].keys) == 2
-    @test VE.overlaystate(bov, 30; framerate = 30.0)[Symbol("arm_left.angle")] ≈ 0.8
-end
-
-@testset "scenespec: a bake never reaches the project file" begin
-    # `bake!` parks rendered frames in `settings`, and `tomlvalue`'s fallback
-    # would have written the `show` form of a Dict of images into the JSON —
-    # megabytes of pixel repr in place of an edit. The bake is DERIVED from the
-    # spec and the curves, both of which are saved.
-    seq = VE.Sequence(VE.VideoSource(testvideo))
-    spec = VE.SceneSpec([VE.ScenePart(:torso, Makie.PlotSpec(:Mesh, "lego_figure_torso.stl"))])
-    ov = VE.addoverlay!(seq, :scene; start = 0, stop = 4, spec = spec)
-    # qualified through `VE`: the suite's Main has neither ColorTypes nor
-    # FixedPointNumbers, and a testset that only ran in my own session with them
-    # imported is a testset that has not run
-    frames = Dict{Int, Matrix{VE.RGBA{VE.N0f8}}}(
-        n => fill(VE.RGBA{VE.N0f8}(1, 0, 0, 1), 64, 64) for n in 0:3)
-    ov.settings = merge(ov.settings, (baked = frames, bakedcanvas = (64, 64)))
-    @test VE.bakedframes(ov) !== nothing
-
-    path = joinpath(mktempdir(), "baked.videoedit.json")
-    VE.saveproject(path, seq)
-    @test filesize(path) < 20_000            # not the pixels
-    back = VE.loadproject(path)
-    @test VE.bakedframes(back.overlays[1]) === nothing        # cache dropped
-    @test get(back.overlays[1].settings, :spec, nothing) isa VE.SceneSpec  # scene kept
-end
-
-@testset "scenespec: a bake survives to disk and comes back" begin
-    # A bake costs minutes, so it goes beside the project like a matte does and
-    # is reloaded on open — including after a crash.
-    seq = VE.Sequence(VE.VideoSource(testvideo))
-    spec = VE.SceneSpec([VE.ScenePart(:torso, Makie.PlotSpec(:Mesh, "lego_figure_torso.stl"))];
-                        backend = :GLMakie)
-    ov = VE.addoverlay!(seq, :scene; start = 0, stop = 4, spec = spec, bakewith = :GLMakie)
-    VE.setoverlaykey!(ov, Symbol("torso.angle"), 0, 0.0)
-    VE.setoverlaykey!(ov, Symbol("torso.angle"), 3, 0.5)
-
-    path = joinpath(mktempdir(), "bake.videoedit.json")
-    canvas = (64, 64)
-    @test VE.bake!(ov, canvas; framerate = 30.0, into = path) == 4
-    VE.saveproject(path, seq)
-
-    # A: it comes back, exactly
-    back = VE.loadproject(path)
-    got = VE.bakedframes(back.overlays[1])
-    @test got !== nothing && length(got) == 4
-    @test all(got[k] == VE.bakedframes(ov)[k] for k in keys(got))
-
-    # B: an edit makes it STALE, and stale must lose. This failed the first time:
-    # `savebakes` recomputed the fingerprint at save time, stamping the new one
-    # onto the old frames, so a changed keyframe reloaded as though current. The
-    # fingerprint is taken WITH the frames and travels with them.
-    edited = VE.loadproject(path)
-    VE.setoverlaykey!(edited.overlays[1], Symbol("torso.angle"), 3, 1.4)
-    VE.saveproject(path, edited)
-    @test VE.bakedframes(VE.loadproject(path).overlays[1]) === nothing
-
-    # C: a crash mid-bake leaves SOME frames; those still count, the rest go live
-    seq2 = VE.Sequence(VE.VideoSource(testvideo))
-    ov2 = VE.addoverlay!(seq2, :scene; start = 0, stop = 4, spec = spec, bakewith = :GLMakie)
-    p2 = joinpath(mktempdir(), "crash.videoedit.json")
-    VE.bake!(ov2, canvas; framerate = 30.0, into = p2)
-    VE.saveproject(p2, seq2)
-    dir = VE.bakeframedir(p2, ov2.id)
-    for f in readdir(dir)[3:end]
-        rm(joinpath(dir, f))
+@testset "the screen is held across frames, and a sample accumulates" begin
+    # TWO claims of step 7, both cheap to lose and both expensive when lost.
+    #
+    # The source pass HOLDS the screen and the plots. Rebuilding a GLMakie screen
+    # per frame is not a slowdown, it is a different program — every plot is
+    # recreated, every attribute forgotten, and a path tracer starts from zero
+    # every time. So the identity of the live scene, not just the picture, is what
+    # has to be asserted.
+    spec = S.Scene(; camera = Makie.campixel!,
+                   plots = [Makie.PlotSpec(:Scatter, [Makie.Point2f(10, 10)];
+                                           markersize = 8.0, name = :dot)])
+    clip = VE.sceneclip((root = spec, joints = Dict{Symbol, Any}(), camera = nothing);
+                        frames = 30, canvas = (64, 48))
+    src = clip.source
+    engine = VE.FxEngine(VE.KA.CPU())
+    VE.render(engine, src, clip, 0) do _; nothing end
+    live1 = src.live
+    @test live1 !== nothing
+    for f in (0, 1, 2, 3)
+        VE.render(engine, src, clip, f) do _; nothing end
     end
-    partial = VE.loadproject(p2).overlays[1]
-    @test length(VE.bakedframes(partial)) == 2
-    @test VE.bakedframe(partial, 0, canvas) !== nothing    # kept
-    @test VE.bakedframe(partial, 3, canvas) === nothing    # missing → drawn live
+    @test src.live === live1                     # …the same screen, four frames on
+    plot1 = Makie.findplot(VE.targetscene(src.live.target), :dot)
+    VE.render(engine, src, clip, 4) do _; nothing end
+    @test Makie.findplot(VE.targetscene(src.live.target), :dot) === plot1
+
+    # PROGRESSIVE: one sample per read at a position, the count reset when the
+    # position moves. `sceneframe!` clears the film on the first read at a
+    # position and adds to it after — a rasteriser ignores that, a path tracer is
+    # the reason it exists, and both go through the same counter.
+    VE.render(engine, src, clip, 10) do _; nothing end
+    @test src.at == 10
+    n = src.samples
+    VE.render(engine, src, clip, 10) do _; nothing end
+    @test src.samples == n + 1                   # standing still ADDS
+    VE.render(engine, src, clip, 11) do _; nothing end
+    @test src.at == 11 && src.samples == 1       # …moving throws the film away
+
+    # a canvas change IS a new screen — the settings go in at construction
+    Base.resize!(src, (32, 24))
+    VE.render(engine, src, clip, 11) do _; nothing end
+    @test src.live !== live1
+    VE.emptyengine!(engine)
 end
 
-@testset "scenespec: survives the project file" begin
-    spec = VE.SceneSpec(
-        [VE.ScenePart(:torso, Makie.PlotSpec(:Mesh, "lego_figure_torso.stl";
-                                             color = :orangered)),
-         VE.ScenePart(:arm_left, Makie.PlotSpec(:Mesh, "lego_figure_arm_left.stl");
-                      parent = :torso, origin = (0.1427, 6.2127, 5.7342),
-                      axis = (0.0, 0.9828, 0.1848), angle = 0.25)];
-        lights = [VE.LightSpec(:ambient; color = (0.1, 0.1, 0.1)),
-                  VE.LightSpec(:point; color = (15000.0, 15000.0, 15000.0),
-                               position = (150.0, 100.0, 200.0))],
-        camera = VE.CameraSpec(; eye = (100.0, 30.0, 80.0), lookat = (0.0, 0.0, -10.0)),
-        backend = :RayMakie,
-        theme = Dict{Symbol, Any}(:RayMakie => Dict{Symbol, Any}(:exposure => 0.8)))
+@testset "a missing renderer is reported, not substituted" begin
+    # Step 9's rule. A scene names the renderer that drew it; opening the project
+    # on a machine without that package must SAY so, not quietly hand the clip to
+    # whatever is loaded and show a different picture than the one that was saved.
+    spec = S.Scene(; camera = Makie.campixel!,
+                   plots = [Makie.PlotSpec(:Scatter, [Makie.Point2f(1, 1)]; name = :dot)])
+    clip = VE.sceneclip((root = spec, joints = Dict{Symbol, Any}(), camera = nothing);
+                        frames = 10, canvas = (32, 24))
+    clip.source.backend = :NoSuchMakie
+    clip.source.bakewith = :AlsoMissing
+    seq = Sequence([clip], 30.0)
+    absent = @test_logs (:warn,) VE.reportbackends(seq)   # not `missing`: that is Base's
+    @test absent == [:AlsoMissing, :NoSuchMakie]       # BOTH sets of settings
+    @test clip.source.backend === :NoSuchMakie         # …and nothing was replaced
 
-    back = VE.scenefromdict(VE.JSON.parse(VE.JSON.json(VE.scenedict(spec))))
+    # …while a project that names only loaded renderers says nothing at all
+    clip.source.backend = :GLMakie
+    clip.source.bakewith = :auto
+    @test isempty(VE.reportbackends(seq))
+end
 
-    @test back.backend === :RayMakie
-    @test length(back.parts) == 2
-    # the TREE survives — without it the animation is a matrix per part
-    @test VE.partbyname(back, :arm_left).parent === :torso
-    @test VE.partbyname(back, :torso).parent === nothing
-    @test VE.scenepathvalue(back, "arm_left.angle") ≈ 0.25
-    @test VE.scenepathvalue(back, "arm_left.origin[2]") ≈ 6.2127
-    # the mesh is a FILE NAME, not a vertex array: a project file cannot hold one
-    @test back.parts[1].plot.args[1] == "lego_figure_torso.stl"
-    @test back.parts[1].plot.kwargs[:color] == Makie.to_color(:orangered)
-    # lights, camera and the backend's own settings all come back
-    @test length(back.lights) == 2 && back.lights[2].type === :point
-    @test back.lights[2].color[1] ≈ 15000.0
-    @test back.camera.eye == (100.0, 30.0, 80.0)
-    @test back.theme[:RayMakie][:exposure] ≈ 0.8
+@testset "a rig's axis is data, its angle is a parameter" begin
+    rig = Dict{String, Any}("parts" => [
+        Dict{String, Any}("name" => "torso", "type" => "Scatter",
+                          "args" => [[Makie.Point3f(0, 0, 0)]],
+                          "origin" => [0.0, 0.0, 0.0], "axis" => [0.0, 0.0, 1.0]),
+        Dict{String, Any}("name" => "arm", "type" => "Scatter", "parent" => "torso",
+                          "args" => [[Makie.Point3f(1, 0, 0)]],
+                          "origin" => [1.0, 0.0, 0.0], "axis" => [0.0, 1.0, 0.0])])
+    built = VE.buildscene(Dict{String, Any}("kind" => "rig", "rig" => rig))
+    @test length(built.joints) == 2
+    @test built.joints[:arm].axis ≈ VE.Vec3f(0, 1, 0)   # …from the description
+    @test built.camera !== nothing
+
+    clip = VE.sceneclip(built; frames = 20, canvas = (64, 48))
+    fx = VE.findslot(clip, :scene)
+    engine = VE.FxEngine(VE.KA.CPU())
+    VE.render(engine, clip.source, clip, 0) do _; nothing end
+
+    objs = VE.sceneattributes(clip.source)
+    arm = objs[findfirst(o -> o.name === :arm, objs)]
+    paths = [String(r.path) for r in arm.rows]
+    # the joint's rows come from the DESCRIPTION — `angle` and `offset` are not
+    # Makie attributes, they are how the part is hung
+    @test "arm.angle" in paths && "arm.offset[1]" in paths
+
+    # keyframing the angle turns the part, and the parent chain carries the rest
+    push!(fx.params, VE.Param(Symbol("arm.angle"), "Angle", 0.0; range = (-3.2, 3.2)))
+    p = VE.param(fx, Symbol("arm.angle"))
+    p.curve = VE.AnimCurve{Float64}()
+    VE.setkey!(p.curve, 0, 0.0); VE.setkey!(p.curve, 19, 1.5)
+    a = Ref{Any}(nothing); b = Ref{Any}(nothing)
+    VE.render(engine, clip.source, clip, 0) do o; a[] = copy(o); end
+    VE.render(engine, clip.source, clip, 19) do o; b[] = copy(o); end
+    @test count(a[] .!= b[]) > 0
+    VE.emptyengine!(engine)
+end
+
+@testset "a scene clip round-trips through a project file" begin
+    build = VE.scenebuild(:text, (64, 48); text = "HI")
+    seq = Sequence(Clip[], 30.0)
+    clip = VE.sceneclip(VE.buildscene(build); build, frames = 20, canvas = (64, 48))
+    push!(seq.clips, clip)
+    fx = VE.findslot(clip, :scene)
+    push!(fx.params, VE.Param(Symbol("title.fontsize"), "Fontsize", 12.0; range = (1.0, 99.0)))
+    VE.param(fx, Symbol("title.fontsize")).curve = VE.AnimCurve{Float64}()
+    VE.setkey!(VE.param(fx, Symbol("title.fontsize")).curve, 0, 12.0)
+
+    path = tempname() * ".videoedit"
+    saveproject(path, seq)
+    seq2 = loadproject(path)
+    rm(path; force = true)
+    c2 = seq2.clips[1]
+    @test c2.source isa VE.SceneSource
+    @test c2.source.build["kind"] == "text"
+    @test c2.source.root isa Makie.SceneSpec
+    # …and the CURVE came back, which is the whole point of the parameters living
+    # on the effect rather than being discovered fresh from a scene each time
+    p2 = VE.param(VE.findslot(c2, :scene), Symbol("title.fontsize"))
+    @test p2 !== nothing && VE.isanimated(p2)
 end

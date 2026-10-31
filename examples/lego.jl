@@ -10,7 +10,7 @@ begin
     using VideoEditor, GLMakie
     import VideoEditor as VE
 
-    project = "/sim/Programmieren/VideoEdit/media/lego.videoedit.json"
+    project = "/sim/Programmieren/VideoEdit/media/lego.videoedit"
     player = Player(project)            # 640x1138 @ 60 fps, cut at frame 90
 end
 

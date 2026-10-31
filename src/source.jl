@@ -1,4 +1,139 @@
 """
+What a [`Clip`](@ref) shows frames of.
+
+A file on disk is one kind ([`VideoSource`](@ref)); a Makie scene rendered on
+demand is another ([`SceneSource`](@ref)). Everything a clip does — trimming,
+keyframes, the effect stack, the placement, compositing — is the same either way,
+because a clip only ever asks its source for a frame of a given size at a given
+index.
+
+The four numbers below are the interface, and every source has them as FIELDS
+rather than behind accessors: `width`, `height`, `framerate`, `nframes`. What
+differs is answered by dispatch — [`decodable`](@ref) says whether frames come
+from a decoder at all, and the render graph's source pass is chosen by
+[`sourcenode`](@ref).
+"""
+abstract type ClipSource end
+
+"""
+    decodable(source) -> Bool
+
+Whether frames of this source come out of a video decoder. False for a source
+that RENDERS its frames, which therefore needs no decode pool, no proxy, no
+thumbnail scan and no reader.
+"""
+decodable(::ClipSource) = true
+
+"Where this source's media lives, or `\"\"` for one that has no file."
+sourcepath(s::ClipSource) = s.path
+
+"""
+A clip whose frames are RENDERED rather than decoded.
+
+Holds the FORMAT — how big the frames are, how fast, and how many — and the live
+render state. It deliberately does NOT hold the scene: that is a
+[`SceneSpec`](@ref) on the clip's `:scene` effect, where it is document data like
+every other parameter, gets saved with the project, and contributes the animatable
+numbers through [`dataparams`](@ref). A source that also held a spec would be a
+second home for it.
+
+`live` is the standing scene and its screen, kept across frames. That is not an
+optimisation detail: rebuilding it per frame meant re-reading ten STL files from
+disk for every frame of a seek (measured: 0.28 s per frame, against 5.1 ms once
+held), and a PROGRESSIVE renderer cannot work at all without it — RayMakie
+accumulates samples into a screen, and a screen thrown away after each frame has
+nothing to accumulate into.
+"""
+mutable struct SceneSource <: ClipSource
+    # WHAT IT DRAWS: a Makie spec — `S.Scene(; camera = cam3d!, plots = [...])` for
+    # a raw scene, a layout spec when the picture wants an axis. The scene itself,
+    # not a description of it beside one: what is animatable is read off the scene
+    # that gets built (see `sceneattributes`), so there is nothing here that could
+    # fall out of step with what is drawn.
+    root::Any
+    # THE RIG, when the scene has one: a joint per named plot. A joint is `angle`
+    # and `offset` applied through the plot's `Transformation`, and applying them
+    # needs the axis to turn about and the base translation to add to.
+    #
+    # Not on the plot, though that is where it belongs: Makie validates plot
+    # attributes against a closed set, so a `jointaxis` on a `Mesh` is refused.
+    # Owned by whoever BUILT the rig, which is the honest second place — it
+    # describes the rig, not the scene, and nothing else reads it.
+    joints::Dict{Symbol, Any}
+    # Where a 3-D scene looks from, once it exists. `cam3d!` places the eye through
+    # `update_cam!` AFTER the scene is realized, and a spec has nowhere to put that.
+    camera::Any
+    # HOW `root` WAS MADE, as data a project file can hold: `{"kind" => "text",
+    # "args" => …}`. A realized spec holds live objects — a rig's
+    # `Transformation`s, loaded meshes — so it cannot be written out; the recipe
+    # can. A placeholder until scenes serialise themselves; see `buildscene`.
+    build::Any
+    backend::Symbol              # which renderer draws it live
+    theme::Dict{Symbol, Any}     # a backend's own settings, under its own name
+    width::Int
+    height::Int
+    framerate::Float64
+    nframes::Int
+    live::Any                    # LiveScene, built on the first render
+    # What the standing scene was last drawn for. A progressive renderer keeps
+    # refining while this is unchanged and starts over when it is not — see
+    # [`sceneframe!`](@ref).
+    at::Int
+    # TWO BACKENDS, ONE SCENE, and that is the whole workflow. Raytracing a frame
+    # costs ~1.2 s at 480x854 and rasterising it costs milliseconds: scrubbing a
+    # timeline at raytracing speed is not editing, and editing against a rasterised
+    # preview and then shipping it is not the picture you wanted. The scene's own
+    # `backend` is what the preview draws with; this is what a BAKE uses.
+    # `:auto` means "the same one" — a scene that is fast enough live has nothing
+    # to switch to.
+    bakewith::Symbol
+    # …and its SETTINGS. A second set, not a second scene: the point of two
+    # backends is that the preview is cheap and the final render is not, and "how
+    # many samples" is exactly the number that differs between them. Empty means
+    # the bake draws with the live settings.
+    baketheme::Dict{Symbol, Any}
+    # Which of the two is being asked for right now. A field rather than an
+    # argument because the render happens inside a graph pass, several calls below
+    # whoever decided — `bakeclip!` sets it around its loop.
+    mode::Symbol                 # :live | :bake
+    # How many samples a PROGRESSIVE renderer has accumulated at `at`. Reset when
+    # the position moves; grown by `refinescene!` while it holds.
+    samples::Int
+    # THE FRAME, ALREADY DRAWN, and which frame it is. A scene draws with GLMakie,
+    # whose screen belongs to thread 1; the composite runs on whichever thread owns
+    # the Lava context, which is the pinned GPU worker. Drawing inside the pass
+    # body therefore goes thread 1 → worker → thread 1 → worker for every frame,
+    # and the hop back waits for the editor's own renderloop to reach a yield:
+    # measured on the lego project at 22.5 ms of WAITING against 7.3 ms of
+    # drawing, per frame. `prerender!` fills these in while the caller is still on
+    # thread 1; the pass body takes what is here. See [`takepending!`](@ref).
+    pending::Any
+    pendingat::Int
+end
+SceneSource(root; joints::Dict{Symbol, Any} = Dict{Symbol, Any}(), camera = nothing,
+            build = nothing, backend::Symbol = :GLMakie,
+            theme::Dict{Symbol, Any} = Dict{Symbol, Any}(),
+            width::Integer = 1920, height::Integer = 1080,
+            framerate::Real = 30.0, nframes::Integer = 90,
+            bakewith::Symbol = :auto,
+            baketheme::Dict{Symbol, Any} = Dict{Symbol, Any}()) =
+    SceneSource(root, joints, camera, build, backend, theme, Int(width), Int(height),
+                Float64(framerate),
+                Int(nframes), nothing, -1, bakewith, baketheme, :live, 0, nothing, -1)
+
+decodable(::SceneSource) = false
+sourcepath(::SceneSource) = ""
+
+function Base.resize!(s::SceneSource, wh::Tuple{Integer, Integer})
+    w, h = max(Int(wh[1]), 2), max(Int(wh[2]), 2)
+    (s.width, s.height) == (w, h) && return s
+    s.width, s.height = w, h
+    s.live = nothing        # the standing screen is that size; it has to go
+    s.samples = 0
+    return s
+end
+
+"""
     VideoSource(path)
 
 Probed metadata for a video file: dimensions, framerate, duration, frame count,
@@ -13,7 +148,7 @@ sequentially while the preview seeks by time, so every per-frame track (flicker,
 stabilization) landed on the wrong frame — 11 frames off at frame 100 on that
 clip. `frametimes` makes the mapping exact for both.
 """
-struct VideoSource
+struct VideoSource <: ClipSource
     path::String
     width::Int
     height::Int

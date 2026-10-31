@@ -280,12 +280,13 @@ and a radius is an integer by the time anything uses it.
         # both nearer and farther go soft — which is what a lens does, and what
         # makes focusing on a mid-ground subject possible at all.
         rad = clamp(Int32(round(abs(z - focus) * Float32(maxr))), Int32(0), maxr)
-        r = 0.0f0; g = 0.0f0; b = 0.0f0; n = 0.0f0
+        r = 0.0f0; g = 0.0f0; b = 0.0f0; a = 0.0f0; n = 0.0f0
         for j in -rad:rad, i in -rad:rad
             xx = clamp(x + i, Int32(1), w)
             yy = clamp(y + j, Int32(1), h)
             c = img[xx, yy]
             r += Float32(red(c)); g += Float32(green(c)); b += Float32(blue(c))
+            a += alphaof(c)
             n += 1.0f0
         end
         # `unitn0f8`, NOT `RGB{N0f8}(::Float32, …)` — the latter validates and calls
@@ -293,6 +294,8 @@ and a radius is an integer by the time anything uses it.
         # makes Lava reject the whole thing. See the note on `unitn0f8`: the clamp
         # IS the check. This kernel had the validating form and so never compiled,
         # which is why depth blur could not render even once depth existed.
-        out[x, y] = RGB{N0f8}(unitn0f8(r / n), unitn0f8(g / n), unitn0f8(b / n))
+        # Coverage is averaged with the colour: this is a box blur, both are
+        # weighted sums of the same taps, and the plane is premultiplied.
+        out[x, y] = topixel(eltype(out), r / n, g / n, b / n, a / n)
     end
 end

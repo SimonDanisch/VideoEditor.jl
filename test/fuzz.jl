@@ -25,7 +25,7 @@
 using Random
 import VideoEditor as VE
 using VideoEditor: Clip, Effect, MotionTrack, Mat3f, RGBFrame, clipsat, clipend, cliplength,
-                   effectiveclip, locate, ntracks, seqlength
+                   locate, ntracks, seqlength
 
 "A synthetic stabilization: real transforms (no analysis to run) plus the crop
 that hides their borders — the state a stabilized clip is in."

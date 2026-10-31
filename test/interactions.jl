@@ -33,6 +33,16 @@ function tcurve!(clip, name::Symbol)
     return pr.curve
 end
 tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing : pr.curve)
+# The slider a parameter's row is bound to. Keyed by (slot id, param) because a
+# clip can carry two slots of the same kind — a name alone names two widgets.
+function tslider(player, clip, name::Symbol)
+    for fx in clip.effects
+        VE.param(fx, name) === nothing && continue
+        w = get(player.fxsliders, (fx.id, name), nothing)
+        w === nothing || return w
+    end
+    return nothing
+end
 
 @testset "UI interactions" begin
     GLMakie.activate!(; visible = false)
@@ -412,11 +422,17 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             # croprect starts empty, so wait for the outline to appear, then clear
             @test waitfor(() -> !isempty(p.croprect[]))
             @test waitfor(() -> isempty(p.croprect[]))
-            # the card stays put now (it is a tool, not a section that comes and
-            # goes) — pressing Remove on a clean clip says so instead of doing damage.
-            # Re-fetch the button: the panel relaid out after the removal, so the
-            # bbox captured above points at whatever moved into that spot (a stray
-            # press there opened the mode Menu, which then ate the next keystrokes).
+            # THE CARD GOES WITH THE SLOT. An analysis IS a stack entry (see
+            # "analyses are stack slots"), so removing the track removes the
+            # StabilizeEffect and the panel has nothing to draw a card from. The
+            # old promise — "the card stays put, it is a tool" — belonged to the
+            # Tools dock, which every tool shared and nothing owned.
+            @test VE.findslot(clip, VE.StabilizeEffect) === nothing
+            @test findfirst(c -> c.title[] == "Stabilize", p.fxwidgets[:fxcards]) === nothing
+            # …and asking for it again brings it back, on a clean clip: Remove
+            # then SAYS there is nothing rather than doing damage.
+            stabopen()
+            @test VE.findslot(clip, VE.StabilizeEffect) !== nothing
             rmbtn2 = p.fxwidgets[:remove]
             bb2 = rmbtn2.layoutobservables.computedbbox[]
             press(Point2f(bb2.origin .+ bb2.widths ./ 2)); release()
@@ -432,12 +448,13 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             @test p.playhead[] == 9
             clip = p.sequence.clips[1]
             VE.startproxy!(p, clip.source; height = 90)
-            t0 = time()
-            while size(p.frame[]) != (160, 90) && time() - t0 < 20
-                sleep(0.1)
-            end
-            @test size(p.frame[]) == (160, 90)       # preview decodes the proxy
-            @test VE.pool(p, clip.source).source.height == 90
+            @test waitfor(() -> VE.pool(p, clip.source).source.height == 90; s = 20)
+            # …and the preview follows it. NOT a fixed (160, 90): the canvas is
+            # derived (`canvassize`), so a clip cropped in an earlier beat makes it
+            # smaller than the proxy — what has to hold is that the preview is the
+            # CANVAS and that the canvas came down with the proxy.
+            @test waitfor(() -> size(p.frame[]) == VE.canvassize(p.sequence); s = 20)
+            @test size(p.frame[], 1) <= 160
             # the axis limits follow on the first successful present — the
             # crop drag below maps through them, so wait for the switch
             @test waitfor(() -> maximum(p.previewaxis.finallimits[])[1] <= 161)
@@ -879,10 +896,10 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             @test all(==(0x80), VE.depthbytes(fill(0.5f0, 3, 3)))   # no range at all
             @test all(==(0x80), VE.depthbytes(fill(NaN32, 2, 2)))   # …and no finite range
 
-            # The effect survives a project-file roundtrip, which is what a new effect
-            # most often forgets: `effectdict`/`effectfromdict` are two lists to update.
+            # The effect survives a project-file roundtrip — which a new effect used
+            # to have to remember, back when the format was two lists to update.
             e = VE.DepthBlurEffect(; focus = 0.25, strength = 0.75)
-            @test VE.op(VE.effectfromdict(VE.effectdict(VE.Effect(e)))) == e
+            @test VE.op(packrt(VE.Effect(e))) == e
             @test VE.isneutral(VE.DepthBlurEffect(; strength = 0.0))
             @test !VE.isneutral(e)
 
@@ -1018,7 +1035,9 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             VE.docrestore!(p, snap0)
             @test isempty(p.sequence.captions)
 
-            @test haskey(VE.OVERLAYBYNAME, :captions)
+            # …and there is a preset that puts them on the timeline as a clip
+            @test VE.buildscene(VE.scenebuild(:captions, (320, 180))).root isa
+                  VE.Makie.SceneSpec
 
             # …and a transcript is a GUESS, so it must be correctable without
             # re-running the model. `captionindexat` is what the editor asks with
@@ -2006,7 +2025,7 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             @test Makie.to_value(trio()[2].label) == "◇"
             ghost0 = sum(length(q.curve.keys) for fx in clip.effects for q in fx.params
                           if VE.isanimated(q) && q.name !== :contrast; init = 0)
-            Makie.set_close_to!(p.fxsliders[:contrast], 1.6); sleep(0.4)
+            Makie.set_close_to!(tslider(p, VE.editclip(p)[1], :contrast), 1.6); sleep(0.4)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             f2 = VE.playheadframe(p, clip)
             @test length(tcurve!(clip, :contrast).keys) == 2
@@ -2032,7 +2051,7 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             # --- rebuild a 2-key ramp for the gesture checks ---
             notify(trio()[2].clicks); sleep(0.3)                    # key at f1'
             press(tlx(2.8)); release(); sleep(0.2)
-            Makie.set_close_to!(p.fxsliders[:contrast], 1.6); sleep(0.4)
+            Makie.set_close_to!(tslider(p, VE.editclip(p)[1], :contrast), 1.6); sleep(0.4)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             ka, kb = (k.frame for k in tcurve!(clip, :contrast).keys)
 
@@ -2048,25 +2067,29 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             @test any(k -> k.frame == mid, tcurve!(clip, :contrast).keys)
 
             # --- hidden curves are INERT: the same grab must scrub, not retime ---
-            p.kfvisible[] = false; sleep(0.2)
+            # `tcurve`, never `tcurve!`: opening the lane is what `tcurve!` does,
+            # and reading the keys through it would put back exactly the state
+            # this beat is about.
             VE.seek!(p, clip.start); sleep(0.2)
-            keysbefore = [(k.frame, k.value) for k in tcurve!(clip, :contrast).keys]
+            keysbefore = [(k.frame, k.value) for k in tcurve(clip, :contrast).keys]
             hidden = markerpix(:contrast, mid)
+            VE.showcurves!(p, false); sleep(0.3)
+            @test !VE.anycurvevisible(p)
             press(hidden); moveto(hidden .+ Point2f(-40, 0)); release(); sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             @test p.playhead[] != clip.start                       # it scrubbed
-            @test [(k.frame, k.value) for k in tcurve!(clip, :contrast).keys] == keysbefore
-            p.kfvisible[] = true; sleep(0.2)
+            @test [(k.frame, k.value) for k in tcurve(clip, :contrast).keys] == keysbefore
+            VE.showcurves!(p, true); sleep(0.2)
 
             # --- Alt-click with no animated curve nearby only hints ---
-            saved = copy(clip.effects); empty!(clip.effects)
+            saved = copy(clip.effects); empty!(clip)
             notify(p.playhead); sleep(0.2)
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.press)
             press(tlx((clip.start + (mid - clip.src_in)) / fps)); release()   # same clip, no curves
             ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.release)
             sleep(0.2)
             @test !VE.isanimated(clip)                         # nothing invented
-            merge!(clip.effects, saved); notify(p.playhead); sleep(0.2)
+            foreach(fx -> VE.addslot!(clip, fx), saved); notify(p.playhead); sleep(0.2)
 
             # --- right-click ◆ → per-KEY ease: smoothing kb flattens ITS tangent ---
             clip = VE.locate(p.sequence, p.playhead[])[1]
@@ -2113,8 +2136,8 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             VE.setkey!(tcurve!(clip, :contrast), sf0, 0.2)
             VE.setkey!(tcurve!(clip, :contrast), clip.src_out - 1, 1.9)
             notify(p.playhead); sleep(0.3)
-            @test VE.valueat(tparam(VE.effectiveclip(clip, sf0), :contrast), 0) ≈ 0.2 atol = 1.0e-6
-            @test VE.valueat(tparam(VE.effectiveclip(clip, clip.src_out - 1), :contrast), 0) ≈ 1.9 atol = 1.0e-6
+            @test VE.valueat(tparam(clip, :contrast), sf0) ≈ 0.2 atol = 1.0e-6
+            @test VE.valueat(tparam(clip, :contrast), clip.src_out - 1) ≈ 1.9 atol = 1.0e-6
             (tparam(clip, :contrast).curve = nothing)                    # leave the state clean
             notify(p.playhead); sleep(0.2)
         end
@@ -2131,7 +2154,7 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             press(tlx(2.0)); release(); sleep(0.2)
             fps = p.sequence.framerate
             base = VE.locate(p.sequence, p.playhead[])[1]
-            savedanims = copy(base.effects); empty!(base.effects)
+            savedanims = copy(base.effects); empty!(base)
             c2 = VE.split!(p.sequence, base.start + (VE.clipend(base) - base.start) ÷ 2)
             c2.start = base.start; c2.track = base.track + 1
             VE.refreshedit!(p); sleep(0.3)
@@ -2190,12 +2213,12 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             @test any(k -> k.frame < f0, oparam.curve.keys)
 
             # restore the timeline: unstack the half and join it back onto base
-            empty!(base.effects)
-            empty!(c2.effects)
+            empty!(base)
+            empty!(c2)
             c2.track = base.track
             c2.start = VE.clipend(base)
             @test VE.joinclips!(p.sequence, base.start) !== nothing
-            merge!(base.effects, savedanims)
+            foreach(fx -> VE.addslot!(base, fx), savedanims)
             VE.refreshedit!(p); notify(p.playhead); sleep(0.3)
         end
 
@@ -2206,7 +2229,7 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             clip = VE.locate(p.sequence, p.playhead[])[1]
             farm = tcurve!(clip, :contrast).keys[1].frame
             VE.play!(p); sleep(0.5)                    # playhead advancing
-            Makie.set_close_to!(p.fxsliders[:contrast], 1.8)
+            Makie.set_close_to!(tslider(p, VE.editclip(p)[1], :contrast), 1.8)
             sleep(0.2); VE.pause!(p); sleep(0.2)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             ks = tcurve!(clip, :contrast).keys
@@ -2227,8 +2250,16 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             nbefore = VE.seqlength(p.sequence)
             nclips0 = length(p.sequence.clips)
             VE.opendock!(p, :effects)                # card clicks need the panel open
-            VE.activatetool!(p, :loopfinder)
-            @test VE.activetoolname(p)[] === :loopfinder
+            # THE PANEL'S OWN ROUTE, because that is what makes the card exist: the
+            # loop finder is a kind with a `make`, so the Add menu puts a SLOT on
+            # the clip, the slot gets a card, and the card is where the tool's own
+            # reference cards are built. Calling `activatetool!` straight had the
+            # tool running with nowhere to draw.
+            @test VE.addeffect!(p, :loopfinder)
+            lfpanel() = p.fxwidgets[:toolpanels][:loopfinder]
+            @test waitfor(() -> haskey(get(p.fxwidgets, :toolpanels, Dict()), :loopfinder))
+            lfpanel().callbacks[1]()          # "Find similar frames" — turns it on
+            @test waitfor(() -> VE.activetoolname(p)[] === :loopfinder)
             ctx = VE.activetool(p)[2]
             @test waitfor(() -> ctx.state !== nothing && !isempty(ctx.state[:refs]); s = 25)
             sleep(0.4)                               # uiqueue draws card + hints
@@ -2246,7 +2277,7 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             @test VE.activetoolname(p)[] === :loopfinder
             # Find adds a SECOND reference card (signatures cached — instant)
             press(tlx(1.0)); release()               # another playhead frame
-            VE.activetool(p)[2].callbacks[1]()       # the panel's Find action
+            lfpanel().callbacks[1]()                 # the panel's Find action
             # the clip under t=1.0 may be an UNCACHED split half (the ▼ cut position
             # is content-driven) — the Find then runs a fresh async analysis; wait
             # for the card like the first Find did instead of a fixed sleep
@@ -2284,11 +2315,18 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             VE.split!(p); sleep(0.3)
             @test length(p.sequence.clips) == nclips + 1
             c1 = p.sequence.clips[1]; c2 = p.sequence.clips[2]
-            pctx = p.fxwidgets[:toolpanels][:blend]
+            # The card is reached the way every other kind is — through the panel,
+            # which puts the slot on the clip. There is no dock that shows every
+            # tool whether or not it was asked for.
+            @test VE.showkind!(p, :blend); sleep(0.3)
+            # RE-FETCHED, never held: the panel rebuilds on every edit and hands
+            # each body a fresh context, so a captured one is the cleared layout
+            # from before the blend was made.
+            pctx() = p.fxwidgets[:toolpanels][:blend]
             @test VE.activetoolname(p)[] === :none      # nothing on …
-            @test !isempty(pctx.controls)               # … and the card is filled anyway
-            @test length(pctx.rows) == 1                # "no blends yet" placeholder
-            @test pctx.state[:fit]                      # "move clips to fit" is the default
+            @test !isempty(pctx().controls)             # … and the card is filled anyway
+            @test length(pctx().rows) == 1              # "no blends yet" placeholder
+            @test pctx().state[:fit]                    # "move clips to fit" is the default
 
             tl.selection[] = [1, 2]; sleep(0.2)
             VE.activatetool!(p, :blend); sleep(0.5)     # clicking the header blends
@@ -2296,9 +2334,9 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             @test isempty(p.sequence.transitions)       # NOT a transition
             @test VE.isanimated(tparam(c2, :opacity))         # the later clip fades in
             @test !VE.isanimated(tparam(c1, :opacity))        # the earlier one is untouched
-            @test c2.blendfrom == c1.id                 # the pair is REMEMBERED, not guessed
+            @test VE.blendpartner(p.sequence, c2) == 1   # the pair is REMEMBERED, not guessed
             @test VE.blends(p.sequence) == [(1, 2, VE.fadeinlength(c2))]
-            @test length(pctx.rows) == 1                # one row per blend
+            @test length(pctx().rows) == 1              # one row per blend
             # with the option ticked the clips are already arranged: one step, done
             @test c2.start < VE.clipend(c1)
             @test VE.clipend(c1) - c2.start == VE.fadeinlength(c2)
@@ -2307,12 +2345,12 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             # overlap follows it
             tl.selection[] = Int[]; tl.selected[] = 2; sleep(0.3)
             @test VE.selectedblend(p) !== nothing
-            VE.setblendlength!(pctx, 1.0); sleep(0.4)
+            VE.setblendlength!(pctx(), 1.0); sleep(0.4)
             @test VE.fadeinlength(c2) == round(Int, 1.0 * fps)
             @test VE.clipend(c1) - c2.start == VE.fadeinlength(c2)
             mid = c2.start + VE.fadeinlength(c2) ÷ 2
             @test length(VE.clipsat(p.sequence, mid)) == 2
-            @test 0.2 < VE.paramvalue(c2, :opacity, c2.src_in + (mid - c2.start)) < 0.8
+            @test 0.2 < VE.valueat(VE.opacityparam(c2), c2.src_in + (mid - c2.start)) < 0.8
 
             # the blend IS an effect entry: switch it off (keys stay), then remove it
             slot = VE.findslot(c2, VE.OpacityEffect)
@@ -2346,11 +2384,14 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             @test c2.track >= track0
 
             # × clears keys, effect entry and the pair together
-            VE.clearfade!(c2, :in); c2.blendfrom = UInt64(0)   # what × does
+            VE.removeblend!(p.sequence, c2)              # what × does
             VE.refreshedit!(p); sleep(0.2)
-            @test !VE.isanimated(tparam(c2, :opacity))
+            # …asserted BEFORE anything asks for the parameter: `tparam` CREATES
+            # the effect when the clip has none, so reading it here would put back
+            # exactly what this beat is about.
             @test VE.findslot(c2, VE.OpacityEffect) === nothing
-            @test c2.blendfrom == 0
+            @test VE.opacityparam(c2) === nothing
+            @test VE.blendpartner(p.sequence, c2) === nothing
             @test isempty(VE.blends(p.sequence))
             # restore for the following beats
             c2.start, c2.track = start0, track0
@@ -2390,7 +2431,7 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             track0, start0 = upper.track, upper.start
             upper.track = 2
             upper.start = lower.start + VE.cliplength(lower) ÷ 2   # overlap the lower one
-            empty!(upper.effects); empty!(lower.effects)
+            empty!(upper); empty!(lower)
             VE.refreshedit!(p); sleep(0.3)
             over = upper.start + 5                                  # both clips cover this
             VE.seek!(p, over); sleep(0.3)
@@ -2413,7 +2454,7 @@ tcurve(clip, name::Symbol) = (pr = tparam(clip, name); pr === nothing ? nothing 
             VE.togglekey!(p, VE.editclip(p)[1], tparam(VE.editclip(p)[1], :opacity)); sleep(0.2)
             @test VE.isanimated(tparam(upper, :opacity))
 
-            empty!(upper.effects); empty!(lower.effects)      # restore for later beats
+            empty!(upper); empty!(lower)      # restore for later beats
             upper.track, upper.start = track0, start0
             VE.refreshedit!(p); sleep(0.2)
             VE.undo!(p); VE.undo!(p); VE.undo!(p); sleep(0.2)       # two keyframe snapshots + the split
@@ -2660,40 +2701,120 @@ end
     @test length(VE.EFFECTS.version.listeners) == n0
 end
 
-# THE GAP THIS CLOSES. `drawoverlays!` was called from `export.jl` and nowhere
-# else, so every overlay kind was correct in the exported file and INVISIBLE in
-# the editor — and the suite was fully green throughout, because every overlay
-# test asserted on an exported frame or on `drawoverlays!` directly. What was
-# missing was an assertion that the PREVIEW shows what the export writes.
-@testset "overlays are drawn in the preview, not only in the export" begin
+# THE BUG STEP 1 OF THE REFACTOR WAS ABOUT: `paramform!` registered a handler on
+# `player.playhead` per parameter row and never took it off, so every card rebuild
+# left another one behind — 118 of them in the session that started this. A leaked
+# playhead handler is not merely garbage: it holds the row it was built for, so a
+# slider that is no longer on screen keeps writing values on every frame.
+#
+# A displayed value is DERIVED from (parameter, position) now, out of one listener
+# for the whole panel (`refreshfxrows!`). What has to hold is that the count does
+# not grow — asserted by rebuilding, not by reading the code, because "nothing
+# registers here" is exactly the kind of claim that stops being true quietly.
+@testset "the panel does not leak playhead handlers" begin
     p = Player(testvideo; gpupreview = false)
     try
         sleep(1.5)
-        seq = p.sequence
+        VE.opendock!(p, :effects)
+        VE.seek!(p, 15); sleep(0.5)
+        clip = VE.locate(p.sequence, p.playhead[])[1]
+        for e in (VE.ColorEffect(saturation = 1.2), VE.BlurEffect(1.0f0),
+                  VE.SharpenEffect(2.0f0, 0.4f0), VE.OpacityEffect(0.9f0))
+            VE.addslot!(clip, VE.Effect(e))
+        end
+        VE.refreshedit!(p); sleep(0.8)
+        nl() = length(p.playhead.listeners)
+        @test length(p.fxwidgets[:fxcards]) == 4      # …so there is something to leak
+        @test !isempty(p.fxrows)
+        base = nl()
+
+        refresh = p.fxwidgets[:fxlistrefresh]
+        for _ in 1:20
+            refresh(force = true)                     # the full teardown + rebuild
+            sleep(0.03)
+        end
+        @test nl() == base
+
+        # …and the way it happens in use: the stack rebuilds at every clip
+        # boundary, which during playback is every cut.
+        VE.split!(p.sequence, 45); VE.refreshedit!(p); sleep(0.3)
+        atcut = nl()
+        for k in 1:20
+            VE.seek!(p, isodd(k) ? 15 : 60)
+            sleep(0.03)
+        end
+        sleep(0.3)
+        @test nl() == atcut
+    finally
+        close(p)
+    end
+end
+
+# THE GAP THIS CLOSES. A graphic drawn over the finished canvas used to be an
+# `Overlay` with a compositing pass of its own, called from `export.jl` and
+# nowhere else — so every overlay kind was correct in the exported file and
+# INVISIBLE in the editor, with the suite fully green throughout, because every
+# test asserted on an exported frame. There is no second pass now: a bar is a
+# clip, so the preview and the export are the same composite by construction.
+# What is left to assert is that adding one CHANGES the picture where it is and
+# nowhere else.
+@testset "a graphic is a clip, and it shows in the preview" begin
+    p = Player(testvideo; gpupreview = false)
+    try
+        sleep(1.5)
         n = 35
         VE.seek!(p, n); sleep(0.6)
         bare = copy(p.frame[])
 
         # a plain filled bar: no 3D, no GPU, nothing that can be unavailable
         # headless, and opaque enough that "did it draw" is not a judgement call
-        VE.addoverlay!(seq, :bar; start = 0, stop = 120, opacity = 1.0)
-        VE.seek!(p, n); sleep(0.6)
+        VE.seek!(p, 0)
+        @test VE.runcommand!(p, :add_bar)
+        c = p.sequence.clips[p.timeline.selected[]]   # the command selects what it made
+        @test c isa Clip
+        @test c.source isa VE.SceneSource
+        @test c.track > 1                       # its own lane, over the footage
+        c.src_out = 120                          # …across the frame we look at
+        VE.refreshedit!(p)
+        VE.seek!(p, n); sleep(0.8)
         drawn = copy(p.frame[])
         # SAME timeline frame on both sides — comparing two different frames of a
-        # moving test pattern "confirmed" this while the overlay drew nothing at
-        # all, which is how it stayed broken.
+        # moving test pattern "confirmed" this while nothing was drawn at all,
+        # which is how it stayed broken.
         @test count(bare .!= drawn) > 0
 
-        # and it must match what the export produces for that frame, bit for bit:
-        # one door, one picture (see `publishframe!`)
-        expect = copy(bare)
-        VE.drawoverlays!(expect, seq.overlays, n;
-                         framerate = seq.framerate, captions = seq.captions)
-        @test drawn == expect
+        # PLAY, with a scene on the timeline. `startaudio!` walks every clip and
+        # asked each source for its PCM; a scene has no file, so pressing play died
+        # with `MethodError: ensurepcm!(::Player, ::SceneSource)`. Nothing in the
+        # suite PLAYED a timeline with a scene on it, so it stayed broken while
+        # every other scene test passed.
+        VE.play!(p); sleep(0.6); VE.pause!(p); sleep(0.2)
+        @test !p.playing[]
+        @test p.presented > 0
 
-        # removing it puts the frame back exactly — the pass is not cumulative
-        empty!(seq.overlays)
-        VE.seek!(p, n); sleep(0.6)
+        # …and the card the scene gets is the ordinary one, with rows on it. What a
+        # scene offers comes from the REALIZED scene, which does not exist when the
+        # panel is first built — so the rebuild signature has to notice that it now
+        # does, or the card is drawn empty once and never again.
+        VE.opendock!(p, :effects)
+        p.timeline.selected[] = findfirst(x -> x === c, p.sequence.clips)
+        VE.refreshedit!(p); sleep(0.8)
+        # `waitfor` belongs to the big UI testset above; this one is standalone
+        for _ in 1:40
+            isempty(p.fxrows) || break
+            sleep(0.25)
+        end
+        @test !isempty(p.fxrows)
+        @test !isempty(p.fxsliders)
+        fx = VE.findslot(c, :scene)
+        @test fx !== nothing && !isempty(fx.params)
+        @test all(q -> q.range !== nothing, fx.params)   # every row is buildable
+
+        # removing it puts the frame back exactly — the composite is not cumulative
+        p.timeline.selected[] = 1
+        VE.deleteclip!(p.sequence, c; ripple = false)
+        VE.refreshedit!(p)
+        VE.seek!(p, n); sleep(0.8)
         @test copy(p.frame[]) == bare
     finally
         close(p)
@@ -2705,12 +2826,19 @@ end
     seq = Sequence(src)
     split!(seq, 40)
     seq.clips[1].crop = (0.1, 0.1, 0.8, 0.8)
-    path = joinpath(mktempdir(), "edit.videoedit.toml")
+    path = joinpath(mktempdir(), "edit.videoedit")
     saveproject(path, seq)
-    p2 = Player(path; gpupreview = false)   # .toml path → the saved edit, not a video
+    p2 = Player(path; gpupreview = false)   # a project path → the saved edit, not a video
     try
         sleep(1.5)
         @test length(p2.sequence.clips) == 2
+        # …and the edit IS that file. Derived from the first source instead, Ctrl+S
+        # on an opened project wrote a NEIGHBOUR of the footage: open
+        # `lego.videoedit`, save, and the work landed in `demo_source.videoedit`
+        # while the checkpoint list and the autosave followed it there.
+        @test VE.projectfile(p2) == path
+        VE.saveproject!(p2)
+        @test VE.projectfile(p2) == path && isfile(path)
         @test p2.sequence.clips[1].crop == (0.1, 0.1, 0.8, 0.8)
         @test VE.seqlength(p2.sequence) == 120
         # The CANVAS, which the crop above defines: 320*0.8 x 180*0.8. This

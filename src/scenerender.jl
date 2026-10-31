@@ -43,52 +43,10 @@ Make `mod` available to scenes that name it, keyed on its own module name.
 """
 usebackend!(mod::Module) = (BACKENDS[nameof(mod)] = mod)
 
-"""
-    makielights(specs) -> Vector{Makie.AbstractLight}
-
-The scene's lights, built from data.
-
-Ambient carries no position; point and directional do. Anything unknown is
-skipped rather than fatal — a scene from a newer editor may name a light type
-this one has not got, and losing a lamp beats losing the frame.
-
-A point light falls off with the SQUARE of distance, which is what makes one
-intensity number mean the same thing to both renderers. Makie's default is
-`Vec2f(0)` — no falloff at all — while a raytracer is physical by construction,
-so a lamp written for RayMakie arrived in GLMakie undimmed: measured at the
-lego figure, intensity 15000 at 269 units away came back a flat (1.0, 1.0, 1.0)
-on every lit pixel. The figure was not missing its legs, it was blue legs blown
-to white on white. With `Vec2f(0, 1)` the same scene renders (0.42, 0.03, 0.07)
-on the red torso — the hue, at nothing clipped.
-"""
-const QUADRATIC = Vec2f(0, 1)
-
-function makielights(specs::AbstractVector{LightSpec})
-    out = Makie.AbstractLight[]
-    for l in specs
-        col = RGBf(l.color...)
-        if l.type === :ambient
-            push!(out, Makie.AmbientLight(col))
-        elseif l.type === :point
-            push!(out, Makie.PointLight(col, Vec3f(l.position), QUADRATIC))
-        elseif l.type === :directional
-            push!(out, Makie.DirectionalLight(col, Vec3f(l.position)))
-        end
-    end
-    return out
-end
-
-"""
-A theme dictionary as Makie `Attributes`, nested dictionaries and all.
-
-`Makie.Theme(; d...)` leaves an inner `Dict` a `Dict`, and Makie then indexes it
-as an `Attributes` — `getindex(::Observable{Any}, ::Symbol)`, which is where a
-raw theme dict falls over. Converting on the way in means the project file can
-hold plain nested JSON and still describe a theme.
-"""
-themeattributes(d::AbstractDict) =
-    Makie.Attributes(; (k => (v isa AbstractDict ? themeattributes(v) : v)
-                        for (k, v) in d)...)
+# Lights are a `Scene` keyword, so they are in the spec like everything else:
+# `S.Scene(; lights = [AmbientLight(...), PointLight(...)])`. There used to be a
+# `LightSpec` here and a converter for it, which is the same parallel description
+# the parts had — and it could only express the two light types it knew.
 
 """
 Pixels are 1:1 unless the scene says otherwise.
@@ -103,7 +61,7 @@ const PIXELEXACT = Makie.Theme(GLMakie = (px_per_unit = 1.0, scalefactor = 1.0))
 """
     backendscreen(backend, spec, canvas) -> screen
 
-An offscreen screen of `backend`, configured from `spec.theme` — WITHOUT touching
+An offscreen screen of `backend`, configured from `theme` — WITHOUT touching
 the global theme.
 
 THE GLOBAL THEME IS NOT OURS. This used to build under `Makie.with_theme(...)`,
@@ -125,16 +83,57 @@ theme that is not theirs.
 silently returns a different size than asked for — measured, a (300, 400) canvas
 came back (434, 579). A spec that says otherwise for this backend wins.
 """
-function backendscreen(backend::Module, spec::SceneSpec, canvas::NTuple{2, Integer})
+function backendscreen(backend::Module, canvas::NTuple{2, Integer};
+                       theme::Dict{Symbol, Any} = Dict{Symbol, Any}())
     opts = Dict{Symbol, Any}(:visible => false, :px_per_unit => 1.0, :scalefactor => 1.0)
-    for (k, v) in get(spec.theme, nameof(backend), Dict{Symbol, Any}())
+    for (k, v) in get(theme, nameof(backend), Dict{Symbol, Any}())
         opts[Symbol(k)] = v
     end
     # a backend that does not know one of these must not die of it
     fields = fieldnames(backend.ScreenConfig)
     filter!(kv -> kv[1] in fields || kv[1] === :visible, opts)
+    # NO RENDERLOOP BEHIND THIS SCREEN. A GLMakie screen starts one by default: an
+    # `@async` task — sticky to the thread that made it, which is thread 1 — that
+    # loops forever holding `with_context(screen.glscreen)` across its `sleep`.
+    # This screen is never shown and never draws by itself; `readfilm` renders it,
+    # through `colorbuffer`, which calls `render_frame` itself.
+    #
+    # Left running, that loop is a THIRD task on thread 1 fighting for the one
+    # current GL context, next to the editor's own renderloop and the scene render
+    # marshalled over by `onmainthread`. Measured on the lego project: playback of
+    # a 60 fps timeline with a scene over it ran at 11.2 / 11.6 / 11.6 fps across
+    # three passes, with `dropped == 0` the whole time — the playhead keeps time
+    # and the picture does not, which is what "janky" is.
+    #
+    # `hasmethod(…, (:start_renderloop,))` rather than passing it blind: it is
+    # GLMakie's keyword, not every renderer's, and the same shape as `readfilm`
+    # asking whether a screen can accumulate.
+    hasmethod(backend.Screen, Tuple{}, (:start_renderloop,)) &&
+        return backend.Screen(; start_renderloop = false, opts...)
     return backend.Screen(; opts...)
 end
+
+"""
+    upright(buf) -> view
+
+A `GLNative` framebuffer with its rows the way a picture has them.
+
+OpenGL numbers scanlines from the BOTTOM, and `Makie.GLNative` is the raw buffer:
+`(width, height)`, y increasing upwards. `Makie.JuliaNative` is the same buffer
+flipped AND transposed — the transpose is what this path does not want, because
+the editor works in `(width, height)` throughout. Taking `GLNative` for the axis
+order inherits the flip with it.
+
+The whole scene came out UPSIDE DOWN and nothing said so: the lego figure hung
+head-down over the birdhouse, and a text preset read "OBEN" as "OBEИ" — O, B and
+E survive a top-to-bottom mirror almost unchanged, which is why it takes an N to
+see it. No test caught it either, because a flip preserves every pixel COUNT: the
+scene still drew on 9238 pixels, the same number as before the rebuild.
+
+The depth buffer `coverage` reads is in the same orientation, so it is flipped
+here too — the two have to agree pixel for pixel.
+"""
+upright(buf::AbstractMatrix) = view(buf, :, size(buf, 2):-1:1)
 
 """
     coverage(screen) -> Union{Nothing, AbstractMatrix{Bool}}
@@ -162,27 +161,62 @@ Dispatch rather than a branch on backend name: a renderer that carries real alph
 the render path above changes.
 """
 coverage(::Any) = nothing
-coverage(screen::GLMakie.Screen) = GLMakie.depthbuffer(screen) .< 1.0f0
 
 """
-    withalpha(img, cov) -> Matrix{RGBA{N0f8}}
+The depth of what was LAST drawn, read without drawing it again.
 
-`img` as RGBA, transparent wherever `cov` says nothing was drawn.
+`GLMakie.depthbuffer` opens with `render_frame` + `glFinish`: a full second
+redraw of the scene [`readfilm`](@ref) has just drawn, and a blocking wait for
+it — on thread 1, where the editor's own renderloop lives, so nothing else moves
+meanwhile. Two renders and two stalls per scene frame.
 
-`cov === nothing` means the renderer could not tell us, and the honest result is
-then fully opaque — an overlay that covers the frame is wrong, but inventing a
-mask from colour would key out the figure's own white parts, which is worse and
-much harder to see.
+Measured on the lego project: playback of that timeline ran at 12.1 fps, the same
+timeline with the scene clip deleted at 32.6 (the renderloop's own 30 Hz ceiling),
+and the scene ALONE at 11.1 — so the scene cost a factor of three all by itself.
+
+Everything below is `depthbuffer`'s own tail, from after the render. Reading the
+texture is what was wanted; drawing it twice was not. It has to run AFTER
+`readfilm`, which is what fills the buffer — `liveframe!` does them in that order.
+
+…and UPRIGHT, like the film it masks: same bottom-up framebuffer, see
+[`upright`](@ref).
 """
-function withalpha(img::AbstractMatrix, cov::Nothing)
-    return RGBA{N0f8}.(img)
+function coverage(screen::GLMakie.Screen)
+    GL = GLMakie.GLAbstraction
+    src = GLMakie.get_depth_buffer(GLMakie.display_framebuffer(screen))
+    depth = Matrix{Float32}(undef, size(src))
+    GL.bind(src)
+    GL.glGetTexImage(src.texturetype, 0, GLMakie.ModernGL.GL_DEPTH_COMPONENT,
+                     GLMakie.ModernGL.GL_FLOAT, depth)
+    GL.bind(src, 0)
+    return upright(depth) .< 1.0f0
 end
 
+"""
+    withalpha(img, cov) -> Matrix{PlanePixel}
+
+`img` as a plane: RGBA, PREMULTIPLIED, uncovered wherever `cov` says nothing was
+drawn.
+
+Premultiplied is the plane convention (see `PlanePixel`), and with a boolean
+coverage it costs nothing to honour: an uncovered pixel is zero in every channel.
+Leaving the colour standing under a zero alpha is what "straight" alpha means, and
+a straight plane read by a compositor that assumes premultiplied puts the
+undrawn background back on the screen — measured: 99.99% of a scene's pixels came
+out non-black over the footage, because dropping the alpha left the colour.
+
+`cov === nothing` means the renderer could not tell us, and the honest result is
+then fully covered — a scene that hides the frame is wrong, but inventing a mask
+from colour would key out the figure's own white parts, which is worse and much
+harder to see.
+"""
+withalpha(img::AbstractMatrix, ::Nothing) = PlanePixel.(img)
+
 function withalpha(img::AbstractMatrix, cov::AbstractMatrix{Bool})
-    out = Matrix{RGBA{N0f8}}(undef, size(img))
+    out = Matrix{PlanePixel}(undef, size(img))
     @inbounds for i in eachindex(img, cov)
         c = img[i]
-        out[i] = RGBA{N0f8}(red(c), green(c), blue(c), cov[i] ? 1 : 0)
+        out[i] = cov[i] ? PlanePixel(red(c), green(c), blue(c), 1) : zero(PlanePixel)
     end
     return out
 end
@@ -203,518 +237,226 @@ end
 # first bake instead of rendering.
 getbackend(name::AbstractString) = getbackend(Symbol(name))
 
-"""
-    renderspec(spec, canvas) -> Matrix{RGBA{N0f8}}
-
-`spec` rendered at `canvas`, by the backend it names, under the theme it carries.
-
-ONE PATH, and it is the preview's. This used to build the scene a second way of
-its own — its own walk over the parts, its own transformation per part — and the
-two disagreed: it derived a jointless part's parent compensation from the
-parent's ANIMATED translation, so lifting the torso by 20.8 gave the head a
-matching -20.8 and the head stayed behind while the body rose. Rendered on
-RayMakie the figure came apart: head detached and turned, legs off the belt.
-GLMakie, which went through the live path, was correct the whole time — which is
-exactly how a second implementation hides, by being the one you look at less.
-
-So there is no second builder. [`livescene!`](@ref) builds, [`liveframe!`](@ref)
-draws, and the backend is the parameter it always was. The theme is applied
-inside `livescene!`, around the whole build: Makie reads a backend's screen
-options from it, so `theme[:RayMakie][:exposure]` reaches the renderer without
-this function knowing what an exposure is.
-"""
-function renderspec(spec::SceneSpec, canvas::NTuple{2, Integer},
-                    backend::Module = getbackend(spec.backend))
-    live = livescene!(nothing, spec, canvas, backend)
-    img = liveframe!(live, spec)
-    # GLMakie hands back a screen that is reused; RayMakie's is per-display.
-    # Closing what we opened is the caller-neutral thing to do either way.
-    applicable(close, live.screen) && close(live.screen)
-    return img
-end
-
-# ---------------------------------------------------------------- baking
-
-# TWO BACKENDS, ONE SCENE — and that is the whole workflow.
+# There is no `renderspec` and no `scenepaths` here.
 #
-# Raytracing a frame costs ~1.2 s at 480x854; rasterising it costs milliseconds.
-# Scrubbing a timeline at raytracing speed is not editing, and editing against a
-# rasterised preview and then shipping it is not the picture you wanted. So the
-# scene carries BOTH: `spec.backend` is what the preview draws with, `bakewith`
-# is what the final render uses, and `bake!` walks the overlay's frame range once
-# and keeps the results.
+# `renderspec` built a scene, drew one frame and closed it — a whole second render
+# path that existed because a bake had nowhere else to go. A scene is a clip's
+# SOURCE now, so one frame of it is `sceneframe!` like every other frame, holding
+# the same screen.
 #
-# A bake is a CACHE, not a state: it is keyed on the frames it covers, and any
-# edit that changes what those frames look like drops it (see `bakedframe`). The
-# alternative — asking the user to remember to re-bake — ships the wrong picture
-# eventually, and silently.
-
-"""
-    bakedframes(ov) -> Union{Nothing, Dict{Int, Matrix{RGBA{N0f8}}}}
-
-The overlay's baked frames, or `nothing` when it has never been baked.
-"""
-bakedframes(ov) = get(ov.settings, :baked, nothing)
-
-"""
-    bake!(ov, canvas; framerate = 0.0, progress = nothing) -> Int
-
-Render every frame of `ov`'s range with its bake backend and keep the results.
-
-Returns how many frames were baked. `progress(done, total)` is called as it goes,
-because at a second per frame a silent minute reads as a hang.
-
-The bake backend comes from `settings.bakewith`, falling back to the spec's own
-— so a scene that names no second backend simply bakes what it previews, which
-is the right answer for a scene that is cheap anyway.
-
-ONE scene held across the range, not one per frame. `renderspec` builds and
-tears down, which means reloading every part's mesh from disk on every frame —
-0.28 s of the lego figure's ten STL files, per frame, on top of the render. A
-bake is the one place that cost would be paid hundreds of times over.
-
-Pass `into` — a project path — and each frame is written to that project's
-sidecar AS IT FINISHES, not at the end. Minutes of raytracing survive a crash
-that way, and the partial directory is directly usable: [`loadbakes!`](@ref)
-takes the frames that are there and draws the rest live. The manifest is only
-written on a clean finish, so an interrupted bake is not mistaken for a whole
-one; until then the frames sit there costing nothing.
-"""
-function bake!(ov, canvas::NTuple{2, Integer}; framerate::Real = 0.0, progress = nothing,
-               into::Union{Nothing, AbstractString} = nothing)
-    spec = get(ov.settings, :spec, nothing)
-    spec isa SceneSpec || return 0
-    backend = get(ov.settings, :bakewith, spec.backend)
-    frames = Dict{Int, Matrix{RGBA{N0f8}}}()
-    total = max(ov.stop - ov.start, 0)
-    # the bake backend, not the spec's: `livescene!` keys its reuse on
-    # `spec.backend`, so a scene previewing on GLMakie and baking on RayMakie has
-    # to say so here or it would bake with the preview's renderer.
-    baking = animatedspec(spec, (;))
-    baking.backend = backend
-    dir = into === nothing ? nothing : bakeframedir(into, ov.id)
-    dir === nothing || isdir(dir) || mkpath(dir)
-    live = nothing
-    try
-        for (k, n) in enumerate(ov.start:(ov.stop - 1))
-            st = overlaystate(ov, n; framerate = framerate)
-            anim = animatedspec(baking, st)
-            live = livescene!(live, anim, canvas, getbackend(backend))
-            frames[n] = liveframe!(live, anim)
-            dir === nothing || writebakeframe(dir, n, frames[n])
-            progress === nothing || progress(k, total)
-        end
-    finally
-        live === nothing || (applicable(close, live.screen) && close(live.screen))
-    end
-    # the fingerprint is taken HERE, with the frames, and travels with them.
-    # Recomputing it at save time instead is the bug this line exists to prevent:
-    # edit a keyframe, save, and `savebakes` would stamp the NEW fingerprint onto
-    # the OLD frames, so reopening accepted a stale bake as current — measured,
-    # it did exactly that.
-    ov.settings = merge(ov.settings, (baked = frames, bakedcanvas = canvas,
-                                      bakedprint = bakefingerprint(ov, canvas)))
-    # the manifest LAST, and only here: it is what marks the bake complete, so an
-    # interrupted run leaves frames without one and is not read back as whole
-    into === nothing || savebakes(into, (; overlays = [ov]))
-    return length(frames)
-end
-
-"Throw the bake away — after an edit that changes what the scene looks like."
-unbake!(ov) = (ov.settings = Base.structdiff(ov.settings,
-                                             NamedTuple{(:baked, :bakedcanvas, :bakedprint)});
-               ov)
-
-# ------------------------------------------------------- the bake on disk
-#
-# A bake costs minutes — the lego walk is 180 raytraced frames — and losing it to
-# a crash, or to closing the editor, means paying that again for a picture that
-# has not changed. So it goes to a SIDECAR beside the project, the way a matte
-# does (`savemattes`, project.jl), and comes back on open.
-#
-# PNG frames in a directory rather than one raw blob or a video:
-#
-#   - RAW is unaffordable. 180 frames of 640x1138 RGBA is 524 MB; the same
-#     frames as PNG are mostly-transparent and compress to a fraction of it.
-#   - A VIDEO would have to carry ALPHA, which rules out the ordinary codecs and
-#     buys a container problem in exchange for nothing.
-#   - A DIRECTORY is what makes it crash-safe: `bake!` writes each frame as it
-#     finishes, so an editor that dies at frame 140 leaves 140 usable frames
-#     rather than a truncated file. A missing frame is simply drawn live.
-#
-# And it is inspectable — the frames are PNGs you can open.
-
-"Directory holding a project's baked scene frames (created on demand)."
-bakedir(path::AbstractString) = string(path, ".bakes")
-bakeframedir(path::AbstractString, id::Integer) = joinpath(bakedir(path), string(id))
-bakemanifest(path::AbstractString, id::Integer) = joinpath(bakedir(path), string(id, ".json"))
-bakename(n::Integer) = string(lpad(n, 6, '0'), ".png")
-
-"""
-    bakefingerprint(ov, canvas) -> UInt64
-
-What the bake was made FROM, in one number.
-
-THE POINT OF PERSISTING AT ALL is undone without this. A bake that no longer
-matches its scene is worse than no bake: it composites a plausible, wrong
-picture, and nothing about the result says it is stale. So the fingerprint
-covers everything that decides what a frame looks like — the scene's parts,
-lights and camera, every curve and keyframe, the frame range, the canvas and the
-bake backend — and a mismatch means the sidecar is ignored and the frames are
-drawn live until somebody re-bakes.
-
-Deliberately fails SAFE in the other direction too: `hash` is stable within a
-Julia version but not promised across them, so an upgrade invalidates old bakes.
-That costs a re-bake, which is the cheap mistake to make.
-"""
-function bakefingerprint(ov, canvas::NTuple{2, Integer})
-    spec = get(ov.settings, :spec, nothing)
-    spec isa SceneSpec || return UInt64(0)
-    h = hash((Int(ov.start), Int(ov.stop), Int(canvas[1]), Int(canvas[2]),
-              String(spec.backend), string(get(ov.settings, :bakewith, spec.backend))))
-    for p in spec.parts
-        h = hash((String(p.name), p.parent === nothing ? "" : String(p.parent),
-                  p.origin, p.axis, p.angle, p.offset, String(p.plot.type),
-                  string(p.plot.args), string(p.plot.kwargs)), h)
-    end
-    for l in spec.lights
-        h = hash((String(l.type), l.color, l.position), h)
-    end
-    h = hash((spec.camera.eye, spec.camera.lookat, spec.camera.up), h)
-    # sorted: a Dict's order is not part of what the picture looks like
-    for key in sort!(collect(keys(ov.animations)); by = String)
-        c = ov.animations[key]
-        h = hash((String(key), String(c.interp)), h)
-        for k in c.keys
-            h = hash((Int(k.frame), Float64(k.value), String(k.ease)), h)
-        end
-    end
-    return h
-end
-
-"One baked frame, written where `loadbakes!` will look for it."
-writebakeframe(dir::AbstractString, n::Integer, img::AbstractMatrix) =
-    open(io -> PNGFiles.save(io, PermutedDimsArray(img, (2, 1))),
-         joinpath(dir, bakename(n)), "w")
-
-"""
-    savebakes(path, seq)
-
-Write every overlay's baked frames beside the project at `path`.
-
-Called from [`saveproject`](@ref) for the same reason `savemattes` is: the frames
-are an EDIT's expensive output, not something to recompute on every open. The
-project JSON itself never carries them — see `CACHEDSETTINGS` in overlays.jl,
-which keeps 18 MB of pixels out of a 13 KB file.
-"""
-function savebakes(path::AbstractString, seq)
-    for ov in seq.overlays
-        frames = bakedframes(ov)
-        frames === nothing && continue
-        canvas = get(ov.settings, :bakedcanvas, nothing)
-        canvas isa NTuple{2, Integer} || continue
-        # the fingerprint TAKEN AT BAKE TIME, never one computed now: the frames
-        # are what they are, and the point of the fingerprint is to say what they
-        # were made from. A bake without one cannot be vouched for, so it is not
-        # persisted rather than persisted unverifiably.
-        print = get(ov.settings, :bakedprint, nothing)
-        print isa Integer || continue
-        dir = bakeframedir(path, ov.id)
-        isdir(dir) || mkpath(dir)
-        for (n, img) in frames
-            writebakeframe(dir, n, img)
-        end
-        open(bakemanifest(path, ov.id), "w") do io
-            JSON.print(io, Dict{String, Any}(
-                "fingerprint" => string(print),
-                "canvas" => [Int(canvas[1]), Int(canvas[2])],
-                "frames" => sort!(collect(keys(frames)))), 2)
-        end
-    end
-    return nothing
-end
-
-"""
-    loadbakes!(path, seq) -> seq
-
-Put a project's baked frames back, when they still match what would be rendered.
-
-A frame the sidecar names but does not have is SKIPPED rather than fatal: that is
-exactly what a crash mid-bake leaves behind, and the missing ones simply draw
-live. Same for a fingerprint that no longer matches — the bake is ignored, not
-deleted, so an accidental edit that is undone gets its bake back.
-"""
-function loadbakes!(path::AbstractString, seq)
-    isdir(bakedir(path)) || return seq
-    for ov in seq.overlays
-        mf = bakemanifest(path, ov.id)
-        isfile(mf) || continue
-        manifest = JSON.parse(read(mf, String))
-        cv = get(manifest, "canvas", nothing)
-        cv isa AbstractVector && length(cv) == 2 || continue
-        canvas = (Int(cv[1]), Int(cv[2]))
-        string(bakefingerprint(ov, canvas)) == get(manifest, "fingerprint", "") || continue
-        dir = bakeframedir(path, ov.id)
-        frames = Dict{Int, Matrix{RGBA{N0f8}}}()
-        for n in get(manifest, "frames", Int[])
-            file = joinpath(dir, bakename(Int(n)))
-            isfile(file) || continue          # died mid-write: take what is there
-            frames[Int(n)] = RGBA{N0f8}.(permutedims(PNGFiles.load(file), (2, 1)))
-        end
-        isempty(frames) && continue
-        ov.settings = merge(ov.settings, (baked = frames, bakedcanvas = canvas,
-                                          bakedprint = bakefingerprint(ov, canvas)))
-    end
-    return seq
-end
-
-"""
-    bakedframe(ov, n, canvas)
-
-The baked frame for timeline frame `n`, or `nothing` to draw it live.
-
-Refuses a bake taken at another canvas size: a resized project would otherwise
-composite a stale, differently-shaped picture, and that is the kind of wrong that
-survives all the way into an export.
-"""
-function bakedframe(ov, n::Integer, canvas::NTuple{2, Integer})
-    b = bakedframes(ov)
-    b === nothing && return nothing
-    get(ov.settings, :bakedcanvas, nothing) == canvas || return nothing
-    bakecurrent(ov, canvas) || return nothing
-    return get(b, Int(n), nothing)
-end
-
-"""
-    bakecurrent(ov, canvas) -> Bool
-
-Whether the bake still describes what would be rendered right now.
-
-THE EDIT DOES NOT DESTROY THE BAKE. Moving a keyframe used to call `unbake!` and
-throw the frames away, so the preview came back live — and the only way back to
-the baked picture was to spend the minutes again, even if you undid the edit
-immediately. Instead the frames stay exactly where they are and this asks whether
-they still apply: edit, and the fingerprint stops matching, so every frame draws
-live on the preview backend; undo, and it matches again and the bake is simply
-there. Nothing was rendered twice and nothing was lost.
-
-Same rule `loadbakes!` applies when a project opens, which is the point — a bake
-is valid exactly when it was made from what is there now, whether that question
-is asked a second or a week later. `unbake!` remains for DISCARDING one on
-purpose.
-"""
-function bakecurrent(ov, canvas::NTuple{2, Integer})
-    print = get(ov.settings, :bakedprint, nothing)
-    print isa Integer || return false          # no fingerprint, nothing to vouch for it
-    return print == bakefingerprint(ov, canvas)
-end
-
-# ------------------------------------------------- the scene's keyframable paths
-
-"""
-    scenepaths(spec) -> Vector{String}
-
-Every path of `spec` a keyframe can be put on, in reading order.
-
-Enumerated from the SCENE, not declared: which values a scene can animate depends
-on which parts it has, so there is no fixed parameter list to register. Each part
-contributes its joint angle and its three offset components; the camera
-contributes its eye. That is the whole of what moves.
-"""
-function scenepaths(spec::SceneSpec)
-    out = String[]
-    for p in spec.parts
-        name = String(p.name)
-        push!(out, "$name.angle")
-        append!(out, ["$name.offset[$i]" for i in 1:3])
-    end
-    append!(out, ["camera.eye[$i]" for i in 1:3])
-    return out
-end
-
-"""
-Sensible slider bounds for a scene path, by what it IS.
-
-An angle is a turn and lives in ±π. An offset and a camera position are lengths
-in the model's own units, and the lego figure is ~30 units tall — so a range that
-lets a limb be nudged and the figure be walked across frame, without a slider
-whose useful travel is one pixel wide.
-"""
-function scenebounds(path::AbstractString)
-    endswith(path, ".angle") && return (-Float64(π), Float64(π))
-    startswith(path, "camera.") && return (-500.0, 500.0)
-    return (-200.0, 200.0)
-end
-
+# `scenepaths` listed what was animatable by walking our description of the scene.
+# `sceneattributes` walks the scene.
 
 # ---------------------------------------------------------------- in the editor
 
-# The 3D scene overlay: a [`SceneSpec`](@ref) rendered over the canvas.
+# A scene is a CLIP's source, and this is what stands open for it.
 #
-# ONE kind, not one per plot type. What it draws is data the overlay carries, and
-# every path in that data is keyframeable through the ordinary curve machinery —
-# `setoverlaykey!(ov, Symbol("arm_left.angle"), frame, value)` swings a limb, and
-# `"camera.eye[1]"` moves the camera. There is nothing here that a Crop or a Text
-# kind would need a second copy of; those become presets that build one of these.
+# The block that used to be here described the overlay: a spec riding in
+# `settings`, `overlaystate` merging per-frame paths over it, `setoverlaykey!`
+# swinging a limb, `renderspec` drawing one frame. None of that exists — the
+# paragraph above says so — and it stood here in the present tense anyway,
+# describing the design the refactor replaced as though it were the code below.
+# A comment that survives what it documents is worse than no comment: it is a
+# false trail that reads as authoritative.
 #
-# The spec rides in `settings` because it is structure, not a number: what changes
-# per frame are the paths, and `overlaystate` merges those over it. Rendering goes
-# through [`renderspec`](@ref), so the backend is whatever the spec names —
-# `:GLMakie` while scrubbing, `:RayMakie` for the final, same scene either way.
+# What is true now: `SceneSource` holds a `LiveScene` across frames, the animated
+# numbers are `Param`s on the clip's `:scene` entry keyed by SOURCE frame like
+# every other clip, and `sceneframe!` writes them onto the standing plots. The
+# backend is whatever the source names — `:GLMakie` while scrubbing, another for
+# the bake, and switching is a rebuild because a screen takes its settings at
+# construction.
 """
-A scene held open across frames: the built scene and its screen.
+A scene held open across frames: what was built, and what it was built from.
 
 WHY IT IS HELD. The first version rebuilt everything inside the per-frame
-callback — a new `Scene`, a new `Screen`, and `partmesh` reloading all ten STL
-files from disk, for every frame of a seek AND of playback. Measured after
-fixing it, at 480x854 with a ten-part figure: first frame 0.28 s, every frame
-after 5.1-5.8 ms on GLMakie. Almost none of the original cost was rendering.
+callback — a new `Scene`, a new `Screen`, and every mesh re-read from disk, for
+every frame of a seek AND of playback. Measured after fixing it, at 480x854 with a
+ten-part figure: first frame 0.28 s, every frame after 5.1-5.8 ms on GLMakie.
+Almost none of the original cost was rendering.
 
 Holding the screen is also what lets a PROGRESSIVE backend work at all: RayMakie
 accumulates samples while the playhead stands still, and a screen thrown away
 after each frame has nothing to accumulate into.
 
-There is no structure-diffing here on purpose — `plotlist!` takes an observable
-of specs and does exactly that, reusing plots whose type is unchanged
-(`update_plot!` → `batch_update!`). Writing a second one by hand was a mistake I
-made and removed.
+There is no spec diffing here and no plot list to keep in step. The structure of a
+clip's scene does not change over its life — `visible` is the only structural
+control it has — so the scene is realized once and after that only VALUES move.
 """
 mutable struct LiveScene
-    scene::Any
+    scene::Any                     # what gets displayed
     screen::Any
-    specs::Observables.Observable{Vector{Makie.PlotSpec}}
-    joints::Dict{Symbol, Any}      # part name → its Transformation
-    bases::Dict{Symbol, Any}       # …and the translation it was BUILT with
+    target::Any                    # what the plots went into: the scene, or a block
     canvas::NTuple{2, Int}
     backend::Symbol
+    root::Any                      # the spec it was built from
+    theme::Dict{Symbol, Any}       # …and the settings its screen was opened with
 end
 
 """
-    livescene!(live, spec, canvas, backend) -> LiveScene
+    realize(root, canvas) -> (scene, target)
 
-Build the scene, or hand back the one already built for this canvas and backend.
+Build what gets displayed and what the plots went into, from a Makie spec.
 
-Only those two force a rebuild. Everything else — parts added or removed, a plot
-changing type, any attribute — goes through the specs observable, which is
-`plotlist!`'s job.
+Two methods, dispatched on what the spec IS. A `SceneSpec` is a raw scene — no
+figure, no layout, and its `camera` keyword is a `Scene` keyword that the scene
+calls on itself. Anything else is a layout tree and needs a `Figure` to live in,
+and then the block brings its own camera. Neither is a special case of the other
+and neither is a branch.
 """
-function livescene!(live::Union{Nothing, LiveScene}, spec::SceneSpec,
-                    canvas::NTuple{2, Integer}, backend::Module)
-    if live !== nothing && live.canvas == canvas && live.backend === spec.backend
+function realize(root::Makie.SceneSpec, canvas::NTuple{2, Int})
+    scene = Makie.Scene(root; size = canvas, backgroundcolor = RGBAf(0, 0, 0, 0))
+    return (scene, scene)
+end
+
+function realize(root, canvas::NTuple{2, Int})
+    fig = Makie.Figure(; size = canvas, backgroundcolor = RGBAf(0, 0, 0, 0))
+    Makie.plot!(fig, root isa Makie.GridLayoutSpec ? root :
+                     Makie.SpecApi.GridLayout([root]))
+    return (fig.scene, fig)
+end
+
+"""
+    targetscene(target) -> Scene
+
+The `Scene` behind whatever the plots went into — a block has one, a figure has
+one, a scene IS one. What `cameracontrols` and `findplot` are asked of, so a value
+written onto a plot works the same in all three.
+"""
+targetscene(s::Makie.Scene) = s
+targetscene(f::Makie.Figure) = f.scene
+targetscene(block) = block.scene
+
+"""
+    livescene!(live, root, canvas, backendname, backend) -> LiveScene
+
+Build the scene, or hand back the one already built for this canvas, backend and
+root spec. Nothing else forces a rebuild, because nothing else can change: a
+clip's scene is realized once and animated by writing values onto it.
+"""
+function livescene!(live::Union{Nothing, LiveScene}, root, canvas::NTuple{2, Integer},
+                    backendname::Symbol, backend::Module;
+                    theme::Dict{Symbol, Any} = Dict{Symbol, Any}())
+    W, H = Int(canvas[1]), Int(canvas[2])
+    # The THEME is in it: a screen takes its settings at construction, so drawing
+    # the same scene at another sample count is a different screen. That is what
+    # makes switching between the live and the bake settings a rebuild and not a
+    # value written onto something already open.
+    if live !== nothing && live.canvas == (W, H) && live.backend === backendname &&
+       live.root === root && live.theme == theme
         return live
     end
     live === nothing || (applicable(close, live.screen) && close(live.screen))
-    W, H = Int(canvas[1]), Int(canvas[2])
-    scene = Makie.Scene(; size = (W, H), backgroundcolor = RGBAf(0, 0, 0, 0),
-                        lights = makielights(spec.lights))
-    Makie.cam3d!(scene)
-    joints = Dict{Symbol, Any}()
-    bases = Dict{Symbol, Any}()
-    specs = Observables.Observable(partspecs(spec, joints, bases, scene))
-    Makie.plotlist!(scene, specs)
-    screen = backendscreen(backend, spec, (W, H))
+    scene, target = realize(root, (W, H))
+    screen = backendscreen(backend, (W, H); theme = theme)
     display(screen, scene)
-    return LiveScene(scene, screen, specs, joints, bases, (W, H), spec.backend)
+    return LiveScene(scene, screen, target, (W, H), backendname, root, theme)
 end
 
 """
-    partspecs(spec, joints, scene) -> Vector{PlotSpec}
+    readfilm(screen, clear) -> image
 
-The scene's parts as plot specs, each NAMED and carrying its own transformation.
+Read the screen's picture, ACCUMULATING into the film it already has when
+`clear = false` and the renderer can do that.
 
-The `name` is what makes a part reachable afterwards — `Makie.findplot(scene,
-:arm_left)` — so an animation can write straight to the plot instead of
-re-specifying the scene. The transformations are built once and kept in
-`joints`, because the parent chain IS the rig: rotating `arm_left` has to carry
-`hand_left` with it.
+A path tracer's frame is a running average of samples: asking it for the picture
+without clearing adds more samples to what is there, which is what makes a live
+preview converge while the playhead stands still instead of costing its full
+budget on every frame. A rasteriser has nothing to accumulate and ignores it.
+
+Asked of the SCREEN rather than branched on a backend name — and asked with
+`hasmethod`, not a dependency, because the renderer is registered at runtime
+(`usebackend!`) and this file must not know which ones exist.
 """
-function partspecs(spec::SceneSpec, joints::Dict{Symbol, Any},
-                   bases::Dict{Symbol, Any}, scene)
-    out = Makie.PlotSpec[]
-    for part in spec.parts
-        parent = part.parent === nothing ? scene : get(joints, part.parent, scene)
-        trans = Makie.Transformation(parent)
-        # THE BASE TRANSLATION, set once. A part with a joint sits at its pivot;
-        # one without must UNDO its parent's translation, because its mesh is
-        # already in world coordinates and would otherwise inherit it twice —
-        # that is what made the hands float beside the figure. `liveframe!` adds
-        # only the animated offset on top, so re-writing this per frame (which it
-        # used to) cannot wipe the compensation out again.
-        base = any(!=(0), part.origin) ? Vec3f(part.origin) :
-               -Vec3f(Makie.transformation(parent).translation[])
-        bases[part.name] = base
-        Makie.translate!(trans, base)
-        joints[part.name] = trans
-        args = map(partmesh, part.plot.args)
-        if any(!=(0), part.origin) && length(args) == 1 && args[1] isa GeometryBasics.Mesh
-            m = args[1]
-            args = Any[GeometryBasics.mesh(m.position .- Point3f(part.origin), faces(m);
-                                           normal = m.normal)]
-        end
-        push!(out, Makie.PlotSpec(part.plot.type, args...; part.plot.kwargs...,
-                                  name = part.name, transformation = trans))
+function readfilm(screen, clear::Bool)
+    if hasmethod(Makie.colorbuffer, Tuple{typeof(screen), typeof(Makie.GLNative)}, (:clear,))
+        return upright(Makie.colorbuffer(screen, Makie.GLNative; clear = clear))
     end
-    return out
+    return upright(Makie.colorbuffer(screen, Makie.GLNative))
+end
+
+
+"Whether this screen accumulates samples across reads — see [`readfilm`](@ref)."
+progressive(screen) =
+    hasmethod(Makie.colorbuffer, Tuple{typeof(screen), typeof(Makie.GLNative)}, (:clear,))
+
+
+"""
+    onmainthread(f) -> f()
+
+Run `f` on thread 1, from wherever this is called.
+
+A scene clip is the one source that draws with the UI's own toolkit: GLMakie's
+screen belongs to thread 1 and asserts it (`ThreadAssertionError: Code must run
+on thread 1`), while the composite runs on whichever thread owns the render
+engine's Lava context — the pinned GPU worker in the usual case. So the two
+owners meet here, at the one operation that has both.
+
+Already on thread 1: straight through, no channel and no scheduler round trip —
+which is the export path, the bake and every headless test.
+
+Safe to call from the worker while thread 1 waits for it: the wait is a `take!`,
+which yields, so a task pinned to thread 1 runs while the caller is blocked.
+"""
+function onmainthread(f::Function)
+    Threads.threadid() == 1 && return f()
+    done = Channel{Any}(1)
+    t = Task() do
+        try
+            put!(done, (true, f()))
+        catch e
+            put!(done, (false, e))     # …and rethrown at the caller, below
+        end
+    end
+    t.sticky = true
+    ccall(:jl_set_task_tid, Cint, (Any, Cint), t, 0)   # 0-based: thread 1
+    schedule(t)
+    # WITH A DEADLINE, and that is not belt-and-braces. A bare `take!` here waits
+    # for a task pinned to thread 1 to be scheduled, and thread 1 is also where
+    # GLMakie's renderloop lives — holding `with_context` across its own `sleep`.
+    # If it never yields at a moment this task can take, the wait never ends and
+    # the editor is simply frozen, with no error and nothing on screen to say why.
+    # Reported live: "played a few janky frames and then immediately froze… then
+    # it unfroze… and now it is frozen forever". A freeze teaches nothing; a
+    # message names the thread and the caller.
+    t0 = time()
+    while !isready(done)
+        time() - t0 > SCENEWAIT &&
+            error("a scene render waited $(SCENEWAIT)s to reach thread 1 and gave up. " *
+                  "Called from thread $(Threads.threadid()); thread 1 is where GLMakie's " *
+                  "screen and the editor's renderloop both live. Renders belong BEFORE " *
+                  "the graph runs (`prerender!`), where the caller is already on thread 1.")
+        sleep(0.001)
+    end
+    ok, val = take!(done)
+    ok || throw(val)
+    return val
 end
 
 """
-    liveframe!(live, spec) -> Matrix{RGBA{N0f8}}
+How long [`onmainthread`](@ref) waits to be let onto thread 1 before giving up.
 
-One frame: write this frame's values onto the standing scene, read the picture.
-
-The joints move through their `Transformation`s and any other attribute through
-`Makie.findplot` + `update!` — direct observable writes, not a re-spec. The docs
-are explicit that specs are the slower path for animation ("it needs to
-re-create plots often and needs to go over the whole plot tree"), and a rig only
-ever changes VALUES between frames.
+Generous — a cold scene builds its screen and loads its meshes on the first call —
+but FINITE, because the alternative is a frozen editor.
 """
-function liveframe!(live::LiveScene, spec::SceneSpec)
-    for part in spec.parts
-        t = get(live.joints, part.name, nothing)
-        if t !== nothing
-            # base + the animated offset — NOT `origin + offset`, which threw the
-            # parent compensation away for every part without a joint.
-            Makie.translate!(t, get(live.bases, part.name, Vec3f(0)) .+ Vec3f(part.offset))
-            Makie.rotate!(t, Vec3f(part.axis), Float32(part.angle))
-        end
-        isempty(part.plot.kwargs) && continue
-        plot = Makie.findplot(live.scene, part.name)
-        plot === nothing || Makie.update!(plot; part.plot.kwargs...)
-    end
-    c = spec.camera
-    Makie.update_cam!(live.scene, Makie.cameracontrols(live.scene),
-                      Vec3f(c.eye), Vec3f(c.lookat), Vec3f(c.up))
-    img = Makie.colorbuffer(live.screen, Makie.GLNative)
+const SCENEWAIT = 10.0
+
+"""
+    liveframe!(live; clear = true) -> Matrix{PlanePixel}
+
+Read the picture off the standing scene.
+
+There is nothing to write here: this frame's values were written onto the plots
+before the render (see `applysceneparams!`), which is where they belong — a plot
+attribute is set directly, not re-specified. The Makie docs are explicit that
+specs are the slower path for animation ("it needs to re-create plots often and
+needs to go over the whole plot tree"), and between frames a scene only ever
+changes values.
+"""
+function liveframe!(live::LiveScene; clear::Bool = true)
+    img = readfilm(live.screen, clear)
     return withalpha(img, coverage(live.screen))
 end
 
-registeroverlay!(:scene, "3D Scene", FxParam[],
-    function (scene, canvas, state)
-        W, H = canvas
-        img = Observables.Observable(zeros(RGBA{N0f8}, W, H))
-        # y ASCENDING, unlike the canvas's own video frame. The render hands back
-        # GLNative, whose row 1 is the scene's BOTTOM — already flipped relative
-        # to a video frame. Drawing it with the descending range the frame uses
-        # flips it a second time and the figure comes out upside down.
-        Makie.image!(scene, (0, W), (0, H), img; interpolate = false, fxaa = false)
-        live = nothing
-        Makie.on(state; update = true) do s
-            spec = get(s, :spec, nothing)
-            spec isa SceneSpec || return
-            # A BAKED frame wins: it is the same scene at final quality, already
-            # rendered. Falls through to live drawing when the bake does not cover
-            # this frame or was taken at another canvas size.
-            ov = get(s, :overlay, nothing)
-            if ov !== nothing
-                b = bakedframe(ov, get(s, :frame, 0), (W, H))
-                b === nothing || (img[] = b; return)
-            end
-            # `animatedspec` writes this frame's paths into a COPY, so a curve
-            # that has ended cannot leave its last value in the stored spec.
-            anim = animatedspec(spec, s)
-            live = livescene!(live, anim, (W, H), getbackend(anim.backend))
-            img[] = liveframe!(live, anim)
-            return
-        end
-        return
-    end)
+# A scene is rendered by `SceneSource`'s pass (scenesource.jl), which holds the
+# `LiveScene` above across frames and writes this frame's numbers onto it. There
+# is no overlay registration here any more: a scene is a CLIP.

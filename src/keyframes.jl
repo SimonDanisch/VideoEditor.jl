@@ -40,6 +40,33 @@ lerp(a::AbstractVector, b::AbstractVector, t::Real) = a .+ t .* (b .- a)
 lerp(a::Colorant, b::Colorant, t::Real) =
     Makie.lerp_oklab(RGBf(a), RGBf(b), Float32(t))
 
+"""
+An IMAGE blends per pixel. Reached through a `:mix` input, never through a curve:
+two pictures as keyframe values would sit in the project file and allocate a third
+one per frame, where what the user has is two sources and a number between them.
+"""
+lerp(a::AbstractMatrix{<:Colorant}, b::AbstractMatrix{<:Colorant}, t::Real) =
+    (size(a) == size(b) ||
+         error("cannot blend images of $(size(a)) and $(size(b)) — resize one first");
+     lerp.(a, b, Float32(t)))
+
+"""
+A MESH blends vertex by vertex, which is only meaningful when the two describe the
+same thing in two poses.
+
+Refused otherwise, loudly: interpolating between meshes of different topology is a
+resampling problem with its own cost and its own choices, not this. Silently
+producing something for "a cube becomes a sphere" would produce garbage that looks
+like an animation.
+"""
+function lerp(a::GeometryBasics.Mesh, b::GeometryBasics.Mesh, t::Real)
+    (length(a.position) == length(b.position) && faces(a) == faces(b)) ||
+        error("cannot morph meshes with different topology ($(length(a.position)) vs \
+               $(length(b.position)) vertices) — that is a resampling problem, not a blend")
+    pos = lerp.(a.position, b.position, Float32(t))
+    return GeometryBasics.mesh(pos, faces(a); normal = normals(a))
+end
+
 Base.isempty(c::AnimCurve) = isempty(c.keys)
 Base.length(c::AnimCurve) = length(c.keys)
 
@@ -129,9 +156,8 @@ end
 
 """
 One tunable parameter — a scalar with a slider range and a default. Effect
-plugins ([`registerplugin!`](@ref)) and overlays ([`registeroverlay!`](@ref))
-both declare their parameters with this, and both get keyframing for free
-because a declared scalar is all the curve engine needs.
+plugins ([`registerplugin!`](@ref)) declare their parameters with this and get
+keyframing for free, because a declared scalar is all the curve engine needs.
 """
 struct FxParam
     name::Symbol
@@ -142,6 +168,137 @@ struct FxParam
 end
 FxParam(name, label; min = 0.0, max = 1.0, default = min) =
     FxParam(Symbol(name), String(label), Float64(min), Float64(max), Float64(default))
+
+"""
+What a parameter can READ FROM: an address that survives sorting, undo and a
+project round trip.
+
+Three kinds, and they are all just inputs — that is the point. A number somewhere
+else in the sequence, a file on disk, another clip's picture. "The texture is that
+video", "the mesh is this STL" and "the opacity is one minus that clip's" are the
+same statement, so they are the same mechanism.
+
+Ids, not objects: position and `objectid` both die on the first sort or reload.
+[`bindinputs!`](@ref) turns these into the objects that get read.
+"""
+abstract type InputRef end
+
+"Another parameter. `clip`/`effect` of `0` mean the one this input is on."
+struct ParamRef <: InputRef
+    clip::UInt64
+    effect::UInt64
+    param::Symbol
+end
+ParamRef(param::Symbol; clip::Integer = 0, effect::Integer = 0) =
+    ParamRef(UInt64(clip), UInt64(effect), param)
+
+"A file: a mesh, an image, a LUT. Read once and held, not per frame."
+struct FileRef <: InputRef
+    path::String
+end
+FileRef(path::AbstractString) = FileRef(String(path))
+
+"""
+Another clip's finished picture.
+
+Resolved by the GRAPH, not by [`valueat`](@ref): a clip's picture is a transient
+that exists while a composition runs, and asking for it outside one would mean
+rendering a second clip in the middle of reading a number. So this is the input
+kind that says "an image arrives here" — [`readinput`](@ref) refuses it, and the
+composition wires it.
+"""
+struct ClipRef <: InputRef
+    clip::UInt64
+end
+ClipRef(clip::Integer) = ClipRef(UInt64(clip))
+
+"""
+Where a parameter's value comes from when it does not come from the parameter
+itself: a small NODE with an operation and one or more inputs.
+
+A parameter is `value`, `curve` **or** `input` — a static number, a curve of its
+own, or the output of this node. That third case is what a cross-dissolve, a
+caption fed by the transcript, an audio-reactive scale, a texture that is another
+clip and a mesh morph all are, and they are one mechanism rather than five.
+
+A NODE and not a single reference, because a blend needs two things and a factor.
+`:mix` is the reason: it takes `a`, `b` and a numeric `t`, and `t` is an ordinary
+parameter with an ordinary slider and an ordinary curve. That is what keeps the
+keyframe engine numeric — a curve of meshes would put two meshes in the project
+file as keyframe VALUES and allocate one per frame in `valueat`, where what the
+user actually has is two sources and a number between them.
+
+`resolved` is filled by [`bindinputs!`](@ref) at the one moment ids can change
+meaning: a structural edit. It is not a cache that could disagree — nothing else
+reads it. An entry of `nothing` is a DANGLING input, and a node with one reads as
+the parameter's own value rather than failing.
+"""
+mutable struct ParamInput
+    const op::Symbol
+    const inputs::Vector{InputRef}
+    resolved::Vector{Any}
+    # What each resolved input's frames are counted in, and what the READER's
+    # are, so a value crossing a clip boundary is converted rather than assumed.
+    from::Vector{Any}
+    to::Any
+end
+ParamInput(op::Symbol, inputs::InputRef...) =
+    ParamInput(op, collect(InputRef, inputs), Any[nothing for _ in inputs],
+               Any[nothing for _ in inputs], nothing)
+
+"""
+    drives(op) -> Bool
+
+Whether a node of this kind supplies the parameter's VALUE, or only points at
+another one.
+
+`:pairedwith` is the second case, and it is the whole of what `Clip.blendfrom`
+used to be: "these two are one edit". A cross-dissolve is keyed on ONE side —
+fading both would darken the middle, because the outgoing clip fades against
+nothing while the incoming one only partly covers it — so the pairing genuinely
+carries no value, and saying so is a predicate rather than a second mechanism.
+"""
+drives(::Val{:pairedwith}) = false
+drives(::Val) = true
+drives(op::Symbol) = drives(Val(op))
+
+"""
+    inputvalue(Val(op), values) -> value
+
+What the node computes from what its inputs delivered.
+
+`:mix` is [`lerp`](@ref) — the same function a curve uses between two keys, which
+is why a mesh or an image blends here without the engine learning anything new.
+It is evaluated on values that just ARRIVED, never on values that were stored.
+"""
+inputvalue(::Val{:copy}, v) = v[1]
+inputvalue(::Val{:invert}, v) = invertvalue(v[1])
+inputvalue(::Val{:mix}, v) = lerp(v[1], v[2], Float64(v[3]))
+inputvalue(op::Symbol, v) = inputvalue(Val(op), v)
+
+invertvalue(v::Real) = oneunit(v) - v
+invertvalue(v::AbstractVector) = oneunit(eltype(v)) .- v
+
+"How many inputs an operation takes — what the panel offers, and what a project
+file is checked against."
+inputarity(::Val{:copy}) = 1
+inputarity(::Val{:invert}) = 1
+inputarity(::Val{:mix}) = 3          # a, b, and the factor between them
+inputarity(::Val{:pairedwith}) = 1
+inputarity(op::Symbol) = inputarity(Val(op))
+
+"""
+    inputframe(node, i, frame) -> Int
+
+`frame`, counted in input `i`'s frames instead of the reader's. Identity within
+one clip; across a clip boundary it goes out to the timeline and back, because
+each clip keys against its own source and the two need not run at the same rate.
+"""
+function inputframe(n::ParamInput, i::Integer, frame::Real)
+    f = n.from[i]
+    (f === n.to || f === nothing || n.to === nothing) && return round(Int, frame)
+    return sourceframe(f, timelineframe(n.to, round(Int, frame)))
+end
 
 """
 One parameter of one effect: what it is called, what it is now, and — if it is
@@ -173,23 +330,63 @@ mutable struct Param{T}
     curve::Union{Nothing, AnimCurve{T}}
     visible::Bool
     const range::Any        # (lo, hi) for a number, `nothing` where it means nothing
+    # Where the value comes from when it comes from somewhere else — see
+    # [`ParamInput`](@ref). The third of the three ways a parameter can have a
+    # value, and the reason there is no separate machinery for a cross-dissolve,
+    # a caption bound to the transcript, an audio-reactive number, a texture that
+    # is another clip, or a mesh morph.
+    input::Union{Nothing, ParamInput}
 end
 Param(name::Symbol, label::AbstractString, value::T;
-      curve = nothing, visible = false, range = nothing) where {T} =
-    Param{T}(name, String(label), value, curve, visible, range)
+      curve = nothing, visible = false, range = nothing, input = nothing) where {T} =
+    Param{T}(name, String(label), value, curve, visible, range, input)
 
 "Whether `p` is animated — has a curve with at least one key."
 isanimated(p::Param) = p.curve !== nothing && !isempty(p.curve)
 
 """
+Whether `p` is DRIVEN — takes its value from another parameter.
+
+A parameter with a `:pairedwith` edge is not: it points at another one and keeps
+its own curve. See [`drives`](@ref).
+"""
+isdriven(p::Param) =
+    p.input !== nothing && drives(p.input.op) && all(!isnothing, p.input.resolved)
+
+"""
     valueat(p::Param, frame) -> T
 
-`p`'s value at `frame`: its curve where it has one, its static value otherwise.
-The static value is also the fallback for a curve that exists but is empty, so
-clearing the last key leaves the parameter where it was rather than at zero.
+`p`'s value at `frame` — the one question the whole animation system answers.
+
+Three sources, in order: an EDGE if it has one (the value resolved at the far end
+and mapped through `op`), its CURVE if it has one, its static value otherwise. The
+static value is also the fallback for a curve that exists but is empty and for an
+edge whose target is gone, so clearing the last key — or deleting what drove a
+parameter — leaves it where it was rather than at zero.
 """
-valueat(p::Param, frame::Real) =
-    isanimated(p) ? something(valueat(p.curve, frame), p.value) : p.value
+function valueat(p::Param{T}, frame::Real) where {T}
+    n = p.input
+    if n !== nothing && drives(n.op) && all(!isnothing, n.resolved)
+        vals = ntuple(i -> readinput(n.resolved[i], inputframe(n, i, frame)),
+                      length(n.resolved))
+        return convert(T, inputvalue(n.op, vals))
+    end
+    return isanimated(p) ? something(valueat(p.curve, frame), p.value) : p.value
+end
+
+"""
+    readinput(resolved, frame) -> value
+
+What one resolved input delivers at `frame`.
+
+A parameter is read at that frame; a file's contents are what they are and do not
+depend on one. A CLIP's picture is refused here on purpose — it lives as a
+transient inside a running composition, so it is wired by the graph and never
+fetched from inside a value lookup.
+"""
+readinput(p::Param, frame::Integer) = valueat(p, frame)
+readinput(x, ::Integer) = x
+# …and the refusal for a `Clip` is in clips.jl, where that type exists.
 
 "Fraction of `p`'s range, clamped to [0,1] — where its value sits in its lane."
 function paramnorm(p::Param, v)
@@ -203,4 +400,29 @@ function paramdenorm(p::Param, u::Real)
     p.range === nothing && return p.value
     lo, hi = p.range
     return lo + clamp(u, 0.0, 1.0) * (hi - lo)
+end
+
+"""
+One parameter row of the effects panel, BOUND to its parameter.
+
+A row is not a place a value is pushed to. What it shows — where the slider sits,
+whether the ◆ is filled — is DERIVED from `param` and `playheadframe(player,
+target)`, and re-derived by [`refreshfxrows!`](@ref) whenever either can have
+moved. The other direction is the slider's own handler, which edits the curve.
+
+The row exists so that derivation has one place to happen per on-screen
+parameter. Before it, `paramform!` registered an `on(player.playhead)` per row:
+118 of them on the lego project, none ever unregistered, and a fresh set with
+every card rebuild.
+
+`colors` is the ◆'s three states (a key here / animated / not animated) — the
+panel's palette, carried rather than looked up, because the row is drawn once and
+the refresh runs on every playhead move.
+"""
+struct ParamRow
+    target::Any                  # the Clip the parameter's frames are counted in
+    param::Param
+    slider::Any                  # its Slider, or `nothing` for a row without one
+    kf::Any                      # the ◆ Button, or `nothing`
+    colors::NTuple{3, Any}
 end

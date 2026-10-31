@@ -291,6 +291,16 @@ cachefor(timeline::Timeline, source::VideoSource) =
     get!(() -> ThumbnailCache(source; gpurun = timeline.gpurun), timeline.caches, source)
 
 """
+A source that has no file to scan has no thumbnail cache and never gets one.
+
+`nothing`, not an empty cache: a cache is a decode worker plus a ring, and
+starting one for a clip that renders its frames would spawn a thread to seek a
+file that does not exist. The band draws as a plain block instead — see
+[`thumbsfor`](@ref).
+"""
+cachefor(::Timeline, ::ClipSource) = nothing
+
+"""
 Switch thumbnail decoding to the GPU runner `f`. Caches created before the
 player's GPU worker existed (the initial sources — `relayout!` runs inside the
 Timeline constructor) restart their workers on the GPU loop; decoded thumbs
@@ -316,6 +326,21 @@ function thumbsfor(timeline::Timeline, source::VideoSource)
         thumb
     end
 end
+
+"A source with no thumbnails asks for none: its band is a plain block."
+thumbsfor(::Timeline, ::ClipSource) = _ -> nothing
+
+"""
+The thumbnail size a cache reports.
+
+A source with no cache still needs a SIZE — the filmstrip's tile pitch is
+`bandheight * (w/h) / pixelspersecond`, so a zero here divides the lane into
+infinitely many tiles and `floor(Int, NaN)` throws inside the plot. 16:9 is the
+honest stand-in: there are no thumbnails to be the wrong shape, and the band is
+drawn as one plain block at that pitch.
+"""
+thumbdims(cache) = (cache.thumbwidth, cache.thumbheight)
+thumbdims(::Nothing) = (16, 9)
 
 function timelineframe(timeline::Timeline, t::Real)
     return clamp(round(Int, t * timeline.sequence.framerate), 0,
@@ -344,7 +369,7 @@ function relayout!(timeline::Timeline)
                         strokecolor_idle = timeline.colors.border,
                         strokecolor_hovered = timeline.colors.accent_subtle,
                         strokecolor_selected = timeline.colors.accent,
-                        thumbsize = (cache.thumbwidth, cache.thumbheight))
+                        thumbsize = thumbdims(cache))
         push!(timeline.clipplots, plt)
         push!(timeline.clipranges, rng)
         push!(timeline.clipstarts, srcstart)
@@ -375,7 +400,7 @@ function relayout!(timeline::Timeline)
             timeline.plotsources[i] = clip.source
             cache = cachefor(timeline, clip.source)
             timeline.clipplots[i].thumbs = thumbsfor(timeline, clip.source)
-            timeline.clipplots[i].thumbsize = (cache.thumbwidth, cache.thumbheight)
+            timeline.clipplots[i].thumbsize = thumbdims(cache)
         end
     end
     timeline.ntr[] = ntr
