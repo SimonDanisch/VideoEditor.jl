@@ -1,10 +1,10 @@
 """
 Non-destructive per-clip effects, interpreted in stack order by `graphof` and run
 as a Mantle graph — the one renderer, whatever the tier. All pixel work is
-GPUFiltering kernels through KernelAbstractions, and the buffers are transients
-placed by the engine's Mantle device, so the same code runs on host memory under
-`KA.CPU()` and on the GPU through Mantle. There is no CPU stack and no GPU stack;
-there is one graph and a backend parameter.
+GPUFiltering kernels, plain KernelInterface functions declared into the graph,
+and the buffers are transients placed by the engine's Mantle device, so the same
+code runs on lavapipe (the CPU) and on a GPU. There is no CPU stack and no GPU
+stack; there is one graph and a device parameter.
 """
 abstract type FxOp end
 
