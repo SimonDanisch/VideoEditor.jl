@@ -89,7 +89,7 @@ function serve(c::Client)
             session(c, sock)
             @info "the farm server closed the connection; reconnecting"
         catch e
-            e isa Refused && rethrow()
+            (e isa Refused || e isa InterruptException) && rethrow()
             @error "farm connection failed; reconnecting" exception = (e, catch_backtrace())
         finally
             close(sock)
@@ -397,12 +397,18 @@ function relay(sock, renderer)
     end
 end
 
-"""End a renderer: asked to close, then given half a minute, then killed."""
-function stop!(renderer)
+"""End a renderer, escalating through SIGTERM to SIGKILL and waiting for exit."""
+function stop!(renderer; grace = 30, terminate = 5)
     process_running(renderer) || return
     isopen(renderer.in) && sendmessage(renderer, Dict{String, Any}("command" => "close"))
     close(renderer.in)
-    timedwait(() -> !process_running(renderer), 30) === :ok || kill(renderer)
+    if timedwait(() -> !process_running(renderer), grace) !== :ok
+        kill(renderer)
+        if timedwait(() -> !process_running(renderer), terminate) !== :ok
+            kill(renderer, Base.SIGKILL)
+        end
+    end
+    wait(renderer)
     return
 end
 

@@ -55,23 +55,39 @@ function twinframe(cache::TrackCache, clip::Clip, sf::Integer)
     return nothing
 end
 
+"A graded plane's key includes the effects, not just the underlying scene."
+trackframekey(clip::Clip, sf::Integer) = (framekey(clip,sf),
+    [(fx.kind, [valuekey(p,sf) for p in fx.params]) for fx in clip.effects if fx.kind !== :scene && fx.enabled[]])
+
+"A valid equivalent PNG, usable even when no HDR master was retained."
+function twintrackframe(cache::TrackCache, clip::Clip, sf::Integer)
+    clip.timeinterp === :flow && return nothing
+    key = trackframekey(clip,sf)
+    for f in get(cache.valid,clip.id,BitSet())
+        f != sf && cachevalid(cache,clip.id,f) && isequal(trackframekey(clip,f),key) && return f
+    end
+    return nothing
+end
+
 "Whether a clip's finished pictures are traced, so worth a farm."
 traced(src::SceneSource) = !get(src.bakescreenopts, :rasterize, true)
 traced(::ClipSource) = false
 
 """
-    distinctframes(seq, frames) -> Vector{Int}
+    distinctframes(seq, frames; hdr = true) -> Vector{Int}
 
 `frames` without those whose traced pictures others of them already trace: a
 frame is left out when every traced clip in it shows a source frame with the key
 (see [`framekey`](@ref)) of one in a frame kept before it. The export links the
-left-out frames' masters from those (see [`twinsourceframe!`](@ref)).
+left-out frames' masters from those (see [`twinsourceframe!`](@ref)). Without
+HDR, compare finished-plane keys (including grading) and reuse equivalent PNGs.
 """
-function distinctframes(seq::Sequence, frames)
+function distinctframes(seq::Sequence, frames; hdr::Bool = true)
     seen = Set{Any}()
     kept = Int[]
     for n in frames
-        keys = [(c.id, framekey(c, sourceframe(c, n))) for c in frameclips(seq, n) if traced(c.source)]
+        keys = [(c.id, hdr ? framekey(c, sourceframe(c,n)) : trackframekey(c, sourceframe(c,n)))
+                for c in frameclips(seq,n) if traced(c.source)]
         (isempty(keys) || !all(in(seen), keys)) && push!(kept, n)
         union!(seen, keys)
     end
@@ -97,7 +113,7 @@ function farmneedsframe(seq::Sequence, n::Integer)
     for c in clips
         cache=trackcache(c)
         sf=sourceframe(c,n)
-        plane=cache!==nothing && cachevalid(cache,c.id,sf)
+        plane=cache!==nothing && (cachevalid(cache,c.id,sf) || twintrackframe(cache,c,sf)!==nothing)
         allcached &= plane
         if c.source isa SceneSource
             if !get(c.source.bakescreenopts,:rasterize,true)

@@ -13,4 +13,14 @@ include(joinpath(@__DIR__,"..","FarmClient","src","FarmClient.jl"))
     portable=FarmClient.versioncommand(julia,"")
     @test !any(startswith("--project"),portable.exec)
 end
+
+if Sys.isunix()
+    @testset "renderer shutdown waits for stubborn processes to exit" begin
+        renderer = open(`sh -c 'trap "" TERM; printf "ready\n"; while :; do read line; done'`, "r+")
+        @test readline(renderer) == "ready"
+        FarmClient.stop!(renderer; grace = 0.1, terminate = 0.1)
+        @test !process_running(renderer)
+        @test renderer.termsignal == Base.SIGKILL
+    end
+end
 end

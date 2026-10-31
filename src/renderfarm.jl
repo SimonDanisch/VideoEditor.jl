@@ -46,7 +46,8 @@ the snapshot every worker renders: the project and its sidecars, the files it
 reads (`data/`, `inputs/`), `environment/Project.toml` (the code) and
 `job.toml`. `key` names the snapshot's content: frames committed for another
 snapshot are not this job's, so a changed edit can never mix with old frames.
-`planes`: whether workers return each frame's planes beside it (see
+`planes`: whether workers return the graded, compositable PNG layers.
+`hdr`: whether they also return linear HDR/auxiliary source buffers (see
 [`renderjob`](@ref)).
 """
 struct RenderJob
@@ -60,7 +61,12 @@ struct RenderJob
     packages::Vector{String}          # the recipes' and effects' packages: a renderer loads them before it renders (`loadpackages`)
     relocations::Dict{String, String}
     planes::Bool
+    hdr::Bool
 end
+
+# Positional callers from before HDR retention was separated keep their policy.
+RenderJob(directory, key, canvas, total, fps, julia, backends, packages, relocations, planes::Bool = true) =
+    RenderJob(directory, key, canvas, total, fps, julia, backends, packages, relocations, planes, planes)
 
 function RenderJob(directory::AbstractString)
     snapshot = joinpath(directory, FARM_SNAPSHOT)
@@ -68,7 +74,8 @@ function RenderJob(directory::AbstractString)
     return RenderJob(abspath(directory), snapshotkey(snapshot), Tuple(Int.(meta["size"])), Int(meta["total"]),
                      Float64(meta["fps"]), String(meta["julia"]), String.(meta["backends"]),
                      String.(meta["packages"]), Dict{String, String}(meta["relocations"]),
-                     Bool(get(meta, "planes", true)))
+                     Bool(get(meta, "planes", true)),
+                     Bool(get(meta, "hdr", get(meta, "planes", true))))
 end
 
 jobsnapshot(job::RenderJob) = joinpath(job.directory, FARM_SNAPSHOT)
@@ -85,39 +92,173 @@ function snapshotkey(snapshot::AbstractString; except = ())
     return bytes2hex(SHA.sha256(MsgPack.pack(sort!(entries))))
 end
 
-"""What a snapshot renders: its edit and files, without the environment of its code."""
+"""Raw snapshot digest without its code environment, including cache bookkeeping."""
 editkey(snapshot::AbstractString) = snapshotkey(snapshot; except = ("environment/Project.toml",))
 
 """
-    carryframes!(job, from) -> Int
+    carryframes!(job, from; frames = nothing) -> Int
 
 Take into `job` the frames `from` committed: the same edit made a job again for
 changed code (a fix in the renderer), so what was rendered stays rendered.
-Refused unless both snapshots hold the same edit, files and settings; only the
-environment of the code may differ. A frame comes with its receipt, which names
-the job it came from; planes are not carried. Returns how many frames came.
+Refused unless both snapshots hold the same artistic edit, input files and
+canvas/frame rate. Code, cache validity and retention may differ. A frame comes
+with its receipt, which names
+the job it came from. Track planes are retained when the destination requests
+them; HDR is carried only when requested. A flattened source is refused for a
+layered destination rather than silently losing editability. Returns how many
+frames came.
+
+For a cut or insertion, `frames` explicitly maps destination => original
+timeline frames. Every pair must show the same saved clips, effects and source
+frames; only placement and trims may differ. Transitions and driven picture
+dependencies are refused. Narration may change independently. As with carrying
+a whole edit, the caller is responsible for changes to the scene package's code.
+Images share storage through hard links where supported. The original job stays
+immutable and the new receipts record both the original job and frame number.
 """
-function carryframes!(job::RenderJob, from::RenderJob)
-    editkey(jobsnapshot(job)) == editkey(jobsnapshot(from)) ||
-        error("$(from.directory) renders another edit than $(job.directory): its frames are not this job's")
+function carryframes!(job::RenderJob, from::RenderJob; frames = nothing)
+    job.planes && !from.planes && error("The source job has finished composites only; separate picture/label planes must be rendered")
+    job.hdr && !from.hdr && error("The source job has no retained HDR buffers; use hdr=false or render them")
+    if frames === nothing
+        job.canvas == from.canvas && job.fps == from.fps && job.total == from.total &&
+            samefarmedit(jobsnapshot(job), jobsnapshot(from)) ||
+            error("$(from.directory) renders another edit than $(job.directory): its frames are not this job's")
+        pairs = [n => n for n in 0:job.total-1]
+    else
+        pairs = collect(frames)
+        verifycarriedframes(job, from, pairs)
+    end
     carried = 0
-    for n in 0:job.total-1
+    source_sequence = job.planes ? loadproject(jobproject(from)) : nothing
+    for (n, original) in pairs
         farmcomplete(job.directory, n, job.key) && continue
-        farmcomplete(from.directory, n, from.key) || continue
-        receipt = JSON.parsefile(farmreceiptpath(from.directory, n))
-        commitbytes!(farmframepath(job.directory, n), read(farmframepath(from.directory, n)))
+        farmcomplete(from.directory, original, from.key) || continue
+        receipt = JSON.parsefile(farmreceiptpath(from.directory, original))
+        if job.planes && isempty(get(receipt, "layers", ())) && !isempty(frameclips(source_sequence, original))
+            error("The source frame has no separate picture/label planes; it must be rendered")
+        end
+        layers = carrylayers!(job, from, get(receipt, "layers", ()))
+        linkfarmframe!(farmframepath(job.directory, n), farmframepath(from.directory, original))
         farmwritejson(farmreceiptpath(job.directory, n),
-                      merge(receipt, Dict("job" => job.key, "carried_from" => from.key, "layers" => Any[])))
+                      merge(receipt, Dict("job" => job.key, "frame" => n,
+                          "carried_from" => from.key, "carried_frame" => original, "layers" => layers)))
         carried += 1
     end
     return carried
 end
 
+"Retain the immutable layer files and their hashes when carrying a frame."
+function carrylayers!(job::RenderJob, from::RenderJob, layers)
+    job.planes || return Any[]
+    carried = Any[]
+    for layer in layers
+        track, id, sf = Int(layer["track"]), parse(UInt64, layer["id"]), Int(layer["frame"])
+        source = cachefile(farmplanes(from.directory, track), id, sf)
+        isfile(source) && filehash(source) == layer["sha256"] || error("A source track plane is missing or corrupt")
+        entry = Dict{String, Any}(layer)
+        linkfarmframe!(cachefile(farmplanes(job.directory, track), id, sf), source)
+        if job.hdr && haskey(layer, "hdr_sha256")
+            raw = cachefile(farmsources(from.directory, track), id, sf)
+            isfile(raw) && filehash(raw) == layer["hdr_sha256"] || error("A source HDR plane is missing or corrupt")
+            linkfarmframe!(cachefile(farmsources(job.directory, track), id, sf), raw)
+        else
+            delete!(entry, "hdr_sha256")
+        end
+        push!(carried, entry)
+    end
+    return carried
+end
+
+"Validate the entire reuse map before publishing any frames."
+function verifycarriedframes(job::RenderJob, from::RenderJob, pairs)
+    job.canvas == from.canvas && job.fps == from.fps || error("carried frames need the same canvas and frame rate")
+    except = ("project.videoedit", "environment/Project.toml", "job.toml")
+    snapshotkey(jobsnapshot(job); except) == snapshotkey(jobsnapshot(from); except) ||
+        error("carried frames need unchanged input files and sidecars")
+    length(unique(first.(pairs))) == length(pairs) || error("duplicate destination in carried frames")
+    after, before = loadproject(jobproject(job)), loadproject(jobproject(from))
+    # Compare saved render data, not mutable Effect/Param object identities.
+    signatures = IdDict{Clip, Any}()
+    function signature(c)
+        get!(signatures, c) do
+            any(p.input !== nothing for fx in c.effects for p in fx.params) &&
+                error("cannot carry a frame with driven picture dependencies")
+            d = decodeblocks(MsgPack.unpack(MsgPack.pack(clipdict(c))))
+            for key in ("start", "src_in", "src_out")
+                delete!(d, key)
+            end
+            d
+        end
+    end
+    for (n, original) in pairs
+        0 <= n < job.total && 0 <= original < from.total || error("carried frame outside its timeline")
+        transitionat(after, n) === nothing && transitionat(before, original) === nothing ||
+            error("cannot carry a transition frame")
+        a, b = frameclips(after, n), frameclips(before, original)
+        length(a) == length(b) && all(zip(a, b)) do (c, old)
+            sourceframe(c, n) == sourceframe(old, original) && isequal(signature(c), signature(old))
+        end || error("frame $n differs from original frame $original; it must be rendered")
+    end
+    return nothing
+end
+
+"Publish an immutable finished image without duplicating its storage."
+function linkfarmframe!(target, source)
+    isfile(target) && samefile(target, source) && return target
+    mkpath(dirname(target))
+    mktempdir(dirname(target)) do dir
+        staged = joinpath(dir, basename(target))
+        try
+            hardlink(source, staged)
+        catch err
+            err isa Base.IOError || err isa SystemError || rethrow()
+            cp(source, staged)
+        end
+        mv(staged, target; force = true)
+    end
+    return target
+end
+
 filehash(path) = open(SHA.sha256, path) |> bytes2hex
+
+"Cache validity changes as frames arrive; render revisions still identify edits."
+farmcacheidentity(x) = x
+function farmcacheidentity(d::AbstractDict)
+    identity = Dict(k => (k == "revisions" ? Dict((r[1],r[2]) => r[3] for r in v) : farmcacheidentity(v))
+                for (k,v) in d if k != "valid" && k != "dirty")
+    # Loading a PNG cache lazily creates its empty HDR source store, including
+    # for the composite. Merely saving that store does not change the edit.
+    if get(identity, "format", nothing) == "hdr" &&
+       get(identity, "source", nothing) === nothing && isempty(identity["revisions"])
+        return nothing
+    end
+    return identity
+end
+
+function farmprojectcontent(path)
+    d = decodeblocks(MsgPack.unpack(read(path)))
+    haskey(d,"framecaches") && (d["framecaches"] = farmcacheidentity(d["framecaches"]))
+    return d
+end
+
+"The same immutable job may resume after its planes were adopted and saved."
+function samefarmsnapshot(a,b)
+    snapshotkey(a;except=("project.videoedit",)) == snapshotkey(b;except=("project.videoedit",)) || return false
+    return isequal(farmprojectcontent(joinpath(a,"project.videoedit")),
+                   farmprojectcontent(joinpath(b,"project.videoedit")))
+end
+
+"Same artistic edit and inputs, independently of code and cache retention."
+function samefarmedit(a,b)
+    except = ("project.videoedit", "environment/Project.toml", "job.toml")
+    snapshotkey(a;except) == snapshotkey(b;except) || return false
+    return isequal(farmprojectcontent(joinpath(a,"project.videoedit")),
+                   farmprojectcontent(joinpath(b,"project.videoedit")))
+end
 
 """
     renderjob(project, directory; inputs = [], root = dirname(project), size = nothing, portable = true,
-              planes = true) -> RenderJob
+              planes = true, hdr = planes) -> RenderJob
 
 Snapshot the saved `project` into `directory/job`: the project and its
 sidecars, the files it reads (soundtracks, recordings, scene scripts, and the
@@ -126,18 +267,24 @@ includes and assets declared in `inputs`), and the environment of its code
 clients on this machine only). Files under `root` keep their relative paths,
 so a script's `include`s still work; others are kept by content.
 
-With `planes`, workers return each frame's track planes and a traced clip's
-linear HDR source beside it, for the edit to adopt (`adoptfarmcache!`): a
-traced 1080p frame's source is over 100 MB. `planes = false` returns finished
-frames only, for a film rendered to be encoded (`encodefarm!`).
+With `planes`, workers return each track's graded PNG, including transparent
+labels, for the edit to adopt (`adoptfarmcache!`). `hdr = false` omits the large
+linear HDR/auxiliary buffers while retaining these compositable layers: label
+changes, translations and cuts can reuse the picture without tracing again.
+`hdr = true` additionally retains the source buffers for denoise/grade edits.
+`planes = false` explicitly discards all editable layers, returning finished
+composites only. HDR retention requires planes. Old snapshots without `hdr`
+retain their original policy.
 
 Narration must be rendered first, so workers need no speech model. Asked again
-for the same directory, the same snapshot resumes the job; anything changed
-(the edit, a file, a package) is refused: make a new job for it.
+for the same directory, the same edit resumes the immutable job even after
+adopted cache validity was saved. Changed render revisions, artistic edits,
+inputs, code or retention are refused: make a new job for them.
 """
 function renderjob(project::AbstractString, directory::AbstractString; inputs = String[],
                    root::AbstractString = dirname(abspath(project)), size = nothing, portable::Bool = true,
-                   planes::Bool = true)
+                   planes::Bool = true, hdr::Bool = planes)
+    hdr && !planes && throw(ArgumentError("HDR retention requires track planes"))
     seq = loadproject(project)
     any(n -> !isempty(strip(n.text)) && isempty(n.samples), seq.narration) &&
         error("render narration before preparing the farm job")
@@ -172,10 +319,10 @@ function renderjob(project::AbstractString, directory::AbstractString; inputs = 
             TOML.print(io, Dict{String, Any}("size" => collect(canvas), "total" => total, "fps" => seq.framerate,
                                              "julia" => string(VERSION), "backends" => farmbackends(seq),
                                              "packages" => loadpackages(seq), "relocations" => relocations,
-                                             "planes" => planes))
+                                             "planes" => planes, "hdr" => hdr))
         end
         if isdir(snapshot)
-            snapshotkey(temp) == snapshotkey(snapshot) ||
+            samefarmsnapshot(temp, snapshot) ||
                 error("the edit, its files or its code changed since $directory was made: use a new job directory")
         else
             mv(temp, snapshot)
@@ -197,6 +344,7 @@ mutable struct FarmRenderer
     planes::String
     # whether they are returned with the frame or only cleared (`renderjob`'s `planes`)
     keepplanes::Bool
+    keephdr::Bool
 end
 function farmthread(renderer::FarmRenderer)
     queue = Mantle.batchqueue(enginedevice(renderer.engine))
@@ -260,7 +408,8 @@ function farmrenderer(job::RenderJob; backend = Mantle.defaultbackend())
     # A recording is a folder: its files map under it, longest first.
     pathmap = Dict(source => joinpath(snapshot, relative) for (source, relative) in job.relocations)
     seq = loadproject(jobproject(job); pathmap)
-    return farmrenderer(seq;backend,directory=job.directory,canvas=job.canvas,keepplanes=job.planes)
+    return farmrenderer(seq;backend,directory=job.directory,canvas=job.canvas,
+                        keepplanes=job.planes,keephdr=job.hdr)
 end
 
 """
@@ -273,12 +422,13 @@ The caller owns the sequence and its input files for the renderer's lifetime.
 """
 function farmrenderer(seq::Sequence; backend = Mantle.defaultbackend(),
                       directory::AbstractString = mktempdir(;cleanup=false),canvas=canvassize(seq),
-                      keepplanes::Bool = true)
+                      keepplanes::Bool = true, keephdr::Bool = keepplanes)
+    keephdr && !keepplanes && throw(ArgumentError("HDR retention requires track planes"))
     mkpath(directory)
     planes = mktempdir(directory; prefix = "planes-", cleanup = false)
     farmcaches!(seq, planes)
     return FarmRenderer(seq, zeros(RGB{N0f8}, canvas...), zeros(RGB{N0f8}, canvas...),
-                        Dict{String, Any}(), FxEngine(backend), ReentrantLock(), false, planes, keepplanes)
+                        Dict{String, Any}(), FxEngine(backend), ReentrantLock(), false, planes, keepplanes, keephdr)
 end
 
 """
@@ -292,7 +442,6 @@ hands back with the frame (`farmlayers!`); it composites every frame once, so it
 keeps no composite cache.
 """
 function farmcaches!(seq::Sequence, directory::AbstractString)
-    isempty(seq.trackcaches) && return seq
     empty!(seq.trackcaches)
     enabletrackcache!(seq, directory)
     seq.compositecache = nothing
@@ -317,13 +466,14 @@ struct FarmLayer
 end
 
 """
-    farmlayers!(seq, n) -> Vector{FarmLayer}
+    farmlayers!(seq, n; hdr = true) -> Vector{FarmLayer}
 
 The planes timeline frame `n` was just composited from, taken out of the
 worker's caches: a worker keeps no frames, and a traced clip's HDR source is
-tens of megabytes a frame.
+tens of megabytes a frame. With `hdr = false`, its temporary source is dropped
+without reading/transferring it; the graded PNG layer is still returned.
 """
-function farmlayers!(seq::Sequence, n::Integer)
+function farmlayers!(seq::Sequence, n::Integer; hdr::Bool = true)
     layers = FarmLayer[]
     for clip in frameclips(seq, n)
         cache = trackcache(clip)
@@ -331,8 +481,15 @@ function farmlayers!(seq::Sequence, n::Integer)
         sf = sourceframe(clip, n)
         cachevalid(cache, clip.id, sf) || continue
         raw = cache.source
-        hdr = raw !== nothing && cachevalid(raw, clip.id, sf) ? takeplane!(raw, clip.id, sf) : UInt8[]
-        push!(layers, FarmLayer(clip.track, clip.id, sf, takeplane!(cache, clip.id, sf), hdr))
+        source = UInt8[]
+        if raw !== nothing && cachevalid(raw, clip.id, sf)
+            if hdr
+                source = takeplane!(raw, clip.id, sf)
+            else
+                dropplane!(raw, clip.id, sf)
+            end
+        end
+        push!(layers, FarmLayer(clip.track, clip.id, sf, takeplane!(cache, clip.id, sf), source))
     end
     return layers
 end
@@ -389,7 +546,7 @@ function farmframes!(renderer::FarmRenderer, indices)
                     # writeframe!'s orientation conversion for VideoIO.
                     PNGFiles.save(io, permutedims(renderer.canvas, (2, 1)))
                     (frame = Int(n), png = take!(io), seconds = (time_ns()-started)/1e9,
-                     layers = renderer.keepplanes ? farmlayers!(renderer.sequence, n) :
+                     layers = renderer.keepplanes ? farmlayers!(renderer.sequence, n; hdr=renderer.keephdr) :
                                                    dropplanes!(renderer.sequence, n))
                 end
             end
@@ -580,7 +737,7 @@ function renderfarm!(job::RenderJob, workers; frames = nothing, reuse = nothing,
     wanted = frames === nothing ? collect(0:total-1) : sort!(unique(Int.(collect(frames))))
     all(n -> 0 <= n < total, wanted) || error("invalid farm frame range")
     requested=length(wanted)
-    reuse===nothing || (wanted = distinctframes(reuse, filter!(n->farmneedsframe(reuse,n),wanted)))
+    reuse===nothing || (wanted = distinctframes(reuse, filter!(n->farmneedsframe(reuse,n),wanted); hdr=job.hdr))
     # An atomic mkdir is a process-wide coordinator lock, including other editors.
     lockdir = joinpath(dir, "coordinator.lock")
     ispath(lockdir) && error("farm directory already has a coordinator: $lockdir")

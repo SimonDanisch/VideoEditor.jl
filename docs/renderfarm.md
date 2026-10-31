@@ -275,32 +275,66 @@ window. The package's small `test/renderfarm.jl` fixture explicitly chooses
 GLMakie to test scheduling, receipts, transfer and encoding; it does not verify
 GPU ray tracing.
 
-Resume currently reuses verified frames from the **same immutable job**. It does
-not automatically reuse frames between edited documents. A job's snapshot holds
-the complete project and its audio sidecars, so even an audio-only edit makes a
-different job. An editor curve change invalidates its entire clip-level bake;
-the scheduler does not calculate which curve segments changed. Supplying a frame
-subset to `renderfarm!` is possible, but is not automatic edit invalidation.
+Resume reuses verified frames from the **same immutable job**. `carryframes!`
+also retains finished frames when an edit is made into another job. Without
+keywords it requires the same edit and inputs. For trims and insertions, pass
+`frames = [destination => original, ...]`: each pair is checked against the
+saved clips, effects and source frames, and all declared input files must stay
+unchanged. Clip IDs must be preserved when editing. Transitions and driven
+picture dependencies are conservatively refused. Code changes remain the
+caller's responsibility, as with carrying an identical edit after a renderer fix.
+The images and requested track planes share storage through hard links; receipts
+retain the original job and frame number. A flattened source cannot supply a
+layered destination and is refused. No original image or receipt is changed. The scheduler then
+renders only the new job's missing frames. Narration is taken from its revised
+project when encoding, independently of picture reuse.
 
-A project with track caches (`enabletrackcache!`) gets its frames' planes back:
-a worker renders into caches of its own, outside the snapshot, and returns each
-frame's track planes and, for a traced clip, its linear HDR source with the
-frame (`farmlayers!`). The coordinator keeps them under
+A project with track caches (`enabletrackcache!`) gets separate track PNGs back:
+the graded picture and the transparent labels remain compositable. Retention of
+the large linear HDR/auxiliary buffers is controlled independently:
+
+| Job options | Retained data | Edits that reuse tracing |
+|---|---|---|
+| `planes=true, hdr=false` | Track PNGs and finished composites | Labels, languages, placement/cuts preserving source pictures |
+| `planes=true, hdr=true` | Track PNGs, HDR/auxiliary buffers and composites | Also grading and denoising |
+| `planes=false` | Finished composites only | Identical finished frames only; labels are burned in |
+
+Use `hdr=false` to save space while retaining editable picture/label layers.
+Disabling HDR must not be implemented by disabling `planes`. Existing jobs
+without an `hdr` setting keep their original retention policy.
+Held pictures can reuse an equivalent graded PNG without an HDR master; their
+key includes the effect stack so different grading is never silently reused.
+
+A worker renders into caches of its own, outside the snapshot, and returns the
+selected data with the frame (`farmlayers!`). Temporary HDR files are discarded
+on the worker when `hdr=false`; they are not read into transfer payloads or
+stored by the coordinator. The coordinator keeps track PNGs under
 `<job>/trackframes` and names their hashes in the frame's receipt.
 `adoptfarmcache!(seq, job)` takes them into the edit's caches wherever the
-clip's frame is unchanged since the job was made, so a grade, denoise or label
-edit after the farm render reuses the traced sources and renders only the
-derived planes:
+clip's frame is unchanged since the job was made. Label edits reuse the graded
+picture PNG even without HDR. Grade/denoise edits need retained HDR to avoid
+tracing again:
 
 ```julia
-renderfarm!(job, farmworkers(job))
 seq = loadproject(project)
+enabletrackcache!(seq, project * ".frames")
+saveproject(project, seq)
+job = renderjob(project, directory; hdr=false)
+renderfarm!(job, farmworkers(job); reuse=seq)
 adoptfarmcache!(seq, job)   # before editing it further
 saveproject(project, seq)
 ```
 
+For another language, load this saved project and change its label clips and
+narration through the editor's mutation API. Preserve picture clip IDs and
+source clocks; do not rebuild the whole sequence to change text. `saveproject`
+to another filename shares immutable cached planes through hard links where
+supported, so language versions do not duplicate pictures. Writing a new label
+publishes a new file and leaves the original version intact. Use ordinary
+`exportvideo` to composite translated labels over the cached pictures. With
+`hdr=false`, this requires no HDR source cache and no further ray tracing.
+
 `encodefarm!` currently encodes all verified PNGs again, then mixes/muxes audio.
-There is no cached video-stream remux path for an audio-only edit. Independent
-scene-frame, composite/video and speech caches are needed before an edited job
-can safely reuse unaffected frames or replace only the soundtrack. Changes to
-speech timing can also affect visuals when a scene follows narration cues.
+There is no cached video-stream remux path for an audio-only edit. Changes to
+speech timing can also affect visuals when a scene follows narration cues;
+those changed pictures must be rendered even if the rest of the film is carried.
