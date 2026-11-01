@@ -45,7 +45,7 @@ function cachewrite!(
     if c.format === :hdr
         writerenderframe(tmp, image)
     else
-        PNGFiles.save(tmp, collect(image))
+        PNGFiles.save(tmp, collect(image); filters = Int(PNGFiles.PNG_FILTER_SUB))
     end
     mv(tmp, file; force = true)
     # An edit during an in-flight render must remain dirty. These counters
