@@ -1620,6 +1620,30 @@ function emptyengine!(e::FxEngine)
     return nothing
 end
 
+"""
+    retainclips!(engine, clips) -> engine
+
+End the compiled plans of every clip not among `clips`, and the compositions of
+any other set of clips: a render that has moved past a clip frees its graphs,
+and their memory goes back to the device's pool for the plans that follow. A
+traced 1080p layer's plan holds its whole HDR chain, so keeping eight of them
+(`MAXCOMPOSITIONS`) outgrew an 8 GB GPU.
+"""
+function retainclips!(e::FxEngine, clips)
+    keep = Set(c.id for c in clips)
+    for (sig, l) in collect(e.layers)
+        l.chain.clip.id in keep && continue
+        Mantle.free!(l.plan)
+        delete!(e.layers, sig)
+    end
+    for (sig, c) in collect(e.compositions)
+        all(ch -> ch.clip.id in keep, c.chains) && continue
+        Mantle.free!(c.plan)
+        delete!(e.compositions, sig)
+    end
+    return e
+end
+
 "The compiled layer plan for this clip's structure, built once."
 function layer!(engine::FxEngine, clip::Clip, fg::FxGraph)
     sig = layersignature(clip, fg)

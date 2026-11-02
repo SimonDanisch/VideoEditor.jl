@@ -2,15 +2,22 @@
 function checkfarmroot(project::AbstractString)
     wanted=TOML.parsefile(project)
     names=String.(collect(keys(wanted["deps"])))
-    actual=farmenvironment(names)
+    # A job of path sources (`portable = false`) pins developed packages by their code.
+    pinned=get(wanted,"content",Dict{String,Any}())
+    actual=farmenvironment(names; portable=isempty(pinned))
     problems=String[]
     for name in names
         get(actual["deps"],name,nothing)==wanted["deps"][name] || push!(problems,"$name: UUID differs")
-        for section in ("sources","compat")
-            expected=get(get(wanted,section,Dict()),name,nothing)
-            found=get(get(actual,section,Dict()),name,nothing)
-            isequal(expected,found) || push!(problems,"$name: $section differs (synchronize the root project)")
+        if haskey(pinned,name)
+            # a path is each machine's own; the code is what has to agree
+            get(get(actual,"content",Dict()),name,nothing)==pinned[name] ||
+                push!(problems,"$name: code differs (synchronize the root project)")
+        else
+            isequal(get(get(wanted,"sources",Dict()),name,nothing),get(get(actual,"sources",Dict()),name,nothing)) ||
+                push!(problems,"$name: sources differs (synchronize the root project)")
         end
+        isequal(get(get(wanted,"compat",Dict()),name,nothing),get(get(actual,"compat",Dict()),name,nothing)) ||
+            push!(problems,"$name: compat differs (synchronize the root project)")
         isequal(get(get(actual,"preferences",Dict()),name,nothing),
                 get(get(wanted,"preferences",Dict()),name,nothing)) || push!(problems,"$name: preferences differ")
     end

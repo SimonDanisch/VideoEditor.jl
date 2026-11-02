@@ -94,7 +94,8 @@ function sequenceaudio(seq::Sequence)
         haskey(tracks, sourcepath(c.source)) && continue
         tracks[sourcepath(c.source)] = loadpcm(c.source)
     end
-    all(isnothing, values(tracks)) && return (Float32[], AUDIORATE)
+    # A timeline of rendered scenes may carry narration and nothing else.
+    isempty(seq.narration) && all(isnothing, values(tracks)) && return (Float32[], AUDIORATE)
     nsamp = ceil(Int, total / seq.framerate * AUDIORATE)
     buf = zeros(Int16, 2, nsamp)
     fillaudio!(buf, seq, tracks, 0)
@@ -135,6 +136,54 @@ function transcribe!(seq::Sequence)
     empty!(seq.captions)                  # the field is `const`: replace contents
     append!(seq.captions, caps)
     return seq.captions
+end
+
+
+"The words of a narration or caption as said: Kokoro's stress marks, punctuation and case removed."
+saidwords(text) = filter(!isempty, split(lowercase(replace(replace(text, r"\[([^\[\]]+)\]\([^)]*\)" => s"\1"),
+                                                             r"[^A-Za-z0-9' ]" => " "))))
+
+"Word-level edit distance."
+function editdistance(a, b)
+    d = collect(0:length(b))
+    for i in eachindex(a)
+        prev = d[1]; d[1] = i
+        for j in eachindex(b)
+            tmp = d[j+1]
+            d[j+1] = min(d[j+1] + 1, d[j] + 1, prev + (a[i] == b[j] ? 0 : 1))
+            prev = tmp
+        end
+    end
+    return d[end]
+end
+
+"""
+    checknarration(seq; tolerance = 0.1) -> Vector{(label, words, differences, heard)}
+
+Whether every narration says its text where the edit plays it: the edit's audio
+while each line is heard ([`narrationspan`](@ref)) is transcribed by the
+installed speech model ([`registertranscribe!`](@ref)) and compared word by word
+with the line's text (stress marks, punctuation and case aside). Line by line,
+because the model's segments run across neighbouring lines. It writes numbers
+as digits and some words in another spelling, so a few differences are normal;
+a line differing in more than `tolerance` of its words, or cut away, is an
+error naming it and what was heard.
+"""
+function checknarration(seq::Sequence; tolerance = 0.1)
+    hasspeechmodel() || error("no speech model installed — see registertranscribe!")
+    audio, rate = sequenceaudio(seq)
+    return map(seq.narration) do nar
+        span = narrationspan(seq, nar)
+        span === nothing && error("the narration $(repr(nar.label)) is cut away")
+        a = clamp(floor(Int, first(span) * rate) + 1, 1, length(audio))
+        b = clamp(ceil(Int, last(span) * rate), a, length(audio))
+        heard = join((c.text for c in INSTALLED.speech(audio[a:b], rate)), " ")
+        expected = saidwords(nar.text)
+        differences = editdistance(expected, saidwords(heard))
+        differences <= tolerance * length(expected) ||
+            error("the narration $(repr(nar.label)) does not say its text; heard: $heard")
+        (label = nar.label, words = length(expected), differences, heard)
+    end
 end
 
 """

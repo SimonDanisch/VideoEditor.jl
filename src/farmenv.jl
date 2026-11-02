@@ -22,9 +22,13 @@ and weak dependencies as the active manifest resolved them, each pinned.
     `[sources]` at their release tags, independently of registry freshness.
   - The environment's package preferences come along, as `[preferences]`.
 
-With `portable = false`, developed packages are `path` sources instead: an
-environment for farm clients on this machine only (its own GPUs), which can
-render what is not committed yet.
+With `portable = false`, developed packages are `path` sources instead, and a
+`[content]` table holds the hash of each one's code (`sourcecontent`): an
+environment for farm clients on this machine, or for clients that run an
+application root of their own (`VIDEOEDITOR_FARM_PROJECT`) holding the same
+code in other folders, such as copies synchronized to each machine. It can
+render what is not committed yet; [`checkfarmroot`](@ref) compares such a
+package by its code, not its path.
 """
 function farmenvironment(roots; project::AbstractString = Base.active_project(), portable::Bool = true)
     manifestpath = Base.project_file_manifest_path(project)
@@ -33,7 +37,7 @@ function farmenvironment(roots; project::AbstractString = Base.active_project(),
     for root in roots
         haskey(entries, root) || error("$root is not in the environment $project")
     end
-    deps, sources, compat = Dict{String, Any}(), Dict{String, Any}(), Dict{String, Any}()
+    deps, sources, compat, content = Dict{String, Any}(), Dict{String, Any}(), Dict{String, Any}(), Dict{String, Any}()
     problems = String[]
     for name in sort!(collect(dependencyclosure(entries, roots)))
         entry = entries[name]
@@ -41,7 +45,12 @@ function farmenvironment(roots; project::AbstractString = Base.active_project(),
         deps[name] = entry["uuid"]
         if haskey(entry, "path")
             path = abspath(dirname(manifestpath), entry["path"])
-            sources[name] = portable ? pinnedsource!(problems, name, path) : Dict{String, Any}("path" => path)
+            if portable
+                sources[name] = pinnedsource!(problems, name, path)
+            else
+                sources[name] = Dict{String, Any}("path" => path)
+                content[name] = sourcecontent(path)
+            end
         elseif haskey(entry, "repo-url")
             rev = get(entry, "repo-rev", "")
             occursin(r"^[0-9a-f]{40}$", rev) ||
@@ -65,6 +74,8 @@ function farmenvironment(roots; project::AbstractString = Base.active_project(),
     isempty(problems) || error("the farm can only render code a worker can fetch:\n  " * join(problems, "\n  "))
     compat["julia"] = "=$(VERSION.major).$(VERSION.minor).$(VERSION.patch)"
     env = Dict{String, Any}("deps" => deps, "sources" => sources, "compat" => compat)
+    # Pkg reads `[sources]` and leaves a table of its own alone
+    isempty(content) || (env["content"] = content)
     # preferences change what a package does: they travel with its code
     preferences = environmentpreferences(project)
     filter!(p -> haskey(deps, first(p)), preferences)
@@ -157,6 +168,30 @@ function pinnedsource!(problems, name, path)
     subdir = relpath(realpath(path), top)
     subdir == "." || (source["subdir"] = replace(subdir, '\\' => '/'))
     return source
+end
+
+"""
+    sourcecontent(path) -> String
+
+The hash of a developed package's code at `path`: its `Project.toml`,
+`Artifacts.toml` and every file under `src`, `ext` and `assets`, by relative
+path. A checkout and a synchronized copy of the same code hash the same; what
+else lies in the folder (tests, docs, generated output, `.git`) does not count.
+"""
+function sourcecontent(path::AbstractString)
+    files = [f for f in ("Project.toml", "Artifacts.toml") if isfile(joinpath(path, f))]
+    for dir in ("src", "ext", "assets")
+        isdir(joinpath(path, dir)) || continue
+        for (root, _, names) in walkdir(joinpath(path, dir)), name in names
+            startswith(name, '.') || push!(files, replace(relpath(joinpath(root, name), path), '\\' => '/'))
+        end
+    end
+    ctx = SHA.SHA256_CTX()
+    for file in sort!(files)
+        SHA.update!(ctx, codeunits(file))
+        SHA.update!(ctx, read(joinpath(path, file)))
+    end
+    return bytes2hex(SHA.digest!(ctx))
 end
 
 """Git's answer in `dir`, or `nothing` where git fails (not a checkout)."""

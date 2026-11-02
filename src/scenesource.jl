@@ -28,7 +28,7 @@ scenespecof(clip::Clip) = scenespecof(clip.source)
 scenespecof(src::SceneSource) = src.root
 scenespecof(::ClipSource) = nothing
 
-"Release a source's live render resources; its saved recipe can be realized again."
+"Release a source's live render resources and its HDR workspace; its saved recipe can be realized again."
 function Base.close(src::SceneSource)
     live=src.live
     if live!==nothing
@@ -40,6 +40,7 @@ function Base.close(src::SceneSource)
         end
         src.live=nothing
     end
+    src.hdr===nothing || (freework!(src.hdr); src.hdr=nothing)
     src.pending=nothing
     src.pendingat=-1
     src.at=-1

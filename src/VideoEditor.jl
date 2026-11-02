@@ -202,7 +202,7 @@ export sam2seed, sam2ready, defaultsegmenter
 export RestoreEffect, registerrestore!, restorewindow!, applyrestore!
 export DepthBlurEffect, DepthTrack, registerdepth!, installdepth!, analyzedepth!, depthframe
 export LookEffect, registerlook!, installlook!, analyzelook!, lookdim
-export Caption, transcribe!, registertranscribe!, installtranscribe!, captionat
+export Caption, transcribe!, registertranscribe!, installtranscribe!, captionat, checknarration
 export captionindexat, editcaption!
 export registerinterpolate!, installinterpolate!, settimeinterp!, smoothslowmo!
 export addnarration!, dropnarration!, rendernarration!, pickfocus!, setinterp!
@@ -210,7 +210,7 @@ export Narration, narrate!, registerspeak!, installspeak!
 export SpeechSettings, VoiceMix, registerspeechmodel!
 export registerplugin!, registereffect!, EffectKind, FxParam, Pointwise, Stencil
 export SceneSource, SceneSpec, sceneclip, textscene, barscene, timecodescene, curvescene
-export programscene, RenderJob, renderjob, FarmWorker, FarmRenderer, farmrenderer, renderfarm!,
+export programscene, RenderJob, renderjob, FarmWorker, FarmRenderer, farmrenderer, renderfarm!, carryframes!,
        farmframes!, closefarm!, encodefarm!, farmstatus, pausefarm!, registerfarm!,
        farmenvironment, FarmServer, farmserver, farmworkers, farmchild, registerlanfarm!
 export TrackCache, enabletrackcache!, invalidatetrack!, invalidateclip!, mutateframe!, mutateframes!,

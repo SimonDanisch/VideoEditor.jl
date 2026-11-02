@@ -2001,7 +2001,10 @@ include("farmenv.jl")     # a job's pinned environment, and the farm's messages 
 include("farmwire.jl")    # large snapshots stream without whole-archive RAM buffers
 include("farmbatch.jl")   # bounded leases, partial retry and incremental wire commits
 include("farmadopt.jl")   # immutable planes share storage without corrupting job receipts
+include("farmretention.jl") # compositable PNGs survive without HDR/auxiliary buffers
+isdefined(Main,:RayMakie) && include("farmretention_gpu.jl") # a translated/retimed overlay does not retrace
 include("farmreuse.jl")   # new snapshots/label edits retain native traced masters
+include("farmcutreuse.jl") # finished frames survive trims and timeline shifts
 include("farmrootprobe.jl") # even runtime version checks keep the sole application environment
 # track and HDR source caches, and the planes farm workers return; render with RayMakie
 isdefined(Main, :RayMakie) && (include("trackcache.jl"); include("hdrcache.jl"); include("guides.jl"))

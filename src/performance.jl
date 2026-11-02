@@ -17,7 +17,7 @@ using Base.ScopedValues: ScopedValue, with
 
 export Timing, ease, ramp, inout, dial, eased, sampledkeys, performancevalue,
        labels_only, filmtext, filmtext!, labelscene!, plotattribute!, propertypath!,
-       buildperformed, performedtracks
+       buildperformed, performedtracks, framekeys
 
 """When each narration line starts and ends, in seconds into the beat, and how long the beat runs."""
 struct Timing
@@ -109,19 +109,26 @@ filmtext!(args...; text, kw...) = Makie.text!(args...; text = filmtext(text), kw
 "Mark `scene` as annotation: all its plots belong to the labels layer."
 labelscene!(scene::Scene) = (CONTEXT[].annotations[scene] = nothing; scene)
 
-"""
-    splitlayer!(scene, layer)
+"Whether `scene` or a scene it is drawn in was marked with `labelscene!` in this build."
+annotated(scene::Scene) = haskey(CONTEXT[].annotations, scene) || (scene.parent !== nothing && annotated(scene.parent))
 
-Keep only `layer`'s plots: text and annotation scenes for `:labels`, everything
-else for `:picture`. Invisible native-property owners named in `keep_owners`
-stay in the labels layer so projections and reveals still follow them.
+"Text is a label wherever it is drawn."
+labelplot(::Union{Makie.Text,Makie.TextLabel}) = true
+labelplot(::Makie.AbstractPlot) = false
+
 """
-function splitlayer!(scene::Scene, layer::Symbol; annotation = false, keep_owners = name -> false)
-    annotation = annotation || haskey(CONTEXT[].annotations, scene)
+    splitlayer!(scene, layer; annotation = annotated, keep_owners)
+
+Keep only `layer`'s plots: text and the plots of scenes for which
+`annotation(scene)` holds for `:labels`, everything else for `:picture`.
+Invisible native-property owners named in `keep_owners` stay in the labels
+layer so projections and reveals still follow them.
+"""
+function splitlayer!(scene::Scene, layer::Symbol; annotation = annotated, keep_owners = name -> false)
+    labels = annotation(scene)
     layer === :labels && (scene.backgroundcolor[] = RGBAf(0, 0, 0, 0))
     for plot in copy(scene.plots)
-        text = plot isa Makie.Text || plot isa Makie.TextLabel
-        keep = layer === :labels ? (text || annotation) : (!text && !annotation)
+        keep = (labels || labelplot(plot)) == (layer === :labels)
         name = Makie.to_value(get(plot.attributes, :name, nothing))
         if !keep && layer === :labels && name isa Symbol && keep_owners(name)
             Makie.update!(plot; visible = false)
@@ -318,21 +325,44 @@ function sceneattributes!(scene, values)
 end
 
 """
-    buildperformed(builder, canvas; layer = :combined, labels = Dict(), keep_owners, extra = (;), options...)
+    buildperformed(builder, canvas; layer = :combined, labels = Dict(), annotation, keep_owners, extra = (;), options...)
         -> (; scene, paths, transforms, aliases)
 
-Run `builder(canvas; options...)`, which returns `(figure, keyed::NamedTuple)`,
-keep only `layer`'s plots, and bind the keyed construction values (plus `extra`
-ones, such as file-series inputs) to the native properties that consume them.
+Run `builder(canvas; options...)`, which returns `(figure or scene, keyed::NamedTuple)`,
+keep only `layer`'s plots (`annotation` and `keep_owners` as `splitlayer!` takes
+them), and bind the keyed construction values (plus `extra` ones, such as
+file-series inputs) to the native properties that consume them.
 """
 function buildperformed(builder, canvas; layer::Symbol = :combined, labels = Dict{String,String}(),
-                        keep_owners = name -> false, extra = (;), options...)
+                        annotation = annotated, keep_owners = name -> false, extra = (;), options...)
     layer in (:combined, :picture, :labels) || throw(ArgumentError("invalid film layer $layer"))
     with(CONTEXT => BuildContext(layer, labels)) do
-        fig, keyed = builder(Tuple(Int.(canvas)); options...)
-        layer === :combined || splitlayer!(fig.scene, layer; keep_owners)
-        (; scene = fig.scene, sceneattributes!(fig.scene, merge(keyed, extra))...)
+        built, keyed = builder(Tuple(Int.(canvas)); options...)
+        scene = rootscene(built)
+        layer === :combined || splitlayer!(scene, layer; annotation, keep_owners)
+        (; scene, sceneattributes!(scene, merge(keyed, extra))...)
     end
+end
+
+rootscene(fig::Makie.Figure) = fig.scene
+rootscene(scene::Scene) = scene
+
+"""
+    framekeys(keys, fps) -> Vector{(frame, value, ease)}
+
+`(seconds, value, ease)` keys placed on frames, as `keyframes!` takes them: a
+step holds from the first frame at or after its time, a key otherwise sits on
+the nearest frame. Keys closer than a frame land on one, keeping the later one's
+value.
+"""
+function framekeys(keys, fps)
+    frame(t, ease) = ease === :hold ? ceil(Int, t * fps - 1f-3) : round(Int, t * fps)
+    placed = sort([(frame(t, ease), v, ease) for (t, v, ease) in keys]; by = first)
+    merged = empty(placed)
+    for k in placed
+        !isempty(merged) && first(last(merged)) == first(k) ? (merged[end] = k) : push!(merged, k)
+    end
+    return merged
 end
 
 """
@@ -348,18 +378,10 @@ function performedtracks(performed, native, fps; layer::Symbol = :combined)
     paths, transforms = native.paths, native.transforms
     keyed = layer === :picture ? performed.picture : [performed.picture; performed.labels]
     tracks = map(filter(entry -> haskey(paths, first(entry)) || startswith(first(entry), "camera"), keyed)) do (name, keys)
-        # A step holds from the first frame at or after its time, a key otherwise
-        # sits on the nearest frame.
-        frame(t, ease) = ease === :hold ? ceil(Int, t * fps - 1f-3) : round(Int, t * fps)
         path = get(paths, name, name)
         scale, offset = get(transforms, path, (1.0, 0.0))
-        frames = [(frame(t, ease), scale * Float64(v) + offset, ease) for (t, v, ease) in keys]
-        # Keys closer than a frame land on one: keep the later one's value.
-        merged = Tuple{Int,Float64,Symbol}[]
-        for k in sort(frames; by = first)
-            !isempty(merged) && first(last(merged)) == first(k) ? (merged[end] = k) : push!(merged, k)
-        end
-        (path, merged, all(k -> k[2] isa Integer, keys))
+        (path, framekeys([(t, scale * Float64(v) + offset, ease) for (t, v, ease) in keys], fps),
+         all(k -> k[2] isa Integer, keys))
     end
     aliased = [(alias, keys, discrete) for (path, keys, discrete) in tracks for alias in get(native.aliases, path, String[])]
     return [tracks; aliased]

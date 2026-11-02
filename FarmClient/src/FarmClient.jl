@@ -89,7 +89,7 @@ function serve(c::Client)
             session(c, sock)
             @info "the farm server closed the connection; reconnecting"
         catch e
-            e isa Refused && rethrow()
+            (e isa Refused || e isa InterruptException) && rethrow()
             @error "farm connection failed; reconnecting" exception = (e, catch_backtrace())
         finally
             close(sock)
@@ -302,7 +302,7 @@ open a connection to the server for it and relay frames until the server
 closes it or the connection drops. A failure before that connection exists is
 the caller's to report; afterwards the server sees the connection end.
 """
-function slotsession(c::Client, id, key, gpu, julia, env, job, backends, packages)
+function slotsession(c::Client, id, key, gpu, julia, env, job, backends, packages; restarts = 20)
     lease = try
         mkpidlock(joinpath(c.root, "locks", "gpu$(gpu.index).pid"); wait = false)
     catch e
@@ -312,29 +312,46 @@ function slotsession(c::Client, id, key, gpu, julia, env, job, backends, package
     logpath = joinpath(c.root, "logs", "$(first(key, 12))-gpu$(gpu.index).log")
     log = open(logpath, "a")
     try
-        renderer = startrenderer(julia, env, job, gpu, backends, packages, log)
-        try
-            eof(renderer) && error("the renderer on $(gpu.name) stopped while starting:\n" * logtail(logpath))
-            ready, _ = receivemessage(renderer)
-            e = farmerror(ready)
-            e === nothing || error(e)
-            slot = connect(c.host, c.port)
-            try
-                sendmessage(slot, Dict{String, Any}("protocol" => FARM_PROTOCOL, "role" => "slot",
-                                                    "machine" => id, "job" => key, "gpu" => gpu.name))
-                @info "rendering on $(gpu.name)"
-                relay(slot, renderer)
-            catch e
-                @error "farm GPU $(gpu.name) stopped" exception = (e, catch_backtrace())
-            finally
-                close(slot)
-            end
-        finally
-            stop!(renderer)
+        # A renderer that stops while the job runs (a GPU reset loses its device)
+        # is started again and joins the render anew.
+        for attempt in 0:restarts
+            attempt > 0 && @warn "the renderer on $(gpu.name) stopped while the job runs; starting it again" attempt
+            renderslot(c, id, key, gpu, julia, env, job, backends, packages, log, logpath) === :server && return
         end
     finally
         close(log)
         close(lease)
+    end
+end
+
+"""
+A renderer on `gpu` for the job, connected to the server, relaying its requests
+until one side ends: `:server` when the server ended the slot (the job is done
+or paused), `:renderer` when the renderer stopped.
+"""
+function renderslot(c::Client, id, key, gpu, julia, env, job, backends, packages, log, logpath)
+    renderer = startrenderer(julia, env, job, gpu, backends, packages, log)
+    try
+        eof(renderer) && error("the renderer on $(gpu.name) stopped while starting:\n" * logtail(logpath))
+        ready, _ = receivemessage(renderer)
+        e = farmerror(ready)
+        e === nothing || error(e)
+        slot = connect(c.host, c.port)
+        try
+            sendmessage(slot, Dict{String, Any}("protocol" => FARM_PROTOCOL, "role" => "slot",
+                                                "machine" => id, "job" => key, "gpu" => gpu.name))
+            @info "rendering on $(gpu.name)"
+            relay(slot, renderer)
+            return :server
+        catch e
+            @error "farm GPU $(gpu.name) stopped" exception = (e, catch_backtrace())
+            # a renderer whose device was lost ends itself after reporting the frame
+            return timedwait(() -> !process_running(renderer), 30) === :ok ? :renderer : :server
+        finally
+            close(slot)
+        end
+    finally
+        stop!(renderer)
     end
 end
 
@@ -380,12 +397,18 @@ function relay(sock, renderer)
     end
 end
 
-"""End a renderer: asked to close, then given half a minute, then killed."""
-function stop!(renderer)
+"""End a renderer, escalating through SIGTERM to SIGKILL and waiting for exit."""
+function stop!(renderer; grace = 30, terminate = 5)
     process_running(renderer) || return
     isopen(renderer.in) && sendmessage(renderer, Dict{String, Any}("command" => "close"))
     close(renderer.in)
-    timedwait(() -> !process_running(renderer), 30) === :ok || kill(renderer)
+    if timedwait(() -> !process_running(renderer), grace) !== :ok
+        kill(renderer)
+        if timedwait(() -> !process_running(renderer), terminate) !== :ok
+            kill(renderer, Base.SIGKILL)
+        end
+    end
+    wait(renderer)
     return
 end
 

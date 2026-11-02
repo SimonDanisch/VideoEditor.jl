@@ -208,9 +208,10 @@ end
 Every GPU the connected farm clients offer, opened for `job`: each client gets
 the job's snapshot, instantiates its environment and starts a renderer per GPU.
 A GPU joins the channel as soon as its renderer is ready, so a render starts on
-the first one while slower machines still install or compile. The channel
-closes once every client has opened or failed all its GPUs; what failed is
-reported, and is the channel's error if no GPU opened at all.
+the first one while slower machines still install or compile. What failed to
+open is reported, and is the channel's error if no GPU opened at all. A GPU
+whose renderer its client starts again (after its device was lost) joins again;
+the render closes the channel when it ends.
 """
 function farmworkers(job::RenderJob, server::FarmServer = farmserver(); exclude=String[])
     machines = filter(farmmachines(server)) do machine
@@ -255,9 +256,11 @@ function farmworkers(job::RenderJob, server::FarmServer = farmserver(); exclude=
 end
 
 """
-Turn what the clients report for a job into workers, until each machine has
-named its GPUs and every one of them has opened or failed, or the machine failed
-or disconnected as a whole.
+Turn what the clients report for a job into workers: first until each machine
+has named its GPUs and every one of them has opened or failed, or the machine
+failed or disconnected as a whole; then, while the render takes workers, the
+GPUs its machines open again (a renderer started anew after its device was
+lost). The render closes `workers` when it ends.
 """
 function collectslots!(workers::Channel{FarmWorker}, server::FarmServer, key, events, machines)
     names = Dict(m.id => m.name for m in machines)
@@ -290,14 +293,27 @@ function collectslots!(workers::Channel{FarmWorker}, server::FarmServer, key, ev
                 expected[id] = arrived[id]
             end
         end
+        isempty(problems) || @warn "farm GPUs left out" problems
+        if opened == 0
+            close(workers, ErrorException("no farm GPU could be opened:\n  " * join(problems, "\n  ")))
+            return
+        end
+        while isopen(workers)
+            isready(events) || (sleep(1); continue)
+            id, report = take!(events)
+            haskey(report, "slot") || continue
+            slot = report["slot"]
+            haskey(expected, id) || (close(slot); continue)
+            try
+                put!(workers, FarmWorker(slot.name, slot))
+                @info "farm GPU joined again" gpu = slot.name
+            catch e
+                e isa InvalidStateException || rethrow()
+                close(slot)                # the render ended meanwhile
+            end
+        end
     finally
         lock(() -> delete!(server.jobs, key), server.guard)
-    end
-    isempty(problems) || @warn "farm GPUs left out" problems
-    if opened == 0
-        close(workers, ErrorException("no farm GPU could be opened:\n  " * join(problems, "\n  ")))
-    else
-        close(workers)
     end
 end
 
@@ -341,7 +357,8 @@ input.
 function farmchild(directory::AbstractString; device = nothing, input::IO = stdin, output::IO = stdout)
     # what scene code prints goes to the client's log, not into the messages
     redirect_stdout(stderr)
-    device === nothing || Mantle.defaultdevice!(Mantle.Device(farmapi(); select = device))
+    gpu = device === nothing ? nothing : Mantle.Device(farmapi(); select = device)
+    gpu === nothing || Mantle.defaultdevice!(gpu)
     renderer = farmrenderer(directory)
     try
         sendmessage(output, Dict{String, Any}("ready" => true))
@@ -356,6 +373,8 @@ function farmchild(directory::AbstractString; device = nothing, input::IO = stdi
                 catch e
                     @error "farm frame $n failed" exception = (e, catch_backtrace())
                     sendmessage(output, Dict{String, Any}("error" => "frame $n: " * sprint(showerror, e)))
+                    # A lost device fails every frame after it: end, and the client starts a renderer again.
+                    gpu !== nothing && Mantle.retired(gpu) && return nothing
                     continue
                 end
                 sendmessage(output, farmmessage(result)...)

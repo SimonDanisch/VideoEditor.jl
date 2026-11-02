@@ -189,6 +189,13 @@ function cachetrackframe!(clip::Clip, sf::Int, readers, engine)
     clip.timeinterp === :flow && return # flow depends on the fractional phase
     token = (clip.id, sf)
     revision = get(cache.revisions, token, UInt64(0))
+    twin = twintrackframe(cache,clip,sf)
+    if twin !== nothing
+        linkplane!(cache,clip.id,sf,cachefile(cache,clip.id,twin))
+        # An edit during publication must remain dirty, as with cachewrite!.
+        get(cache.revisions,token,UInt64(0)) == revision || push!(get!(() -> BitSet(),cache.dirty,clip.id),sf)
+        return nothing
+    end
     push!(cache.rendering, token)
     src = clip.source
     mode = src isa SceneSource ? src.mode : :live
@@ -272,7 +279,9 @@ function saveframecaches!(path, seq)
             source = cachefile(cache, id, sf)
             isfile(source) || continue
             dest = joinpath(target, string(id), basename(source))
-            mkpath(dirname(dest)); cp(source, dest; force = true)
+            # Rendered planes are immutable (writers publish by rename), so
+            # language versions can share pictures without duplicating storage.
+            linkfarmframe!(dest, source)
         end
         cache.directory = target
     end
