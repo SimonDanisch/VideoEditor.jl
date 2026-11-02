@@ -143,7 +143,7 @@ Free device-local VRAM in bytes — the driver's budget minus its usage
 """
 function freedevicevram(backend::KA.Backend)
     try
-        heaps = Mantle.probe_device_memory_budget(Mantle.vk_context())
+        heaps = Mantle.probe_device_memory_budget(backend)
         free = 0
         for h in heaps
             h.device_local || continue
@@ -433,7 +433,7 @@ startswithparams(s::GpuVideoStream, bytes) =
 function startfeed!(s::GpuVideoStream, g::Integer)
     if s.dec === nothing
         params = isempty(s.leadparams) ? s.bitstream[s.gops[1].bytes] : s.leadparams
-        ctx = Mantle.vk_context()
+        ctx = Mantle.Device()
         s.dec = s.codec === :hevc ? Mantle.VideoDecode.H265Decoder(ctx, params; chroma = true) :
                                     Mantle.VideoDecode.H264Decoder(ctx, params; chroma = true)
     end

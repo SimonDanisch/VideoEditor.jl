@@ -14,7 +14,7 @@ using Lavapipe_jll
 # on a GPU (it crashed on macOS and tracked a frame wrong on Zen 3). And not the
 # GPU: rendering there from the test thread takes the GPU's context, and the
 # editor's GPU worker then cannot submit to it.
-const LVP = VE.Mantle.backend(VE.Mantle.Device("lavapipe"))
+const LVP = VE.Mantle.Device("lavapipe")
 lvp(x::AbstractArray) = VE.Mantle.devicearray(LVP, x)
 
 # The process's GPU device is made on the editor's GPU worker, as the editor makes
