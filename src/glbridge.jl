@@ -240,7 +240,7 @@ function setupgpupreview!(player::Player, gp::GPUPreview, W::Integer, H::Integer
         gp.packed = KA.allocate(backend, UInt32, Int(W) * Int(H))   # RGBA pack scratch
         empty!(gp.eimages)
         map(1:2) do _   # double buffer: blit into one while GL samples the other
-            img = lavamod.ExternalImage(W, H)
+            img = lavamod.ExternalImage(backend, W, H)
             push!(gp.eimages, img)
             (lavamod.memoryfd(img), img.allocation_size)
         end
