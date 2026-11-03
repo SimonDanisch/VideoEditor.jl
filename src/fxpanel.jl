@@ -2090,12 +2090,9 @@ function openscenecontrols!(player::Player, query::AbstractString; keepselection
         sections.apply()
         i = query == "acting" ? findfirst(s -> animationsection(s) &&
             any(p -> !sections.onlyactive[] || p.name in sections.active[], s.params), sections.sections) : nothing
-        if i === nothing
-            Makie.set!(sections.box, query)
-        else
-            label = lowercase(sections.sections[i].label)
-            sections.picker.i_selected[] = findfirst(o -> last(o) == label, sections.picker.options[])
-        end
+        # Filtered, not picked: the menu's own pick selects the object, which shows
+        # its rows at every time, and this view has just left any selection.
+        Makie.set!(sections.box, i === nothing ? query : lowercase(sections.sections[i].label))
     end
     player.fxpanel.scroll.scroll[] = Makie.Vec2f(0,0)
     sections === nothing || scrollinspectorto!(player,sections.box)

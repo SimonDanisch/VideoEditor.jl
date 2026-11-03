@@ -93,10 +93,17 @@ using Main.EditingWalkthroughActions
                      end);
                      click(() -> timelinepos(p,0));
                      typefield(p,()->camera().view.control,"8");
+                     click(() -> timelinepos(p,24));
+                     reveal(p,()->p.fxwidgets[Symbol(:kfacc_,fx().id,:_,camera().name)][2]);
                      click(() -> center(p.fxwidgets[Symbol(:kfacc_,fx().id,:_,camera().name)][2]));
-                     click(() -> timelinepos(p,24));typefield(p,()->camera().view.control,"6");
+                     FI.Lazy(_ -> begin
+                         @test VE.haskeyat(camera(),24)
+                         FI.Wait(0)
+                     end);
+                     typefield(p,()->camera().view.control,"6");
                      FI.Lazy(_ -> begin
                          @test VE.isanimated(camera())
+                         @test VE.valueat(camera(),0) ≈ 8
                          @test VE.valueat(camera(),24) ≈ 6
                          @test clip().source.camera.eye[1] ≈ 6
                          FI.Wait(0)

@@ -76,6 +76,7 @@ using Main.EditingWalkthroughActions
                     FI.Wait(0)
                 end);
                 click(()->timelinepos(p,12));
+                reveal(p,()->p.fxwidgets[Symbol(:kfacc_,fx().id,:_,prm(:still).name)][2]);
                 click(()->center(p.fxwidgets[Symbol(:kfacc_,fx().id,:_,prm(:still).name)][2]));
                 typefield(p,()->prm(:still).view.control,"3");
                 reveal(p,()->sections().activecheck);click(()->center(sections().activecheck));
