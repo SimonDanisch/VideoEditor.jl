@@ -39,8 +39,9 @@ mutable struct GPUPreview
                          # GLMakie's notify-upload writes into the texture the render
                          # object holds, and uploading linear CPU pixels into the
                          # imported optimal-tiled external texture shreds the image
+    setup::ReentrantLock # serializes `setupgpupreview!`
 end
-GPUPreview() = GPUPreview(0, 0, nothing, Any[], Any[], 1, true, nothing)
+GPUPreview() = GPUPreview(0, 0, nothing, Any[], Any[], 1, true, nothing, ReentrantLock())
 
 """
 A GPU render error is a BUG, not a mode: playback pauses LOUDLY (status + log)
@@ -232,6 +233,18 @@ target size and the preview plot has processed it (so the plot geometry is
 current before its texture is replaced).
 """
 function setupgpupreview!(player::Player, gp::GPUPreview, W::Integer, H::Integer)
+    # One at a time. Making the images waits on the GPU worker, so the UI thread runs
+    # other tasks meanwhile, and a second frame's present arrives here while the size
+    # still reads as not set up. Two runs interleaved leave the textures importing
+    # one run's images and the blit filling another's: a black preview.
+    lock(gp.setup) do
+        (gp.width, gp.height) == (W, H) && return nothing
+        importsharedimages!(player, gp, W, H)
+    end
+    return nothing
+end
+
+function importsharedimages!(player::Player, gp::GPUPreview, W::Integer, H::Integer)
     # VideoEditor names no backend — reach the decoder through the backend's module
     lavamod = parentmodule(typeof(player.analysisbackend))
     fds = runowned(player) do
