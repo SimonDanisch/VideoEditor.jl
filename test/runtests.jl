@@ -184,7 +184,7 @@ end
     st = VE.FxState()
     luma, chroma = VE.planebuffers!(st, LVP, (W, H))
     VE.copyplanes!(st, VE.Nv12Frame(lvp(y), lvp(uv)))
-    raw = VE.Mantle.Buffer(LVP, RGB{Float32}, (W, H))
+    raw = VE.Mantle.Buffer(LVP, VE.ColorTypes.RGB{Float32}, (W, H))
     g = VE.Mantle.Graph(LVP)
     # Which matrix applies is known per stream, after this plan is recorded.
     bt601 = VE.Mantle.GPURef(LVP, Int32(0))
