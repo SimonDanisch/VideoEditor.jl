@@ -156,7 +156,9 @@ Base.close(r::OwnedTestFrames) = (r.closed[] = true; nothing)
             other = joinpath(dir, "otheredit")
             cp(regen, other)
             rm(joinpath(other, "frames"); recursive = true)
-            open(io -> write(io, UInt8[0]), joinpath(other, "job", "project.videoedit"), "a")
+            # An input of its own: the project is compared by content, so a stray byte
+            # at the end of its file is still the same edit.
+            write(joinpath(other, "job", "changed-input.dat"), UInt8[0])
             @test_throws r"another edit" VE.carryframes!(VE.RenderJob(other), job)
 
             # A GPU whose device was lost leaves the render; its renderer, started
