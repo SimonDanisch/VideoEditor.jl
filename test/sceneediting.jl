@@ -79,7 +79,7 @@ end
         seq = VE.Sequence([clip], 24); seq.canvas = (96,64)
         path = joinpath(dir, "edit.videoedit")
         VE.saveproject(path, seq)
-        renderer = VE.farmrenderer(VE.renderjob(path, joinpath(dir, "job")))
+        renderer = VE.farmrenderer(VE.renderjob(path,joinpath(dir,"job");portable=false))
         try
             original = only(VE.farmframes!(renderer, [4])).png
             c = only(renderer.sequence.clips); src = c.source
@@ -95,7 +95,8 @@ end
             camera = VE.param(fx, Symbol("camera.eye[1]"))
             @test VE.valueat(camera, 7) ≈ 4.7 atol=1e-6
             position = VE.param(fx, Symbol("body.translation[1]"))
-            VE.setvalue!(position, 2.0, 6)
+            # At the key the frame below reads: a value set between keys is a key of its own.
+            VE.setvalue!(position, 2.0, 7)
             @test !VE.isfollowing(position)
             VE.farmframes!(renderer, [7])
             body, face = VE.sceneobjectplots(src, :body)
@@ -105,7 +106,7 @@ end
             VE.setvalue!(rotation, 90.0, 6)
             VE.farmframes!(renderer, [7])
             @test face.transformation.translation[] - body.transformation.translation[] ≈ VE.Vec3f(1,0,0) atol=1e-5
-            VE.setvalue!(camera, 8.0, 6)
+            VE.setvalue!(camera, 8.0, 7)
             VE.farmframes!(renderer, [7])
             @test src.camera.eye[1] ≈ 8
             colour = VE.param(fx, Symbol("body.color[1]"))
@@ -124,7 +125,7 @@ end
             @test !VE.isfollowing(VE.param(reopenedfx, position.name))
             @test VE.isanimated(VE.param(reopenedfx, position.name))
             @test VE.isfollowing(VE.param(reopenedfx, Symbol("camera.lookat[1]")))
-            saved = VE.farmrenderer(VE.renderjob(path, joinpath(dir, "edited-job")))
+            saved = VE.farmrenderer(VE.renderjob(path,joinpath(dir,"edited-job");portable=false))
             try
                 @test only(VE.farmframes!(saved, [7])).png == only(VE.farmframes!(renderer, [7])).png
             finally
@@ -307,7 +308,7 @@ end
         VE.keyframes!(c,"body.phase",[0=>0.,7=>0.7];ease=:linear)
         seq = VE.Sequence([c],24);seq.canvas=(96,64)
         path=joinpath(dir,"performance.videoedit");VE.saveproject(path,seq)
-        renderer=VE.farmrenderer(VE.renderjob(path,joinpath(dir,"original")))
+        renderer=VE.farmrenderer(VE.renderjob(path,joinpath(dir,"original");portable=false))
         try
             VE.farmframes!(renderer,[4])
             c=only(renderer.sequence.clips);src=c.source;fx=VE.findslot(c,:scene)
@@ -316,7 +317,7 @@ end
             @test VE.isanimated(phase)
             @test VE.scenevalue(src,phase.name) ≈ 0.4
             @test VE.Makie.findplot(VE.targetscene(src.live.target),:body).transformation.translation[][1] ≈ 0.4
-            VE.setvalue!(phase,2,4);VE.farmframes!(renderer,[6])
+            VE.setvalue!(phase,2,6);VE.farmframes!(renderer,[6])
             @test VE.Makie.findplot(VE.targetscene(src.live.target),:body).transformation.translation[][1] ≈ 2
             offset=VE.param(fx,Symbol("body.offset[1]"));VE.setvalue!(offset,1,6)
             VE.farmframes!(renderer,[6])
@@ -330,7 +331,7 @@ end
             VE.farmframes!(renderer,[7]);VE.saveproject(path,renderer.sequence)
             back=VE.loadproject(path)
             @test VE.isanimated(VE.param(VE.findslot(only(back.clips),:scene),phase.name))
-            saved=VE.farmrenderer(VE.renderjob(path,joinpath(dir,"edited")))
+            saved=VE.farmrenderer(VE.renderjob(path,joinpath(dir,"edited");portable=false))
             try
                 @test only(VE.farmframes!(saved,[7])).png == only(VE.farmframes!(renderer,[7])).png
             finally
