@@ -179,20 +179,25 @@ end
     # `y[x, row]`, and a flat plane under `@inbounds` answers row one for every
     # row: a whole preview and export of one scanline, and no test decodes on a GPU.
     W, H = 16, 8
-    y = UInt8[16 + 20 * row for x in 1:W, row in 1:H]
-    uv = fill(0x80, W, H ÷ 2)
+    y = UInt8[16 + 8 * row for x in 1:W, row in 1:H]
+    uv = fill(0xc8, W, H ÷ 2)
     st = VE.FxState()
     luma, chroma = VE.planebuffers!(st, LVP, (W, H))
     VE.copyplanes!(st, VE.Nv12Frame(lvp(y), lvp(uv)))
     raw = VE.Mantle.Buffer(LVP, RGB{Float32}, (W, H))
     g = VE.Mantle.Graph(LVP)
-    VE.Mantle.dispatch!(g, VE.GPUFiltering.nv12torgb_kernel!, (raw, luma, chroma, false), (W, H); name = "nv12")
+    # Which matrix applies is known per stream, after this plan is recorded.
+    bt601 = VE.Mantle.GPURef(LVP, Int32(0))
+    VE.Mantle.dispatch!(g, VE.GPUFiltering.nv12torgb_kernel!, (raw, luma, chroma, bt601), (W, H); name = "nv12")
     plan = VE.Mantle.record!(VE.Mantle.Plan(g))
-    VE.Mantle.run!(plan)
-    VE.Mantle.waitidle(LVP)
-    got = Array(VE.Mantle.storage(raw))
-    want(row) = 1.164f0 * (20 * row) / 255
-    @test [got[1, row].r for row in 1:H] ≈ want.(1:H)
+    red(row, is601) = VE.GPUFiltering.yuv_to_rgb(Float32(y[1, row]), 200f0, 200f0, is601)[1]
+    for is601 in (false, true)
+        bt601[] = Int32(is601)
+        VE.Mantle.run!(plan)
+        VE.Mantle.waitidle(LVP)
+        got = Array(VE.Mantle.storage(raw))
+        @test [got[1, row].r for row in 1:H] ≈ [red(row, is601) for row in 1:H]
+    end
     VE.Mantle.free!(plan)
 end
 

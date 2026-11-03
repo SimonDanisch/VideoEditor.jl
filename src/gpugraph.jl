@@ -557,9 +557,12 @@ function chainpass!(g, ::SourceNode, ::Nothing, ::Nothing, ctx::ChainBuild, dims
     convert = gate!(ctx, g) do
         st.baked === nothing && !st.uploaded && st.decoded !== nothing
     end
+    # A parameter, because `st.source` is only known from the first `update!` on: read
+    # here it is always "no source", which is BT.709 for every stream.
+    bt601 = param!(() -> Int32(sourceisbt601(st)), ctx, g, Int32(0))
     Mantle.repeat!(g, 1; while_nonzero = convert) do _
         Mantle.dispatch!(g, GPUFiltering.nv12torgb_kernel!,
-                         (raw, luma, chroma, sourceisbt601(st)), dims; name = "source/nv12")
+                         (raw, luma, chroma, bt601), dims; name = "source/nv12")
     end
     # ALWAYS, and this is the one pass the chain is guaranteed: whatever filled
     # `raw` — a stored host frame, a stored bake, or the conversion above — a
