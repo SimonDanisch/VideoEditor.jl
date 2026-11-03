@@ -2221,7 +2221,7 @@ end
             sleep(0.2)
             @test p.fxwidgets[:kfmenu].open[]
             @test p.clipmodal === nothing || !p.clipmodal.open[]
-            notify(p.fxwidgets[:kfmenubtn1].clicks); sleep(0.2)
+            p.fxwidgets[:kfmenubtn1].clicks[] += 1; sleep(0.2)
             @test !p.fxwidgets[:kfmenu].open[]
             @test length(tcurve!(clip, :sharpen).keys) == ns2 - 1
             @test length(tcurve!(clip, :brightness).keys) == nb
@@ -2263,7 +2263,7 @@ end
             # frame and the playhead gets the key that was asked for.
             @test !VE.isanimated(tparam(clip, :contrast))
             @test Makie.to_value(trio()[2].label) == "◇"
-            notify(trio()[2].clicks); sleep(0.3)
+            trio()[2].clicks[] += 1; sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             f1 = VE.playheadframe(p, clip)
             @test [k.frame for k in tcurve!(clip, :contrast).keys] == [clip.src_in, f1]
@@ -2286,22 +2286,22 @@ end
                           if VE.isanimated(q) && q.name !== :contrast; init = 0) == ghost0
             @test Makie.to_value(trio()[2].label) == "◆"
             # --- ◀ ▶ jump between keys ---
-            notify(trio()[1].clicks); sleep(0.3)
+            trio()[1].clicks[] += 1; sleep(0.3)
             @test VE.playheadframe(p, VE.locate(p.sequence, p.playhead[])[1]) == f1
-            notify(trio()[3].clicks); sleep(0.3)
+            trio()[3].clicks[] += 1; sleep(0.3)
             @test VE.playheadframe(p, VE.locate(p.sequence, p.playhead[])[1]) == f2
             # --- ◆ ON a key removes it; the last one left is the constant again ---
-            notify(trio()[2].clicks); sleep(0.3)
+            trio()[2].clicks[] += 1; sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             @test [k.frame for k in tcurve!(clip, :contrast).keys] == [clip.src_in, f1]
-            notify(trio()[1].clicks); sleep(0.3)     # ◀ back onto a remaining key
-            notify(trio()[2].clicks); sleep(0.3)
+            trio()[1].clicks[] += 1; sleep(0.3)     # ◀ back onto a remaining key
+            trio()[2].clicks[] += 1; sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             @test !VE.isanimated(tparam(clip, :contrast))
             @test Makie.to_value(trio()[2].label) == "◇"
 
             # --- rebuild a 2-key ramp for the gesture checks ---
-            notify(trio()[2].clicks); sleep(0.3)                    # key at f1'
+            trio()[2].clicks[] += 1; sleep(0.3)                    # key at f1'
             seekpick(2.8); sleep(0.2)
             dragslider!(tslider(p, VE.editclip(p)[1], :contrast), 1.6); sleep(0.4)
             clip = VE.locate(p.sequence, p.playhead[])[1]
@@ -2371,7 +2371,7 @@ end
             ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.release)
             sleep(0.2)
             @test p.fxwidgets[:kfmenu].open[]
-            notify(p.fxwidgets[:kfmenubtn2].clicks); sleep(0.2)    # "Ease in & out"
+            p.fxwidgets[:kfmenubtn2].clicks[] += 1; sleep(0.2)    # "Ease in & out"
             @test c.keys[end].ease === :smooth
             # hermite: ka linear (m0=1), kb smooth (m1=0) → H(t) = -t³ + t² + t
             @test VE.valueat(c, fq) ≈ va + (vb - va) * (-tq^3 + tq^2 + tq) atol = 1.0e-9
@@ -2381,7 +2381,7 @@ end
             ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.press)
             ev.mousebutton[] = MouseButtonEvent(Mouse.right, Mouse.release)
             sleep(0.2)
-            notify(p.fxwidgets[:kfmenubtn3].clicks); sleep(0.2)    # "Hold until the next key"
+            p.fxwidgets[:kfmenubtn3].clicks[] += 1; sleep(0.2)    # "Hold until the next key"
             @test c.keys[end - 1].ease === :hold
             @test VE.valueat(c, fq) == va
             @test VE.valueat(c, kb) == vb                          # the next key still lands
@@ -2395,12 +2395,12 @@ end
             # row 4 is "Simplify to Bézier anchors"; clearing is last, where a
             # destructive entry belongs
             @test Makie.to_value(p.fxwidgets[:kfmenubtn4].label) == "Simplify to Bézier anchors"
-            notify(p.fxwidgets[:kfmenubtn5].clicks); sleep(0.3)
+            p.fxwidgets[:kfmenubtn5].clicks[] += 1; sleep(0.3)
             clip = VE.locate(p.sequence, p.playhead[])[1]
             @test !VE.isanimated(tparam(clip, :contrast))
 
             # --- E2E: the keys really drive the render — sampled ends of the ramp ---
-            notify(trio()[2].clicks); sleep(0.3)                   # start it again at the playhead
+            trio()[2].clicks[] += 1; sleep(0.3)                   # start it again at the playhead
             clip = VE.locate(p.sequence, p.playhead[])[1]
             sf0 = VE.playheadframe(p, clip)
             VE.setkey!(tcurve!(clip, :contrast), sf0, 0.2)
@@ -2571,7 +2571,7 @@ end
             # BY FIELD: the entry is a NamedTuple precisely so a new field cannot
             # shift what `[6]` means — which is exactly what appending `tool` did.
             @test cards[1].rm !== nothing
-            notify(cards[1].rm.clicks); sleep(0.3)
+            cards[1].rm.clicks[] += 1; sleep(0.3)
             @test length(ctx.state[:refs]) == 1
             @test length(lfcards()) == 1
             @test ctx.state[:active][] == 1              # selection follows the survivor
@@ -3160,7 +3160,7 @@ end
         fx = VE.findslot(clip, VE.ColorEffect)
         ev = Makie.events(p.fig)
         eye(q) = p.fxwidgets[Symbol(:kflane_, fx.id, :_, q.name)]
-        tap!(b) = (notify(b.clicks); sleep(0.35))
+        tap!(b) = (b.clicks[] += 1; sleep(0.35))
         alttap!(b) = (ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.press);
                        tap!(b);
                        ev.keyboardbutton[] = KeyEvent(Keyboard.left_alt, Keyboard.release);
