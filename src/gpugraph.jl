@@ -604,8 +604,10 @@ frame would be a new address the recording never sees.
 function planebuffers!(st::FxState, dev, dims::Tuple{Int, Int})
     p = st.planes
     p === nothing || return p
-    st.planes = (Mantle.Buffer(dev, zeros(UInt8, dims[1] * dims[2])),
-                 Mantle.Buffer(dev, zeros(UInt8, dims[1] * (dims[2] ÷ 2))))
+    # Matrices, as `nv12torgb_kernel!` indexes them: a flat plane under `y[x, row]`
+    # and `@inbounds` reads row one for every row.
+    st.planes = (Mantle.Buffer(dev, zeros(UInt8, dims[1], dims[2])),
+                 Mantle.Buffer(dev, zeros(UInt8, dims[1], dims[2] ÷ 2)))
     return st.planes
 end
 

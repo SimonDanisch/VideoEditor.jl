@@ -174,6 +174,28 @@ end
     @test !istaskdone(w.task)      # …because the worker itself survived
 end
 
+@testset "decoded NV12 planes keep their rows" begin
+    # What the source pass does with a GPU-decoded frame. The kernel indexes
+    # `y[x, row]`, and a flat plane under `@inbounds` answers row one for every
+    # row: a whole preview and export of one scanline, and no test decodes on a GPU.
+    W, H = 16, 8
+    y = UInt8[16 + 20 * row for x in 1:W, row in 1:H]
+    uv = fill(0x80, W, H ÷ 2)
+    st = VE.FxState()
+    luma, chroma = VE.planebuffers!(st, LVP, (W, H))
+    VE.copyplanes!(st, VE.Nv12Frame(lvp(y), lvp(uv)))
+    raw = VE.Mantle.Buffer(LVP, RGB{Float32}, (W, H))
+    g = VE.Mantle.Graph(LVP)
+    VE.Mantle.dispatch!(g, VE.GPUFiltering.nv12torgb_kernel!, (raw, luma, chroma, false), (W, H); name = "nv12")
+    plan = VE.Mantle.record!(VE.Mantle.Plan(g))
+    VE.Mantle.run!(plan)
+    VE.Mantle.waitidle(LVP)
+    got = Array(VE.Mantle.storage(raw))
+    want(row) = 1.164f0 * (20 * row) / 255
+    @test [got[1, row].r for row in 1:H] ≈ want.(1:H)
+    VE.Mantle.free!(plan)
+end
+
 @testset "Sequence ops" begin
     src = VideoSource(testvideo)  # 120 frames
     seq = Sequence(src)
