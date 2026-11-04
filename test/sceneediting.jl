@@ -39,7 +39,7 @@ import VideoEditor as VE
             @test isempty(src.root.args)
             @test (src.width,src.height) == (48,32)
         finally
-            src.live === nothing || close(src.live.screen)
+            close(src)
         end
     end
 end
@@ -160,9 +160,12 @@ end
             sections = player.fxwidgets[Symbol(:fxsections_, fx.id)]
             @test sections.box.layoutobservables.computedbbox[].widths[1] > 200
             @test first(sections.cards).layoutobservables.computedbbox[].widths[1] > 200
+            # Where the renderer has a thread of its own the frame lands after the edit
+            # returns, so what the source says is waited for.
+            settled(pred) = timedwait(pred, 60; pollint = 0.02) === :ok
             camera.view.control.stored_string[] = "9.25"
             @test VE.valueat(camera, 0) ≈ 9.25
-            @test c.source.camera.eye[1] ≈ 9.25
+            @test settled(() -> c.source.camera.eye[1] ≈ 9.25)
             # Preview quality is session state, outside the saved document and Undo.
             undo_count = length(player.undostack)
             VE.setpreviewscale!(player, 0.5)
@@ -176,9 +179,9 @@ end
             VE.followscene!(player, c, camera)
             @test VE.isfollowing(camera)
             @test !VE.isanimated(camera)
-            @test c.source.camera.eye[1] ≈ 4
+            @test settled(() -> c.source.camera.eye[1] ≈ 4)
             VE.seek!(player, 3)
-            @test c.source.camera.eye[1] ≈ 4
+            @test settled(() -> c.source.camera.eye[1] ≈ 4)
             @test VE.valueat(camera, 3) ≈ 4 atol=1e-6
             VE.togglekey!(player, c, camera)
             @test !VE.isfollowing(camera)

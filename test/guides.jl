@@ -17,15 +17,21 @@ VE.usebackend!(RayMakie)
             @test frame.metadata["normal_valid"]
             hit = map(n -> any(!iszero, n), frame.normal)
             @test count(hit) > 100
-            colors = frame.albedo[hit]
+            # Guides are filtered like the image, so a silhouette pixel blends with what is
+            # behind it and a normal averages over the pixel's footprint. Only a pixel the
+            # filter sees one material on holds that material's exact albedo.
+            margin = 3
+            inside = [hit[i] && all(hit[clamp(i[1] + a, 1, size(hit, 1)), clamp(i[2] + b, 1, size(hit, 2))]
+                                    for a in -margin:margin, b in -margin:margin) for i in CartesianIndices(hit)]
+            colors = frame.albedo[inside]
             red = filter(a -> a.r > 0.5f0, colors)
             mixed = filter(a -> a.g > 0.5f0, colors)
             @test length(red) > 30 && length(mixed) > 30
             @test all(a -> max(abs(a.r - 0.8f0), abs(a.g - 0.1f0), abs(a.b - 0.05f0)) < 2.0f-6, red)
             @test all(a -> max(abs(a.r - 0.1f0), abs(a.g - 0.625f0), abs(a.b - 0.275f0)) < 2.0f-6, mixed)
-            @test all(n -> abs(sum(abs2, n) - 1.0f0) < 2.0f-5, frame.normal[hit])
+            @test all(n -> abs(sum(abs2, n) - 1.0f0) < 5.0f-2, frame.normal[inside])
+            @test all(n -> sum(abs2, n) < 1.0f0 + 2.0f-5, frame.normal[hit])
             @test all(iszero, frame.normal[.!hit])
-            # Centre-ray guides are not a sample-filtered beauty coverage mask.
             # Use known asymmetric geometry to test orientation directly.
             redpixels = findall(a -> a.r > 0.5f0, frame.albedo)
             mixedpixels = findall(a -> a.g > 0.5f0, frame.albedo)

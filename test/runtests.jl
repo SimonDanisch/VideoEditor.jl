@@ -2029,14 +2029,18 @@ include("farmwire.jl")    # large snapshots stream without whole-archive RAM buf
 include("farmbatch.jl")   # bounded leases, partial retry and incremental wire commits
 include("farmadopt.jl")   # immutable planes share storage without corrupting job receipts
 include("farmretention.jl") # compositable PNGs survive without HDR/auxiliary buffers
-isdefined(Main,:RayMakie) && include("farmretention_gpu.jl") # a translated/retimed overlay does not retrace
+# A file that draws through the editor's graph itself does so where the editor does: on
+# the thread that owns the device (`mantlethread`), which is the worker's since the device
+# is made there. On the test thread it stops at `SubmitChannel is single-writer`.
+ongpu(file) = VE.onthread(() -> include(joinpath(@__DIR__, file)), VE.mantlethread(VE.Mantle))
+isdefined(Main,:RayMakie) && ongpu("farmretention_gpu.jl") # a translated/retimed overlay does not retrace
 include("farmreuse.jl")   # new snapshots/label edits retain native traced masters
 include("farmcutreuse.jl") # finished frames survive trims and timeline shifts
 include("farmrootprobe.jl") # even runtime version checks keep the sole application environment
 # track and HDR source caches, and the planes farm workers return; render with RayMakie
-isdefined(Main, :RayMakie) && (include("trackcache.jl"); include("hdrcache.jl"); include("guides.jl"))
+isdefined(Main, :RayMakie) && (ongpu("trackcache.jl"); ongpu("hdrcache.jl"); ongpu("guides.jl"))
 # the OIDN effect is OIDNRunner's extension of the editor
-isdefined(Main, :RayMakie) && isdefined(Main, :OIDNRunner) && include("oidn_effect.jl")
+isdefined(Main, :RayMakie) && isdefined(Main, :OIDNRunner) && ongpu("oidn_effect.jl")
 # farm clients render through their own processes; the first run compiles a job environment
 get(ENV, "VIDEOEDITOR_FARM_TEST", "") == "1" && isdefined(Main, :RayMakie) && include("farmclient.jl")
 include("recordedanimation.jl") # streamed simulation arrays; GPU integration when RayMakie is loaded

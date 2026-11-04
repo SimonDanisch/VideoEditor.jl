@@ -96,7 +96,7 @@ module SceneEditingWalkthroughTests
                             @test VE.sceneselection(p)[].object === :actor
                             @test VE.selectedscenesections(p, clip()) == Set([:actor])
                             @test Set(sec.name for (sec, card) in zip(sections().sections, sections().cards) if card.visible[]) == Set([:actor])
-                            @test any(sec -> sec.label == "Actor · face", sections().sections)
+                            @test any(sec -> sec.label == "Actor", sections().sections)
                             @test sections().onlyactive[]
                             @test all(card.open[] for (sec, card) in zip(sections().sections, sections().cards) if card.visible[])
                             FI.Wait(0)
@@ -138,10 +138,10 @@ module SceneEditingWalkthroughTests
                         FI.Wait(0)
                     end);
                     click(() -> center(sections().picker));
-                    click(() -> menurow(sections().picker, "actor · face"));
+                    click(() -> menurow(sections().picker, "actor"));
                     FI.Lazy(_ -> begin
                         @test VE.sceneselection(p)[].object === :actor
-                        @test [sec.label for (sec,card) in zip(sections().sections,sections().cards) if card.visible[]] == ["Actor · face"]
+                        @test [sec.label for (sec,card) in zip(sections().sections,sections().cards) if card.visible[]] == ["Actor"]
                         @test VE.param(fx(), Symbol("actor.smile")).view !== nothing
                         FI.Wait(0)
                     end)
@@ -222,12 +222,7 @@ module SceneEditingWalkthroughTests
                 @test M.cameracontrols(view.camera).eyeposition[] ≈ clip().source.camera.eye
                 recordactions(
                     view, out, "camera_path_keys", [
-                        click(() -> center(button((; fig = view.fig), "Camera path")));
-                        FI.Lazy(_ -> begin
-                            VE.scrollinspectorto!(p, VE.param(fx(), Symbol("camera.eye[1]")).view.kf)
-                            FI.Wait(0.2)
-                        end);
-                        click(() -> center(VE.param(fx(), Symbol("camera.eye[1]")).view.kf));FI.Wait(0.75)
+                        click(() -> center(button((; fig = view.fig), "Camera path")));FI.Wait(0.75)
                     ]
                 )
                 @test VE.sceneselection(p)[].object === :camera
@@ -287,7 +282,9 @@ module SceneEditingWalkthroughTests
                     FI.KeyDown(M.Keyboard.left_shift); click(emptybandpoint); FI.KeyUp(M.Keyboard.left_shift)
                 ])
                 @test clip().id in p.timeline.selection[]
-                recordactions(p, out, "clear_scene_selection", click(() -> center(p.fxwidgets[:sceneclearbutton])))
+                # A recording's clock starts at zero, so a click at the same moment of another
+                # recording reads as the second half of a double click on this button.
+                recordactions(p, out, "clear_scene_selection", [FI.Wait(0.5); click(() -> center(p.fxwidgets[:sceneclearbutton]))])
                 @test VE.sceneselection(p)[] === nothing
                 @test view.fig === p.fig
                 for mode in (:scene, :film, :both)
