@@ -618,13 +618,16 @@ function bakepane!(player::Player, parent, clip::Clip, modal)
           color = uicolors.text_muted, tellwidth = true)
     bakemenu = Ref{Any}(nothing)
     bakeopts = get!(() -> Dict{Symbol, Any}(), player.fxwidgets, :bakeopts)
-    apply = bakesettings!(clip.source, body[4, 1], uicolors;
+    # The settings come last. A renderer can list thirty of them, more than a window
+    # holds, and the pane scrolls what does not fit: below them, the button that runs
+    # the bake and the one that closes the dialog were out of the window.
+    apply = bakesettings!(clip.source, body[6, 1], uicolors;
                           menu = bakemenu, widgets = bakeopts)
     player.fxwidgets[:bakemenu] = bakemenu
 
-    status = Label(body[5, 1], ""; halign = :left, fontsize = 11,
+    status = Label(body[4, 1], ""; halign = :left, fontsize = 11,
                    color = uicolors.text_muted, tellwidth = false)
-    row = GridLayout(body[6, 1])
+    row = GridLayout(body[5, 1])
     go = Button(row[1, 1]; label = "Bake", width = 120)
     cancel = Button(row[1, 2]; label = "Close", width = 100)
     player.fxwidgets[:bakego] = go
@@ -698,10 +701,11 @@ function bakepane!(player::Player, parent, clip::Clip, modal)
 end
 
 """
-    fittabs!(tabs) -> nothing
+    fittabs!(tabs, modal) -> nothing
 
 Size a `Tabs` block to the tab that is showing, so the dialog around it can size
-itself to what is actually in it.
+itself to what is actually in it, as far as the window has room. What does not fit
+scrolls inside the tab, as a `Tabs` does.
 
 The tab that is SHOWING rather than the largest of them: the two forms differ by
 a third of the dialog's height, and sizing to the larger leaves the other one
@@ -716,14 +720,15 @@ scrolled out of sight. `refresh_contentsize!` recomputes rather than reads,
 because a layout that has not been through a `computedbbox` yet has published
 nothing.
 """
-function fittabs!(tabs)
+function fittabs!(tabs, modal)
     w, h = Makie.refresh_contentsize!(tabs[tabs.active[]])
     (w > 0 && h > 0) || return nothing
     # Rounded UP: a content width the block matches to the pixel leaves the tab's
     # own scroll view a fraction short, and it answers with a scrollbar along the
     # bottom of a dialog that fits.
     tabs.width = ceil(w) + 1
-    tabs.height = ceil(h) + 1 + tabs.headerheight[]
+    room = Makie.widths(modal.blockscene.viewport[])[2] - modal.header_height[] - 4 * modal.contentpadding[]
+    tabs.height = min(ceil(h) + 1 + tabs.headerheight[], room)
     return nothing
 end
 
@@ -771,9 +776,10 @@ function openrendermodal!(player::Player)
     # the tabs block gets the bigger tab's size, and the modal's own
     # content-sizing takes it from there. Live: switching the renderer rebuilds
     # the settings form, and the dialog grows with it.
-    fittabs!(tabs)
-    onany((_...) -> fittabs!(tabs),
-          tabs.active, tabs[1].contentsize, tabs[2].contentsize, tabs.headerheight)
+    fittabs!(tabs, modal)
+    onany((_...) -> fittabs!(tabs, modal),
+          tabs.active, tabs[1].contentsize, tabs[2].contentsize, tabs.headerheight,
+          modal.blockscene.viewport)
     open!(modal)
     return nothing
 end

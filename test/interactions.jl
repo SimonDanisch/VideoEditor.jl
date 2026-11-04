@@ -3491,6 +3491,11 @@ end
         @test w.tabs.active[] == 2
         go = first(b for b in allblocks(p.fxwidgets[:bakemodal].body)
                    if b isa Makie.Button && b.label[] == "Bake")
+        # In the window, whatever the renderer lists: RayMakie's thirty settings put
+        # this button 630 px below the bottom of the figure.
+        window = Rect2f(p.fig.scene.viewport[])
+        @test ctr(go.layoutobservables.computedbbox[]) in window
+        @test widths(w.modal.subfigure.layoutobservables.computedbbox[])[2] <= widths(window)[2]
 
         # The spinner runs WHILE it renders — watched from before the press, because
         # a bake this short can be over before the click itself returns: on the Mac
