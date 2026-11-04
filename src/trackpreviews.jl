@@ -356,12 +356,16 @@ function scenethumbnail!(p,player,c,second,identity)
         (sf,effects,c.crop,c.look)
     end
     original=c.source;backend=getbackend(original.backend)
+    # Before the lock, not under it. The scene this replaces may belong to another
+    # renderer, and closing it hops to that renderer's thread, where `close` takes
+    # SCENELOCK: held across that hop, switching a clip's renderer hung the editor.
+    # Only this task touches `p.active`.
+    p.active===nothing || first(p.active)==identity || closepreviewscene!(p)
     rendered=onthread(renderthread(backend)) do;lock(SCENELOCK) do
         # This task may have waited in the renderer's queue since the idle check
         # in previewloop. New input must take precedence over an obsolete job.
         scenepreviewbusy(p,player) && return DeferredScenePreview()
-        if p.active===nothing || first(p.active)!=identity
-            closepreviewscene!(p)
+        if p.active===nothing
             opts=copy(original.screenopts)
             original.backend===:RayMakie && (opts[:rasterize]=true)
             width,height=scenethumbdims(original)
