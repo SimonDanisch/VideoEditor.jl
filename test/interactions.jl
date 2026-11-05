@@ -581,6 +581,19 @@ end
                 VE.pause!(p); sleep(0.3)
                 @test p.audio.proc === nothing
 
+                # A feeder on its way out stops its own process, not a later one. Pausing
+                # and playing again quickly left that playback silent, 2 times in 100.
+                VE.play!(p)
+                stale = p.audio.proc
+                VE.pause!(p)
+                VE.play!(p)
+                current = p.audio.proc
+                VE.stopaudio!(p, stale)
+                @test p.audio.proc === current
+                @test process_running(current)
+                VE.pause!(p); sleep(0.3)
+                @test p.audio.proc === nothing
+
                 # the Sound/Muted button (one isolated real click)
                 mutebtn = first(b for b in fig.content
                                 if b isa Makie.Button && b.label[] in ("Sound", "Muted"))

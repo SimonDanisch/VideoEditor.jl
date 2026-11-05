@@ -61,6 +61,9 @@ using Main.EditingWalkthroughActions
             recordactions(p,out,"input_defers_queued_preview",[
                 FI.MouseTo(center(p.previewaxis),0.05);
                 FI.Lazy(_ -> begin
+                    # The gesture again, right here: input parks scene jobs for .2 s, and the frame
+                    # recorded after the move above can take longer than that by itself.
+                    ev=M.events(p.fig);ev.mouseposition[]=ev.mouseposition[]
                     # A time the timeline has not asked for: one it has may have finished already.
                     @test VE.scenethumbnail!(manager,p,clip(),1/3,VE.scenepreviewidentity(clip().source)) isa VE.DeferredScenePreview
                     @test manager.active===active

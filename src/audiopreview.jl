@@ -180,7 +180,9 @@ function startaudio!(player::Player)
         e isa Union{EOFError, Base.IOError, InvalidStateException} ||
             @error "audio feeder died" exception = (e, catch_backtrace())
     finally
-        stopaudio!(player)
+        # Its own process. By now `pause!` and `play!` may have started another, and
+        # stopping that one left a playback with no sound.
+        stopaudio!(player, proc)
     end
     return nothing
 end
@@ -190,8 +192,15 @@ function stopaudio!(player::Player)
     ap = player.audio
     ap isa AudioPreview || return nothing
     proc = ap.proc
-    ap.proc = nothing
-    if proc !== nothing && process_running(proc)
+    proc === nothing || stopaudio!(player, proc)
+    return nothing
+end
+
+"Stop `proc`, and the feed only if `proc` is still the current one."
+function stopaudio!(player::Player, proc)
+    ap = player.audio
+    ap.proc === proc && (ap.proc = nothing)
+    if process_running(proc)
         kill(proc)         # first — a blocked feeder may hold the pipe open
         close(proc.in)
     end
