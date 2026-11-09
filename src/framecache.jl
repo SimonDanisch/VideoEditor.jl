@@ -10,11 +10,18 @@ mutable struct TrackCache
     renders::Int
     format::Symbol
     source::Any
+    hot::Union{Nothing, Pair{Tuple{UInt64, Int, UInt64}, Matrix{PlanePixel}}}
+    pending::Dict{Tuple{UInt64, Int, UInt64}, Task}
 end
 TrackCache(directory::AbstractString; format = :png) = TrackCache(
     String(directory),
-    Dict{UInt64, BitSet}(), Dict{UInt64, BitSet}(), Set{Tuple{UInt64, Int}}(), Dict{Tuple{UInt64, Int}, UInt64}(), 0, 0, format, nothing
+    Dict{UInt64, BitSet}(), Dict{UInt64, BitSet}(), Set{Tuple{UInt64, Int}}(), Dict{Tuple{UInt64, Int}, UInt64}(), 0, 0, format, nothing,
+    nothing, Dict{Tuple{UInt64, Int, UInt64}, Task}()
 )
+
+planepixels(image::Matrix{PlanePixel}) = image
+planepixels(image) = PlanePixel.(image)
+planetoken(c::TrackCache, id, frame) = (UInt64(id), Int(frame), get(c.revisions, (UInt64(id), Int(frame)), UInt64(0)))
 
 cachefile(c::TrackCache, id::Integer, frame::Integer) =
     joinpath(c.directory, string(id), string(frame; pad = 6) * (c.format === :hdr ? ".vehdr" : ".png"))
@@ -45,7 +52,8 @@ function cachewrite!(
     if c.format === :hdr
         writerenderframe(tmp, image)
     else
-        PNGFiles.save(tmp, collect(image); filters = Int(PNGFiles.PNG_FILTER_SUB))
+        pixels = collect(image)
+        PNGFiles.save(tmp, pixels; filters = Int(PNGFiles.PNG_FILTER_SUB))
     end
     mv(tmp, file; force = true)
     # An edit during an in-flight render must remain dirty. These counters
@@ -54,5 +62,6 @@ function cachewrite!(
     push!(get!(() -> BitSet(), c.valid, UInt64(id)), Int(frame))
     delete!(get!(() -> BitSet(), c.dirty, UInt64(id)), Int(frame))
     c.renders += 1
+    c.format === :png && (c.hot = planetoken(c, id, frame) => planepixels(pixels))
     return image
 end

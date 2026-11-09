@@ -62,15 +62,20 @@ function exportvideo(path::AbstractString, seq::Sequence;
     try
         withfinalscenes(seq) do
             for n in 0:(total - 1)
+                prefetchframeplanes!(seq, n)
                 renderframe!(outbuf, seq, n, readers, engine; black = blackhost)
                 writeframe!(writer, outbuf, hostout, backend)
                 progress === nothing || n % 30 == 0 && progress(n + 1, total)
             end
         end
     finally
-        VideoIO.close_video_out!(writer)
-        foreach(close, values(readers))
-        emptyengine!(engine)
+        try
+            finishcacheprefetch!(seq)
+        finally
+            VideoIO.close_video_out!(writer)
+            foreach(close, values(readers))
+            emptyengine!(engine)
+        end
     end
     if wantaudio
         muxaudio(videopath, seq, path)

@@ -2034,6 +2034,7 @@ include("farmretention.jl") # compositable PNGs survive without HDR/auxiliary bu
 # is made there. On the test thread it stops at `SubmitChannel is single-writer`.
 ongpu(file) = VE.onthread(() -> include(joinpath(@__DIR__, file)), VE.mantlethread(VE.Mantle))
 isdefined(Main,:RayMakie) && ongpu("farmretention_gpu.jl") # a translated/retimed overlay does not retrace
+include("planeprefetch.jl") # bounded decoded planes preserve revision/file validity
 include("farmreuse.jl")   # new snapshots/label edits retain native traced masters
 include("farmcutreuse.jl") # finished frames survive trims and timeline shifts
 include("farmrootprobe.jl") # even runtime version checks keep the sole application environment

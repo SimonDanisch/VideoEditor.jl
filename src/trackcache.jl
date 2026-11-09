@@ -19,7 +19,48 @@ function cachedtrackframe(clip::Clip, sf::Integer)
     c === nothing && return nothing
     cachevalid(c, clip.id, sf) || return nothing
     c.hits += 1
-    return PlanePixel.(PNGFiles.load(cachefile(c, clip.id, sf)))
+    key = planetoken(c, clip.id, sf)
+    c.hot !== nothing && first(c.hot) == key && return last(c.hot)
+    task = pop!(c.pending, key, nothing)
+    pixels = task === nothing ? planepixels(PNGFiles.load(cachefile(c, clip.id, sf))) : fetch(task)
+    # A queued read belongs to the revision it started from, not a later edit.
+    planetoken(c, clip.id, sf) == key && cachevalid(c, clip.id, sf) || return nothing
+    c.hot = key => pixels
+    return pixels
+end
+
+"Read a bounded window of already committed PNGs; dirty labels are rendered normally."
+function prefetchframeplanes!(seq::Sequence, n::Integer; ahead::Integer = 4)
+    wanted = IdDict{TrackCache, Set{Tuple{UInt64, Int, UInt64}}}()
+    for frame in n:min(n + ahead - 1, seqlength(seq) - 1), clip in frameclips(seq, frame)
+        c = trackcache(clip)
+        c === nothing && continue
+        sf = sourceframe(clip, frame)
+        cachevalid(c, clip.id, sf) || continue
+        push!(get!(() -> Set{Tuple{UInt64, Int, UInt64}}(), wanted, c), planetoken(c, clip.id, sf))
+    end
+    for c in values(seq.trackcaches)
+        keys = get(wanted, c, Set{Tuple{UInt64, Int, UInt64}}())
+        for key in collect(Base.keys(c.pending))
+            key in keys && continue
+            fetch(pop!(c.pending, key))
+        end
+        for key in keys
+            c.hot !== nothing && first(c.hot) == key && continue
+            haskey(c.pending, key) && continue
+            path = cachefile(c, key[1], key[2])
+            c.pending[key] = Threads.@spawn planepixels(PNGFiles.load($path))
+        end
+    end
+    return nothing
+end
+
+function finishcacheprefetch!(seq::Sequence)
+    for c in values(seq.trackcaches)
+        foreach(fetch, values(c.pending))
+        empty!(c.pending)
+    end
+    return nothing
 end
 
 function invalidatecomposite!(seq::Sequence, frames)
