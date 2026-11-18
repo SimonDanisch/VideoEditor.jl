@@ -626,18 +626,19 @@ function startmezzanine!(player::Player, source::VideoSource)
 end
 
 """
-Enable GPU playback if the device supports hardware video decode. The capability is
-probed with `Mantle.videodecodes` ON THE GPU WORKER, so the worker
-creates and owns the (process-global, single-writer) Vulkan context — keeping async
-analysis on the same thread. On success it attaches a [`GPUPreview`] and opens a
-streaming decoder per source; otherwise it is a silent no-op and playback stays on
-the CPU. Called in the background from the default `Player` constructor.
+Enable GPU playback if the player's device supports hardware video decode. The
+capability is probed with `Mantle.videodecodes` on the GPU worker, which made the
+device in the `Player` constructor and owns its (process-global, single-writer)
+context. On success it attaches a [`GPUPreview`] and opens a streaming decoder per
+source; otherwise it is a silent no-op and playback decodes on the CPU, while effects
+and analyses still run on the device. Called in the background from the default
+`Player` constructor.
 """
 function autodetectgpu!(player::Player)
     player.gpupreview isa GPUPreview && return nothing   # already enabled (explicit gpupreview)
     capable = try
         rungpusync(player) do
-            Mantle.videodecodes(Mantle.defaultbackend())
+            Mantle.videodecodes(player.analysisbackend)
         end
     catch e
         # a silent false here is how GPU decode gets demoted to the CPU unnoticed
@@ -645,9 +646,6 @@ function autodetectgpu!(player::Player)
         false
     end
     capable || return nothing
-    player.analysisbackend = Mantle.defaultbackend()               # wraps the worker-owned context
-    emptyengine!(player.engine)                          # its plans hold pool regions now
-    player.engine = FxEngine(player.analysisbackend)     # the engine follows the backend
     player.gpupreview = GPUPreview()
     haskey(player.fxwidgets, :lanechip) && (player.fxwidgets[:lanechip][] = "GPU")
     setgpurun!(player.timeline, f -> rungpusync(f, player))   # GPU thumbnails from here on

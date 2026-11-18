@@ -30,7 +30,7 @@ const GRAPHDIR = joinpath(@__DIR__, "..", "..", "..", "gen", "graphs", "basicvsr
 A restorer matching [`VideoEditor.registerrestore!`](@ref)'s contract, plus the
 window length the exported graph expects and the model's upscale factor.
 """
-function basicvsrpprestorer(; graphdir = GRAPHDIR, backend = KA.CPU())
+function basicvsrpprestorer(; graphdir = GRAPHDIR, backend = Mantle.defaultbackend())
     isdir(graphdir) || error("no exported BasicVSR++ graph at $graphdir — " *
                              "run tools/export_basicvsrpp.py first")
     g = DNNKernels.loadgraph(joinpath(graphdir, "basicvsrpp.json"))

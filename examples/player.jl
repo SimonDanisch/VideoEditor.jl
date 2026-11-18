@@ -6,7 +6,7 @@ bird = "/windows/Users/sdani/Cloudi/giffers/20260708_160827.mp4"
 # No `analysisbackend = Mantle.defaultbackend()`: the GPU context belongs to the thread that
 # touches it FIRST, so building it here makes MAIN the owner and every later
 # analysis on the pinned worker asserts "BatchQueue is single-writer".
-# `autodetectgpu!` establishes worker ownership in the right order.
+# The `Player` constructor makes the device on its GPU worker instead.
 player = Player(bird; gpupreview=true);
 
 begin

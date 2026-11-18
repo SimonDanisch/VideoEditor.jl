@@ -1,6 +1,6 @@
 """
     analyzemotion!(clip; mode=:similarity, analysis_width=320, cutoff=1.0,
-                   backend=KA.CPU(), progress=nothing) -> MotionTrack
+                   backend=Mantle.defaultbackend(), progress=nothing) -> MotionTrack
 
 Camera stabilization. Four modes:
 
@@ -28,7 +28,7 @@ in preview and export. Saved with the project.
 """
 function analyzemotion!(clip::Clip; mode::Symbol = :similarity, analysis_width::Integer = 320,
                         cutoff::Real = 1.0, levels::Integer = 4,
-                        backend = KA.CPU(), progress = nothing)
+                        backend = Mantle.defaultbackend(), progress = nothing)
     mode in (:similarity, :tripod, :perspective, :smooth) ||
         error("mode must be :similarity, :tripod, :perspective or :smooth")
     # Nothing to track in a clip that renders its own frames: there is no file to
@@ -215,7 +215,7 @@ function cameralock!(clip::Clip; point = nothing, window::Integer = 96,
                      reacqradius::Integer = 64, coastframes::Integer = 90,
                      maxfeatures::Integer = 120, replenishfrac::Real = 0.5,
                      redetectevery::Integer = 6,
-                     backend = KA.CPU(), progress = nothing, debug = nothing)
+                     backend = Mantle.defaultbackend(), progress = nothing, debug = nothing)
     n = srclength(clip)
     n >= 2 || return nothing
     decodable(clip.source) || return nothing   # see `analyzemotion!`
@@ -375,7 +375,7 @@ function cameralock!(clip::Clip; point = nothing, window::Integer = 96,
 end
 
 """
-    analyzeobject!(clip, point; backend=KA.CPU(), progress=nothing) -> MotionTrack
+    analyzeobject!(clip, point; backend=Mantle.defaultbackend(), progress=nothing) -> MotionTrack
 
 Object lock: pin the content under `point` (source pixels in the clip's
 first frame) so it does not move a pixel — [`cameralock!`](@ref) with an
@@ -449,7 +449,7 @@ function cropintersect(a::NTuple{4, Float64}, b::NTuple{4, Float64})
 end
 
 """
-    loopsignatures(clip; matchwidth=64, backend=KA.CPU(), progress=nothing) -> gw×gh×n
+    loopsignatures(clip; matchwidth=64, backend=Mantle.defaultbackend(), progress=nothing) -> gw×gh×n
 
 Per-frame appearance signatures of the clip's STABILIZED, cropped content —
 the domain both the loop search and the loop TOOL score frame similarity in.
@@ -458,7 +458,7 @@ track, crops, downscales to `matchwidth` and is normalized to zero mean/unit
 std, so lighting drift doesn't dominate the comparison.
 """
 function loopsignatures(clip::Clip; matchwidth::Integer = 64,
-                        backend = KA.CPU(), progress = nothing)
+                        backend = Mantle.defaultbackend(), progress = nothing)
     src = clip.source
     n = srclength(clip)
     W, H = src.width, src.height
@@ -550,7 +550,7 @@ not a reverse/boomerang.
 """
 function findloop(clip::Clip; minseconds::Real = 1.5, maxseconds::Real = 6.0,
                   matchwidth::Integer = 64, step::Integer = 2, lengthbias::Real = 0.0,
-                  backend = KA.CPU(), progress = nothing)
+                  backend = Mantle.defaultbackend(), progress = nothing)
     fps = clip.source.framerate
     n = srclength(clip)
     n >= 4 || throw(ArgumentError("clip too short to loop"))

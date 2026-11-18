@@ -214,10 +214,9 @@ end
 
 # There is no second walker over the stack here. `composite` (gpugraph.jl) is
 # the one renderer — every frame the editor shows or exports goes through it,
-# one clip or eight — and it is not GPU-specific: the engine's Mantle device backs
-# its transients with host memory on `KA.CPU()` and VRAM through Mantle, and the
-# passes run the identical kernels either way. The tier is the engine's backend,
-# a parameter — never a second code path.
+# one clip or eight — and it is not GPU-specific: the engine's Mantle device is a
+# GPU or lavapipe on the CPU, and the passes run the identical kernels either way.
+# The tier is the engine's backend, a parameter — never a second code path.
 #
 # There used to be one anyway: `applyeffects!` walked `liveeffects` with two
 # scratch buffers, plus `applyeffect!` methods that re-stated what Color, Blur

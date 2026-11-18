@@ -107,7 +107,7 @@ frame resolution; see [`findchange`](@ref) for the automatic version.
 """
 function contactsheet(seq::Sequence, t0::Real = 0.0, t1::Real = seqduration(seq);
                       cells::Integer = 64, size::Integer = 512, labels::Bool = true,
-                      backend = KA.CPU())
+                      backend = Mantle.defaultbackend())
     isempty(seq.clips) && return (fill(RGB{N0f8}(0, 0, 0), size, size), NamedTuple[])
     frames = sheetframes(seq, t0, t1, cells)
     canvas = canvassize(seq)
@@ -148,7 +148,7 @@ The same as [`contactsheet`](@ref) but in ONE row and bigger — for reading a
 short span (a gesture, a cut, a transition) in order, left to right.
 """
 function filmstrip(seq::Sequence, t0::Real, t1::Real; count::Integer = 8,
-                   height::Integer = 120, labels::Bool = true, backend = KA.CPU())
+                   height::Integer = 120, labels::Bool = true, backend = Mantle.defaultbackend())
     isempty(seq.clips) && return (fill(RGB{N0f8}(0, 0, 0), height, height), NamedTuple[])
     frames = sheetframes(seq, t0, t1, count)
     canvas = canvassize(seq)
@@ -183,7 +183,7 @@ filmstrip(player::Player, args...; kwargs...) = filmstrip(player.sequence, args.
 One finished frame at timeline time `t`, scaled to `width` — what the export
 writes there. The spatial counterpart of a sheet cell.
 """
-function framegrab(seq::Sequence, t::Real; width::Integer = 480, backend = KA.CPU())
+function framegrab(seq::Sequence, t::Real; width::Integer = 480, backend = Mantle.defaultbackend())
     return regiongrab(seq, t, (0.0, 0.0, 1.0, 1.0); width = width, backend = backend)
 end
 
@@ -199,7 +199,7 @@ Cheap: the crop is taken from the rendered frame, so the detail is real pixels,
 not an upscaled thumbnail (as long as `width` stays under `w × source width`).
 """
 function regiongrab(seq::Sequence, t::Real, rect::NTuple{4, Real};
-                    width::Integer = 480, backend = KA.CPU())
+                    width::Integer = 480, backend = Mantle.defaultbackend())
     canvas = canvassize(seq)
     isempty(seq.clips) && return fill(RGB{N0f8}(0, 0, 0), width, width)
     n = clamp(round(Int, t * seq.framerate), 0, max(seqlength(seq) - 1, 0))
@@ -262,7 +262,7 @@ find in that range. This is the automatic half of the zoom: use it when the
 property is measurable, [`contactsheet`](@ref) when only a model can judge it.
 """
 function findchange(seq::Sequence, t0::Real = 0.0, t1::Real = seqduration(seq);
-                    threshold::Real = 0.08, backend = KA.CPU())
+                    threshold::Real = 0.08, backend = Mantle.defaultbackend())
     isempty(seq.clips) && return nothing
     last = max(seqlength(seq) - 1, 0)
     lo = clamp(round(Int, t0 * seq.framerate), 0, last)

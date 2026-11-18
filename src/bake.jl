@@ -269,7 +269,7 @@ would use if nobody said otherwise and the kind of widget each wants:
 `:flag` (checkbox), `:number`, `:symbol`, or `:expr` — a Julia expression the
 screen build evaluates in the backend's module, for the settings a text box
 cannot carry as a plain value (`integrator = VolPath(samples=256)`,
-`device = CPU()`).
+`device = Mantle.defaultbackend()`).
 
 `ScreenConfig`'s fields ARE what `activate!` and `Screen(...)` accept, and Makie
 keeps their defaults in the default theme under the backend's name — so this needs

@@ -97,13 +97,12 @@ hostgray!(host::Matrix{Float32}, frames::AbstractVector, sf::Integer) =
 """
     graysource(backend, source) -> StreamGraySource | GrayReader
 
-Frame source for an analysis pass over `source`: a GPU backend decodes through
-its own chunked [`GpuVideoStream`](@ref) (falling back to VideoIO with a warning
-when the stream won't open — unsupported codec, VRAM); the CPU backend reads via
-VideoIO. Feed frames with [`grayinto!`](@ref)/[`hostgray!`](@ref)/[`rgbinto!`](@ref);
+Frame source for an analysis pass over `source`: a device that decodes video
+streams it through its own chunked [`GpuVideoStream`](@ref) (falling back to VideoIO
+with a warning when the stream won't open — unsupported codec, VRAM); any other
+device reads via VideoIO. Feed frames with [`grayinto!`](@ref)/[`hostgray!`](@ref)/[`rgbinto!`](@ref);
 `close` when done.
 """
-graysource(backend::KA.CPU, source::VideoSource) = GrayReader(source)
 function graysource(backend, source::VideoSource)
     # A GPU with no hardware decoder reads on the CPU by design, not as a fallback
     # worth a warning: see `opendecoder`.
@@ -304,7 +303,7 @@ function refinecampath(clip::Clip, seed::Vector{Mat3f}, n::Integer; window::Inte
 end
 
 """
-    similaritypath!(clip; backend=KA.CPU(), progress=nothing, ...) -> MotionTrack
+    similaritypath!(clip; backend=Mantle.defaultbackend(), progress=nothing, ...) -> MotionTrack
 
 Camera lock via the two-pass Lucas-Kanade + RANSAC-similarity pipeline (see file
 header). Estimates a smooth per-frame **similarity** (translation + rotation + uniform
@@ -318,7 +317,7 @@ function similaritypath!(clip::Clip; window::Integer = 11, iters::Integer = 15,
                          refwindow::Integer = 28, refradius::Integer = 10,
                          outlierwindow::Integer = 3, outliertrans::Real = 20.0,
                          outlierscale::Real = 0.1, outlierrot::Real = 5.0,
-                         backend = KA.CPU(), progress = nothing)
+                         backend = Mantle.defaultbackend(), progress = nothing)
     n = srclength(clip)
     n >= 2 || return nothing
     # Feed both passes from the backend's frame source: on the GPU the chunked

@@ -196,7 +196,7 @@ function bundleadjust(tracks::Vector{Track}, n::Int; iters::Integer = 25, huber:
 end
 
 """
-    bundlelock!(clip; analysis_width=480, backend=KA.CPU(), progress=nothing) -> MotionTrack
+    bundlelock!(clip; analysis_width=480, backend=Mantle.defaultbackend(), progress=nothing) -> MotionTrack
 
 Production camera lock: extract long feature trajectories ([`extracttracks`])
 and solve a global similarity bundle adjustment ([`bundleadjust`]) for a
@@ -207,7 +207,7 @@ DaVinci's *Similarity + Camera Lock*.
 """
 function bundlelock!(clip::Clip; analysis_width::Integer = 480, window::Integer = 32,
                      searchradius::Integer = 8, huber::Real = 1.5, iters::Integer = 25,
-                     backend = KA.CPU(), progress = nothing, kwargs...)
+                     backend = Mantle.defaultbackend(), progress = nothing, kwargs...)
     n = srclength(clip)
     n >= 2 || return nothing
     source = clip.source

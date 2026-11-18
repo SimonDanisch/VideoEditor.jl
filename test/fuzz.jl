@@ -48,13 +48,17 @@ function visiblerect(player)
     return (lims.origin[1] / W, lims.origin[2] / H, lims.widths[1] / W, lims.widths[2] / H)
 end
 
-"Render timeline frame `n` the way the EXPORT does (exact decode, crops baked)."
+"""
+Render timeline frame `n` the way the EXPORT does (exact decode, crops baked), reading
+the source with VideoIO as the preview's CPU lane (`gpupreview = false`) does: a
+hardware decoder rounds YUV to RGB differently.
+"""
 function exportframe(seq, n, engine, readers)
     cs = clipsat(seq, n)
     isempty(cs) && return nothing
     out = RGBFrame(undef, VE.canvassize(seq)...)   # the SEQUENCE's format, as the encoder writes it
     ok = VE.composite(engine, cs, n,
-                      (clip, _) -> get!(() -> VE.opendecoder(clip.source, engine.backend),
+                      (clip, _) -> get!(() -> VE.SequentialReader(clip.source),
                                         readers, clip.source.path);
                       canvas = VE.canvassize(seq), exact = true) do canvas
         copyto!(out, canvas)

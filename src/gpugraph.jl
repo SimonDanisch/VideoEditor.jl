@@ -1596,17 +1596,12 @@ The device `engine` renders on, made by its first render rather than with the
 engine. A Vulkan context belongs to the thread that touches it first, and an
 engine is built wherever its owner is — a `Player` on thread 1 — while it renders
 on the thread [`mantlethread`](@ref) answers.
-
-The device of the analysis backend, and the default device for the CPU one:
-analysis kernels run on the CPU there, and effects are rendered by Mantle, which
-has no host device.
 """
 function enginedevice(e::FxEngine)
     e.device === nothing && (e.device = renderdevice(e.backend))
     return e.device
 end
 renderdevice(backend) = Mantle.Device(backend)
-renderdevice(::KA.CPU) = Mantle.Device()
 
 """
 Give every compiled composition's regions back to the pool. Explicit — Mantle

@@ -14,7 +14,7 @@ function run(project,out)
         @test timedwait(() -> get(p.fxwidgets,:publishedframe,-1)==0,120)===:ok
         @test first(p.sequence.clips).source.live.backend===:RayMakie
         @test first(p.sequence.clips).source.live.screen.rasterize
-        @test !(first(p.sequence.clips).source.live.screen.config.device isa VE.KA.CPU)
+        @test first(p.sequence.clips).source.live.screen.config.device isa VE.Mantle.Device
         VE.GLMakie.stop_renderloop!(p.screen;close_after_renderloop=false)
         M.disconnect!(p.screen,M.mouse_position);M.events(p.fig).hasfocus[]=false
         clip()=VE.selectedclip(p)

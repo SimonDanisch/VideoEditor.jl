@@ -787,20 +787,23 @@ end
             be = p.analysisbackend
             KA = VE.KA
             W, H = 32, 24
-            img = KA.allocate(be, VE.RGB{VE.N0f8}, W, H)
-            fill!(img, VE.RGB{VE.N0f8}(0.5, 0.4, 0.3))
-            out = KA.allocate(be, VE.RGB{VE.N0f8}, W, H)
-            fill!(out, VE.RGB{VE.N0f8}(0.1, 0.2, 0.3))
-            VE.lookmix_kernel!(be)(out, img, 0.5f0; ndrange = (W, H))
-            KA.synchronize(be)
-            @test Array(out)[1, 1] isa VE.RGB{VE.N0f8}
-
-            dep = KA.allocate(be, UInt8, W, H); fill!(dep, 0x80)
-            dst = KA.allocate(be, VE.RGB{VE.N0f8}, W, H)
-            VE.depthblur_kernel!(be)(dst, img, dep, Int32(W), Int32(H), 0.5f0, Int32(3);
-                                     ndrange = (W, H))
-            KA.synchronize(be)
-            @test Array(dst)[1, 1] isa VE.RGB{VE.N0f8}
+            # On the player's GPU worker, which owns the device.
+            mixed, blurred = VE.rungpusync(p) do
+                img = KA.allocate(be, VE.RGB{VE.N0f8}, W, H)
+                fill!(img, VE.RGB{VE.N0f8}(0.5, 0.4, 0.3))
+                out = KA.allocate(be, VE.RGB{VE.N0f8}, W, H)
+                fill!(out, VE.RGB{VE.N0f8}(0.1, 0.2, 0.3))
+                VE.lookmix_kernel!(be)(out, img, 0.5f0; ndrange = (W, H))
+                KA.synchronize(be)
+                dep = KA.allocate(be, UInt8, W, H); fill!(dep, 0x80)
+                dst = KA.allocate(be, VE.RGB{VE.N0f8}, W, H)
+                VE.depthblur_kernel!(be)(dst, img, dep, Int32(W), Int32(H), 0.5f0, Int32(3);
+                                         ndrange = (W, H))
+                KA.synchronize(be)
+                (Array(out), Array(dst))
+            end
+            @test mixed[1, 1] isa VE.RGB{VE.N0f8}
+            @test blurred[1, 1] isa VE.RGB{VE.N0f8}
         end
 
         @testset "resizing a depth map keeps its values" begin

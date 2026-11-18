@@ -62,9 +62,9 @@ VE.usebackend!(RayMakie)      # a scene names its renderer in text; the name has
 # into a recording the first already handed over. Off, the take renders; the
 # analysis this demo is about does not use it either way.
 #
-# The effect engine and the export still run on the GPU: `analysisbackend` is
-# what both follow, and left unset it is `KA.CPU()`.
-player = VE.Player(PROJECT; analysisbackend = Mantle.defaultbackend(), gpupreview = false)
+# The effect engine and the export still run on the GPU: both follow the player's
+# device, which the player makes on its GPU worker.
+player = VE.Player(PROJECT; gpupreview = false)
 seq = player.sequence
 fig = player.fig
 resize!(fig, 1500, 950)

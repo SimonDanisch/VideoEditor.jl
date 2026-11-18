@@ -110,7 +110,7 @@ mutable struct Player <: Editor
     # canvas and could not go finer. An Observable because the ring on the preview
     # and the number in the panel are both derived from it — see `setbrushradius!`.
     const brushradius::Observable{Float64}
-    analysisbackend::Any  # KA backend for analysis/GPU playback; set by auto-detect
+    analysisbackend::Any  # the Mantle device analyses, effects and GPU playback run on
     const fig::Figure
     const previewaxis::Axis
     const cropmode::Base.RefValue{Bool}
@@ -476,14 +476,15 @@ function Player(path::AbstractString; capacity::Integer = 64,
     # the farm server: machines offer it their GPUs with `julia -m FarmClient all <address>`
     any(c -> c.name === :farm_lan, COMMANDS) || startlanfarm!()
     # GPU playback is the default: leaving both `analysisbackend` and `gpupreview`
-    # unset auto-detects a video-capable Vulkan device (below) and, if present, runs
-    # decode + effects on the GPU. Pass either to force the choice.
+    # unset auto-detects whether the device decodes video (below) and, if it does,
+    # runs decode + effects on it. Pass either to force the choice.
     autodetect = analysisbackend === nothing && gpupreview === nothing
-    backend = analysisbackend === nothing ? KA.CPU() : analysisbackend
-    # an explicit GPU analysis backend implies GPU playback — `gpupreview = false` opts out
-    wantgpu = gpupreview === true || (gpupreview === nothing && !(backend isa KA.CPU))
-    wantgpu && backend isa KA.CPU &&
-        error("gpupreview = true requires a GPU backend, e.g. Player(path; analysisbackend = Mantle.defaultbackend(), gpupreview = true)")
+    # The device is made on the GPU worker, which owns its context from then on
+    # (see `GPUWorker`); analyses and effects run on it whichever lane plays back.
+    worker = GPUWorker()
+    backend = analysisbackend === nothing ? rungpusync(Mantle.defaultbackend, worker) : analysisbackend
+    # an explicit analysis backend implies GPU playback — `gpupreview = false` opts out
+    wantgpu = gpupreview === true || (gpupreview === nothing && analysisbackend !== nothing)
     # a project path opens the saved edit instead of a video
     isproject = endswith(lowercase(path), ".videoedit")
     sequence = isproject ? loadproject(path) : Sequence(VideoSource(path))
@@ -522,6 +523,7 @@ function Player(path::AbstractString; capacity::Integer = 64,
                 frame, playhead, playing; background, uicolors, analysisbackend = backend,
                 effects, previewscale = validpreviewscale(previewscale))
     end
+    player.gpuworker = worker
     # The editor UI is GLMakie even when the current scene backend is RayMakie.
     # Routing `display(fig)` through the active scene backend tried to raytrace
     # the editor's own widgets and could terminate the session on headless X11.
@@ -1413,8 +1415,7 @@ function publishframe!(player::Player, n::Integer)
     player.fxwidgets[:publishedframe] = Int(n)
     clips = clipsat(player.sequence, n)
     gpu_scene = any(c -> c.source isa SceneSource && c.source.live !== nothing &&
-        c.source.live.backend === :RayMakie &&
-        !(c.source.live.screen.config.device isa KA.CPU), clips)
+        c.source.live.backend === :RayMakie, clips)
     label = gpu_scene ? "GPU scene" : gpuready(player) ? "GPU" : "CPU"
     chip = player.fxwidgets[:lanechip]
     chip[] == label || (chip[] = label)

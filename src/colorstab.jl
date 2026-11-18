@@ -1,5 +1,5 @@
 """
-    analyzecolor!(clip; cutoff=0.5, backend=KA.CPU(), progress=nothing) -> ColorTrack
+    analyzecolor!(clip; cutoff=0.5, backend=Mantle.defaultbackend(), progress=nothing) -> ColorTrack
 
 Color/exposure stabilization: measure per-channel mean/std for every source
 frame of the clip, low-pass the trajectories (`cutoff` Hz — slow intentional
@@ -10,7 +10,7 @@ The track is keyed by absolute source frame, so it stays valid across
 later splits/moves of the clip. Applied automatically (before user
 effects) in preview and export. Saved with the project.
 """
-function analyzecolor!(clip::Clip; cutoff::Real = 0.5, backend = KA.CPU(), progress = nothing)
+function analyzecolor!(clip::Clip; cutoff::Real = 0.5, backend = Mantle.defaultbackend(), progress = nothing)
     n = srclength(clip)
     n >= 24 || return nothing  # too short to separate flicker from content
     decodable(clip.source) || return nothing   # a rendered clip has no flicker

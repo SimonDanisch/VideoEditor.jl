@@ -76,15 +76,15 @@ GLMakie.activate!(; visible = false, framerate = 30)
 # NOT `analysisbackend = Mantle.defaultbackend()`. the GPU context belongs to whichever
 # thread touches it FIRST, and constructing the backend here makes that MAIN —
 # after which every analysis on the pinned worker dies with "BatchQueue is
-# single-writer; cross-thread sweep forbidden". `autodetectgpu!` (spawned by the
-# constructor) gets the order right: `vk_context()` through `rungpusync` first,
-# the backend built around the worker-owned context second.
+# single-writer; cross-thread sweep forbidden". The constructor makes the device
+# on its GPU worker, and `autodetectgpu!` (spawned by it) then turns on GPU
+# playback; wait for that rather than racing it.
 player = Player(demosource)
 let t0 = time()
-    while !(player.analysisbackend isa KA.GPU) && time() - t0 < 90
+    while player.gpupreview === nothing && time() - t0 < 90
         sleep(0.2)
     end
-    player.analysisbackend isa KA.GPU ||
+    player.gpupreview !== nothing ||
         @warn "GPU autodetect did not enable the GPU tier — the walkthrough will run on the CPU tier"
 end
 # DO NOT set `player.gpupreview = nothing` here — see record_loop_demo.jl. The

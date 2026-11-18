@@ -66,7 +66,7 @@ A dialog text box and a project file both hold text, so a STRING is read against
 the field's declared type: a field that takes a `Symbol` gets one (`tonemap`),
 one that takes a number gets it parsed, and anything else is a Julia expression
 evaluated in the backend's own module — `integrator = "VolPath(samples=256)"`,
-`device = "CPU()"`. The expression is the only way a text box can carry an
+`device = "Mantle.defaultbackend()"`. The expression is the only way a text box can carry an
 object, and it is what makes the dialogs reach everything `activate!` accepts
 rather than the numbers-and-flags subset. It is also why a backend registered
 with [`usebackend!`](@ref) must re-export what its settings name (RayMakie

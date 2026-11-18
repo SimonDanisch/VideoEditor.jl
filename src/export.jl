@@ -169,13 +169,8 @@ decodesource(sr::SequentialReader, frame::Integer; playing::Bool = false,
 
 sourceinto!(out, sr::SequentialReader, f) = (out === f || copyto!(out, f); out)
 
-"Frame-sized working buffer on `backend` (a plain host frame on the CPU)."
-allocframe(::KA.CPU, dims::NTuple{2, Int}) = RGBFrame(undef, dims...)
-allocframe(backend, dims::NTuple{2, Int}) = KA.allocate(backend, RGB{N0f8}, dims)
-
 "The export canvas (downloaded to the host every frame; stays device-local —
 BAR/unified memory reads ~70 MB/s from the CPU, 8× slower than staged readback)."
-alloccanvas(::KA.CPU, dims::NTuple{2, Int}) = zeros(RGB{N0f8}, dims...)
 alloccanvas(backend, dims::NTuple{2, Int}) = KA.allocate(backend, RGB{N0f8}, dims)
 
 "Black canvas for gaps and the composite base (device canvases copy a host zero frame)."
@@ -183,8 +178,6 @@ fillblack!(buf::RGBFrame, blackhost) = fill!(buf, RGB{N0f8}(0, 0, 0))
 fillblack!(buf, blackhost) = copyto!(buf, blackhost)
 
 "Publish the composed canvas to the encoder (device canvases download via `hostout`)."
-writeframe!(writer, canvas::RGBFrame, hostout, backend) =
-    write(writer, PermutedDimsArray(canvas, (2, 1)))
 function writeframe!(writer, canvas, hostout, backend)
     KA.synchronize(backend)
     copyto!(hostout, canvas)
@@ -198,7 +191,6 @@ decodes (frames land device-resident through the chunked session — no host
 round-trip); everything else reads sequentially on the CPU. A failure to open
 the declared lane fails the export loudly instead of silently switching.
 """
-opendecoder(source::VideoSource, ::KA.CPU) = SequentialReader(source)
 function opendecoder(source::VideoSource, backend)
     # The capability the docstring promises. Without it a Metal export reached
     # `openstream`, whose decoder is Vulkan Video, failed with an `UndefVarError`
