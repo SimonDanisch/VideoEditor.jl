@@ -317,9 +317,6 @@ function collectslots!(workers::Channel{FarmWorker}, server::FarmServer, key, ev
     end
 end
 
-"""The API whose devices farm renderers choose from on this platform."""
-farmapi() = Sys.isapple() ? Mantle.MetalAPI() : Mantle.VulkanAPI()
-
 """
     farmgpus(path)
 
@@ -329,10 +326,9 @@ that cannot make a device (an integrated one lacking a feature the renderer
 needs, say) carries the reason as its `problem`.
 """
 function farmgpus(path::AbstractString)
-    api = farmapi()
-    gpus = map(Mantle.devices(api)) do d
+    gpus = map(Mantle.devices()) do d
         problem = try
-            Mantle.Device(api; select = d.index)
+            Mantle.Device(d.index)
             ""
         catch e
             # any failure makes the GPU unusable; the reason goes to whoever offers it
@@ -357,7 +353,7 @@ input.
 function farmchild(directory::AbstractString; device = nothing, input::IO = stdin, output::IO = stdout)
     # what scene code prints goes to the client's log, not into the messages
     redirect_stdout(stderr)
-    gpu = device === nothing ? nothing : Mantle.Device(farmapi(); select = device)
+    gpu = device === nothing ? nothing : Mantle.Device(device)
     gpu === nothing || Mantle.defaultdevice!(gpu)
     renderer = farmrenderer(directory)
     try
